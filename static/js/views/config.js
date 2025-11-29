@@ -59,6 +59,16 @@ const ConfigView = {
         const tableCard = UI.card("outlined", "overflow-hidden p-0");
         const table = UI.el("table", "w-full text-left");
 
+        // 默认按优先级（weight）降序排序，高优先级在前；次级按名称升序
+        const sortedProviders = (providers || []).slice().sort((a, b) => {
+            const wa = (a.preferences?.weight ?? a.weight ?? 0);
+            const wb = (b.preferences?.weight ?? b.weight ?? 0);
+            if (wb !== wa) return wb - wa;
+            const na = (a.provider || a.name || "").toLowerCase();
+            const nb = (b.provider || b.name || "").toLowerCase();
+            return na.localeCompare(nb);
+        });
+
         const thead = UI.el("thead", "bg-md-surface-container-highest");
         thead.innerHTML = `<tr>
             <th class="px-4 py-3 text-label-large text-md-on-surface">名称</th>
@@ -72,11 +82,12 @@ const ConfigView = {
 
         const tbody = UI.el("tbody", "divide-y divide-md-outline-variant");
 
-        if (!providers || providers.length === 0) {
+        if (!sortedProviders || sortedProviders.length === 0) {
             tbody.innerHTML = '<tr><td colspan="6" class="text-center py-12 text-body-medium text-md-on-surface-variant">暂无渠道配置，点击"添加渠道"开始配置</td></tr>';
         } else {
-            providers.forEach((provider, index) => {
-                const tr = ConfigView._createProviderRow(provider, index, providers);
+            sortedProviders.forEach((provider) => {
+                const originalIndex = (providers || []).indexOf(provider);
+                const tr = ConfigView._createProviderRow(provider, originalIndex, providers);
                 tbody.appendChild(tr);
             });
         }
@@ -89,13 +100,14 @@ const ConfigView = {
         // 移动端：卡片列表视图
         const mobileWrapper = UI.el("div", "md:hidden flex flex-col gap-3");
         
-        if (!providers || providers.length === 0) {
+        if (!sortedProviders || sortedProviders.length === 0) {
             const emptyCard = UI.card("outlined", "p-8 text-center");
             emptyCard.appendChild(UI.el("p", "text-body-medium text-md-on-surface-variant", "暂无渠道配置，点击\"添加渠道\"开始配置"));
             mobileWrapper.appendChild(emptyCard);
         } else {
-            providers.forEach((provider, index) => {
-                const card = ConfigView._createProviderCard(provider, index, providers);
+            sortedProviders.forEach((provider) => {
+                const originalIndex = (providers || []).indexOf(provider);
+                const card = ConfigView._createProviderCard(provider, originalIndex, providers);
                 mobileWrapper.appendChild(card);
             });
         }
@@ -348,6 +360,29 @@ const ConfigView = {
         const renderDialogContent = () => {
             const content = UI.el("div", "flex flex-col gap-3");
 
+            // 统一复制方法（含回退）
+            const copyModelName = async (text) => {
+                const t = text || "";
+                if (!t) return;
+                try {
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        await navigator.clipboard.writeText(t);
+                    } else {
+                        const ta = document.createElement("textarea");
+                        ta.value = t;
+                        ta.style.position = "fixed";
+                        ta.style.left = "-10000px";
+                        document.body.appendChild(ta);
+                        ta.select();
+                        document.execCommand("copy");
+                        document.body.removeChild(ta);
+                    }
+                    UI.snackbar(`已复制: ${t}`, null, null, { variant: "success" });
+                } catch (err) {
+                    UI.snackbar("复制失败", null, null, { variant: "error" });
+                }
+            };
+
             // 顶部控制栏：全部测试 + 并发数 + 搜索（同一行，移动端自动换行）
             const controlSection = UI.el("div", "flex flex-wrap items-center gap-2");
 
@@ -412,6 +447,13 @@ const ConfigView = {
                     
                     // MD3 List Item: 56dp 高度，标准结构
                     const listItem = UI.el("li", "flex items-center h-14 px-4 hover:bg-md-surface-container-low active:bg-md-surface-container transition-colors cursor-default");
+                    // 行空白区域点击亦可复制（排除按钮/输入控件）
+                    listItem.setAttribute("data-tooltip", "点击复制模型名");
+                    listItem.onclick = (e) => {
+                        if (!e.target.closest("button") && !e.target.closest("input")) {
+                            copyModelName(model);
+                        }
+                    };
                     
                     // Leading: 状态图标（24x24）
                     const leading = UI.el("div", "w-10 h-10 flex items-center justify-center flex-shrink-0 -ml-2");
@@ -421,10 +463,21 @@ const ConfigView = {
                     
                     // Content: 模型名称 + 辅助信息
                     const contentArea = UI.el("div", "flex-1 min-w-0 ml-2");
+                    // 内容区域点击复制
+                    contentArea.setAttribute("data-tooltip", "点击复制模型名");
+                    contentArea.onclick = (e) => {
+                        e.stopPropagation();
+                        copyModelName(model);
+                    };
                     
-                    // Headline: 模型名称
+                    // Headline: 模型名称（点击复制）
                     const headline = UI.el("div", "font-mono text-body-medium text-md-on-surface truncate", model);
                     headline.title = model;
+                    headline.setAttribute("data-tooltip", "点击复制模型名");
+                    headline.onclick = (e) => {
+                        e.stopPropagation();
+                        copyModelName(model);
+                    };
                     contentArea.appendChild(headline);
                     
                     // Supporting text: 耗时或错误信息
@@ -779,6 +832,8 @@ const ConfigView = {
                 return;
             }
             ConfigView._apiConfig = bodyConfig;
+            // 更新列表显示以应用按优先级的默认排序
+            Views.render("config");
             UI.snackbar(`优先级已更新为 ${newWeight}`, null, null, { variant: "success" });
         } catch (e) {
             UI.snackbar(`更新优先级失败: ${e.message}`, null, null, { variant: "error" });
@@ -912,38 +967,180 @@ Object.assign(ConfigView, {
         basicSection.appendChild(urlWrap.wrapper);
         form.appendChild(basicSection);
 
-        // API Keys Section - 自动伸缩输入框
-        const keysHeader = UI.el("div", "inline-flex items-center gap-2 text-md-secondary text-label-large mb-2 mt-4");
-        keysHeader.appendChild(UI.icon("key", "text-lg", true));
-        keysHeader.appendChild(UI.el("span", "", "API Keys"));
-        form.appendChild(keysHeader);
-
-        const keysSection = UI.el("div", "bg-md-surface-container p-4 rounded-md-lg");
-        keysSection.appendChild(UI.el("div", "text-body-small text-md-on-surface-variant mb-3", "每行一个 API Key，输入框会自动调整高度"));
+                // API Keys Section - 列表输入框
+                const keysHeader = UI.el("div", "inline-flex items-center gap-2 text-md-secondary text-label-large mb-2 mt-4");
+                keysHeader.appendChild(UI.icon("key", "text-lg", true));
+                keysHeader.appendChild(UI.el("span", "", "API Keys"));
+                form.appendChild(keysHeader);
         
-        // 创建自动伸缩的 textarea
-        const keysTextarea = document.createElement("textarea");
-        keysTextarea.className = "w-full px-4 py-3 bg-md-surface border border-md-outline rounded-md-xs text-body-medium text-md-on-surface font-mono focus:outline-none focus:border-md-primary focus:border-2 transition-all resize-none overflow-hidden";
-        keysTextarea.placeholder = "sk-xxx...\nsk-yyy...";
-        keysTextarea.value = providerData.api_keys.join("\n");
-        keysTextarea.rows = 1;
+                if (!Array.isArray(providerData.api_keys)) {
+                    providerData.api_keys = [];
+                }
         
-        // 自动调整高度函数
-        const autoResize = () => {
-            keysTextarea.style.height = "auto";
-            keysTextarea.style.height = Math.max(48, Math.min(keysTextarea.scrollHeight, 200)) + "px";
-        };
+                const keysSection = UI.el("div", "bg-md-surface-container p-4 rounded-md-lg flex flex-col gap-3");
         
-        keysTextarea.oninput = (e) => {
-            providerData.api_keys = e.target.value.split("\n").map(k => k.trim()).filter(k => k);
-            autoResize();
-        };
+                // 顶部统计 + 操作按钮
+                const keysToolbar = UI.el("div", "flex items-center justify-between");
+                const keysSummary = UI.el("span", "text-body-small text-md-on-surface-variant", "");
+                const keysActions = UI.el("div", "flex items-center gap-2");
         
-        // 初始化高度
-        setTimeout(autoResize, 0);
+                const addKeyBtn = UI.btn("添加密钥", null, "text", "add");
+                const copyAllBtn = UI.btn("复制全部", null, "text", "content_copy");
         
-        keysSection.appendChild(keysTextarea);
-        form.appendChild(keysSection);
+                keysActions.appendChild(copyAllBtn);
+                keysActions.appendChild(addKeyBtn);
+                keysToolbar.appendChild(keysSummary);
+                keysToolbar.appendChild(keysActions);
+                keysSection.appendChild(keysToolbar);
+        
+                // 列表容器（内部滚动）
+                const listWrapper = UI.el("div", "mt-1 border border-md-outline rounded-md-xs bg-md-surface overflow-hidden");
+                const listContainer = UI.el("div", "max-h-64 overflow-y-auto divide-y divide-md-outline-variant");
+                listWrapper.appendChild(listContainer);
+                keysSection.appendChild(listWrapper);
+        
+                // 底部提示
+                keysSection.appendChild(
+                    UI.el(
+                        "div",
+                        "mt-2 text-body-small text-md-on-surface-variant/80",
+                        "提示: 输入回车可快速添加新密钥"
+                    )
+                );
+        
+                const renderKeyRows = () => {
+                    listContainer.innerHTML = "";
+        
+                    const keys = providerData.api_keys;
+                    if (!keys.length) {
+                        keys.push("");
+                    }
+        
+                    let nonEmptyCount = 0;
+        
+                    keys.forEach((value, index) => {
+                        if (value && value.trim()) nonEmptyCount += 1;
+        
+                        const row = UI.el("div", "flex items-center gap-2 px-3 py-2");
+        
+                        // 序号
+                        const indexLabel = UI.el(
+                            "span",
+                            "w-6 text-right text-body-small text-md-on-surface-variant",
+                            String(index + 1)
+                        );
+        
+                        // 输入框
+                        const input = document.createElement("input");
+                        input.type = "text";
+                        input.className =
+                            "flex-1 px-2 py-1 bg-md-surface border border-transparent rounded-md-xs " +
+                            "text-body-small font-mono text-md-on-surface " +
+                            "focus:outline-none focus:border-md-primary focus:border-2";
+                        input.value = value || "";
+                        input.setAttribute("data-key-index", String(index));
+        
+                        input.oninput = (e) => {
+                            providerData.api_keys[index] = e.target.value;
+                        };
+        
+                        // 回车快速添加/跳转
+                        input.onkeydown = (e) => {
+                            if (e.key === "Enter") {
+                                e.preventDefault();
+                                const lastIndex = providerData.api_keys.length - 1;
+                                if (index === lastIndex) {
+                                    providerData.api_keys.push("");
+                                    renderKeyRows();
+                                    setTimeout(() => {
+                                        const inputs = listContainer.querySelectorAll('input[data-key-index]');
+                                        const last = inputs[inputs.length - 1];
+                                        if (last) last.focus();
+                                    }, 0);
+                                } else {
+                                    const inputs = listContainer.querySelectorAll('input[data-key-index]');
+                                    const next = inputs[index + 1];
+                                    if (next) next.focus();
+                                }
+                            }
+                        };
+        
+                        // 复制按钮
+                        const copyBtn = UI.iconBtn(
+                            "content_copy",
+                            () => {
+                                const text = (input.value || "").trim();
+                                if (!text) {
+                                    UI.snackbar("该行没有可复制的密钥", null, null, { variant: "error" });
+                                    return;
+                                }
+                                navigator.clipboard
+                                    .writeText(text)
+                                    .then(() => {
+                                        UI.snackbar("已复制密钥", null, null, { variant: "success" });
+                                    })
+                                    .catch(() => {
+                                        UI.snackbar("复制失败", null, null, { variant: "error" });
+                                    });
+                            },
+                            "standard",
+                            { tooltip: "复制" }
+                        );
+                        copyBtn.classList.add("text-md-primary");
+        
+                        // 删除按钮
+                        const deleteBtn = UI.iconBtn(
+                            "delete",
+                            () => {
+                                providerData.api_keys.splice(index, 1);
+                                renderKeyRows();
+                            },
+                            "standard",
+                            { tooltip: "删除" }
+                        );
+                        deleteBtn.classList.add("text-md-error");
+        
+                        row.appendChild(indexLabel);
+                        row.appendChild(input);
+                        row.appendChild(copyBtn);
+                        row.appendChild(deleteBtn);
+                        listContainer.appendChild(row);
+                    });
+        
+                    keysSummary.textContent = `总计: ${nonEmptyCount} 个密钥`;
+                };
+        
+                // 按钮行为
+                addKeyBtn.onclick = () => {
+                    providerData.api_keys.push("");
+                    renderKeyRows();
+                    setTimeout(() => {
+                        const inputs = listContainer.querySelectorAll('input[data-key-index]');
+                        const last = inputs[inputs.length - 1];
+                        if (last) last.focus();
+                    }, 0);
+                };
+        
+                copyAllBtn.onclick = () => {
+                    const nonEmptyKeys = providerData.api_keys
+                        .map((k) => (k || "").trim())
+                        .filter((k) => k.length > 0);
+                    if (!nonEmptyKeys.length) {
+                        UI.snackbar("没有可复制的密钥", null, null, { variant: "error" });
+                        return;
+                    }
+                    navigator.clipboard
+                        .writeText(nonEmptyKeys.join("\n"))
+                        .then(() => {
+                            UI.snackbar("已复制所有密钥", null, null, { variant: "success" });
+                        })
+                        .catch(() => {
+                            UI.snackbar("复制失败", null, null, { variant: "error" });
+                        });
+                };
+        
+                renderKeyRows();
+                form.appendChild(keysSection);
 
         // Models Section - Chip 标签组
         const modelHeader = UI.el("div", "inline-flex items-center gap-2 text-md-tertiary text-label-large mb-2 mt-4");
@@ -953,13 +1150,11 @@ Object.assign(ConfigView, {
 
         const modelSection = UI.el("div", "bg-md-surface-container p-4 rounded-md-lg");
         
-        // 操作按钮
+        // 顶部操作按钮
         const modelActions = UI.el("div", "flex items-center gap-2 mb-3");
         const fetchModelsBtn = UI.btn("获取模型", null, "tonal", "sync");
-        const addModelBtn = UI.btn("手动添加", null, "outlined", "add");
         const clearModelsBtn = UI.btn("清空全部", null, "text", "delete");
         modelActions.appendChild(fetchModelsBtn);
-        modelActions.appendChild(addModelBtn);
         modelActions.appendChild(clearModelsBtn);
         modelSection.appendChild(modelActions);
         
@@ -976,30 +1171,77 @@ Object.assign(ConfigView, {
                 return;
             }
             
+            // 构建别名映射：上游 -> 别名
+            const aliasMap = new Map();
+            providerData.modelMappings.forEach(m => {
+                if (m.from && m.to) aliasMap.set(m.to, m.from);
+            });
+
             providerData.models.forEach((model, index) => {
-                const chip = UI.el("div", "inline-flex items-center gap-1 pl-3 pr-1 py-1 rounded-md-full bg-md-primary-container text-md-on-primary-container text-label-medium group cursor-pointer hover:shadow-md-1 transition-all");
+                const display = aliasMap.get(model) || model;
+
+                const chip = UI.el("div", "inline-flex items-center gap-2 pl-3 pr-1 py-1 rounded-md-full bg-md-primary-container text-md-on-primary-container text-label-medium group cursor-pointer hover:shadow-md-1 transition-all");
+                // 提示：点击复制模型名
+                chip.setAttribute("data-tooltip", "点击复制模型名");
+
+                // 统一复制方法（含回退）
+                const copyModel = async () => {
+                    const text = display || "";
+                    if (!text) return;
+                    try {
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            await navigator.clipboard.writeText(text);
+                        } else {
+                            const ta = document.createElement("textarea");
+                            ta.value = text;
+                            ta.style.position = "fixed";
+                            ta.style.left = "-10000px";
+                            document.body.appendChild(ta);
+                            ta.select();
+                            document.execCommand("copy");
+                            document.body.removeChild(ta);
+                        }
+                        UI.snackbar(`已复制: ${text}`, null, null, { variant: "success" });
+                    } catch (err) {
+                        UI.snackbar("复制失败", null, null, { variant: "error" });
+                    }
+                };
+
+                // 整个 Chip 点击复制（除删除按钮外）
+                chip.onclick = () => {
+                    copyModel();
+                };
                 
                 // 模型名（点击复制）
-                const modelName = UI.el("span", "font-mono select-none", model);
+                const modelName = UI.el("span", "font-mono select-none", display);
                 modelName.onclick = (e) => {
                     e.stopPropagation();
-                    navigator.clipboard.writeText(model).then(() => {
-                        UI.snackbar(`已复制: ${model}`, null, null, { variant: "success" });
-                    }).catch(() => {
-                        UI.snackbar("复制失败", null, null, { variant: "error" });
-                    });
+                    copyModel();
                 };
                 chip.appendChild(modelName);
+
+                // 按钮组：删除
+                const btnGroup = UI.el("div", "flex items-center gap-1 ml-1");
+
+                // 点击按钮组空白处也触发复制（除删除按钮外）
+                btnGroup.onclick = (e) => {
+                    if (!e.target.closest("button")) {
+                        e.stopPropagation();
+                        copyModel();
+                    }
+                };
                 
                 // 删除按钮
-                const deleteBtn = UI.el("button", "w-5 h-5 rounded-full flex items-center justify-center hover:bg-md-on-primary-container/12 transition-colors ml-1");
+                const deleteBtn = UI.el("button", "w-5 h-5 rounded-full flex items-center justify-center hover:bg-md-on-primary-container/12 transition-colors");
                 deleteBtn.appendChild(UI.icon("close", "text-sm"));
                 deleteBtn.onclick = (e) => {
                     e.stopPropagation();
                     providerData.models.splice(index, 1);
                     renderModelChips();
                 };
-                chip.appendChild(deleteBtn);
+                btnGroup.appendChild(deleteBtn);
+                
+                chip.appendChild(btnGroup);
                 
                 modelChipsContainer.appendChild(chip);
             });
@@ -1007,21 +1249,56 @@ Object.assign(ConfigView, {
         
         renderModelChips();
         modelSection.appendChild(modelChipsContainer);
-        form.appendChild(modelSection);
-        
-        // 手动添加模型
-        addModelBtn.onclick = () => {
-            const modelName = prompt("请输入模型名称:");
-            if (modelName && modelName.trim()) {
-                const trimmed = modelName.trim();
-                if (!providerData.models.includes(trimmed)) {
-                    providerData.models.push(trimmed);
-                    renderModelChips();
-                } else {
-                    UI.snackbar("该模型已存在", null, null, { variant: "error" });
-                }
+
+        // 手动输入模型：多个用逗号或空格分隔
+        const manualInputWrap = UI.textField(
+            "手动输入模型名称",
+            "例如 gpt-4o mini, claude-3-sonnet 或用空格分隔",
+            "text",
+            "",
+            {
+                helperText: "多个用逗号或空格分隔，按回车快速添加",
+                variant: "outlined"
             }
+        );
+        const manualInput = manualInputWrap.input;
+
+        const applyManualInput = () => {
+            const raw = manualInput.value || "";
+            const parts = raw
+                .split(/[, \s]+/)
+                .map((s) => s.trim())
+                .filter((s) => s.length > 0);
+
+            if (!parts.length) return;
+
+            let added = 0;
+            parts.forEach((name) => {
+                if (!providerData.models.includes(name)) {
+                    providerData.models.push(name);
+                    added++;
+                }
+            });
+
+            if (added > 0) {
+                renderModelChips();
+                UI.snackbar(`已添加 ${added} 个模型`, null, null, { variant: "success" });
+            } else {
+                UI.snackbar("输入的模型已在列表中", null, null, { variant: "info" });
+            }
+
+            manualInput.value = "";
         };
+
+        manualInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") {
+                e.preventDefault();
+                applyManualInput();
+            }
+        });
+
+        modelSection.appendChild(manualInputWrap.wrapper);
+        form.appendChild(modelSection);
         
         // 获取模型 - 打开模态框
         fetchModelsBtn.onclick = () => ConfigView._openFetchModelsDialog(providerData, renderModelChips, fetchModelsBtn);
@@ -1036,7 +1313,7 @@ Object.assign(ConfigView, {
         };
 
         // Model Mappings Section
-        ConfigView._renderMappingsSection(form, providerData);
+        ConfigView._renderMappingsSection(form, providerData, renderModelChips);
 
         // Routing Section
         ConfigView._renderRoutingSection(form, prefs);
@@ -1145,9 +1422,25 @@ Object.assign(ConfigView, {
             }
             const data = await res.json();
             let models = Array.isArray(data) ? data : data.models || (data.data || []).map(m => m.id).filter(Boolean);
-            // 去重
+            // 去重（上游名）
             fetchedModels = Array.from(new Set(models));
-            if (!fetchedModels.length) {
+
+            // 根据重定向构建显示名集合（上游 -> 显示别名）
+            var aliasMap = new Map();
+            providerData.modelMappings.forEach(m => {
+                if (m.from && m.to) aliasMap.set(m.to, m.from);
+            });
+            var displayModels = [];
+            const seenDisplay = new Set();
+            fetchedModels.forEach((name) => {
+                const disp = aliasMap.get(name) || name;
+                if (!seenDisplay.has(disp)) {
+                    seenDisplay.add(disp);
+                    displayModels.push({ display: disp, upstream: name });
+                }
+            });
+
+            if (!displayModels.length) {
                 UI.snackbar("未获取到任何模型", null, null, { variant: "error" });
                 return;
             }
@@ -1160,16 +1453,45 @@ Object.assign(ConfigView, {
             }
         }
 
-        // 选中状态：默认选中已有模型
-        const selected = new Set(
-            providerData.models.filter(m => fetchedModels.includes(m))
-        );
+        // 选中状态：默认选中已有模型（按重定向别名显示）
+        const aliasDisplay = (name) => (aliasMap.get(name) || name);
+        const displayNameSet = new Set(displayModels.map(d => d.display));
+        const selected = new Set();
+        providerData.models.forEach((m) => {
+            const disp = aliasDisplay(m);
+            if (displayNameSet.has(disp)) {
+                selected.add(disp);
+            }
+        });
 
         // 搜索关键词
         let searchKeyword = "";
 
         const renderDialogContent = () => {
             const content = UI.el("div", "flex flex-col gap-4");
+
+            // 统一复制方法（含回退）
+            const copyModelName = async (text) => {
+                const t = text || "";
+                if (!t) return;
+                try {
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        await navigator.clipboard.writeText(t);
+                    } else {
+                        const ta = document.createElement("textarea");
+                        ta.value = t;
+                        ta.style.position = "fixed";
+                        ta.style.left = "-10000px";
+                        document.body.appendChild(ta);
+                        ta.select();
+                        document.execCommand("copy");
+                        document.body.removeChild(ta);
+                    }
+                    UI.snackbar(`已复制: ${t}`, null, null, { variant: "success" });
+                } catch (err) {
+                    UI.snackbar("复制失败", null, null, { variant: "error" });
+                }
+            };
 
             // 搜索框
             const searchWrapper = UI.el("div", "relative");
@@ -1196,16 +1518,16 @@ Object.assign(ConfigView, {
             const updateStats = () => {
                 const visibleCount = rowRefs.filter(r => r.row.style.display !== "none").length;
                 if (searchKeyword) {
-                    statsText.textContent = `显示 ${visibleCount} / ${fetchedModels.length} 个模型，已选 ${selected.size} 个`;
+                    statsText.textContent = `显示 ${visibleCount} / ${displayModels.length} 个模型，已选 ${selected.size} 个`;
                 } else {
-                    statsText.textContent = `共 ${fetchedModels.length} 个模型，已选 ${selected.size} 个`;
+                    statsText.textContent = `共 ${displayModels.length} 个模型，已选 ${selected.size} 个`;
                 }
             };
 
             const filterModels = () => {
                 const keyword = searchKeyword.toLowerCase();
-                rowRefs.forEach(({ row, model }) => {
-                    if (!keyword || model.toLowerCase().includes(keyword)) {
+                rowRefs.forEach(({ row, display }) => {
+                    if (!keyword || display.toLowerCase().includes(keyword)) {
                         row.style.display = "";
                     } else {
                         row.style.display = "none";
@@ -1216,9 +1538,9 @@ Object.assign(ConfigView, {
 
             // 全选当前可见的模型
             const selectAllBtn = UI.btn("全选", () => {
-                rowRefs.forEach(({ model, row, setChecked }) => {
+                rowRefs.forEach(({ display, row, setChecked }) => {
                     if (row.style.display !== "none") {
-                        selected.add(model);
+                        selected.add(display);
                         setChecked(true);
                     }
                 });
@@ -1227,9 +1549,9 @@ Object.assign(ConfigView, {
 
             // 全不选当前可见的模型
             const clearAllBtn = UI.btn("全不选", () => {
-                rowRefs.forEach(({ model, row, setChecked }) => {
+                rowRefs.forEach(({ display, row, setChecked }) => {
                     if (row.style.display !== "none") {
-                        selected.delete(model);
+                        selected.delete(display);
                         setChecked(false);
                     }
                 });
@@ -1242,12 +1564,19 @@ Object.assign(ConfigView, {
             toolbar.appendChild(actions);
             content.appendChild(toolbar);
 
-            // 渲染模型列表
-            fetchedModels.forEach((model) => {
+            // 渲染模型列表（按重定向别名显示，内部保留上游名用于提示）
+            displayModels.forEach(({ display, upstream }) => {
                 const row = UI.el("div", "px-4 py-2 flex items-center hover:bg-md-surface-container transition-colors border-b border-md-outline-variant last:border-b-0");
+                // 行空白区域点击复制（排除复选框/按钮/label）
+                row.setAttribute("data-tooltip", "点击复制模型名");
+                row.onclick = (e) => {
+                    if (!e.target.closest("input") && !e.target.closest("button") && !e.target.closest("label")) {
+                        copyModelName(display);
+                    }
+                };
 
                 // 自定义 checkbox（避免 UI.checkbox 的问题）
-                const checked = selected.has(model);
+                const checked = selected.has(display);
                 const checkboxWrapper = UI.el("label", "inline-flex items-center cursor-pointer");
                 const checkboxInput = document.createElement("input");
                 checkboxInput.type = "checkbox";
@@ -1265,11 +1594,11 @@ Object.assign(ConfigView, {
                 checkboxInput.addEventListener("change", (e) => {
                     const isChecked = e.target.checked;
                     if (isChecked) {
-                        selected.add(model);
+                        selected.add(display);
                         checkboxBox.className = "w-5 h-5 rounded-sm border-2 transition-all flex items-center justify-center bg-md-primary border-md-primary";
                         checkIcon.className = "material-symbols-outlined text-sm text-md-on-primary transition-transform scale-100";
                     } else {
-                        selected.delete(model);
+                        selected.delete(display);
                         checkboxBox.className = "w-5 h-5 rounded-sm border-2 transition-all flex items-center justify-center border-md-on-surface-variant hover:border-md-on-surface";
                         checkIcon.className = "material-symbols-outlined text-sm text-md-on-primary transition-transform scale-0";
                     }
@@ -1279,13 +1608,19 @@ Object.assign(ConfigView, {
                 checkboxWrapper.appendChild(checkboxInput);
                 checkboxWrapper.appendChild(checkboxBox);
 
-                // 模型名
-                const label = UI.el("span", "flex-1 ml-3 font-mono text-body-medium text-md-on-surface truncate", model);
-                label.title = model;
+                // 模型名（点击复制显示名）
+                const label = UI.el("span", "flex-1 ml-3 font-mono text-body-medium text-md-on-surface truncate", display);
+                label.title = `${display} (${upstream})`;
+                label.setAttribute("data-tooltip", "点击复制模型名");
+                label.onclick = (e) => {
+                    e.stopPropagation();
+                    copyModelName(display);
+                };
 
-                // 已存在标记
+                // 已存在标记（按显示名判断）
                 let badge = null;
-                if (providerData.models.includes(model)) {
+                const displayNamesSet = new Set(providerData.models.map(alias => (aliasMap.get(alias) || alias)));
+                if (displayNamesSet.has(display)) {
                     badge = UI.el("span", "ml-2 px-2 py-0.5 rounded-md-xs bg-md-primary-container text-md-on-primary-container text-label-small flex-shrink-0", "已添加");
                 }
 
@@ -1298,7 +1633,8 @@ Object.assign(ConfigView, {
                 // 保存引用
                 rowRefs.push({
                     row,
-                    model,
+                    display,
+                    upstream,
                     setChecked: (isChecked) => {
                         checkboxInput.checked = isChecked;
                         if (isChecked) {
@@ -1338,7 +1674,7 @@ Object.assign(ConfigView, {
         );
     },
 
-    _renderMappingsSection(form, providerData) {
+    _renderMappingsSection(form, providerData, rerenderCb) {
         const header = UI.el("div", "inline-flex items-center gap-2 text-md-secondary text-label-large mb-2 mt-4");
         header.appendChild(UI.icon("swap_horiz", "text-lg", true));
         header.appendChild(UI.el("span", "", "模型重定向"));
@@ -1364,18 +1700,19 @@ Object.assign(ConfigView, {
                 fromInput.value = mapping.from || "";
                 fromInput.placeholder = "请求模型名";
                 fromInput.className = "flex-1 px-3 py-2 bg-md-surface border border-md-outline rounded-md-xs text-body-medium text-md-on-surface focus:outline-none focus:border-md-primary focus:border-2";
-                fromInput.oninput = (e) => { providerData.modelMappings[i].from = e.target.value.trim(); };
+                fromInput.oninput = (e) => { providerData.modelMappings[i].from = e.target.value.trim(); if (rerenderCb) rerenderCb(); };
                 
                 const toInput = document.createElement("input");
                 toInput.type = "text";
                 toInput.value = mapping.to || "";
                 toInput.placeholder = "上游模型名";
                 toInput.className = "flex-1 px-3 py-2 bg-md-surface border border-md-outline rounded-md-xs text-body-medium text-md-on-surface focus:outline-none focus:border-md-primary focus:border-2";
-                toInput.oninput = (e) => { providerData.modelMappings[i].to = e.target.value.trim(); };
+                toInput.oninput = (e) => { providerData.modelMappings[i].to = e.target.value.trim(); if (rerenderCb) rerenderCb(); };
                 
                 const deleteBtn = UI.iconBtn("delete", () => {
                     providerData.modelMappings.splice(i, 1);
                     renderList();
+                    if (rerenderCb) rerenderCb();
                 }, "standard", { tooltip: "删除" });
                 deleteBtn.classList.add("opacity-0", "group-hover:opacity-100", "transition-opacity");
                 
@@ -1392,6 +1729,7 @@ Object.assign(ConfigView, {
         section.appendChild(UI.btn("添加重定向", () => {
             providerData.modelMappings.push({ from: "", to: "" });
             renderList();
+            if (rerenderCb) rerenderCb();
         }, "tonal", "add"));
         form.appendChild(section);
     },
@@ -1449,6 +1787,21 @@ Object.assign(ConfigView, {
         );
         headersArea.input.classList.add("font-mono");
         headersArea.input.oninput = (e) => { prefs._headersText = e.target.value; };
+
+        const formatHeadersJson = () => {
+            const raw = headersArea.input.value?.trim() || "";
+            if (!raw) return;
+            try {
+                const obj = JSON.parse(raw);
+                const pretty = JSON.stringify(obj, null, 2);
+                headersArea.input.value = pretty;
+                prefs._headersText = pretty;
+                UI.snackbar("Headers JSON 已格式化", null, null, { variant: "success" });
+            } catch (err) {
+                UI.snackbar(`Headers JSON 格式错误: ${err.message}`, null, null, { variant: "error" });
+            }
+        };
+        headersArea.input.addEventListener("change", formatHeadersJson);
         section.appendChild(headersArea.wrapper);
 
         // 请求体参数覆写 (post_body_parameter_overrides) - 使用 JSON 对象形式编辑
@@ -1468,6 +1821,21 @@ Object.assign(ConfigView, {
         );
         overridesArea.input.classList.add("font-mono");
         overridesArea.input.oninput = (e) => { prefs._postBodyOverridesText = e.target.value; };
+
+        const formatOverridesJson = () => {
+            const raw = overridesArea.input.value?.trim() || "";
+            if (!raw) return;
+            try {
+                const obj = JSON.parse(raw);
+                const pretty = JSON.stringify(obj, null, 2);
+                overridesArea.input.value = pretty;
+                prefs._postBodyOverridesText = pretty;
+                UI.snackbar("Overrides JSON 已格式化", null, null, { variant: "success" });
+            } catch (err) {
+                UI.snackbar(`Overrides JSON 格式错误: ${err.message}`, null, null, { variant: "error" });
+            }
+        };
+        overridesArea.input.addEventListener("change", formatOverridesJson);
         section.appendChild(overridesArea.wrapper);
 
         section.appendChild(UI.switch("启用 Tools 能力", prefs.tools !== false, (checked) => { prefs.tools = checked; }));

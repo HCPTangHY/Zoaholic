@@ -82,9 +82,21 @@ async def fetch_channel_models(
     # 获取代理配置
     proxy = provider_config.get("proxy") or safe_get(app.state.config, "preferences", "proxy")
     
+    # 验证 base_url 格式
+    base_url = provider.get("base_url", "")
+    if base_url and not base_url.startswith(("http://", "https://")):
+        # 自动添加 https:// 前缀
+        provider["base_url"] = f"https://{base_url}"
+        logger.info(f"Auto-prefixed base_url: {provider['base_url']}")
+    
     try:
         async with app.state.client_manager.get_client(provider["base_url"], proxy) as client:
-            models = await channel.models_adapter(client, provider)
+            # 设置超时，避免请求卡死
+            import asyncio
+            models = await asyncio.wait_for(
+                channel.models_adapter(client, provider),
+                timeout=30.0
+            )
             return JSONResponse(content={"models": models})
     except Exception as e:
         # 尽量提取并返回上游的错误信息
@@ -179,6 +191,12 @@ async def test_channel(
         raise HTTPException(status_code=400, detail="base_url 是必填项")
     if not model:
         raise HTTPException(status_code=400, detail="model 是必填项")
+    
+    # 验证 base_url 格式
+    if not base_url.startswith(("http://", "https://")):
+        # 自动添加 https:// 前缀
+        base_url = f"https://{base_url}"
+        logger.info(f"Auto-prefixed base_url: {base_url}")
     
     # 构建 provider 配置
     provider = {

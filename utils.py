@@ -450,23 +450,48 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
 def post_all_models(api_index, config, api_list, models_list):
     all_models = []
     unique_models = set()
+    # 构建别名归一化映射（alias -> upstream 以及 upstream -> alias）
+    alias_keys = set()
+    upstream_to_alias = {}
+    alias_to_upstream = {}
+    for provider_item in config.get("providers", []):
+        model_dict = get_model_dict(provider_item)  # alias -> upstream
+        for alias, upstream in model_dict.items():
+            alias_keys.add(alias)
+            alias_to_upstream[alias] = upstream
+            if upstream != alias:
+                upstream_to_alias[upstream] = alias
+
+    def normalize_model_name(name: str) -> str:
+        """将上游原名统一转换为展示别名；若无映射，则保持原名"""
+        return upstream_to_alias.get(name, name)
 
     if config['api_keys'][api_index]['model']:
         for model in config['api_keys'][api_index]['model']:
             if model == "all":
-                # 如果模型名为 all，则返回所有模型
+                # 如果模型名为 all，则返回所有模型（统一为别名并去重）
                 all_models = get_all_models(config)
-                return all_models
+                final_models = []
+                seen = set()
+                for item in all_models:
+                    disp = normalize_model_name(item["id"])
+                    if disp not in seen:
+                        seen.add(disp)
+                        item["id"] = disp
+                        final_models.append(item)
+                return final_models
             if "/" in model:
                 provider = model.split("/")[0]
                 model = model.split("/")[1]
                 if model == "*":
                     if provider.startswith("sk-") and provider in api_list:
+                        # 将聚合器返回的上游名转换为展示别名，避免出现“本名+重定向名”重复
                         for model_item in models_list[provider]:
-                            if model_item not in unique_models:
-                                unique_models.add(model_item)
+                            disp = normalize_model_name(model_item)
+                            if disp not in unique_models:
+                                unique_models.add(disp)
                                 model_info = {
-                                    "id": model_item,
+                                    "id": disp,
                                     "object": "model",
                                     "created": 1720524448858,
                                     "owned_by": "Zoaholic"
@@ -477,7 +502,11 @@ def post_all_models(api_index, config, api_list, models_list):
                             if provider_item['provider'] != provider:
                                 continue
                             model_dict = get_model_dict(provider_item)
+                            # 剔除被重定向的上游原名，仅保留展示别名
+                            upstream_candidates = {v for k, v in model_dict.items() if v != k}
                             for model_item in model_dict.keys():
+                                if model_item in upstream_candidates:
+                                    continue
                                 if model_item not in unique_models:
                                     unique_models.add(model_item)
                                     model_info = {
@@ -490,21 +519,29 @@ def post_all_models(api_index, config, api_list, models_list):
                                     all_models.append(model_info)
                 else:
                     if provider.startswith("sk-") and provider in api_list:
-                        if model in models_list[provider] and model not in unique_models:
-                            unique_models.add(model)
-                            model_info = {
-                                "id": model,
-                                "object": "model",
-                                "created": 1720524448858,
-                                "owned_by": "Zoaholic"
-                            }
-                            all_models.append(model_info)
+                        # 支持别名/上游名两种写法，统一输出为展示别名
+                        upstream_name = alias_to_upstream.get(model, model)
+                        if upstream_name in models_list[provider]:
+                            disp = normalize_model_name(upstream_name)
+                            if disp not in unique_models:
+                                unique_models.add(disp)
+                                model_info = {
+                                    "id": disp,
+                                    "object": "model",
+                                    "created": 1720524448858,
+                                    "owned_by": "Zoaholic"
+                                }
+                                all_models.append(model_info)
                     else:
                         for provider_item in config["providers"]:
                             if provider_item['provider'] != provider:
                                 continue
                             model_dict = get_model_dict(provider_item)
+                            # 剔除被重定向的上游原名后再进行精确匹配
+                            upstream_candidates = {v for k, v in model_dict.items() if v != k}
                             for model_item in model_dict.keys():
+                                if model_item in upstream_candidates:
+                                    continue
                                 if model_item not in unique_models and model_item == model:
                                     unique_models.add(model_item)
                                     model_info = {
@@ -519,25 +556,41 @@ def post_all_models(api_index, config, api_list, models_list):
             if model.startswith("sk-") and model in api_list:
                 continue
 
-            if model not in unique_models:
-                unique_models.add(model)
+            disp = normalize_model_name(model)
+            if disp not in unique_models:
+                unique_models.add(disp)
                 model_info = {
-                    "id": model,
+                    "id": disp,
                     "object": "model",
                     "created": 1720524448858,
                     "owned_by": "Zoaholic"
                 }
                 all_models.append(model_info)
 
-    return all_models
+    # 最终统一：仍为上游原名的 id 转换为展示别名，并做去重
+    final_models = []
+    seen = set()
+    for item in all_models:
+        disp = normalize_model_name(item["id"])
+        if disp not in seen:
+            seen.add(disp)
+            item["id"] = disp
+            final_models.append(item)
+    return final_models
 
 def get_all_models(config):
     all_models = []
     unique_models = set()
 
     for provider in config["providers"]:
-        model_dict = provider["_model_dict_cache"]
+        # 使用映射缓存（若不存在则回退到实时计算）
+        model_dict = provider.get("_model_dict_cache") or get_model_dict(provider)
+        # 识别被重定向的上游原名（出现在映射值中的项且与键不同）
+        upstream_candidates = {v for k, v in model_dict.items() if v != k}
         for model in model_dict.keys():
+            # 仅返回展示别名，过滤掉被重定向的上游原名
+            if model in upstream_candidates:
+                continue
             if model not in unique_models:
                 unique_models.add(model)
                 model_info = {

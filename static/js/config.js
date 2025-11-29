@@ -5,11 +5,10 @@
 const AppConfig = {
     appName: "Zoaholic Gateway",
     version: "v2.0.0",
-    currentUser: {
-        role: "admin",
-        key: "sk-admin-demo-key-12345",
-        balance: 999.99
-    },
+    
+    // 当前用户信息 - 从 localStorage 加载或为空
+    currentUser: null,
+    
     // 导航顺序：总览 - 日志 - 密钥 - 渠道 - 对话 - 工具箱
     navItems: [
         { id: "dashboard", label: "控制台总览", icon: "dashboard" },
@@ -18,7 +17,114 @@ const AppConfig = {
         { id: "config", label: "渠道配置", icon: "settings_applications" },
         { id: "chat", label: "对话", icon: "chat" },
         { id: "tools", label: "工具箱", icon: "extension" }
-    ]
+    ],
+
+    /**
+     * 初始化用户认证状态
+     */
+    initAuth() {
+        const savedKey = localStorage.getItem("zoaholic_api_key");
+        if (savedKey) {
+            AppConfig.currentUser = {
+                key: savedKey,
+                role: localStorage.getItem("zoaholic_user_role") || "user",
+                balance: 0
+            };
+            return true;
+        }
+        return false;
+    },
+
+    /**
+     * 验证 API Key
+     * @param {string} apiKey - 要验证的 API Key
+     * @returns {Promise<{valid: boolean, role: string, message: string}>}
+     */
+    async validateApiKey(apiKey) {
+        if (!apiKey || !apiKey.trim()) {
+            return { valid: false, role: "", message: "API Key 不能为空" };
+        }
+
+        try {
+            // 尝试调用需要认证的 API 来验证 key
+            const response = await fetch("/v1/models", {
+                headers: {
+                    "Authorization": `Bearer ${apiKey}`
+                }
+            });
+
+            if (response.status === 403) {
+                return { valid: false, role: "", message: "API Key 无效或已过期" };
+            }
+
+            if (response.status === 429) {
+                return { valid: false, role: "", message: "请求过于频繁，请稍后再试" };
+            }
+
+            if (!response.ok) {
+                return { valid: false, role: "", message: `验证失败: HTTP ${response.status}` };
+            }
+
+            // 验证成功，尝试获取角色信息
+            let role = "user";
+            try {
+                const configRes = await fetch("/v1/api_config", {
+                    headers: { "Authorization": `Bearer ${apiKey}` }
+                });
+                if (configRes.ok) {
+                    role = "admin";
+                }
+            } catch (e) {
+                // 忽略错误，默认为普通用户
+            }
+
+            return { valid: true, role, message: "验证成功" };
+        } catch (e) {
+            return { valid: false, role: "", message: `网络错误: ${e.message}` };
+        }
+    },
+
+    /**
+     * 登录
+     * @param {string} apiKey - API Key
+     * @param {string} role - 用户角色
+     */
+    login(apiKey, role) {
+        localStorage.setItem("zoaholic_api_key", apiKey);
+        localStorage.setItem("zoaholic_user_role", role);
+        AppConfig.currentUser = {
+            key: apiKey,
+            role: role,
+            balance: 0
+        };
+    },
+
+    /**
+     * 登出
+     */
+    logout() {
+        localStorage.removeItem("zoaholic_api_key");
+        localStorage.removeItem("zoaholic_user_role");
+        AppConfig.currentUser = null;
+        // 刷新页面以显示登录界面
+        window.location.reload();
+    },
+
+    /**
+     * 检查是否已登录
+     */
+    isLoggedIn() {
+        return AppConfig.currentUser !== null && AppConfig.currentUser.key;
+    },
+
+    /**
+     * 检查是否是管理员
+     */
+    isAdmin() {
+        return AppConfig.currentUser && 
+               (AppConfig.currentUser.role === "admin" || 
+                (AppConfig.currentUser.role && AppConfig.currentUser.role.includes("admin")));
+    }
 };
 
 // Mock Data to simulate backend responses

@@ -281,19 +281,24 @@
                 display: flex !important;
             }
             
+            /* On mobile, let the whole page scroll */
+            html, body {
+                height: auto !important;
+                min-height: 100vh;
+                overflow-x: hidden;
+                overflow-y: auto;
+            }
+            
             #app-root {
                 flex-direction: column;
+                height: auto !important;
+                min-height: 100vh;
             }
             
             #main-content {
                 order: 1;
                 padding-bottom: 88px; /* Space for bottom nav (80px) + safe area */
-            }
-
-            /* On mobile, let the whole page (body) scroll instead of nesting scroll containers */
-            body {
-                overflow-y: auto;
-                overflow-x: hidden;
+                flex: 1 0 auto;
             }
             
             /* Content viewport should not capture scroll on mobile */
@@ -306,12 +311,22 @@
             #bottom-nav {
                 display: none !important;
             }
+            
+            /* Desktop: fixed viewport layout */
+            html, body {
+                height: 100vh;
+                overflow: hidden;
+            }
+            
+            #app-root {
+                height: 100vh;
+            }
         }
     </style>
 </head>
-<body class="bg-md-surface text-md-on-surface min-h-screen w-screen overflow-x-hidden">
+<body class="bg-md-surface text-md-on-surface h-screen w-screen overflow-hidden md:overflow-hidden">
     <!-- Material Design 3 Layout Structure -->
-    <div class="flex h-full w-full" id="app-root">
+    <div class="flex h-screen w-full" id="app-root">
         <!-- Navigation Rail (MD3 Style) - Desktop -->
         <div class="w-20 flex-shrink-0 bg-md-surface-container flex flex-col items-center py-3 gap-3 border-r border-md-outline-variant" id="nav-rail">
             <!-- Logo/Brand -->
