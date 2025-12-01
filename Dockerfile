@@ -2,7 +2,9 @@ FROM python:3.11 AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 COPY pyproject.toml uv.lock ./
-RUN uv pip install -r pyproject.toml --system --no-cache
+# 使用 uv export 导出依赖列表，然后安装到系统 Python
+RUN uv export --frozen --no-dev --no-hashes -o requirements.txt && \
+    uv pip install --system --no-cache -r requirements.txt
 
 FROM python:3.11-slim-bullseye
 EXPOSE 8000
