@@ -160,6 +160,7 @@ async def process_request(
         logger.info(f"provider: {channel_id[:11]:<11} model: {request.model:<22} engine: {engine[:13]:<13} role: {role}")
 
     last_message_role = safe_get(request, "messages", -1, "role", default=None)
+    
     url, headers, payload = await get_payload(request, engine, provider, api_key)
     headers.update(safe_get(provider, "preferences", "headers", default={}))  # add custom headers
     
@@ -184,8 +185,8 @@ async def process_request(
             if request.stream:
                 generator = fetch_response_stream(client, url, headers, payload, engine, original_model, timeout_value, enabled_plugins=enabled_plugins)
                 wrapped_generator, first_response_time = await error_handling_wrapper(
-                    generator, channel_id, engine, request.stream, 
-                    app.state.error_triggers, keepalive_interval=keepalive_interval, 
+                    generator, channel_id, engine, request.stream,
+                    app.state.error_triggers, keepalive_interval=keepalive_interval,
                     last_message_role=last_message_role
                 )
                 response = StarletteStreamingResponse(wrapped_generator, media_type="text/event-stream")

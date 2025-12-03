@@ -18,15 +18,38 @@ from urllib.parse import urlparse, urlunparse
 from .log_config import logger
 
 def get_model_dict(provider):
+    """
+    构建模型别名到上游模型名的映射字典。
+    
+    如果 provider 配置了 model_prefix，会同时生成：
+    - 带前缀的别名 -> 上游模型（用于模型列表展示和带前缀请求匹配）
+    - 不带前缀的别名 -> 上游模型（用于不带前缀请求的路由匹配）
+    
+    Returns:
+        dict: {alias: upstream_model} 映射
+    """
     model_dict = {}
+    prefix = provider.get('model_prefix', '').strip()
+    
     if "model" not in provider:
         logger.error(f"Error: model is not set in provider: {provider}")
         return model_dict
+        
     for model in provider['model']:
         if isinstance(model, str):
-            model_dict[model] = model
+            # 字符串模型：别名和上游都是自己
+            if prefix:
+                model_dict[f"{prefix}{model}"] = model  # 带前缀别名 -> 上游
+            model_dict[model] = model  # 原始名 -> 上游（用于路由匹配）
+            
         if isinstance(model, dict):
-            model_dict.update({str(new): old for old, new in model.items()})
+            # dict 模型格式: {upstream: alias}
+            for upstream, alias in model.items():
+                alias_str = str(alias)
+                if prefix:
+                    model_dict[f"{prefix}{alias_str}"] = upstream  # 带前缀别名 -> 上游
+                model_dict[alias_str] = upstream  # 原始别名 -> 上游（用于路由匹配）
+                
     return model_dict
 
 class BaseAPI:

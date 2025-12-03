@@ -126,6 +126,8 @@ async def lifespan(app: FastAPI):
 
         app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
         app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", 99999)
+        # 初始化 models_list（用于存储从其他 API Key 引用的模型列表）
+        app.state.models_list = {}
         # pprint(dict(app.state.provider_timeouts))
         # pprint(dict(app.state.keepalive_interval))
         # print("app.state.provider_timeouts", app.state.provider_timeouts)

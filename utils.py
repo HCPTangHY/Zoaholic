@@ -72,11 +72,24 @@ def _quote_colon_strings(obj):
 def save_api_yaml(config_data):
     # 深拷贝配置数据并处理包含冒号的字符串
     import copy
-    processed_data = _quote_colon_strings(copy.deepcopy(config_data))
+    processed_data = copy.deepcopy(config_data)
+    
+    # 清理运行时字段（以 _ 开头的字段不应该被保存到配置文件）
+    for provider in processed_data.get('providers', []):
+        keys_to_remove = [k for k in list(provider.keys()) if k.startswith('_')]
+        for k in keys_to_remove:
+            del provider[k]
+    
+    for api_key in processed_data.get('api_keys', []):
+        keys_to_remove = [k for k in list(api_key.keys()) if k.startswith('_')]
+        for k in keys_to_remove:
+            del api_key[k]
+    
+    processed_data = _quote_colon_strings(processed_data)
     with open(API_YAML_PATH, "w", encoding="utf-8") as f:
         yaml.dump(processed_data, f)
 
-async def update_config(config_data, use_config_url=False, skip_model_fetch=False):
+async def update_config(config_data, use_config_url=False, skip_model_fetch=False, save_to_file=True):
     for index, provider in enumerate(config_data['providers']):
         if provider.get('project_id'):
             if "google-vertex-ai" not in provider.get("base_url", ""):
@@ -199,9 +212,10 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
     api_list = [item["api"] for item in api_keys_db]
     # logger.info(json.dumps(config_data, indent=4, ensure_ascii=False))
 
-    # 管理阶段：每次更新内存中的 config（非 CONFIG_URL 模式）时，同步写回本地 api.yaml，
+    # 管理阶段：只在显式请求保存时（save_to_file=True）才同步写回本地 api.yaml，
     # 这样 /v1/api_config/update 等管理接口修改后的配置可以持久化，供其他组件/环境复用。
-    if not use_config_url:
+    # 启动时加载配置不应该触发保存，避免自动添加的字段污染原始配置文件。
+    if not use_config_url and save_to_file:
         save_api_yaml(config_data)
 
     return config_data, api_keys_db, api_list
@@ -214,7 +228,8 @@ async def load_config(app=None):
             conf = yaml.load(file)
 
         if conf:
-            config, api_keys_db, api_list = await update_config(conf, use_config_url=False)
+            # 启动时加载配置，不要自动保存文件，避免污染原始配置
+            config, api_keys_db, api_list = await update_config(conf, use_config_url=False, save_to_file=False)
         else:
             logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
             config, api_keys_db, api_list = {}, {}, []
@@ -265,7 +280,8 @@ async def load_config(app=None):
             # 更新配置
             # logger.info(config_data)
             if config_data:
-                config, api_keys_db, api_list = await update_config(config_data, use_config_url=True)
+                # 从 CONFIG_URL 加载的配置，不保存到本地文件
+                config, api_keys_db, api_list = await update_config(config_data, use_config_url=True, save_to_file=False)
             else:
                 logger.error(f"Error fetching or parsing config from {config_url}")
                 config, api_keys_db, api_list = {}, {}, []
@@ -332,8 +348,6 @@ async def wait_for_timeout(wait_for_thing, timeout = 3, wait_task=None):
 async def error_handling_wrapper(generator, channel_id, engine, stream, error_triggers, keepalive_interval=None, last_message_role=None):
 
     async def new_generator(first_item=None, with_keepalive=False, wait_task=None, timeout=3):
-        # print("type(first_item)", type(first_item))
-        # print("first_item", ensure_string(first_item))
         if first_item:
             yield await ensure_string(first_item)
 
@@ -542,6 +556,9 @@ def post_all_models(api_index, config, api_list, models_list):
                         for provider_item in config["providers"]:
                             if provider_item['provider'] != provider:
                                 continue
+                            # 跳过禁用的渠道
+                            if provider_item.get("enabled") is False:
+                                continue
                             # 分组过滤：provider 必须与当前 Key 分组有交集
                             p_groups = provider_item.get("groups") or ["default"]
                             if isinstance(p_groups, str):
@@ -554,8 +571,13 @@ def post_all_models(api_index, config, api_list, models_list):
                             model_dict = get_model_dict(provider_item)
                             # 剔除被重定向的上游原名，仅保留展示别名
                             upstream_candidates = {v for k, v in model_dict.items() if v != k}
+                            # 如果渠道配置了 model_prefix，只展示带前缀的模型名
+                            prefix = provider_item.get('model_prefix', '').strip()
                             for model_item in model_dict.keys():
                                 if model_item in upstream_candidates:
+                                    continue
+                                # 如果有前缀，只返回带前缀的模型名
+                                if prefix and not model_item.startswith(prefix):
                                     continue
                                 if model_item not in unique_models:
                                     unique_models.add(model_item)
@@ -598,6 +620,9 @@ def post_all_models(api_index, config, api_list, models_list):
                         for provider_item in config["providers"]:
                             if provider_item['provider'] != provider:
                                 continue
+                            # 跳过禁用的渠道
+                            if provider_item.get("enabled") is False:
+                                continue
                             # 分组过滤：provider 必须与当前 Key 分组有交集
                             p_groups = provider_item.get("groups") or ["default"]
                             if isinstance(p_groups, str):
@@ -610,8 +635,13 @@ def post_all_models(api_index, config, api_list, models_list):
                             model_dict = get_model_dict(provider_item)
                             # 剔除被重定向的上游原名后再进行精确匹配
                             upstream_candidates = {v for k, v in model_dict.items() if v != k}
+                            # 如果渠道配置了 model_prefix，只展示带前缀的模型名
+                            prefix = provider_item.get('model_prefix', '').strip()
                             for model_item in model_dict.keys():
                                 if model_item in upstream_candidates:
+                                    continue
+                                # 如果有前缀，只返回带前缀的模型名
+                                if prefix and not model_item.startswith(prefix):
                                     continue
                                 if model_item not in unique_models and model_item == model:
                                     unique_models.add(model_item)
@@ -654,6 +684,10 @@ def get_all_models(config, allowed_groups=None):
     unique_models = set()
     
     for provider in config["providers"]:
+        # 跳过禁用的渠道
+        if provider.get("enabled") is False:
+            continue
+            
         # 分组过滤：如果提供了允许分组集合，需存在交集
         if allowed_groups is not None:
             p_groups = provider.get("groups") or ["default"]
@@ -668,9 +702,16 @@ def get_all_models(config, allowed_groups=None):
         model_dict = provider.get("_model_dict_cache") or get_model_dict(provider)
         # 识别被重定向的上游原名（出现在映射值中的项且与键不同）
         upstream_candidates = {v for k, v in model_dict.items() if v != k}
+        
+        # 如果渠道配置了 model_prefix，只展示带前缀的模型名
+        prefix = provider.get('model_prefix', '').strip()
+        
         for model in model_dict.keys():
             # 仅返回展示别名，过滤掉被重定向的上游原名
             if model in upstream_candidates:
+                continue
+            # 如果有前缀，只返回带前缀的模型名，过滤掉不带前缀的原始模型名
+            if prefix and not model.startswith(prefix):
                 continue
             if model not in unique_models:
                 unique_models.add(model)

@@ -312,9 +312,10 @@ class InterceptorRegistry:
             enabled_plugin_names = set(parse_enabled_plugins(enabled_plugins).keys())
         
         for interceptor in interceptors:
-            # 如果指定了 enabled_plugins，则只执行该列表中的插件的拦截器
-            if enabled_plugin_names is not None:
-                if interceptor.plugin_name and interceptor.plugin_name not in enabled_plugin_names:
+            # 如果拦截器属于某个插件，需要该插件被显式启用
+            # enabled_plugins 为 None 或空列表时，跳过所有插件拦截器
+            if interceptor.plugin_name:
+                if not enabled_plugin_names or interceptor.plugin_name not in enabled_plugin_names:
                     continue
             
             try:
@@ -421,9 +422,10 @@ class InterceptorRegistry:
             enabled_plugin_names = set(parse_enabled_plugins(enabled_plugins).keys())
         
         for interceptor in interceptors:
-            # 如果指定了 enabled_plugins，则只执行该列表中的插件的拦截器
-            if enabled_plugin_names is not None:
-                if interceptor.plugin_name and interceptor.plugin_name not in enabled_plugin_names:
+            # 如果拦截器属于某个插件，需要该插件被显式启用
+            # enabled_plugins 为 None 或空列表时，跳过所有插件拦截器
+            if interceptor.plugin_name:
+                if not enabled_plugin_names or interceptor.plugin_name not in enabled_plugin_names:
                     continue
             
             try:

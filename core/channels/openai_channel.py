@@ -191,6 +191,8 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
 
 async def fetch_gpt_response_stream(client, url, headers, payload, model, timeout):
     """处理 GPT/OpenAI 流式响应"""
+    from ..log_config import logger
+    
     timestamp = int(datetime.timestamp(datetime.now()))
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
@@ -198,6 +200,7 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
     has_send_thinking = False
     ark_tag = False
     json_payload = await asyncio.to_thread(json.dumps, payload)
+    
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_gpt_response_stream")
         if error_message:
@@ -220,7 +223,8 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
                     continue
                 if line and not line.startswith(":") and (result:=line.lstrip("data: ").strip()) and not line.startswith("event: "):
                     if result.strip() == "[DONE]":
-                        break
+                        yield "data: [DONE]" + end_of_line
+                        return
                     line = await asyncio.to_thread(json.loads, result)
                     line['id'] = f"chatcmpl-{random_str}"
 

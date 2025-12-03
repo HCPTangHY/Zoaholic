@@ -109,8 +109,21 @@ async def get_provider_rules(
     if model_rule == "all":
         # 如模型名为 all，则返回所有模型
         for provider in config["providers"]:
+            # 跳过禁用的渠道
+            if provider.get("enabled") is False:
+                continue
             model_dict = provider["_model_dict_cache"]
+            # 识别被重定向的上游原名
+            upstream_candidates = {v for k, v in model_dict.items() if v != k}
+            # 如果渠道配置了 model_prefix，只返回带前缀的模型名
+            prefix = provider.get('model_prefix', '').strip()
             for model in model_dict.keys():
+                # 过滤掉被重定向的上游原名
+                if model in upstream_candidates:
+                    continue
+                # 如果有前缀，只返回带前缀的模型名
+                if prefix and not model.startswith(prefix):
+                    continue
                 provider_rules.append(provider["provider"] + "/" + model)
 
     elif "/" in model_rule:

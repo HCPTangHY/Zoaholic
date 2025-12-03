@@ -443,9 +443,15 @@ async def get_models_by_groups(
         # 所以应该过滤掉 "pro"，只保留 "pronothink"
         redirected_upstreams = {v for k, v in model_dict.items() if v != k}
         
+        # 如果渠道配置了 model_prefix，只展示带前缀的模型名
+        prefix = provider.get('model_prefix', '').strip()
+        
         for alias, upstream in model_dict.items():
             # 如果别名同时也是其他映射的上游目标，说明它被重定向了，跳过
             if alias in redirected_upstreams:
+                continue
+            # 如果有前缀，只返回带前缀的模型名
+            if prefix and not alias.startswith(prefix):
                 continue
             
             if alias not in unique_models:

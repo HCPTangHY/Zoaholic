@@ -1019,6 +1019,7 @@ const ConfigView = {
             modelMappings: [],
             engine: originalProvider?.engine || "",
             image: originalProvider?.image !== false,
+            model_prefix: originalProvider?.model_prefix || "",
             preferences: { ...rawPreferences },
         };
 
@@ -1114,6 +1115,14 @@ Object.assign(ConfigView, {
         urlWrap.input.setAttribute("data-config-base-url-input", "1");
         urlWrap.input.oninput = (e) => { providerData.base_url = e.target.value; };
         basicSection.appendChild(urlWrap.wrapper);
+
+        // 模型前缀：为该渠道的所有模型名添加前缀
+        const prefixWrap = UI.textField("模型前缀", "例如 azure- 或 aws/", "text", providerData.model_prefix, {
+            required: false,
+            helperText: "可选：为该渠道的模型名添加前缀，请求带前缀的模型将只匹配此渠道"
+        });
+        prefixWrap.input.oninput = (e) => { providerData.model_prefix = e.target.value; };
+        basicSection.appendChild(prefixWrap.wrapper);
 
         // 分组编辑 - 多组支持
         if (!Array.isArray(providerData.groups)) {
@@ -2479,6 +2488,12 @@ Object.assign(ConfigView, {
 
         target.provider = providerData.name;
         target.base_url = providerData.base_url;
+        // 模型前缀：如果有值则保存，否则删除该字段
+        if (providerData.model_prefix && providerData.model_prefix.trim()) {
+            target.model_prefix = providerData.model_prefix.trim();
+        } else {
+            delete target.model_prefix;
+        }
         target.api = !providerData.api_keys.length ? "" : providerData.api_keys.length === 1 ? providerData.api_keys[0] : providerData.api_keys.slice();
         
         const finalModels = [...providerData.models];

@@ -246,7 +246,9 @@ class StatsMiddleware:
                 if not body_sent:
                     body_sent = True
                     return {"type": "http.request", "body": body_bytes, "more_body": False}
-                return {"type": "http.request", "body": b"", "more_body": False}
+                # 等待真正的 disconnect 消息，而不是返回空 body
+                # 这对于 StreamingResponse 的正确迭代很重要
+                return await receive()
             else:
                 return await receive()
 

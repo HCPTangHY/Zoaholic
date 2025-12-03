@@ -146,10 +146,15 @@ async def get_payload(request: RequestModel, engine, provider, api_key=None):
         # 获取该渠道启用的插件列表
         enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
 
+        from .log_config import logger
+        logger.debug(f"[get_payload] Before apply_request_interceptors, model={payload.get('model')}, enabled_plugins={enabled_plugins}")
+
         # 应用请求拦截器（插件可在此修改 url/headers/payload）
         url, headers, payload = await apply_request_interceptors(
             request, engine, provider, api_key, url, headers, payload, enabled_plugins
         )
+
+        logger.debug(f"[get_payload] After apply_request_interceptors, model={payload.get('model')}")
 
         return url, headers, payload
      
