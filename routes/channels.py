@@ -54,7 +54,7 @@ async def fetch_channel_models(
     """
     app = get_app()
     
-    engine = provider_config.get("engine") or provider_config.get("type") or "gpt"
+    engine = provider_config.get("engine") or provider_config.get("type") or "openai"
     
     # 获取渠道定义
     channel = get_channel(engine)
@@ -64,9 +64,10 @@ async def fetch_channel_models(
     if not channel.models_adapter:
         raise HTTPException(status_code=400, detail=f"Channel '{engine}' does not support fetching models")
     
-    # 构建 provider 配置
+    # 构建 provider 配置，如果 base_url 为空则使用渠道默认值
+    config_base_url = provider_config.get("base_url", "")
     provider = {
-        "base_url": provider_config.get("base_url", channel.default_base_url or ""),
+        "base_url": config_base_url if config_base_url else (channel.default_base_url or ""),
         "api": provider_config.get("api_key") or provider_config.get("api") or "",
         # Vertex AI 特定配置
         "project_id": provider_config.get("project_id", ""),
@@ -181,16 +182,23 @@ async def test_channel(
     
     app = get_app()
     
-    engine = test_config.get("engine") or test_config.get("type") or ""
+    engine = test_config.get("engine") or test_config.get("type") or "openai"
     base_url = test_config.get("base_url", "")
     api_key = test_config.get("api_key") or test_config.get("api") or ""
     model = test_config.get("model", "")
     timeout = test_config.get("timeout", 30)
     
-    if not base_url:
-        raise HTTPException(status_code=400, detail="base_url 是必填项")
     if not model:
         raise HTTPException(status_code=400, detail="model 是必填项")
+    
+    # 如果 base_url 为空，使用渠道默认值
+    if not base_url:
+        channel = get_channel(engine)
+        if channel and channel.default_base_url:
+            base_url = channel.default_base_url
+            logger.info(f"Using default base_url for channel '{engine}': {base_url}")
+        else:
+            raise HTTPException(status_code=400, detail="base_url 是必填项（该渠道类型没有默认地址）")
     
     # 验证 base_url 格式
     if not base_url.startswith(("http://", "https://")):
@@ -370,3 +378,87 @@ async def test_channel(
                 "error": error_message
             }
         )
+
+
+@router.post("/v1/channels/models_by_groups", dependencies=[Depends(rate_limit_dependency)])
+async def get_models_by_groups(
+    token: str = Depends(verify_admin_api_key),
+    request_body: dict = Body(..., description="Request body containing groups array")
+):
+    """
+    根据分组获取可用的模型列表。
+    
+    请求体示例:
+    {
+        "groups": ["default", "premium"]  // 分组数组
+    }
+    
+    返回:
+    {
+        "models": [
+            {"id": "gpt-4o", "object": "model", "owned_by": "Zoaholic"},
+            ...
+        ]
+    }
+    """
+    from core.utils import get_model_dict
+    
+    app = get_app()
+    config = app.state.config
+    providers = config.get("providers", [])
+    
+    # 获取请求的分组
+    requested_groups = request_body.get("groups", [])
+    if isinstance(requested_groups, str):
+        requested_groups = [requested_groups]
+    if not requested_groups:
+        requested_groups = ["default"]
+    
+    allowed_groups = set(requested_groups)
+    
+    # 收集符合分组条件的模型
+    all_models = []
+    unique_models = set()
+    
+    for provider in providers:
+        # 检查渠道是否启用
+        if provider.get("enabled") is False:
+            continue
+        
+        # 分组过滤：provider 必须与请求的分组有交集
+        p_groups = provider.get("groups") or ["default"]
+        if isinstance(p_groups, str):
+            p_groups = [p_groups] if p_groups else ["default"]
+        if not isinstance(p_groups, list) or not p_groups:
+            p_groups = ["default"]
+        
+        if not allowed_groups.intersection(set(p_groups)):
+            continue
+        
+        # 获取模型字典
+        model_dict = provider.get("_model_dict_cache") or get_model_dict(provider)
+        
+        # 识别被重定向的上游原名（在此渠道内，出现在映射值中且与键不同的项）
+        # 例如: {"pro": "pro", "pronothink": "pro"} 中，"pro" 作为值被 "pronothink" 重定向
+        # 所以应该过滤掉 "pro"，只保留 "pronothink"
+        redirected_upstreams = {v for k, v in model_dict.items() if v != k}
+        
+        for alias, upstream in model_dict.items():
+            # 如果别名同时也是其他映射的上游目标，说明它被重定向了，跳过
+            if alias in redirected_upstreams:
+                continue
+            
+            if alias not in unique_models:
+                unique_models.add(alias)
+                model_info = {
+                    "id": alias,
+                    "object": "model",
+                    "created": 1720524448858,
+                    "owned_by": "Zoaholic"
+                }
+                all_models.append(model_info)
+    
+    # 按模型名排序
+    all_models.sort(key=lambda x: x["id"])
+    
+    return JSONResponse(content={"models": all_models})

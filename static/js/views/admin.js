@@ -696,26 +696,153 @@ const AdminView = {
         };
         quotaSection.appendChild(creditsField.wrapper);
 
-        // Models
-        const modelsText = Array.isArray(keyData.models) ? keyData.models.join("\n") : "";
-        const modelsArea = UI.textArea(
-            "可用模型规则 (model)",
-            "每行一条规则，例如:\n- all\n- openai/gpt-4o\n- openai/*\n留空表示默认 all。",
-            modelsText,
-            4,
+        // Models Section - Chip 标签组
+        const modelHeader = UI.el("div", "inline-flex items-center gap-2 text-md-tertiary text-label-large mb-2 mt-2");
+        modelHeader.appendChild(UI.icon("psychology", "text-lg", true));
+        modelHeader.appendChild(UI.el("span", "", "模型配置"));
+        quotaSection.appendChild(modelHeader);
+
+        const modelSection = UI.el("div", "");
+        
+        // 顶部操作按钮
+        const modelActions = UI.el("div", "flex items-center gap-2 mb-3");
+        const fetchModelsBtn = UI.btn("获取模型", null, "tonal", "sync");
+        const clearModelsBtn = UI.btn("清空全部", null, "text", "delete");
+        modelActions.appendChild(fetchModelsBtn);
+        modelActions.appendChild(clearModelsBtn);
+        modelSection.appendChild(modelActions);
+        
+        // 模型 Chip 容器
+        const modelChipsContainer = UI.el("div", "flex flex-wrap gap-2 min-h-[48px] p-3 bg-md-surface-container-highest rounded-md-xs border border-dashed border-md-outline-variant");
+        
+        // 渲染模型 Chips
+        const renderModelChips = () => {
+            modelChipsContainer.innerHTML = "";
+            
+            if (keyData.models.length === 0) {
+                const emptyHint = UI.el("div", "w-full text-center text-body-small text-md-on-surface-variant/60 py-2", "暂无模型规则，点击「获取模型」或手动添加。留空表示默认 all。");
+                modelChipsContainer.appendChild(emptyHint);
+                return;
+            }
+
+            keyData.models.forEach((model, index) => {
+                const chip = UI.el("div", "inline-flex items-center gap-2 pl-3 pr-1 py-1 rounded-md-full bg-md-primary-container text-md-on-primary-container text-label-medium group cursor-pointer hover:shadow-md-1 transition-all");
+                chip.setAttribute("data-tooltip", "点击复制模型规则");
+
+                // 复制方法
+                const copyModel = async () => {
+                    const text = model || "";
+                    if (!text) return;
+                    try {
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            await navigator.clipboard.writeText(text);
+                        } else {
+                            const ta = document.createElement("textarea");
+                            ta.value = text;
+                            ta.style.position = "fixed";
+                            ta.style.left = "-10000px";
+                            document.body.appendChild(ta);
+                            ta.select();
+                            document.execCommand("copy");
+                            document.body.removeChild(ta);
+                        }
+                        UI.snackbar(`已复制: ${text}`, null, null, { variant: "success" });
+                    } catch (err) {
+                        UI.snackbar("复制失败", null, null, { variant: "error" });
+                    }
+                };
+
+                chip.onclick = () => { copyModel(); };
+                
+                // 模型名
+                const modelName = UI.el("span", "font-mono select-none", model);
+                modelName.onclick = (e) => {
+                    e.stopPropagation();
+                    copyModel();
+                };
+                chip.appendChild(modelName);
+
+                // 删除按钮
+                const btnGroup = UI.el("div", "flex items-center gap-1 ml-1");
+                const deleteBtn = UI.el("button", "w-5 h-5 rounded-full flex items-center justify-center hover:bg-md-on-primary-container/12 transition-colors");
+                deleteBtn.appendChild(UI.icon("close", "text-sm"));
+                deleteBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    keyData.models.splice(index, 1);
+                    renderModelChips();
+                };
+                btnGroup.appendChild(deleteBtn);
+                
+                chip.appendChild(btnGroup);
+                
+                modelChipsContainer.appendChild(chip);
+            });
+        };
+        
+        renderModelChips();
+        modelSection.appendChild(modelChipsContainer);
+
+        // 手动输入模型：多个用逗号或空格分隔
+        const manualInputWrap = UI.textField(
+            "手动输入模型规则",
+            "例如 all, gpt-4o 或 openai/* 用空格/逗号分隔",
+            "text",
+            "",
             {
-                helperText: "仅对该 API Key 生效的模型访问规则，具体语义参考文档。",
+                helperText: "多个用逗号或空格分隔，按回车快速添加",
+                variant: "outlined"
             }
         );
-        modelsArea.input.oninput = (e) => {
-            const val = e.target.value || "";
-            keyData.models = val
-                .split("\n")
+        const manualInput = manualInputWrap.input;
+
+        const applyManualInput = () => {
+            const raw = manualInput.value || "";
+            const parts = raw
+                .split(/[,\s]+/)
                 .map((s) => s.trim())
-                .filter((s) => s);
+                .filter((s) => s.length > 0);
+
+            if (!parts.length) return;
+
+            let added = 0;
+            parts.forEach((name) => {
+                if (!keyData.models.includes(name)) {
+                    keyData.models.push(name);
+                    added++;
+                }
+            });
+
+            if (added > 0) {
+                renderModelChips();
+                UI.snackbar(`已添加 ${added} 条规则`, null, null, { variant: "success" });
+            } else {
+                UI.snackbar("输入的规则已在列表中", null, null, { variant: "info" });
+            }
+
+            manualInput.value = "";
         };
-        modelsArea.input.classList.add("font-mono");
-        quotaSection.appendChild(modelsArea.wrapper);
+
+        manualInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") {
+                e.preventDefault();
+                applyManualInput();
+            }
+        });
+
+        modelSection.appendChild(manualInputWrap.wrapper);
+        quotaSection.appendChild(modelSection);
+        
+        // 获取模型 - 打开模态框
+        fetchModelsBtn.onclick = () => AdminView._openFetchModelsDialog(keyData, renderModelChips, fetchModelsBtn);
+        
+        // 清空全部
+        clearModelsBtn.onclick = () => {
+            if (keyData.models.length === 0) return;
+            if (confirm("确定要清空所有模型规则吗？")) {
+                keyData.models = [];
+                renderModelChips();
+            }
+        };
 
         form.appendChild(quotaSection);
 
@@ -948,6 +1075,271 @@ const AdminView = {
             },
             "确认添加",
             { cancelText: "取消" }
+        );
+    },
+
+    /**
+     * 获取模型 - 打开 MD3 模态框，根据分组获取可用模型并复选
+     */
+    async _openFetchModelsDialog(keyData, renderModelChips, fetchBtn) {
+        // 获取当前 API Key 的分组
+        const groups = Array.isArray(keyData.groups) && keyData.groups.length > 0
+            ? keyData.groups
+            : ["default"];
+
+        if (fetchBtn && typeof fetchBtn.setLoading === "function") {
+            fetchBtn.setLoading(true);
+        }
+
+        const adminKey = AppConfig?.currentUser?.key || null;
+        const headers = { "Content-Type": "application/json" };
+        if (adminKey) headers["Authorization"] = `Bearer ${adminKey}`;
+
+        let fetchedModels = [];
+
+        try {
+            const res = await fetch("/v1/channels/models_by_groups", {
+                method: "POST",
+                headers,
+                body: JSON.stringify({ groups }),
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                UI.snackbar(`获取模型失败: ${err.detail || res.status}`, null, null, { variant: "error" });
+                return;
+            }
+            const data = await res.json();
+            const models = Array.isArray(data.models) ? data.models : [];
+            fetchedModels = models.map(m => m.id || m).filter(Boolean);
+
+            if (!fetchedModels.length) {
+                UI.snackbar("当前分组下没有可用模型", null, null, { variant: "info" });
+                return;
+            }
+        } catch (e) {
+            UI.snackbar(`获取模型失败: ${e.message}`, null, null, { variant: "error" });
+            return;
+        } finally {
+            if (fetchBtn && typeof fetchBtn.setLoading === "function") {
+                fetchBtn.setLoading(false);
+            }
+        }
+
+        // 选中状态：默认选中已有模型
+        const selected = new Set();
+        keyData.models.forEach((m) => {
+            if (fetchedModels.includes(m)) {
+                selected.add(m);
+            }
+        });
+
+        // 搜索关键词
+        let searchKeyword = "";
+
+        const renderDialogContent = () => {
+            const content = UI.el("div", "flex flex-col gap-4");
+
+            // 分组提示
+            const groupsHint = UI.el("div", "flex items-center gap-2 text-body-small text-md-on-surface-variant");
+            groupsHint.appendChild(UI.icon("folder", "text-sm"));
+            groupsHint.appendChild(document.createTextNode(`当前分组: ${groups.join(", ")}`));
+            content.appendChild(groupsHint);
+
+            // 搜索框
+            const searchWrapper = UI.el("div", "relative");
+            const searchIcon = UI.icon("search", "absolute left-3 top-1/2 -translate-y-1/2 text-md-on-surface-variant");
+            const searchInput = document.createElement("input");
+            searchInput.type = "text";
+            searchInput.placeholder = "搜索模型名称...";
+            searchInput.className = "w-full pl-10 pr-4 py-3 bg-md-surface-container border border-md-outline rounded-md-full text-body-medium text-md-on-surface focus:outline-none focus:border-md-primary focus:border-2 transition-all";
+            searchWrapper.appendChild(searchIcon);
+            searchWrapper.appendChild(searchInput);
+            content.appendChild(searchWrapper);
+
+            // 顶部统计 + 全选/全不选
+            const toolbar = UI.el("div", "flex items-center justify-between p-3 bg-md-surface-container-highest rounded-md-xs");
+            const statsText = UI.el("span", "text-body-medium text-md-on-surface-variant", "");
+            const actions = UI.el("div", "flex items-center gap-2");
+
+            // 模型列表容器
+            const listContainer = UI.el("div", "max-h-[360px] overflow-y-auto rounded-md-xs border border-md-outline-variant bg-md-surface");
+
+            // 存储所有行的引用，用于搜索过滤
+            const rowRefs = [];
+
+            const updateStats = () => {
+                const visibleCount = rowRefs.filter(r => r.row.style.display !== "none").length;
+                if (searchKeyword) {
+                    statsText.textContent = `显示 ${visibleCount} / ${fetchedModels.length} 个模型，已选 ${selected.size} 个`;
+                } else {
+                    statsText.textContent = `共 ${fetchedModels.length} 个模型，已选 ${selected.size} 个`;
+                }
+            };
+
+            const filterModels = () => {
+                const keyword = searchKeyword.toLowerCase();
+                rowRefs.forEach(({ row, model }) => {
+                    if (!keyword || model.toLowerCase().includes(keyword)) {
+                        row.style.display = "";
+                    } else {
+                        row.style.display = "none";
+                    }
+                });
+                updateStats();
+            };
+
+            // 全选当前可见的模型
+            const selectAllBtn = UI.btn("全选", () => {
+                rowRefs.forEach(({ model, row, setChecked }) => {
+                    if (row.style.display !== "none") {
+                        selected.add(model);
+                        setChecked(true);
+                    }
+                });
+                updateStats();
+            }, "text", "select_all");
+
+            // 全不选当前可见的模型
+            const clearAllBtn = UI.btn("全不选", () => {
+                rowRefs.forEach(({ model, row, setChecked }) => {
+                    if (row.style.display !== "none") {
+                        selected.delete(model);
+                        setChecked(false);
+                    }
+                });
+                updateStats();
+            }, "text", "deselect");
+
+            actions.appendChild(selectAllBtn);
+            actions.appendChild(clearAllBtn);
+            toolbar.appendChild(statsText);
+            toolbar.appendChild(actions);
+            content.appendChild(toolbar);
+
+            // 渲染模型列表
+            fetchedModels.forEach((model) => {
+                const row = UI.el("div", "px-4 py-2 flex items-center hover:bg-md-surface-container transition-colors border-b border-md-outline-variant last:border-b-0 cursor-pointer");
+                
+                // 自定义 checkbox
+                const checked = selected.has(model);
+                const checkboxWrapper = UI.el("label", "inline-flex items-center cursor-pointer");
+                const checkboxInput = document.createElement("input");
+                checkboxInput.type = "checkbox";
+                checkboxInput.checked = checked;
+                checkboxInput.className = "sr-only peer";
+                
+                const checkboxBox = UI.el("div", `w-5 h-5 rounded-sm border-2 transition-all flex items-center justify-center ${
+                    checked
+                        ? "bg-md-primary border-md-primary"
+                        : "border-md-on-surface-variant hover:border-md-on-surface"
+                }`);
+                const checkIcon = UI.icon("check", `text-sm text-md-on-primary transition-transform ${checked ? "scale-100" : "scale-0"}`);
+                checkboxBox.appendChild(checkIcon);
+                
+                // 切换选中状态的函数
+                const toggleSelection = () => {
+                    const newChecked = !checkboxInput.checked;
+                    checkboxInput.checked = newChecked;
+                    if (newChecked) {
+                        selected.add(model);
+                        checkboxBox.className = "w-5 h-5 rounded-sm border-2 transition-all flex items-center justify-center bg-md-primary border-md-primary";
+                        checkIcon.className = "material-symbols-outlined text-sm text-md-on-primary transition-transform scale-100";
+                    } else {
+                        selected.delete(model);
+                        checkboxBox.className = "w-5 h-5 rounded-sm border-2 transition-all flex items-center justify-center border-md-on-surface-variant hover:border-md-on-surface";
+                        checkIcon.className = "material-symbols-outlined text-sm text-md-on-primary transition-transform scale-0";
+                    }
+                    updateStats();
+                };
+                
+                checkboxInput.addEventListener("change", (e) => {
+                    const isChecked = e.target.checked;
+                    if (isChecked) {
+                        selected.add(model);
+                        checkboxBox.className = "w-5 h-5 rounded-sm border-2 transition-all flex items-center justify-center bg-md-primary border-md-primary";
+                        checkIcon.className = "material-symbols-outlined text-sm text-md-on-primary transition-transform scale-100";
+                    } else {
+                        selected.delete(model);
+                        checkboxBox.className = "w-5 h-5 rounded-sm border-2 transition-all flex items-center justify-center border-md-on-surface-variant hover:border-md-on-surface";
+                        checkIcon.className = "material-symbols-outlined text-sm text-md-on-primary transition-transform scale-0";
+                    }
+                    updateStats();
+                });
+                
+                checkboxWrapper.appendChild(checkboxInput);
+                checkboxWrapper.appendChild(checkboxBox);
+
+                // 行点击切换选中状态（排除 checkbox 本身）
+                row.onclick = (e) => {
+                    if (!e.target.closest("input") && !e.target.closest("label")) {
+                        toggleSelection();
+                    }
+                };
+
+                // 模型名
+                const label = UI.el("span", "flex-1 ml-3 font-mono text-body-medium text-md-on-surface truncate", model);
+                label.title = model;
+
+                // 已存在标记
+                let badge = null;
+                if (keyData.models.includes(model)) {
+                    badge = UI.el("span", "ml-2 px-2 py-0.5 rounded-md-xs bg-md-primary-container text-md-on-primary-container text-label-small flex-shrink-0", "已添加");
+                }
+
+                row.appendChild(checkboxWrapper);
+                row.appendChild(label);
+                if (badge) row.appendChild(badge);
+
+                listContainer.appendChild(row);
+
+                // 保存引用
+                rowRefs.push({
+                    row,
+                    model,
+                    setChecked: (isChecked) => {
+                        checkboxInput.checked = isChecked;
+                        if (isChecked) {
+                            checkboxBox.className = "w-5 h-5 rounded-sm border-2 transition-all flex items-center justify-center bg-md-primary border-md-primary";
+                            checkIcon.className = "material-symbols-outlined text-sm text-md-on-primary transition-transform scale-100";
+                        } else {
+                            checkboxBox.className = "w-5 h-5 rounded-sm border-2 transition-all flex items-center justify-center border-md-on-surface-variant hover:border-md-on-surface";
+                            checkIcon.className = "material-symbols-outlined text-sm text-md-on-primary transition-transform scale-0";
+                        }
+                    }
+                });
+            });
+
+            content.appendChild(listContainer);
+
+            // 搜索事件
+            searchInput.oninput = (e) => {
+                searchKeyword = e.target.value.trim();
+                filterModels();
+            };
+
+            updateStats();
+            return content;
+        };
+
+        UI.dialog(
+            "选择模型",
+            renderDialogContent,
+            () => {
+                // 将选中的模型添加到 keyData.models（去重）
+                const existingSet = new Set(keyData.models);
+                let added = 0;
+                selected.forEach(m => {
+                    if (!existingSet.has(m)) {
+                        keyData.models.push(m);
+                        added++;
+                    }
+                });
+                renderModelChips();
+                UI.snackbar(`已选择 ${selected.size} 个模型${added > 0 ? `，新增 ${added} 个` : ""}`, null, null, { variant: "success" });
+                return true;
+            },
+            "确认选择",
+            { width: "max-w-2xl", cancelText: "取消" }
         );
     },
 };

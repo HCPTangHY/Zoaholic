@@ -1196,8 +1196,16 @@ const UI = {
         dialog.appendChild(footer);
         scrim.appendChild(dialog);
         
-        scrim.addEventListener("click", (e) => {
-            if (e.target === scrim) scrim.remove();
+        // 防止拖动选择文字时意外关闭：只有在 mousedown 和 mouseup 都发生在 scrim 上才关闭
+        let mouseDownOnScrim = false;
+        scrim.addEventListener("mousedown", (e) => {
+            mouseDownOnScrim = (e.target === scrim);
+        });
+        scrim.addEventListener("mouseup", (e) => {
+            if (mouseDownOnScrim && e.target === scrim) {
+                scrim.remove();
+            }
+            mouseDownOnScrim = false;
         });
         
         const handleEscape = (e) => {
@@ -1282,8 +1290,16 @@ const UI = {
         sheet.appendChild(footer);
         scrim.appendChild(sheet);
         
-        scrim.addEventListener("click", (e) => {
-            if (e.target === scrim) closeWithAnimation();
+        // 防止拖动选择文字时意外关闭：只有在 mousedown 和 mouseup 都发生在 scrim 上才关闭
+        let mouseDownOnScrim = false;
+        scrim.addEventListener("mousedown", (e) => {
+            mouseDownOnScrim = (e.target === scrim);
+        });
+        scrim.addEventListener("mouseup", (e) => {
+            if (mouseDownOnScrim && e.target === scrim) {
+                closeWithAnimation();
+            }
+            mouseDownOnScrim = false;
         });
         
         const handleEscape = (e) => {

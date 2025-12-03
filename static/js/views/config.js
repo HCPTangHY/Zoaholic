@@ -74,6 +74,7 @@ const ConfigView = {
             <th class="px-4 py-3 text-label-large text-md-on-surface">名称</th>
             <th class="px-4 py-3 text-label-large text-md-on-surface">分组</th>
             <th class="px-4 py-3 text-label-large text-md-on-surface">类型</th>
+            <th class="px-4 py-3 text-label-large text-md-on-surface">插件</th>
             <th class="px-4 py-3 text-center text-label-large text-md-on-surface">状态</th>
             <th class="px-4 py-3 text-center text-label-large text-md-on-surface">优先级</th>
             <th class="px-4 py-3 text-right text-label-large text-md-on-surface">操作</th>
@@ -83,7 +84,7 @@ const ConfigView = {
         const tbody = UI.el("tbody", "divide-y divide-md-outline-variant");
 
         if (!sortedProviders || sortedProviders.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" class="text-center py-12 text-body-medium text-md-on-surface-variant">暂无渠道配置，点击"添加渠道"开始配置</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="7" class="text-center py-12 text-body-medium text-md-on-surface-variant">暂无渠道配置，点击"添加渠道"开始配置</td></tr>';
         } else {
             sortedProviders.forEach((provider) => {
                 const originalIndex = (providers || []).indexOf(provider);
@@ -119,28 +120,37 @@ const ConfigView = {
      * 创建移动端渠道卡片
      */
     _createProviderCard(provider, index, providers) {
-        const card = UI.card("outlined", "p-4");
+        const isEnabled = provider.enabled !== false;
+        
+        // 根据启用状态设置卡片样式 - 禁用时添加左侧边框和降低不透明度
+        const cardClasses = isEnabled
+            ? "p-4"
+            : "p-4 opacity-60 border-l-4 border-l-md-error/50 bg-md-surface-container/30";
+        const card = UI.card("outlined", cardClasses);
         
         // 头部：名称 + 状态
         const header = UI.el("div", "flex items-center justify-between mb-3");
         const nameSection = UI.el("div", "flex items-center gap-2");
-        nameSection.appendChild(UI.icon("dns", "text-md-primary text-xl"));
-        nameSection.appendChild(UI.el("span", "text-title-medium text-md-on-surface font-medium", provider.provider || provider.name || ""));
+        const nameIconClasses = isEnabled ? "text-md-primary text-xl" : "text-md-on-surface-variant/50 text-xl";
+        const nameTextClasses = isEnabled
+            ? "text-title-medium text-md-on-surface font-medium"
+            : "text-title-medium text-md-on-surface-variant font-medium";
+        nameSection.appendChild(UI.icon("dns", nameIconClasses));
+        nameSection.appendChild(UI.el("span", nameTextClasses, provider.provider || provider.name || ""));
         header.appendChild(nameSection);
         
-        // 状态标签
-        const isEnabled = provider.enabled !== false;
-        const statusChip = UI.el("span", `inline-flex items-center gap-1 px-2 py-0.5 rounded-md-full text-label-small ${
+        // 状态标签 - 禁用时使用醒目的错误色系
+        const statusChip = UI.el("span", `inline-flex items-center gap-1.5 px-3 py-1 rounded-md-full text-label-medium font-medium ${
             isEnabled
                 ? "bg-md-success-container text-md-on-success-container"
-                : "bg-md-surface-container-high text-md-on-surface-variant"
+                : "bg-md-error-container text-md-on-error-container"
         }`);
-        statusChip.appendChild(UI.icon(isEnabled ? "check_circle" : "cancel", "text-sm"));
-        statusChip.appendChild(document.createTextNode(isEnabled ? "启用" : "禁用"));
+        statusChip.appendChild(UI.icon(isEnabled ? "check_circle" : "block", "text-base"));
+        statusChip.appendChild(document.createTextNode(isEnabled ? "启用" : "已禁用"));
         header.appendChild(statusChip);
         card.appendChild(header);
         
-        // 信息区域：分组、类型、优先级
+        // 信息区域：分组、类型、插件、优先级
         const infoSection = UI.el("div", "flex flex-wrap gap-2 mb-4");
         
         // 分组 - 多组支持
@@ -160,6 +170,29 @@ const ConfigView = {
         typeChip.appendChild(UI.icon("memory", "text-sm"));
         typeChip.appendChild(document.createTextNode(engine));
         infoSection.appendChild(typeChip);
+        
+        // 插件 - 展示启用的插件数量和名称
+        const enabledPlugins = provider.preferences?.enabled_plugins || [];
+        if (enabledPlugins.length > 0) {
+            const pluginChip = UI.el("span", "inline-flex items-center gap-1.5 px-3 py-1 rounded-md-full bg-md-primary-container text-md-on-primary-container text-label-medium cursor-pointer hover:shadow-md-1 transition-all");
+            pluginChip.appendChild(UI.icon("extension", "text-sm"));
+            // 解析插件名称（去除 :options 部分）
+            const pluginNames = enabledPlugins.map(p => {
+                const colonIdx = p.indexOf(":");
+                return colonIdx === -1 ? p : p.substring(0, colonIdx);
+            });
+            if (pluginNames.length <= 2) {
+                pluginChip.appendChild(document.createTextNode(pluginNames.join(", ")));
+            } else {
+                pluginChip.appendChild(document.createTextNode(`${pluginNames[0]} +${pluginNames.length - 1}`));
+            }
+            pluginChip.title = `已启用插件: ${pluginNames.join(", ")}`;
+            pluginChip.onclick = (e) => {
+                e.stopPropagation();
+                ConfigView.openConfigSideSheet({ index: originalIndex, provider });
+            };
+            infoSection.appendChild(pluginChip);
+        }
         
         // 优先级 - 可编辑输入框
         const weight = (provider.preferences?.weight) || provider.weight || 0;
@@ -218,14 +251,26 @@ const ConfigView = {
     },
 
     _createProviderRow(provider, index, providers) {
-        const tr = UI.el("tr", "hover:bg-md-surface-container transition-colors group");
+        const isEnabled = provider.enabled !== false;
+        
+        // 根据启用状态设置行样式
+        const rowClasses = isEnabled
+            ? "hover:bg-md-surface-container transition-colors group"
+            : "bg-md-surface-container/30 opacity-60 transition-colors group border-l-4 border-l-md-error/50";
+        const tr = UI.el("tr", rowClasses);
 
         // 渠道名称
         const name = provider.provider || provider.name || "";
         const nameTd = UI.el("td", "px-4 py-3");
         const nameContent = UI.el("div", "flex items-center gap-2");
-        nameContent.appendChild(UI.icon("dns", "text-md-on-surface-variant group-hover:text-md-primary transition-colors text-lg"));
-        nameContent.appendChild(UI.el("span", "text-body-large text-md-on-surface font-medium", name));
+        const nameIconClasses = isEnabled
+            ? "text-md-on-surface-variant group-hover:text-md-primary transition-colors text-lg"
+            : "text-md-on-surface-variant/50 text-lg";
+        const nameTextClasses = isEnabled
+            ? "text-body-large text-md-on-surface font-medium"
+            : "text-body-large text-md-on-surface-variant font-medium";
+        nameContent.appendChild(UI.icon("dns", nameIconClasses));
+        nameContent.appendChild(UI.el("span", nameTextClasses, name));
         nameTd.appendChild(nameContent);
 
         // 分组 - 多组支持
@@ -248,16 +293,58 @@ const ConfigView = {
         typeChip.appendChild(document.createTextNode(engine));
         typeTd.appendChild(typeChip);
 
-        // 状态
-        const isEnabled = provider.enabled !== false;
+        // 插件 - 展示启用的插件
+        const pluginsTd = UI.el("td", "px-4 py-3");
+        const enabledPlugins = provider.preferences?.enabled_plugins || [];
+        if (enabledPlugins.length > 0) {
+            const pluginsWrapper = UI.el("div", "flex flex-wrap gap-1");
+            // 解析插件名称（去除 :options 部分）
+            const pluginNames = enabledPlugins.map(p => {
+                const colonIdx = p.indexOf(":");
+                return colonIdx === -1 ? p : p.substring(0, colonIdx);
+            });
+            // 最多显示 2 个插件 Chip，其余折叠
+            const displayPlugins = pluginNames.slice(0, 2);
+            const remainingCount = pluginNames.length - displayPlugins.length;
+            
+            displayPlugins.forEach(pluginName => {
+                const chip = UI.el("span", "inline-flex items-center gap-1 px-2 py-0.5 rounded-md-full bg-md-primary-container text-md-on-primary-container text-label-small cursor-pointer hover:shadow-md-1 transition-all");
+                chip.appendChild(UI.icon("extension", "text-xs"));
+                chip.appendChild(document.createTextNode(pluginName));
+                chip.title = pluginName;
+                chip.onclick = (e) => {
+                    e.stopPropagation();
+                    ConfigView.openConfigSideSheet({ index, provider });
+                };
+                pluginsWrapper.appendChild(chip);
+            });
+            
+            if (remainingCount > 0) {
+                const moreChip = UI.el("span", "inline-flex items-center px-2 py-0.5 rounded-md-full bg-md-surface-container-high text-md-on-surface-variant text-label-small cursor-pointer hover:bg-md-surface-container transition-colors");
+                moreChip.appendChild(document.createTextNode(`+${remainingCount}`));
+                moreChip.title = `还有 ${remainingCount} 个插件: ${pluginNames.slice(2).join(", ")}`;
+                moreChip.onclick = (e) => {
+                    e.stopPropagation();
+                    ConfigView.openConfigSideSheet({ index, provider });
+                };
+                pluginsWrapper.appendChild(moreChip);
+            }
+            
+            pluginsTd.appendChild(pluginsWrapper);
+        } else {
+            const emptyText = UI.el("span", "text-body-small text-md-on-surface-variant/50", "—");
+            pluginsTd.appendChild(emptyText);
+        }
+
+        // 状态 - 禁用时使用更醒目的错误色系
         const statusTd = UI.el("td", "px-4 py-3 text-center");
-        const statusChip = UI.el("span", `inline-flex items-center gap-1 px-2 py-0.5 rounded-md-full text-label-small ${
+        const statusChip = UI.el("span", `inline-flex items-center gap-1.5 px-3 py-1 rounded-md-full text-label-medium font-medium ${
             isEnabled
                 ? "bg-md-success-container text-md-on-success-container"
-                : "bg-md-surface-container-high text-md-on-surface-variant"
+                : "bg-md-error-container text-md-on-error-container"
         }`);
-        statusChip.appendChild(UI.icon(isEnabled ? "check_circle" : "cancel", "text-sm"));
-        statusChip.appendChild(document.createTextNode(isEnabled ? "启用" : "禁用"));
+        statusChip.appendChild(UI.icon(isEnabled ? "check_circle" : "block", "text-base"));
+        statusChip.appendChild(document.createTextNode(isEnabled ? "启用" : "已禁用"));
         statusTd.appendChild(statusChip);
 
         // 优先级/权重 - 可编辑输入框
@@ -312,6 +399,7 @@ const ConfigView = {
         tr.appendChild(nameTd);
         tr.appendChild(groupTd);
         tr.appendChild(typeTd);
+        tr.appendChild(pluginsTd);
         tr.appendChild(statusTd);
         tr.appendChild(priorityTd);
         tr.appendChild(actionsTd);
@@ -326,14 +414,26 @@ const ConfigView = {
         
         // 获取模型列表
         const modelArray = Array.isArray(provider.model) ? provider.model : (provider.models || []);
-        const models = [];
+        const aliasToUpstream = new Map();
+        
         modelArray.forEach(m => {
             if (typeof m === "string") {
-                models.push(m);
+                // 字符串模型：别名和上游都是自己
+                aliasToUpstream.set(m, m);
             } else if (typeof m === "object") {
-                // 模型映射，取 key（上游模型名）
-                Object.keys(m).forEach(k => models.push(k));
+                // 映射格式: { 上游模型名(key): 别名(value) }
+                Object.entries(m).forEach(([upstream, alias]) => {
+                    if (typeof alias === "string") {
+                        aliasToUpstream.set(alias, upstream);
+                    }
+                });
             }
+        });
+        
+        // 最终模型列表：存储 { display: 别名, upstream: 上游模型名 }
+        const models = [];
+        aliasToUpstream.forEach((upstream, alias) => {
+            models.push({ display: alias, upstream: upstream });
         });
 
         if (models.length === 0) {
@@ -347,20 +447,23 @@ const ConfigView = {
 
     /**
      * 打开渠道测试模态框
+     * @param {Object} provider - 渠道配置
+     * @param {string} providerName - 渠道名称
+     * @param {Array<{display: string, upstream: string}>} models - 模型列表（display=别名, upstream=上游模型名）
      */
     _openTestDialog(provider, providerName, models) {
         // 测试状态管理
         const testState = {
             concurrency: 3,
             searchKeyword: "",
-            results: new Map(), // model -> { status: 'pending'|'testing'|'success'|'error', latency: number, error: string }
+            results: new Map(), // display -> { status: 'pending'|'testing'|'success'|'error', latency: number, error: string }
             isRunning: false,
             abortController: null,
         };
 
-        // 初始化所有模型状态
+        // 初始化所有模型状态（按别名作为 key）
         models.forEach(m => {
-            testState.results.set(m, { status: "pending", latency: null, error: null });
+            testState.results.set(m.display, { status: "pending", latency: null, error: null });
         });
 
         let dialogRef = null;
@@ -446,12 +549,14 @@ const ConfigView = {
                 list.innerHTML = "";
                 const keyword = testState.searchKeyword.toLowerCase();
                 
-                models.forEach(model => {
-                    if (keyword && !model.toLowerCase().includes(keyword)) {
+                models.forEach(modelInfo => {
+                    const { display, upstream } = modelInfo;
+                    // 搜索时匹配别名
+                    if (keyword && !display.toLowerCase().includes(keyword)) {
                         return;
                     }
 
-                    const result = testState.results.get(model);
+                    const result = testState.results.get(display);
                     
                     // MD3 List Item: 56dp 高度，标准结构
                     const listItem = UI.el("li", "flex items-center h-14 px-4 hover:bg-md-surface-container-low active:bg-md-surface-container transition-colors cursor-default");
@@ -459,7 +564,7 @@ const ConfigView = {
                     listItem.setAttribute("data-tooltip", "点击复制模型名");
                     listItem.onclick = (e) => {
                         if (!e.target.closest("button") && !e.target.closest("input")) {
-                            copyModelName(model);
+                            copyModelName(display);
                         }
                     };
                     
@@ -475,16 +580,17 @@ const ConfigView = {
                     contentArea.setAttribute("data-tooltip", "点击复制模型名");
                     contentArea.onclick = (e) => {
                         e.stopPropagation();
-                        copyModelName(model);
+                        copyModelName(display);
                     };
                     
-                    // Headline: 模型名称（点击复制）
-                    const headline = UI.el("div", "font-mono text-body-medium text-md-on-surface truncate", model);
-                    headline.title = model;
+                    // Headline: 显示 别名(上游名)，如果相同只显示一个
+                    const displayText = display !== upstream ? `${display}(${upstream})` : display;
+                    const headline = UI.el("div", "font-mono text-body-medium text-md-on-surface truncate", displayText);
+                    headline.title = displayText;
                     headline.setAttribute("data-tooltip", "点击复制模型名");
                     headline.onclick = (e) => {
                         e.stopPropagation();
-                        copyModelName(model);
+                        copyModelName(display);
                     };
                     contentArea.appendChild(headline);
                     
@@ -495,9 +601,9 @@ const ConfigView = {
                     
                     listItem.appendChild(contentArea);
                     
-                    // Trailing: 测试按钮
+                    // Trailing: 测试按钮（测试时使用上游模型名）
                     const trailing = UI.el("div", "flex items-center gap-2 ml-4 flex-shrink-0");
-                    const testBtn = UI.iconBtn("play_arrow", () => ConfigView._testSingleModel(provider, model, testState, updateRow), "standard", { tooltip: "测试此模型" });
+                    const testBtn = UI.iconBtn("play_arrow", () => ConfigView._testSingleModel(provider, upstream, display, testState, updateRow), "standard", { tooltip: "测试此模型" });
                     testBtn.classList.add("text-md-primary");
                     if (result.status === "testing") {
                         testBtn.disabled = true;
@@ -507,7 +613,7 @@ const ConfigView = {
                     listItem.appendChild(trailing);
                     
                     list.appendChild(listItem);
-                    rowRefs.set(model, { listItem, leading, supporting, testBtn });
+                    rowRefs.set(display, { listItem, leading, supporting, testBtn });
                 });
 
                 // 空状态
@@ -519,12 +625,12 @@ const ConfigView = {
                 }
             };
 
-            // 更新单行
-            const updateRow = (model) => {
-                const ref = rowRefs.get(model);
+            // 更新单行（按别名查找）
+            const updateRow = (display) => {
+                const ref = rowRefs.get(display);
                 if (!ref) return;
 
-                const result = testState.results.get(model);
+                const result = testState.results.get(display);
                 
                 // 更新状态图标
                 ref.leading.innerHTML = "";
@@ -558,19 +664,19 @@ const ConfigView = {
                 startAllBtn.style.display = "none";
                 stopBtn.style.display = "";
 
-                // 重置所有状态
+                // 重置所有状态（按别名）
                 models.forEach(m => {
-                    testState.results.set(m, { status: "pending", latency: null, error: null });
+                    testState.results.set(m.display, { status: "pending", latency: null, error: null });
                 });
                 renderRows();
 
-                // 并发测试
+                // 并发测试（使用上游模型名测试，按别名更新状态）
                 const queue = [...models];
                 const runNext = async () => {
                     while (queue.length > 0 && testState.isRunning) {
-                        const model = queue.shift();
-                        if (!model) break;
-                        await ConfigView._testSingleModel(provider, model, testState, updateRow);
+                        const modelInfo = queue.shift();
+                        if (!modelInfo) break;
+                        await ConfigView._testSingleModel(provider, modelInfo.upstream, modelInfo.display, testState, updateRow);
                     }
                 };
 
@@ -680,15 +786,20 @@ const ConfigView = {
 
     /**
      * 测试单个模型 - 使用专用渠道测试接口
+     * @param {Object} provider - 渠道配置
+     * @param {string} upstream - 上游模型名（用于实际测试请求）
+     * @param {string} display - 别名（用于状态更新和显示）
+     * @param {Object} testState - 测试状态对象
+     * @param {Function} updateCallback - 更新回调
      */
-    async _testSingleModel(provider, model, testState, updateCallback) {
+    async _testSingleModel(provider, upstream, display, testState, updateCallback) {
         const adminKey = AppConfig?.currentUser?.key || null;
         const headers = { "Content-Type": "application/json" };
         if (adminKey) headers["Authorization"] = `Bearer ${adminKey}`;
 
-        // 设置为测试中
-        testState.results.set(model, { status: "testing", latency: null, error: null });
-        if (updateCallback) updateCallback(model);
+        // 设置为测试中（按别名更新状态）
+        testState.results.set(display, { status: "testing", latency: null, error: null });
+        if (updateCallback) updateCallback(display);
 
         // 获取 API Key（支持多种格式）
         let apiKey = "";
@@ -706,7 +817,7 @@ const ConfigView = {
                     engine: provider.engine || "openai",
                     base_url: provider.base_url,
                     api_key: apiKey,
-                    model: model,
+                    model: upstream,  // 使用上游模型名进行测试
                     timeout: 30,
                 }),
                 signal: testState.abortController?.signal,
@@ -715,24 +826,24 @@ const ConfigView = {
             const data = await res.json().catch(() => ({}));
 
             if (res.ok && data.success) {
-                testState.results.set(model, {
+                testState.results.set(display, {
                     status: "success",
                     latency: data.latency_ms || null,
                     error: null
                 });
             } else {
                 const errorMsg = data.error || data.detail || data.message || `HTTP ${res.status}`;
-                testState.results.set(model, { status: "error", latency: null, error: errorMsg });
+                testState.results.set(display, { status: "error", latency: null, error: errorMsg });
             }
         } catch (e) {
             if (e.name === "AbortError") {
-                testState.results.set(model, { status: "pending", latency: null, error: null });
+                testState.results.set(display, { status: "pending", latency: null, error: null });
             } else {
-                testState.results.set(model, { status: "error", latency: null, error: e.message });
+                testState.results.set(display, { status: "error", latency: null, error: e.message });
             }
         }
 
-        if (updateCallback) updateCallback(model);
+        if (updateCallback) updateCallback(display);
     },
 
     /**
@@ -996,8 +1107,9 @@ Object.assign(ConfigView, {
         nameWrap.input.oninput = (e) => { providerData.name = e.target.value; };
         basicSection.appendChild(nameWrap.wrapper);
  
-        // Base URL：占位文本会根据所选渠道的 default_base_url 动态更新，这里不再写死 OpenAI 示例
-        const urlWrap = UI.textField("上游 Base URL", "", "text", providerData.base_url, { required: true });
+        // Base URL：占位文本会根据所选渠道的 default_base_url 动态更新
+        // 留空时将使用渠道类型的默认 base_url
+        const urlWrap = UI.textField("上游 Base URL", "", "text", providerData.base_url, { required: false, helperText: "留空则使用渠道类型的默认地址" });
         // 标记为配置用 Base URL 输入框，便于 _loadChannelTypes 动态更新 placeholder
         urlWrap.input.setAttribute("data-config-base-url-input", "1");
         urlWrap.input.oninput = (e) => { providerData.base_url = e.target.value; };
@@ -1513,11 +1625,7 @@ Object.assign(ConfigView, {
      * 获取模型 - 打开 MD3 模态框，复选模型列表（含全选 / 全不选 / 模糊搜索）
      */
     async _openFetchModelsDialog(providerData, renderModelChips, fetchBtn) {
-        if (!providerData.base_url) {
-            UI.snackbar("请先填写 Base URL", null, null, { variant: "error" });
-            return;
-        }
-        if (!providerData.api_keys.length) {
+        if (!providerData.api_keys.length || !providerData.api_keys.some(k => k && k.trim())) {
             UI.snackbar("请先填写至少一个 API Key", null, null, { variant: "error" });
             return;
         }
@@ -1693,15 +1801,8 @@ Object.assign(ConfigView, {
 
             // 渲染模型列表（按重定向别名显示，内部保留上游名用于提示）
             displayModels.forEach(({ display, upstream }) => {
-                const row = UI.el("div", "px-4 py-2 flex items-center hover:bg-md-surface-container transition-colors border-b border-md-outline-variant last:border-b-0");
-                // 行空白区域点击复制（排除复选框/按钮/label）
-                row.setAttribute("data-tooltip", "点击复制模型名");
-                row.onclick = (e) => {
-                    if (!e.target.closest("input") && !e.target.closest("button") && !e.target.closest("label")) {
-                        copyModelName(display);
-                    }
-                };
-
+                const row = UI.el("div", "px-4 py-2 flex items-center hover:bg-md-surface-container transition-colors border-b border-md-outline-variant last:border-b-0 cursor-pointer");
+                
                 // 自定义 checkbox（避免 UI.checkbox 的问题）
                 const checked = selected.has(display);
                 const checkboxWrapper = UI.el("label", "inline-flex items-center cursor-pointer");
@@ -1717,6 +1818,22 @@ Object.assign(ConfigView, {
                 }`);
                 const checkIcon = UI.icon("check", `text-sm text-md-on-primary transition-transform ${checked ? "scale-100" : "scale-0"}`);
                 checkboxBox.appendChild(checkIcon);
+                
+                // 切换选中状态的函数
+                const toggleSelection = () => {
+                    const newChecked = !checkboxInput.checked;
+                    checkboxInput.checked = newChecked;
+                    if (newChecked) {
+                        selected.add(display);
+                        checkboxBox.className = "w-5 h-5 rounded-sm border-2 transition-all flex items-center justify-center bg-md-primary border-md-primary";
+                        checkIcon.className = "material-symbols-outlined text-sm text-md-on-primary transition-transform scale-100";
+                    } else {
+                        selected.delete(display);
+                        checkboxBox.className = "w-5 h-5 rounded-sm border-2 transition-all flex items-center justify-center border-md-on-surface-variant hover:border-md-on-surface";
+                        checkIcon.className = "material-symbols-outlined text-sm text-md-on-primary transition-transform scale-0";
+                    }
+                    updateStats();
+                };
                 
                 checkboxInput.addEventListener("change", (e) => {
                     const isChecked = e.target.checked;
@@ -1735,14 +1852,16 @@ Object.assign(ConfigView, {
                 checkboxWrapper.appendChild(checkboxInput);
                 checkboxWrapper.appendChild(checkboxBox);
 
-                // 模型名（点击复制显示名）
+                // 行点击切换选中状态（排除 checkbox 本身）
+                row.onclick = (e) => {
+                    if (!e.target.closest("input") && !e.target.closest("label")) {
+                        toggleSelection();
+                    }
+                };
+
+                // 模型名
                 const label = UI.el("span", "flex-1 ml-3 font-mono text-body-medium text-md-on-surface truncate", display);
                 label.title = `${display} (${upstream})`;
-                label.setAttribute("data-tooltip", "点击复制模型名");
-                label.onclick = (e) => {
-                    e.stopPropagation();
-                    copyModelName(display);
-                };
 
                 // 已存在标记（按显示名判断）
                 let badge = null;
@@ -2344,8 +2463,8 @@ Object.assign(ConfigView, {
     },
 
     async _saveProvider(providerData, apiConfig, providers, providerIndex) {
-        if (!providerData.name || !providerData.base_url) {
-            UI.snackbar("渠道标识和 Base URL 为必填项", null, null, { variant: "error" });
+        if (!providerData.name) {
+            UI.snackbar("渠道标识为必填项", null, null, { variant: "error" });
             return false;
         }
 

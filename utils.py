@@ -17,7 +17,6 @@ from core.log_config import logger
 from core.utils import (
     safe_get,
     get_model_dict,
-    update_initial_model,
     ThreadSafeCircularList,
     provider_api_circular_list,
 )
@@ -117,13 +116,6 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
                 "text-embedding-3-small",
                 "text-embedding-3-large",
             ]
-
-        if (not skip_model_fetch) and not provider.get("model"):
-            model_list = await update_initial_model(provider)
-            if model_list:
-                provider["model"] = model_list
-                if not use_config_url:
-                    save_api_yaml(config_data)
 
         if provider.get("tools") is None:
             provider["tools"] = True

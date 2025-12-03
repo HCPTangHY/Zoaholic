@@ -110,6 +110,12 @@ async def get_payload(request: RequestModel, engine, provider, api_key=None):
         request = _prepend_system_prompt(request, channel_system_prompt)
      
     channel = get_channel(engine)
+    
+    # 如果 provider 的 base_url 为空，使用渠道的默认 base_url
+    if channel and not provider.get('base_url'):
+        if channel.default_base_url:
+            provider = {**provider, 'base_url': channel.default_base_url}
+    
     if channel and channel.request_adapter:
         # 先由具体渠道适配器构建 URL / headers / payload
         url, headers, payload = await channel.request_adapter(request, engine, provider, api_key)
