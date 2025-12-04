@@ -1,6 +1,6 @@
 [project]
 name = "Zoaholic"
-version = "1.7.4"
+version = "1.7.5"
 description = "A LLM API gateway base on Uni-API."
 readme = "README.md"
 requires-python = ">=3.11"
