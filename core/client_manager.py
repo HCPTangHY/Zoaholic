@@ -21,8 +21,16 @@ class ClientManager:
     - 通过 init() 注入默认配置（headers/http2/verify/follow_redirects 等）
     """
 
-    def __init__(self, pool_size: int = 100) -> None:
+    def __init__(self, pool_size: int = 300, max_keepalive_connections: int = 100) -> None:
+        """
+        初始化客户端管理器
+        
+        Args:
+            pool_size: 最大并发连接数（增加到300支持更多长时间请求）
+            max_keepalive_connections: keepalive 连接数
+        """
         self.pool_size = pool_size
+        self.max_keepalive_connections = max_keepalive_connections
         self.clients: Dict[str, httpx.AsyncClient] = {}
         self.default_config: dict = {}
 
@@ -49,11 +57,14 @@ class ClientManager:
         if client_key not in self.clients:
             timeout = httpx.Timeout(
                 connect=15.0,
-                read=None,  # 为单个请求设置超时
-                write=30.0,
-                pool=self.pool_size,
+                read=None,  # 保持None，由各渠道自行控制超时
+                write=60.0,  # 写入超时增加到60秒
+                pool=10.0,  # 获取连接的超时（防止永久阻塞）
             )
-            limits = httpx.Limits(max_connections=self.pool_size)
+            limits = httpx.Limits(
+                max_connections=self.pool_size,  # 增加到300
+                max_keepalive_connections=self.max_keepalive_connections
+            )
 
             client_config = {
                 **self.default_config,

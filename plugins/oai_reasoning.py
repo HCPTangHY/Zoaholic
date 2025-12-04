@@ -147,6 +147,7 @@ async def oai_reasoning_request_interceptor(
     """
     model = payload.get("model", "")
     
+    # 早期退出：不是 reasoning 模型直接返回
     if not is_openai_reasoning_model(model, engine):
         return url, headers, payload
     

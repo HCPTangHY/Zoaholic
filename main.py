@@ -37,7 +37,7 @@ from core.stats import (
 )
 from core.plugins import get_plugin_manager
 
-DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 100))
+DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 600))
 is_debug = bool(os.getenv("DEBUG", False))
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
 
@@ -211,8 +211,8 @@ async def lifespan(app: FastAPI):
             "follow_redirects": True
         }
 
-        # 初始化客户端管理器
-        app.state.client_manager = ClientManager(pool_size=30)
+        # 初始化客户端管理器（增加连接池以支持长时间请求）
+        app.state.client_manager = ClientManager(pool_size=300, max_keepalive_connections=100)
         await app.state.client_manager.init(default_config)
 
 

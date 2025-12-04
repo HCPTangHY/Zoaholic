@@ -113,11 +113,19 @@ class LogEntry(BaseModel):
 
     @field_serializer("timestamp")
     def serialize_dt(self, dt: datetime):
+        # SQLite 的 func.now() 返回 UTC 时间但没有时区信息
+        # 确保返回带时区的 ISO 格式，前端才能正确转换为本地时间
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         return dt.isoformat()
     
     @field_serializer("raw_data_expires_at")
     def serialize_expires_at(self, dt: Optional[datetime]):
-        return dt.isoformat() if dt else None
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
 
 
 class LogsPage(BaseModel):

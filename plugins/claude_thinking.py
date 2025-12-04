@@ -10,11 +10,18 @@ Claude Thinking 模式插件
 使用方式：
 - 请求模型名为 claude-3-5-sonnet-20241022-thinking 时自动启用
 - 会自动去掉 -thinking 后缀，添加预填充，并转换响应流
+
+关键设计：
+- 使用 contextvars 在请求和响应拦截器之间共享状态
+- 预填充 <thinking> 后，上游响应不会再返回 <thinking> 标签
+- 转换器初始状态为 inside_thinking=True，等待 </thinking> 标签
 """
 
 import re
 import json
+import asyncio
 from typing import Any, Dict, Optional, Tuple
+from contextvars import ContextVar
 
 from core.log_config import logger
 from core.plugins import (
@@ -28,7 +35,7 @@ from core.plugins import (
 # 插件元信息
 PLUGIN_INFO = {
     "name": "claude_thinking",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "Claude Thinking 模式插件 - 支持 -thinking 后缀模型的思考链处理",
     "author": "Zoaholic Team",
     "dependencies": [],
@@ -48,9 +55,10 @@ EXTENSIONS = [
 THINK_OPEN = "<thinking>"
 THINK_CLOSE = "</thinking>"
 
-# 用于在请求和响应之间传递状态的上下文存储
-# key: request_id 或其他唯一标识, value: 状态信息
-_request_context: Dict[str, Dict[str, Any]] = {}
+# 使用 contextvars 在请求和响应之间共享状态
+# 每个请求都在自己的协程中处理，contextvars 可以隔离不同请求的状态
+_thinking_mode_ctx: ContextVar[bool] = ContextVar("claude_thinking_mode", default=False)
+_transformer_ctx: ContextVar[Optional["ThinkingStreamTransformer"]] = ContextVar("claude_thinking_transformer", default=None)
 
 
 def is_thinking_claude_model(model: Any) -> bool:
@@ -136,7 +144,7 @@ class ThinkingStreamTransformer:
     """
     SSE 流转换器
     
-    将 <thinking>...</thinking> 前的内容映射到 reasoning_content，
+    将 </thinking> 前的内容映射到 reasoning_content，
     之后的内容映射到 content。
     """
     
@@ -145,7 +153,7 @@ class ThinkingStreamTransformer:
         self.close_tag_lower = self.close_tag.lower()
         self.keep_tail = len(self.close_tag_lower) - 1
         self.pending = ""
-        self.inside_thinking = True
+        self.inside_thinking = True  # 预填充后，初始就在 thinking 模式中
     
     def build_patched_data(self, parsed: Dict[str, Any], patch_delta: Dict[str, Any]) -> Dict[str, Any]:
         """构建修补后的数据"""
@@ -231,7 +239,7 @@ class ThinkingStreamTransformer:
         
         return outputs
     
-    def transform_line(self, line: str) -> list:
+    async def transform_line(self, line: str) -> list:
         """
         转换单行 SSE 数据
         
@@ -262,10 +270,10 @@ class ThinkingStreamTransformer:
         if not trimmed or not line.startswith("data: "):
             return [line + "\n"]
         
-        # 解析 JSON
+        # 异步解析 JSON（避免阻塞事件循环）
         json_str = line[6:]  # 移除 "data: " 前缀
         try:
-            parsed = json.loads(json_str)
+            parsed = await asyncio.to_thread(json.loads, json_str)
         except json.JSONDecodeError:
             return [line + "\n"]
         
@@ -285,6 +293,7 @@ class ThinkingStreamTransformer:
             return [line + "\n"]
         
         outputs = []
+        # 先处理 reasoning_content，再处理 content
         if has_rc:
             outputs.extend(self.handle_text_chunk(parsed, delta["reasoning_content"]))
         if has_c:
@@ -307,10 +316,6 @@ class ThinkingStreamTransformer:
         return outputs
 
 
-# 全局转换器实例（按请求 ID 存储）
-_transformers: Dict[str, ThinkingStreamTransformer] = {}
-
-
 # ==================== 请求拦截器 ====================
 
 async def claude_thinking_request_interceptor(
@@ -329,6 +334,10 @@ async def claude_thinking_request_interceptor(
     """
     model = payload.get("model", "")
     
+    # 每次请求开始时都重置状态，确保不会残留旧值
+    _thinking_mode_ctx.set(False)
+    _transformer_ctx.set(None)
+    
     if not is_thinking_claude_model(model):
         return url, headers, payload
     
@@ -344,16 +353,12 @@ async def claude_thinking_request_interceptor(
     # 调整 token 预算
     adjust_reasoning_and_completion_tokens(payload)
     
-    # 记录状态，用于响应钩子判断
-    # 使用 request 对象的 id 或生成一个标识
-    request_id = id(request)
-    _request_context[str(request_id)] = {
-        "is_thinking_model": True,
-        "original_model": original_model,
-    }
+    # 设置 thinking 模式标记，供响应拦截器使用
+    _thinking_mode_ctx.set(True)
     
-    # 在 payload 中添加标记，供响应钩子使用
-    payload["_claude_thinking_request_id"] = str(request_id)
+    # 创建转换器实例，供响应拦截器使用
+    transformer = ThinkingStreamTransformer()
+    _transformer_ctx.set(transformer)
     
     logger.debug(f"[claude_thinking] Modified payload: model={payload['model']}, "
                  f"max_completion_tokens={payload.get('max_completion_tokens')}")
@@ -372,52 +377,51 @@ async def claude_thinking_response_interceptor(
     """
     Claude Thinking 响应拦截器
     
-    转换 SSE 流中的 <thinking>...</thinking> 内容
+    转换 SSE 流中的 </thinking> 前后的内容
     """
+    # 快速退出：检查是否为 thinking 模式（最优先）
+    if not _thinking_mode_ctx.get():
+        return response_chunk
+    
     if not is_stream:
         return response_chunk
     
     if not isinstance(response_chunk, str):
         return response_chunk
     
-    # 检查是否为 thinking 模式的响应
-    # 由于响应钩子无法直接访问请求上下文，我们通过模型名判断
-    # 或者检查响应内容中是否包含 thinking 相关内容
-    
-    # 简化处理：为所有 Claude 模型的流式响应应用转换
-    # 如果不是 thinking 模式，转换器会直接透传内容
-    if "claude" not in model.lower():
+    # 获取转换器
+    transformer = _transformer_ctx.get()
+    if not transformer:
         return response_chunk
     
-    # 获取或创建转换器
-    # 使用模型名作为简单的标识（实际应用中可能需要更精确的请求标识）
-    transformer_key = f"{model}_{id(response_chunk)}"
+    # 处理响应块（异步处理每一行）
+    lines = response_chunk.split("\n")
+    output_lines = []
     
-    # 由于每个 chunk 都会调用钩子，我们需要一个持久的转换器
-    # 这里使用一个简化的方案：每次都创建新的转换器处理单行
-    # 实际应用中可能需要更复杂的状态管理
+    for line in lines:
+        if line.strip():
+            transformed = await transformer.transform_line(line)
+            output_lines.extend(transformed)
+        else:
+            output_lines.append(line + "\n")
     
-    # 检查是否包含 thinking 标签
-    if THINK_OPEN in response_chunk or THINK_CLOSE in response_chunk:
-        # 创建转换器处理
-        transformer = ThinkingStreamTransformer()
-        
-        # 处理响应块
-        lines = response_chunk.split("\n")
-        output_lines = []
-        
-        for line in lines:
-            if line.strip():
-                output_lines.extend(transformer.transform_line(line))
-            else:
-                output_lines.append(line + "\n")
-        
-        # 刷新剩余内容
-        output_lines.extend(transformer.flush())
-        
-        return "".join(output_lines)
+    result = "".join(output_lines)
     
-    return response_chunk
+    # 如果收到 [DONE]，刷新并重置状态
+    if "data: [DONE]" in response_chunk:
+        try:
+            flush_outputs = transformer.flush()
+            if flush_outputs:
+                # 在 [DONE] 前插入刷新的内容
+                done_idx = result.find("data: [DONE]")
+                if done_idx != -1:
+                    result = result[:done_idx] + "".join(flush_outputs) + result[done_idx:]
+        finally:
+            # 确保无论如何都重置状态，避免污染后续请求
+            _thinking_mode_ctx.set(False)
+            _transformer_ctx.set(None)
+    
+    return result
 
 
 # ==================== 插件生命周期 ====================
@@ -458,10 +462,6 @@ def teardown(manager):
     # 注销拦截器
     unregister_request_interceptor("claude_thinking_request")
     unregister_response_interceptor("claude_thinking_response")
-    
-    # 清理上下文
-    _request_context.clear()
-    _transformers.clear()
     
     logger.info(f"[{PLUGIN_INFO['name']}] 已清理完成")
 

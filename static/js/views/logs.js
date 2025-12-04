@@ -449,26 +449,53 @@ const LogsView = {
         // 返回体
         if (log.response_body) {
             const responseSection = LogsView._createCollapsibleSection("返回体", () => {
+                const pre = UI.el("pre", "text-body-small font-mono bg-md-surface-container p-3 rounded-md overflow-x-auto max-h-64 overflow-y-auto whitespace-pre-wrap");
+                
                 try {
-                    // 尝试解析多行SSE格式
-                    const lines = log.response_body.split('\n').filter(l => l.trim());
-                    const parsed = lines.map(line => {
-                        if (line.startsWith('data: ')) {
-                            try {
-                                return JSON.parse(line.slice(6));
-                            } catch {
-                                return line;
-                            }
-                        }
-                        return line;
-                    });
-                    const pre = UI.el("pre", "text-body-small font-mono bg-md-surface-container p-3 rounded-md overflow-x-auto max-h-64 overflow-y-auto");
-                    pre.textContent = JSON.stringify(parsed, null, 2);
+                    // 首先尝试解析为单个 JSON 对象（非流式响应）
+                    const singleJson = JSON.parse(log.response_body);
+                    pre.textContent = JSON.stringify(singleJson, null, 2);
                     return pre;
                 } catch {
-                    const pre = UI.el("pre", "text-body-small font-mono bg-md-surface-container p-3 rounded-md overflow-x-auto max-h-64 overflow-y-auto whitespace-pre-wrap");
-                    pre.textContent = log.response_body;
-                    return pre;
+                    // 如果失败，尝试解析为 SSE 流式格式
+                    try {
+                        const lines = log.response_body.split('\n').filter(l => l.trim());
+                        const parsed = [];
+                        
+                        for (const line of lines) {
+                            if (line.startsWith('data: ')) {
+                                const dataStr = line.slice(6);
+                                if (dataStr === '[DONE]') {
+                                    parsed.push('[DONE]');
+                                } else {
+                                    try {
+                                        parsed.push(JSON.parse(dataStr));
+                                    } catch {
+                                        // 解析失败的行保留原样
+                                        parsed.push(line);
+                                    }
+                                }
+                            } else if (line.startsWith(': ')) {
+                                // SSE 注释行（如心跳）
+                                parsed.push(line);
+                            } else {
+                                parsed.push(line);
+                            }
+                        }
+                        
+                        // 如果成功解析了至少一个对象，显示为 JSON
+                        if (parsed.some(item => typeof item === 'object')) {
+                            pre.textContent = JSON.stringify(parsed, null, 2);
+                        } else {
+                            // 否则显示原始文本
+                            pre.textContent = log.response_body;
+                        }
+                        return pre;
+                    } catch {
+                        // 完全无法解析，显示原始文本
+                        pre.textContent = log.response_body;
+                        return pre;
+                    }
                 }
             });
             detailContainer.appendChild(responseSection);
@@ -583,8 +610,46 @@ const LogsView = {
         if (log.response_body) {
             section.appendChild(LogsView._createCollapsibleSection("返回体", () => {
                 const pre = UI.el("pre", "text-xs font-mono bg-md-surface-container p-2 rounded overflow-x-auto max-h-40 overflow-y-auto whitespace-pre-wrap");
-                pre.textContent = log.response_body;
-                return pre;
+                
+                try {
+                    // 首先尝试解析为单个 JSON 对象（非流式响应）
+                    const singleJson = JSON.parse(log.response_body);
+                    pre.textContent = JSON.stringify(singleJson, null, 2);
+                    return pre;
+                } catch {
+                    // 如果失败，尝试解析为 SSE 流式格式
+                    try {
+                        const lines = log.response_body.split('\n').filter(l => l.trim());
+                        const parsed = [];
+                        
+                        for (const line of lines) {
+                            if (line.startsWith('data: ')) {
+                                const dataStr = line.slice(6);
+                                if (dataStr === '[DONE]') {
+                                    parsed.push('[DONE]');
+                                } else {
+                                    try {
+                                        parsed.push(JSON.parse(dataStr));
+                                    } catch {
+                                        parsed.push(line);
+                                    }
+                                }
+                            } else {
+                                parsed.push(line);
+                            }
+                        }
+                        
+                        if (parsed.some(item => typeof item === 'object')) {
+                            pre.textContent = JSON.stringify(parsed, null, 2);
+                        } else {
+                            pre.textContent = log.response_body;
+                        }
+                        return pre;
+                    } catch {
+                        pre.textContent = log.response_body;
+                        return pre;
+                    }
+                }
             }));
         }
 

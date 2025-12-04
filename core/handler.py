@@ -35,8 +35,8 @@ from utils import safe_get, error_handling_wrapper
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
-# 默认超时时间
-DEFAULT_TIMEOUT = 100
+# 默认超时时间（10分钟，支持长时间 reasoning 请求）
+DEFAULT_TIMEOUT = 600
 
 # 调试模式标志
 is_debug = False
