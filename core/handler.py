@@ -244,12 +244,13 @@ async def process_request(
 
             # 更新成功计数和首次响应时间
             background_tasks.add_task(
-                update_channel_stats_func, 
-                current_info["request_id"], channel_id, request.model, 
+                update_channel_stats_func,
+                current_info["request_id"], channel_id, request.model,
                 current_info["api_key"], success=True, provider_api_key=api_key
             )
             current_info["first_response_time"] = first_response_time
             current_info["success"] = True
+            current_info["status_code"] = 200
             current_info["provider"] = channel_id
             return response
 
@@ -579,6 +580,7 @@ class ModelRequestHandler:
                         current_info["retry_path"] = json.dumps(retry_path, ensure_ascii=False)
                     current_info["retry_count"] = current_retry_count
                     current_info["success"] = False
+                    current_info["status_code"] = status_code
                     # 记录处理时间
                     if "start_time" in current_info:
                         process_time = time() - current_info["start_time"]
@@ -594,6 +596,7 @@ class ModelRequestHandler:
         current_info = self.request_info_getter()
         current_info["first_response_time"] = -1
         current_info["success"] = False
+        current_info["status_code"] = status_code
         current_info["provider"] = None
         # 记录最终的重试信息
         if retry_path:

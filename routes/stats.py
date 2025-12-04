@@ -97,7 +97,9 @@ class LogEntry(BaseModel):
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
-    is_flagged: bool
+    success: bool = False
+    status_code: Optional[int] = None
+    is_flagged: bool = False
     
     # 扩展日志字段
     provider_id: Optional[str] = None
@@ -669,6 +671,8 @@ async def get_logs(
                 prompt_tokens=row.prompt_tokens,
                 completion_tokens=row.completion_tokens,
                 total_tokens=row.total_tokens,
+                success=row.success if hasattr(row, 'success') else False,
+                status_code=row.status_code if hasattr(row, 'status_code') else None,
                 is_flagged=row.is_flagged,
                 # 扩展日志字段
                 provider_id=row.provider_id,

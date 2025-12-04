@@ -267,7 +267,7 @@ const LogsView = {
 
             // 状态
             const statusTd = UI.el("td", "px-3 py-3 text-center align-top");
-            statusTd.appendChild(LogsView._createStatusChip(log.is_flagged));
+            statusTd.appendChild(LogsView._createStatusChip(log.success, log.status_code, log.is_flagged));
 
             tr.appendChild(expandTd);
             tr.appendChild(tsTd);
@@ -324,7 +324,7 @@ const LogsView = {
             
             const rightTop = UI.el("div", "flex items-center gap-2");
             rightTop.appendChild(UI.icon(isExpanded ? "expand_less" : "expand_more", "text-md-on-surface-variant"));
-            rightTop.appendChild(LogsView._createStatusChip(log.is_flagged));
+            rightTop.appendChild(LogsView._createStatusChip(log.success, log.status_code, log.is_flagged));
             topRow.appendChild(rightTop);
             card.appendChild(topRow);
 
@@ -397,6 +397,8 @@ const LogsView = {
         basicInfo.appendChild(LogsView._createDetailItem("Endpoint", log.endpoint || "-"));
         basicInfo.appendChild(LogsView._createDetailItem("总Tokens", log.total_tokens != null ? String(log.total_tokens) : "-"));
         basicInfo.appendChild(LogsView._createDetailItem("请求ID", log.id != null ? `#${log.id}` : "-"));
+        basicInfo.appendChild(LogsView._createDetailItem("状态码", log.status_code != null ? String(log.status_code) : "-"));
+        basicInfo.appendChild(LogsView._createDetailItem("请求状态", log.success ? "成功" : "失败"));
         detailContainer.appendChild(basicInfo);
 
         // 重试路径
@@ -560,6 +562,8 @@ const LogsView = {
         const basicInfo = UI.el("div", "grid grid-cols-2 gap-2 text-body-small");
         basicInfo.appendChild(LogsView._createInfoItem("客户端IP", log.client_ip || "-"));
         basicInfo.appendChild(LogsView._createInfoItem("总Tokens", log.total_tokens != null ? String(log.total_tokens) : "-"));
+        basicInfo.appendChild(LogsView._createInfoItem("状态码", log.status_code != null ? String(log.status_code) : "-"));
+        basicInfo.appendChild(LogsView._createInfoItem("请求状态", log.success ? "成功" : "失败"));
         section.appendChild(basicInfo);
 
         // 重试路径
@@ -701,19 +705,29 @@ const LogsView = {
         contentEl.appendChild(footer);
     },
 
-    _createStatusChip(isFlagged) {
+    _createStatusChip(success, statusCode, isFlagged) {
         const chip = UI.el(
             "span",
             "inline-flex items-center gap-1 px-2 py-0.5 rounded-md-full text-label-small"
         );
+        
+        // 优先显示道德审查失败
         if (isFlagged) {
             chip.classList.add("md-chip-status-error");
             chip.appendChild(UI.icon("report", "text-sm"));
             chip.appendChild(document.createTextNode("Flagged"));
-        } else {
+        } else if (success) {
+            // 成功请求
             chip.classList.add("md-chip-status-healthy");
             chip.appendChild(UI.icon("check_circle", "text-sm"));
-            chip.appendChild(document.createTextNode("OK"));
+            const text = statusCode ? `${statusCode}` : "OK";
+            chip.appendChild(document.createTextNode(text));
+        } else {
+            // 失败请求
+            chip.classList.add("md-chip-status-error");
+            chip.appendChild(UI.icon("error", "text-sm"));
+            const text = statusCode ? `${statusCode}` : "Failed";
+            chip.appendChild(document.createTextNode(text));
         }
         return chip;
     },

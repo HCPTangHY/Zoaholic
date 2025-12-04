@@ -271,11 +271,19 @@ class ThinkingStreamTransformer:
             return outputs
         
         # 非 data: 行直接透传
-        if not trimmed or not line.startswith("data: "):
+        if not trimmed or not line.startswith("data:"):
             return [line + "\n"]
         
         # 异步解析 JSON（避免阻塞事件循环）
-        json_str = line[6:]  # 移除 "data: " 前缀
+        # 安全地移除 "data: " 或 "data:" 前缀
+        if line.startswith("data: "):
+            json_str = line[6:]  # 移除 "data: " (6个字符)
+        else:
+            json_str = line[5:]  # 移除 "data:" (5个字符)
+        
+        json_str = json_str.strip()
+        if not json_str:
+            return [line + "\n"]
         try:
             parsed = await asyncio.to_thread(json.loads, json_str)
         except json.JSONDecodeError:
@@ -288,6 +296,12 @@ class ThinkingStreamTransformer:
         
         delta = choices[0].get("delta", {})
         if not isinstance(delta, dict):
+            return [line + "\n"]
+        
+        # 检查是否有 usage 信息需要透传（重要：用于 token 计费）
+        usage = parsed.get("usage")
+        if usage:
+            # 带有 usage 的消息直接透传，确保计费信息不丢失
             return [line + "\n"]
         
         has_rc = isinstance(delta.get("reasoning_content"), str)

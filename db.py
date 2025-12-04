@@ -21,6 +21,8 @@ class RequestStat(Base):
     provider = Column(String, index=True)
     model = Column(String, index=True)
     api_key = Column(String, index=True)
+    success = Column(Boolean, default=False, index=True)  # 请求是否成功
+    status_code = Column(Integer, nullable=True, index=True)  # HTTP 状态码
     is_flagged = Column(Boolean, default=False)
     text = Column(Text)
     prompt_tokens = Column(Integer, default=0)

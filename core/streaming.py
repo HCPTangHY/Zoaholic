@@ -126,27 +126,48 @@ class LoggingStreamingResponse(Response):
                 yield chunk
                 continue
 
-            line = chunk.decode("utf-8")
+            chunk_text = chunk.decode("utf-8")
             if self.debug:
-                logger.info(line.encode("utf-8").decode("unicode_escape"))
+                logger.info(chunk_text.encode("utf-8").decode("unicode_escape"))
 
-            if line.startswith("data:"):
-                line = line.lstrip("data: ")
+            # 按行分割处理，一个 chunk 可能包含多个 SSE 事件
+            lines = chunk_text.split("\n")
+            for line in lines:
+                line = line.strip()
+                
+                # 跳过空行和注释行
+                if not line or line.startswith(":"):
+                    continue
 
-            if not line.startswith("[DONE]") and not line.startswith("OK") and not line.startswith(":"):
+                if line.startswith("data:"):
+                    line = line[5:].strip()  # 移除 "data:" 前缀（5个字符）
+
+                # 跳过特殊标记和空行
+                if not line or line.startswith("[DONE]") or line.startswith("OK"):
+                    continue
+
+                # 尝试解析 JSON
                 try:
                     resp = await asyncio.to_thread(json.loads, line)
+                    # Claude API 的 usage 字段
                     input_tokens = safe_get(resp, "message", "usage", "input_tokens", default=0)
-                    input_tokens = safe_get(resp, "usage", "prompt_tokens", default=0)
+                    # OpenAI 兼容的 usage 字段
+                    if not input_tokens:
+                        input_tokens = safe_get(resp, "usage", "prompt_tokens", default=0)
                     output_tokens = safe_get(resp, "usage", "completion_tokens", default=0)
                     total_tokens = input_tokens + output_tokens
 
-                    self.current_info["prompt_tokens"] = input_tokens
-                    self.current_info["completion_tokens"] = output_tokens
-                    self.current_info["total_tokens"] = total_tokens
+                    if total_tokens > 0:
+                        self.current_info["prompt_tokens"] = input_tokens
+                        self.current_info["completion_tokens"] = output_tokens
+                        self.current_info["total_tokens"] = total_tokens
                 except Exception as e:
-                    logger.error(f"Error parsing streaming response: {str(e)}, line: {repr(line)}")
-                    # 出错时照样把原始 chunk 透传出去
+                    # 仅在调试模式下记录解析错误，避免正常运行时的噪音
+                    if self.debug:
+                        logger.error(f"Error parsing streaming response: {str(e)}, line: {repr(line)}")
+                    # 出错时继续处理下一行
+            
+            # 透传原始 chunk
             yield chunk
         
         # 保存响应体
