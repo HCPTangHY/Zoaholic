@@ -106,9 +106,20 @@ class LoggingStreamingResponse(Response):
                 logger.error(f"Error updating stats in LoggingStreamingResponse: {str(e)}")
 
     async def _logging_iterator(self):
+        # 用于收集响应体的缓冲区（仅在配置了保留时间时使用）
+        response_chunks = []
+        max_response_size = 100 * 1024  # 100KB
+        total_response_size = 0
+        should_save_response = self.current_info.get("raw_data_expires_at") is not None
+        
         async for chunk in self.body_iterator:
             if isinstance(chunk, str):
                 chunk = chunk.encode("utf-8")
+
+            # 收集响应体（限制大小）
+            if should_save_response and total_response_size < max_response_size:
+                response_chunks.append(chunk)
+                total_response_size += len(chunk)
 
             # 音频流不解析 usage，直接透传
             if self.current_info.get("endpoint", "").endswith("/v1/audio/speech"):
@@ -137,6 +148,16 @@ class LoggingStreamingResponse(Response):
                     logger.error(f"Error parsing streaming response: {str(e)}, line: {repr(line)}")
                     # 出错时照样把原始 chunk 透传出去
             yield chunk
+        
+        # 保存响应体
+        if should_save_response and response_chunks:
+            try:
+                response_body = b"".join(response_chunks).decode("utf-8", errors="replace")
+                if total_response_size >= max_response_size:
+                    response_body += f"\n[Truncated, total size: {total_response_size} bytes]"
+                self.current_info["response_body"] = response_body
+            except Exception as e:
+                logger.error(f"Error saving response body: {str(e)}")
 
     async def close(self) -> None:
         if not self._closed:

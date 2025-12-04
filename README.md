@@ -481,6 +481,7 @@ preferences: # 全局配置
   rate_limit: 999999/min # 全局速率限制，支持 15/min,10/day 等组合
   keepalive_interval: # 心跳间隔（秒），适合长推理场景
     gemini-2.5-pro: 50
+  log_raw_data_retention_hours: 24 # 日志原始数据保留时间（小时），设为 0 或不设置表示不保存请求/响应原始数据
   error_triggers: # 错误触发器，响应文本包含任意字符串时视为错误并触发冷却
     - The bot's usage is covered by the developer
     - process this request due to overload or policy

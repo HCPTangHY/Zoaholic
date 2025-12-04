@@ -1,9 +1,11 @@
 import os
 import json
 import uuid
+import asyncio
 import tomllib
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
 
 from starlette.responses import Response
@@ -27,7 +29,7 @@ from core.middleware import StatsMiddleware, request_info, get_api_key
 
 from utils import safe_get, load_config
 
-from db import DISABLE_DATABASE
+from db import DISABLE_DATABASE, async_session, RequestStat
 from core.stats import (
     create_tables,
     update_paid_api_keys_states,
@@ -74,6 +76,61 @@ def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT)
 
     return result
 
+async def cleanup_expired_raw_data():
+    """
+    定时清理过期的原始数据（请求头、请求体、返回体）
+    启动时立即执行一次，之后每小时执行一次
+    清理已过期的数据字段（保留日志记录本身）
+
+    """
+    from sqlalchemy import update
+    
+    first_run = True
+    while True:
+        try:
+            # 第一次立即执行，之后每小时执行
+            if not first_run:
+                await asyncio.sleep(3600)
+            first_run = False
+            
+            if DISABLE_DATABASE or async_session is None:
+                continue
+                
+            async with async_session() as session:
+                now = datetime.now(timezone.utc)
+                
+                # 清理过期的原始数据字段
+                # 只清理有过期时间且已过期的记录
+                stmt = (
+                    update(RequestStat)
+                    .where(RequestStat.raw_data_expires_at.isnot(None))
+                    .where(RequestStat.raw_data_expires_at < now)
+                    .where(
+                        (RequestStat.request_headers.isnot(None)) |
+                        (RequestStat.request_body.isnot(None)) |
+                        (RequestStat.response_body.isnot(None))
+                    )
+                    .values(
+                        request_headers=None,
+                        request_body=None,
+                        response_body=None
+                    )
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+                
+                if result.rowcount > 0:
+                    logger.info(f"Cleaned up expired raw data from {result.rowcount} log entries")
+                    
+        except asyncio.CancelledError:
+            logger.info("Raw data cleanup task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in raw data cleanup task: {e}")
+            # 出错后等待一段时间再重试
+            await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时的代码
@@ -81,8 +138,12 @@ async def lifespan(app: FastAPI):
     set_routing_debug_mode(is_debug)
     set_handler_debug_mode(is_debug)
     
+    # 启动定时清理任务
+    cleanup_task = None
     if not DISABLE_DATABASE:
         await create_tables()
+        cleanup_task = asyncio.create_task(cleanup_expired_raw_data())
+        logger.info("Started raw data cleanup background task")
 
     if app and not hasattr(app.state, 'config'):
         # logger.warning("Config not found, attempting to reload")
@@ -195,6 +256,14 @@ async def lifespan(app: FastAPI):
 
     yield
     # 关闭时的代码
+    # 取消清理任务
+    if cleanup_task:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+    
     # await app.state.client.aclose()
     if hasattr(app.state, 'client_manager'):
         await app.state.client_manager.close()

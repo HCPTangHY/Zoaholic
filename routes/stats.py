@@ -94,12 +94,30 @@ class LogEntry(BaseModel):
     api_key_prefix: Optional[str] = None
     process_time: Optional[float] = None
     first_response_time: Optional[float] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
     is_flagged: bool
+    
+    # 扩展日志字段
+    provider_id: Optional[str] = None
+    provider_key_index: Optional[int] = None
+    api_key_name: Optional[str] = None
+    api_key_group: Optional[str] = None
+    retry_count: Optional[int] = None
+    retry_path: Optional[str] = None  # JSON格式的重试路径
+    request_headers: Optional[str] = None  # JSON格式的请求头
+    request_body: Optional[str] = None  # 请求体
+    response_body: Optional[str] = None  # 返回体
+    raw_data_expires_at: Optional[datetime] = None  # 原始数据过期时间
 
     @field_serializer("timestamp")
     def serialize_dt(self, dt: datetime):
         return dt.isoformat()
+    
+    @field_serializer("raw_data_expires_at")
+    def serialize_expires_at(self, dt: Optional[datetime]):
+        return dt.isoformat() if dt else None
 
 
 class LogsPage(BaseModel):
@@ -609,6 +627,8 @@ async def get_logs(
         rows = rows_result.scalars().all()
 
     items: List[LogEntry] = []
+    now = datetime.now(timezone.utc)
+    
     for row in rows:
         api_key = row.api_key or ""
         if api_key and len(api_key) > 11:
@@ -617,6 +637,15 @@ async def get_logs(
             api_key_prefix = f"{prefix}...{suffix}"
         else:
             api_key_prefix = api_key
+
+        # 检查原始数据是否过期
+        raw_data_expired = False
+        if row.raw_data_expires_at:
+            # 确保时区一致性：如果数据库时间没有时区信息，将其视为UTC
+            expires_at = row.raw_data_expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            raw_data_expired = expires_at < now
 
         items.append(
             LogEntry(
@@ -629,8 +658,21 @@ async def get_logs(
                 api_key_prefix=api_key_prefix,
                 process_time=row.process_time,
                 first_response_time=row.first_response_time,
+                prompt_tokens=row.prompt_tokens,
+                completion_tokens=row.completion_tokens,
                 total_tokens=row.total_tokens,
                 is_flagged=row.is_flagged,
+                # 扩展日志字段
+                provider_id=row.provider_id,
+                provider_key_index=row.provider_key_index,
+                api_key_name=row.api_key_name,
+                api_key_group=row.api_key_group,
+                retry_count=row.retry_count,
+                retry_path=row.retry_path if not raw_data_expired else None,
+                request_headers=row.request_headers if not raw_data_expired else None,
+                request_body=row.request_body if not raw_data_expired else None,
+                response_body=row.response_body if not raw_data_expired else None,
+                raw_data_expires_at=row.raw_data_expires_at,
             )
         )
 

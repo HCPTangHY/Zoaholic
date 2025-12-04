@@ -8,8 +8,9 @@
 import json
 import asyncio
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
-from typing import Dict, Union, Optional, Any, Callable, TYPE_CHECKING
+from typing import Dict, Union, Optional, Any, Callable, List, TYPE_CHECKING
 
 import httpx
 from fastapi import HTTPException, BackgroundTasks
@@ -173,6 +174,19 @@ async def process_request(
     # 确保日志中一定记录模型名（使用当前请求对象上的 model）
     if hasattr(request, "model") and getattr(request, "model", None):
         current_info["model"] = request.model
+    
+    # 记录渠道ID和上游key索引
+    current_info["provider_id"] = channel_id
+    if api_key:
+        try:
+            # 从 provider_api_circular_list 中获取所有 keys
+            circular_list = provider_api_circular_list.get(provider['provider'])
+            if circular_list and hasattr(circular_list, 'items'):
+                api_keys_list = circular_list.items
+                if api_key in api_keys_list:
+                    current_info["provider_key_index"] = api_keys_list.index(api_key)
+        except (ValueError, TypeError, AttributeError):
+            pass
 
     proxy = safe_get(app.state.config, "preferences", "proxy", default=None)  # global proxy
     proxy = safe_get(provider, "preferences", "proxy", default=proxy)  # provider proxy
@@ -348,10 +362,14 @@ class ModelRequestHandler:
                 retry_count = 1
         else:
             tmp_retry_count = sum(
-                provider_api_circular_list[provider['provider']].get_items_count() 
+                provider_api_circular_list[provider['provider']].get_items_count()
                 for provider in matching_providers
             ) * 2
             retry_count = min(tmp_retry_count, 10)
+
+        # 初始化重试路径记录
+        retry_path: List[Dict[str, Any]] = []
+        current_retry_count = 0
 
         while True:
             if index > num_matching_providers + retry_count:
@@ -419,10 +437,22 @@ class ModelRequestHandler:
                     self.request_info_getter, self.update_channel_stats_func,
                     endpoint, role, local_timeout_value, keepalive_interval
                 )
+                # 成功时记录重试路径和重试次数
+                current_info = self.request_info_getter()
+                if retry_path:
+                    current_info["retry_path"] = json.dumps(retry_path, ensure_ascii=False)
+                current_info["retry_count"] = current_retry_count
                 return response
-            except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError, 
-                    httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, 
+            except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError,
+                    httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout,
                     httpx.ConnectError) as e:
+                # 记录重试路径
+                current_retry_count += 1
+                retry_path.append({
+                    "provider": provider_name,
+                    "error": str(e)[:200],  # 限制错误信息长度
+                    "status_code": None  # 稍后更新
+                })
 
                 # 根据异常类型设置状态码和错误消息
                 if isinstance(e, httpx.ReadTimeout):
@@ -527,10 +557,19 @@ class ModelRequestHandler:
                     import traceback
                     traceback.print_exc()
 
-                if auto_retry and (status_code not in [400, 413] 
+                # 更新重试路径中的状态码
+                if retry_path:
+                    retry_path[-1]["status_code"] = status_code
+
+                if auto_retry and (status_code not in [400, 413]
                     or urlparse(provider.get('base_url', '')).netloc == 'models.inference.ai.azure.com'):
                     continue
                 else:
+                    # 失败时也记录重试信息
+                    current_info = self.request_info_getter()
+                    if retry_path:
+                        current_info["retry_path"] = json.dumps(retry_path, ensure_ascii=False)
+                    current_info["retry_count"] = current_retry_count
                     return JSONResponse(
                         status_code=status_code,
                         content={"error": f"Error: Current provider response failed: {error_message}"}
@@ -540,6 +579,10 @@ class ModelRequestHandler:
         current_info["first_response_time"] = -1
         current_info["success"] = False
         current_info["provider"] = None
+        # 记录最终的重试信息
+        if retry_path:
+            current_info["retry_path"] = json.dumps(retry_path, ensure_ascii=False)
+        current_info["retry_count"] = current_retry_count
         return JSONResponse(
             status_code=status_code,
             content={"error": f"All {request_data.model} error: {error_message}"}

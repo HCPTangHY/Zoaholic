@@ -29,6 +29,18 @@ class RequestStat(Base):
     prompt_price = Column(Float, default=0.0)
     completion_price = Column(Float, default=0.0)
     timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    
+    # 扩展日志字段
+    provider_id = Column(String, nullable=True, index=True)  # 渠道ID
+    provider_key_index = Column(Integer, nullable=True)  # 渠道使用的上游key索引
+    api_key_name = Column(String, nullable=True)  # 使用的key
+    api_key_group = Column(String, nullable=True)  # 分组
+    retry_count = Column(Integer, default=0)  # 重试次数
+    retry_path = Column(Text, nullable=True)  # 重试路径JSON格式
+    request_headers = Column(Text, nullable=True)  # 请求头JSON格式
+    request_body = Column(Text, nullable=True)  # 请求体JSON格式
+    response_body = Column(Text, nullable=True)  # 返回体JSON格式
+    raw_data_expires_at = Column(DateTime(timezone=True), nullable=True)  # 原始数据过期时间
 
 class ChannelStat(Base):
     __tablename__ = 'channel_stats'

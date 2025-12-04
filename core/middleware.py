@@ -12,6 +12,7 @@ import uuid
 import asyncio
 import contextvars
 from time import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Callable, Any
 
 from pydantic import ValidationError
@@ -193,6 +194,10 @@ class StatsMiddleware:
         client = scope.get("client")
         client_ip = client[0] if client else "unknown"
 
+        # 获取用户key相关信息
+        api_key_name = safe_get(config, "api_keys", api_index, "name", default=None)
+        api_key_group = safe_get(config, "api_keys", api_index, "group", default=None)
+
         # 初始化 request_info
         request_id = str(uuid.uuid4())
         request_info_data = {
@@ -206,11 +211,22 @@ class StatsMiddleware:
             "model": None,
             "success": False,
             "api_key": token,
+            "api_key_name": api_key_name,
+            "api_key_group": api_key_group,
             "is_flagged": False,
             "text": None,
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
+            # 扩展日志字段
+            "provider_id": None,
+            "provider_key_index": None,
+            "retry_count": 0,
+            "retry_path": None,
+            "request_headers": None,
+            "request_body": None,
+            "response_body": None,
+            "raw_data_expires_at": None,
         }
 
         current_request_info = request_info.set(request_info_data)
@@ -237,6 +253,28 @@ class StatsMiddleware:
                     parsed_body = json.loads(body_bytes)
                 except json.JSONDecodeError:
                     parsed_body = None
+
+        # 获取原始数据保留时间配置（小时），默认为0表示不保存
+        raw_data_retention_hours = safe_get(
+            config, "preferences", "log_raw_data_retention_hours", default=0
+        )
+        
+        # 如果配置了保留时间，保存请求头和请求体
+        if raw_data_retention_hours > 0:
+            # 过滤敏感头信息
+            safe_headers = {k: v for k, v in headers_dict.items()
+                          if k not in ("authorization", "x-api-key")}
+            current_info["request_headers"] = json.dumps(safe_headers, ensure_ascii=False)
+            
+            # 保存请求体（限制大小，避免存储过大数据）
+            max_body_size = 100 * 1024  # 100KB
+            if body_bytes and len(body_bytes) <= max_body_size:
+                current_info["request_body"] = body_bytes.decode("utf-8", errors="replace")
+            elif body_bytes:
+                current_info["request_body"] = f"[Body too large: {len(body_bytes)} bytes]"
+            
+            # 设置过期时间
+            current_info["raw_data_expires_at"] = datetime.now(timezone.utc) + timedelta(hours=raw_data_retention_hours)
 
         # 创建新的 receive 函数，重放已读取的 body
         body_sent = False
