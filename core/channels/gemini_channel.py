@@ -192,6 +192,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
         'stream_options',
         'prompt',
         'size',
+        'max_completion_tokens',  # 将在下面转换为 maxOutputTokens
     ]
     generation_config = {}
 
@@ -245,7 +246,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
                 if "gemini-3-pro-image" in original_model:
                     value = 1
                 generation_config["temperature"] = value
-            elif field == "max_tokens":
+            elif field == "max_tokens" or field == "max_completion_tokens":
                 if value > 65536:
                     value = 65536
                 generation_config["maxOutputTokens"] = value

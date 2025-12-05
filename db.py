@@ -39,9 +39,11 @@ class RequestStat(Base):
     api_key_group = Column(String, nullable=True)  # 分组
     retry_count = Column(Integer, default=0)  # 重试次数
     retry_path = Column(Text, nullable=True)  # 重试路径JSON格式
-    request_headers = Column(Text, nullable=True)  # 请求头JSON格式
-    request_body = Column(Text, nullable=True)  # 请求体JSON格式
-    response_body = Column(Text, nullable=True)  # 返回体JSON格式
+    request_headers = Column(Text, nullable=True)  # 用户请求头JSON格式
+    request_body = Column(Text, nullable=True)  # 用户请求体
+    upstream_request_body = Column(Text, nullable=True)  # 发送到上游的请求体
+    upstream_response_body = Column(Text, nullable=True)  # 上游返回的原始响应体
+    response_body = Column(Text, nullable=True)  # 返回给用户的响应体
     raw_data_expires_at = Column(DateTime(timezone=True), nullable=True)  # 原始数据过期时间
 
 class ChannelStat(Base):

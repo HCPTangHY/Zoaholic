@@ -173,6 +173,18 @@ async def process_request(
         logger.info(json.dumps({k: v for k, v in payload.items() if k != 'file'}, indent=4, ensure_ascii=False))
 
     current_info = request_info_getter()
+    
+    # 记录发送到上游的请求体（如果配置了保留时间）
+    if current_info.get("raw_data_expires_at"):
+        try:
+            max_body_size = 100 * 1024  # 100KB
+            upstream_body_str = json.dumps({k: v for k, v in payload.items() if k != 'file'}, ensure_ascii=False)
+            if len(upstream_body_str) <= max_body_size:
+                current_info["upstream_request_body"] = upstream_body_str
+            else:
+                current_info["upstream_request_body"] = f"[Body too large: {len(upstream_body_str)} bytes]"
+        except Exception as e:
+            logger.error(f"Error saving upstream request body: {str(e)}")
     # 确保日志中一定记录模型名（使用当前请求对象上的 model）
     if hasattr(request, "model") and getattr(request, "model", None):
         current_info["model"] = request.model
@@ -460,9 +472,16 @@ class ModelRequestHandler:
                     httpx.ConnectError) as e:
                 # 记录重试路径
                 current_retry_count += 1
+                
+                # 获取完整的错误详情
+                if isinstance(e, HTTPException):
+                    full_error = str(e.detail) if hasattr(e, 'detail') else str(e)
+                else:
+                    full_error = str(e)
+                
                 retry_path.append({
                     "provider": provider_name,
-                    "error": str(e)[:200],  # 限制错误信息长度
+                    "error": full_error[:2000],  # 增加错误信息长度限制到 2000 字符
                     "status_code": None  # 稍后更新
                 })
 

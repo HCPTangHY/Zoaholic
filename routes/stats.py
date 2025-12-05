@@ -108,9 +108,11 @@ class LogEntry(BaseModel):
     api_key_group: Optional[str] = None
     retry_count: Optional[int] = None
     retry_path: Optional[str] = None  # JSON格式的重试路径
-    request_headers: Optional[str] = None  # JSON格式的请求头
-    request_body: Optional[str] = None  # 请求体
-    response_body: Optional[str] = None  # 返回体
+    request_headers: Optional[str] = None  # 用户请求头
+    request_body: Optional[str] = None  # 用户请求体
+    upstream_request_body: Optional[str] = None  # 发送到上游的请求体
+    upstream_response_body: Optional[str] = None  # 上游返回的响应体
+    response_body: Optional[str] = None  # 返回给用户的响应体
     raw_data_expires_at: Optional[datetime] = None  # 原始数据过期时间
 
     @field_serializer("timestamp")
@@ -683,6 +685,8 @@ async def get_logs(
                 retry_path=row.retry_path if not raw_data_expired else None,
                 request_headers=row.request_headers if not raw_data_expired else None,
                 request_body=row.request_body if not raw_data_expired else None,
+                upstream_request_body=getattr(row, 'upstream_request_body', None) if not raw_data_expired else None,
+                upstream_response_body=getattr(row, 'upstream_response_body', None) if not raw_data_expired else None,
                 response_body=row.response_body if not raw_data_expired else None,
                 raw_data_expires_at=row.raw_data_expires_at,
             )

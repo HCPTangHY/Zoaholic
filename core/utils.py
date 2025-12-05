@@ -751,41 +751,56 @@ def parse_json_safely(json_str):
 
 async def upload_image_to_0x0st(base64_image: str):
     """
-    Uploads a base64 encoded image to 0x0.st.
+    Uploads a base64 encoded image to freeimage.host.
+    
+    Uses freeimage.host public guest API (no API key registration required).
+    API docs: https://freeimage.host/page/api
 
     Args:
         base64_image: The base64 encoded image string.
 
     Returns:
-        The URL of the uploaded image.
+        The URL of the uploaded image, or original base64_image if upload fails.
     """
+    # 提取纯 base64 数据（去除 data URI 前缀，如 "data:image/png;base64,"）
     if "," in base64_image:
-        base64_image_split = base64_image.split(",")[1]
+        base64_data = base64_image.split(",")[1]
+    else:
+        base64_data = base64_image
 
-    image_data = base64.b64decode(base64_image_split)
-
-    img_format = get_image_format(image_data)
-    if not img_format:
-        img_format = 'png'  # 如果无法检测到格式，则默认为 png
-
-    content_type = f'image/{img_format}'
-    file_name = f'image.{img_format}'
-
-    files = {'file': (file_name, image_data, content_type)}
-    data = {'expires': '24', 'secret': '123456'}
-
+    # freeimage.host 公共 guest API key
+    FREEIMAGE_API_KEY = "6d207e02198a847aa98d0a2a901485a5"
+    
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post("https://0x0.st", files=files, data=data)
+            # freeimage.host API: POST https://freeimage.host/api/1/upload
+            # 参数: key (API key), source (base64 或文件), format (json/redirect/txt)
+            response = await client.post(
+                "https://freeimage.host/api/1/upload",
+                data={
+                    'key': FREEIMAGE_API_KEY,
+                    'source': base64_data,
+                    'format': 'json',
+                },
+                timeout=30.0
+            )
             response.raise_for_status()
-            return response.text.strip()
+            result = response.json()
+            if result.get('success') or result.get('status_code') == 200:
+                # 返回直接图片链接
+                url = result.get('image', {}).get('url')
+                if url:
+                    return url
+            logger.error(f"freeimage.host 上传失败: {result}")
         except httpx.RequestError as e:
-            logger.error(f"请求 0x0.st 时出错: {e}")
-            # raise HTTPException(status_code=500, detail="上传图片到 0x0.st 失败")
+            logger.error(f"请求 freeimage.host 时出错: {e}")
         except httpx.HTTPStatusError as e:
-            logger.error(f"上传图片到 0x0.st 时发生 HTTP 错误: {e.response.status_code}")
-            # raise HTTPException(status_code=e.response.status_code, detail=f"上传图片到 0x0.st 失败: {e.response.text}")
-        return base64_image
+            logger.error(f"上传图片到 freeimage.host 时发生 HTTP 错误: {e.response.status_code}, {e.response.text}")
+        except Exception as e:
+            logger.error(f"freeimage.host 上传异常: {e}")
+    
+    # 上传失败，返回原始 base64
+    return base64_image
 
 if __name__ == "__main__":
     provider = {

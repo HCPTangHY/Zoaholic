@@ -107,6 +107,7 @@ class LoggingStreamingResponse(Response):
 
     async def _logging_iterator(self):
         # 用于收集响应体的缓冲区（仅在配置了保留时间时使用）
+        # response_chunks 用于收集返回给用户的响应（即经过转换后的）
         response_chunks = []
         max_response_size = 100 * 1024  # 100KB
         total_response_size = 0
@@ -170,7 +171,7 @@ class LoggingStreamingResponse(Response):
             # 透传原始 chunk
             yield chunk
         
-        # 保存响应体
+        # 保存返回给用户的响应体（即经过转换后的 OpenAI 格式）
         if should_save_response and response_chunks:
             try:
                 response_body = b"".join(response_chunks).decode("utf-8", errors="replace")
