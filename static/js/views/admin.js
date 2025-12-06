@@ -144,7 +144,7 @@ const AdminView = {
         const thead = UI.el("thead", "bg-md-surface-container-highest");
         thead.innerHTML = `
             <tr>
-                <th class="px-4 py-3 text-label-large text-md-on-surface">Key</th>
+                <th class="px-4 py-3 text-label-large text-md-on-surface">名称 / Key</th>
                 <th class="px-4 py-3 text-label-large text-md-on-surface">角色</th>
                 <th class="px-4 py-3 text-label-large text-md-on-surface text-center">额度 / 使用</th>
                 <th class="px-4 py-3 text-label-large text-md-on-surface">模型规则</th>
@@ -268,11 +268,21 @@ const AdminView = {
         // Key column
         const keyTd = UI.el("td", "px-4 py-3");
         const keyContent = UI.el("div", "flex flex-col gap-1");
+        
+        // 显示名称（如果有）
+        const keyName = apiKeyObj?.name || apiKeyObj?.preferences?.name || "";
+        if (keyName) {
+            const nameRow = UI.el("div", "flex items-center gap-2 mb-1");
+            nameRow.appendChild(UI.icon("label", "text-md-primary text-sm"));
+            nameRow.appendChild(UI.el("span", "text-title-small text-md-on-surface font-medium", keyName));
+            keyContent.appendChild(nameRow);
+        }
+        
         const keyRow = UI.el("div", "flex items-center gap-2");
         keyRow.appendChild(UI.icon("vpn_key", "text-md-on-surface-variant group-hover:text-md-primary transition-colors"));
         const keyText = UI.el(
             "span",
-            "text-body-large font-mono text-md-on-surface",
+            "text-body-medium font-mono text-md-on-surface",
             info.displayKey
         );
         keyText.title = key || "未配置";
@@ -394,7 +404,15 @@ const AdminView = {
         const left = UI.el("div", "flex items-center gap-2");
         left.appendChild(UI.icon("vpn_key", "text-md-primary text-xl"));
         const title = UI.el("div", "flex flex-col");
-        title.appendChild(UI.el("span", "text-title-medium font-mono text-md-on-surface", info.displayKey));
+        
+        // 显示名称（如果有）
+        const keyName = apiKeyObj?.name || apiKeyObj?.preferences?.name || "";
+        if (keyName) {
+            title.appendChild(UI.el("span", "text-title-medium text-md-on-surface font-medium", keyName));
+            title.appendChild(UI.el("span", "text-body-small font-mono text-md-on-surface-variant", info.displayKey));
+        } else {
+            title.appendChild(UI.el("span", "text-title-medium font-mono text-md-on-surface", info.displayKey));
+        }
         title.appendChild(UI.el("span", "text-body-small text-md-on-surface-variant", `角色: ${info.role}`));
         left.appendChild(title);
         header.appendChild(left);
@@ -537,6 +555,7 @@ const AdminView = {
         return {
             index: keyIndex,
             api: originalKey?.api || "",
+            name: originalKey?.name || originalKey?.preferences?.name || "",
             role: originalKey?.role || "",
             models,
             groups,
@@ -557,6 +576,16 @@ const AdminView = {
         form.appendChild(basicHeader);
 
         const basicSection = UI.el("div", "bg-md-surface-container p-4 rounded-md-lg flex flex-col gap-3");
+
+        // Key 名称
+        const nameField = UI.textField("Key 名称", "例如 生产环境Key、测试用Key", "text", keyData.name, {
+            leadingIcon: "label",
+            helperText: "为此 API Key 设置一个友好的显示名称，便于识别和管理。",
+        });
+        nameField.input.oninput = (e) => {
+            keyData.name = e.target.value.trim();
+        };
+        basicSection.appendChild(nameField.wrapper);
 
         // API Key + 生成按钮
         const apiRow = UI.el("div", "flex flex-col gap-2");
@@ -893,6 +922,13 @@ const AdminView = {
                 : { api: "", model: [], preferences: {} };
 
         target.api = apiValue;
+        
+        // 保存名称
+        if (keyData.name && keyData.name.trim()) {
+            target.name = keyData.name.trim();
+        } else {
+            delete target.name;
+        }
         
         if (keyData.role && keyData.role.trim()) {
             target.role = keyData.role.trim();

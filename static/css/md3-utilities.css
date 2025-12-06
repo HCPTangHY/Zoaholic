@@ -322,3 +322,110 @@
   border-color: var(--md-color-primary);
   background-color: var(--md-color-surface-container-low);
 }
+
+/* ========== Thinking/Reasoning Section Styles ========== */
+/* Collapsible section for displaying model reasoning process */
+
+.thinking-section {
+  margin-bottom: 16px;
+  border: 1px solid var(--md-color-outline-variant);
+  border-radius: 8px;
+  overflow: hidden;
+  background-color: #F8F9FA;
+  transition: all 0.3s ease;
+}
+
+.thinking-section.hidden {
+  display: none;
+}
+
+.thinking-header {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  background-color: #E8EAF6;
+  border-bottom: 1px solid var(--md-color-outline-variant);
+}
+
+.thinking-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 8px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  color: #3F51B5;
+  text-align: left;
+  border-radius: 6px;
+  transition: background-color 0.15s ease;
+}
+
+.thinking-toggle:hover {
+  background-color: rgba(63, 81, 181, 0.08);
+}
+
+.thinking-toggle .material-symbols-outlined:first-child {
+  font-size: 20px;
+  color: #3F51B5;
+}
+
+.thinking-icon {
+  margin-left: auto;
+  font-size: 20px;
+  color: #3F51B5;
+  transition: transform 0.3s ease;
+}
+
+.thinking-content {
+  padding: 12px 16px;
+  font-size: 14px;
+  line-height: 1.6;
+  color: #37474F;
+  background-color: #F8F9FA;
+  max-height: 400px;
+  overflow-y: auto;
+  transition: max-height 0.3s ease, padding 0.3s ease;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+.thinking-content.collapsed {
+  max-height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  overflow: hidden;
+}
+
+.thinking-content::-webkit-scrollbar {
+  width: 6px;
+}
+
+.thinking-content::-webkit-scrollbar-track {
+  background: #E8EAF6;
+  border-radius: 3px;
+}
+
+.thinking-content::-webkit-scrollbar-thumb {
+  background: #9FA8DA;
+  border-radius: 3px;
+}
+
+.thinking-content::-webkit-scrollbar-thumb:hover {
+  background: #7986CB;
+}
+
+/* Thinking content typography */
+.thinking-content br {
+  display: block;
+  margin: 4px 0;
+}
+
+.thinking-content code {
+  background-color: #E3F2FD;
+  padding: 2px 4px;
+  border-radius: 3px;
+  font-size: 13px;
+}

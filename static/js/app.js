@@ -31,6 +31,11 @@ const App = {
         App.setupMobileMenu();
         App.setupResponsiveListeners();
         App.setupUserMenu();
+
+        // 安装全局鉴权拦截器，后端 key 失效触发统一退出
+        if (AppConfig && typeof AppConfig.installAuthInterceptor === "function") {
+            AppConfig.installAuthInterceptor();
+        }
         
         // 初始化路由系统
         Views.initRouter();

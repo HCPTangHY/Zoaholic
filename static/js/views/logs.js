@@ -10,6 +10,15 @@ const LogsView = {
         totalPages: 0,
         items: [],
         expandedRows: new Set(), // 跟踪展开的行
+        // 筛选条件
+        filters: {
+            startTime: null,
+            endTime: null,
+            provider: "",
+            apiKey: "",
+            model: "",
+            success: null, // null=全部, true=成功, false=失败
+        },
     },
 
     render(container) {
@@ -32,7 +41,12 @@ const LogsView = {
 
         container.appendChild(header);
 
+        // 筛选面板
+        const filterPanel = LogsView._createFilterPanel();
+        container.appendChild(filterPanel);
+
         const content = UI.el("div", "flex flex-col gap-4");
+        content.id = "logs-content";
         container.appendChild(content);
 
         const loading = UI.spinner(40);
@@ -44,6 +58,202 @@ const LogsView = {
         };
 
         LogsView._loadPage(content, 1, false);
+    },
+
+    _createFilterPanel() {
+        const panel = UI.card("outlined", "p-4 mb-4");
+        
+        // 第一行：时间筛选
+        const timeRow = UI.el("div", "flex flex-wrap items-end gap-4 mb-4");
+        
+        // 开始时间
+        const startTimeGroup = UI.el("div", "flex flex-col gap-1");
+        startTimeGroup.appendChild(UI.el("label", "text-label-small text-md-on-surface-variant", "开始时间"));
+        const startTimeInput = UI.el("input", "px-3 py-2 rounded-md border border-md-outline bg-md-surface text-md-on-surface text-body-medium");
+        startTimeInput.type = "datetime-local";
+        startTimeInput.id = "filter-start-time";
+        if (LogsView._state.filters.startTime) {
+            startTimeInput.value = LogsView._formatDatetimeLocal(LogsView._state.filters.startTime);
+        }
+        startTimeGroup.appendChild(startTimeInput);
+        timeRow.appendChild(startTimeGroup);
+        
+        // 结束时间
+        const endTimeGroup = UI.el("div", "flex flex-col gap-1");
+        endTimeGroup.appendChild(UI.el("label", "text-label-small text-md-on-surface-variant", "结束时间"));
+        const endTimeInput = UI.el("input", "px-3 py-2 rounded-md border border-md-outline bg-md-surface text-md-on-surface text-body-medium");
+        endTimeInput.type = "datetime-local";
+        endTimeInput.id = "filter-end-time";
+        if (LogsView._state.filters.endTime) {
+            endTimeInput.value = LogsView._formatDatetimeLocal(LogsView._state.filters.endTime);
+        }
+        endTimeGroup.appendChild(endTimeInput);
+        timeRow.appendChild(endTimeGroup);
+        
+        // 快捷时间按钮
+        const quickTimeGroup = UI.el("div", "flex items-center gap-2");
+        const quickButtons = [
+            { label: "1小时", hours: 1 },
+            { label: "24小时", hours: 24 },
+            { label: "7天", hours: 24 * 7 },
+            { label: "30天", hours: 24 * 30 },
+        ];
+        quickButtons.forEach(({ label, hours }) => {
+            const btn = UI.el("button", "px-3 py-1.5 text-label-medium rounded-md bg-md-surface-container-high text-md-on-surface hover:bg-md-surface-container-highest transition-colors");
+            btn.textContent = label;
+            btn.onclick = () => {
+                const now = new Date();
+                const start = new Date(now.getTime() - hours * 60 * 60 * 1000);
+                startTimeInput.value = LogsView._formatDatetimeLocal(start);
+                endTimeInput.value = LogsView._formatDatetimeLocal(now);
+            };
+            quickTimeGroup.appendChild(btn);
+        });
+        timeRow.appendChild(quickTimeGroup);
+        
+        panel.appendChild(timeRow);
+        
+        // 第二行：搜索筛选
+        const searchRow = UI.el("div", "flex flex-wrap items-end gap-4 mb-4");
+        
+        // 渠道搜索
+        const providerGroup = UI.el("div", "flex flex-col gap-1 flex-1 min-w-[150px]");
+        providerGroup.appendChild(UI.el("label", "text-label-small text-md-on-surface-variant", "渠道"));
+        const providerInput = UI.el("input", "px-3 py-2 rounded-md border border-md-outline bg-md-surface text-md-on-surface text-body-medium w-full");
+        providerInput.type = "text";
+        providerInput.placeholder = "模糊搜索渠道名...";
+        providerInput.id = "filter-provider";
+        providerInput.value = LogsView._state.filters.provider || "";
+        providerGroup.appendChild(providerInput);
+        searchRow.appendChild(providerGroup);
+        
+        // 令牌搜索
+        const apiKeyGroup = UI.el("div", "flex flex-col gap-1 flex-1 min-w-[150px]");
+        apiKeyGroup.appendChild(UI.el("label", "text-label-small text-md-on-surface-variant", "令牌/分组"));
+        const apiKeyInput = UI.el("input", "px-3 py-2 rounded-md border border-md-outline bg-md-surface text-md-on-surface text-body-medium w-full");
+        apiKeyInput.type = "text";
+        apiKeyInput.placeholder = "模糊搜索令牌...";
+        apiKeyInput.id = "filter-api-key";
+        apiKeyInput.value = LogsView._state.filters.apiKey || "";
+        apiKeyGroup.appendChild(apiKeyInput);
+        searchRow.appendChild(apiKeyGroup);
+        
+        // 模型搜索
+        const modelGroup = UI.el("div", "flex flex-col gap-1 flex-1 min-w-[150px]");
+        modelGroup.appendChild(UI.el("label", "text-label-small text-md-on-surface-variant", "模型"));
+        const modelInput = UI.el("input", "px-3 py-2 rounded-md border border-md-outline bg-md-surface text-md-on-surface text-body-medium w-full");
+        modelInput.type = "text";
+        modelInput.placeholder = "模糊搜索模型名...";
+        modelInput.id = "filter-model";
+        modelInput.value = LogsView._state.filters.model || "";
+        modelGroup.appendChild(modelInput);
+        searchRow.appendChild(modelGroup);
+        
+        // 状态筛选
+        const statusGroup = UI.el("div", "flex flex-col gap-1");
+        statusGroup.appendChild(UI.el("label", "text-label-small text-md-on-surface-variant", "状态"));
+        const statusSelect = UI.el("select", "px-3 py-2 rounded-md border border-md-outline bg-md-surface text-md-on-surface text-body-medium");
+        statusSelect.id = "filter-success";
+        statusSelect.innerHTML = `
+            <option value="">全部</option>
+            <option value="true">成功</option>
+            <option value="false">失败</option>
+        `;
+        if (LogsView._state.filters.success === true) {
+            statusSelect.value = "true";
+        } else if (LogsView._state.filters.success === false) {
+            statusSelect.value = "false";
+        }
+        statusGroup.appendChild(statusSelect);
+        searchRow.appendChild(statusGroup);
+        
+        panel.appendChild(searchRow);
+        
+        // 第三行：操作按钮和每页条数
+        const actionRow = UI.el("div", "flex flex-wrap items-center justify-between gap-4");
+        
+        const leftActions = UI.el("div", "flex items-center gap-3");
+        
+        // 每页条数
+        const pageSizeGroup = UI.el("div", "flex items-center gap-2");
+        pageSizeGroup.appendChild(UI.el("span", "text-label-medium text-md-on-surface-variant", "每页"));
+        const pageSizeSelect = UI.el("select", "px-2 py-1 rounded-md border border-md-outline bg-md-surface text-md-on-surface text-body-medium");
+        pageSizeSelect.id = "filter-page-size";
+        [10, 20, 50, 100, 200].forEach(size => {
+            const option = document.createElement("option");
+            option.value = size;
+            option.textContent = size;
+            if (size === LogsView._state.pageSize) {
+                option.selected = true;
+            }
+            pageSizeSelect.appendChild(option);
+        });
+        pageSizeGroup.appendChild(pageSizeSelect);
+        pageSizeGroup.appendChild(UI.el("span", "text-label-medium text-md-on-surface-variant", "条"));
+        leftActions.appendChild(pageSizeGroup);
+        
+        actionRow.appendChild(leftActions);
+        
+        const rightActions = UI.el("div", "flex items-center gap-2");
+        
+        // 重置按钮
+        const resetBtn = UI.el("button", "px-4 py-2 text-label-medium rounded-md border border-md-outline text-md-on-surface hover:bg-md-surface-container transition-colors");
+        resetBtn.textContent = "重置";
+        resetBtn.onclick = () => {
+            LogsView._state.filters = {
+                startTime: null,
+                endTime: null,
+                provider: "",
+                apiKey: "",
+                model: "",
+                success: null,
+            };
+            startTimeInput.value = "";
+            endTimeInput.value = "";
+            providerInput.value = "";
+            apiKeyInput.value = "";
+            modelInput.value = "";
+            statusSelect.value = "";
+            pageSizeSelect.value = "20";
+            LogsView._state.pageSize = 20;
+            LogsView._state.page = 1;
+            LogsView._state.expandedRows.clear();
+            const content = document.getElementById("logs-content");
+            if (content) LogsView._loadPage(content, 1, false);
+        };
+        rightActions.appendChild(resetBtn);
+        
+        // 搜索按钮
+        const searchBtn = UI.el("button", "px-4 py-2 text-label-medium rounded-md bg-md-primary text-md-on-primary hover:opacity-90 transition-opacity");
+        searchBtn.textContent = "搜索";
+        searchBtn.onclick = () => {
+            // 收集筛选条件
+            LogsView._state.filters.startTime = startTimeInput.value ? new Date(startTimeInput.value) : null;
+            LogsView._state.filters.endTime = endTimeInput.value ? new Date(endTimeInput.value) : null;
+            LogsView._state.filters.provider = providerInput.value.trim();
+            LogsView._state.filters.apiKey = apiKeyInput.value.trim();
+            LogsView._state.filters.model = modelInput.value.trim();
+            const successVal = statusSelect.value;
+            LogsView._state.filters.success = successVal === "" ? null : successVal === "true";
+            LogsView._state.pageSize = parseInt(pageSizeSelect.value, 10);
+            LogsView._state.page = 1;
+            LogsView._state.expandedRows.clear();
+            const content = document.getElementById("logs-content");
+            if (content) LogsView._loadPage(content, 1, false);
+        };
+        rightActions.appendChild(searchBtn);
+        
+        actionRow.appendChild(rightActions);
+        panel.appendChild(actionRow);
+        
+        return panel;
+    },
+
+    _formatDatetimeLocal(date) {
+        if (!date) return "";
+        const d = new Date(date);
+        const pad = (n) => n.toString().padStart(2, "0");
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
     },
 
     async _loadPage(contentEl, page, keepPage) {
@@ -60,9 +270,33 @@ const LogsView = {
         contentEl.appendChild(loading);
 
         try {
-            const url = `/v1/logs?page=${encodeURIComponent(LogsView._state.page)}&page_size=${encodeURIComponent(
-                LogsView._state.pageSize
-            )}`;
+            // 构建带筛选参数的 URL
+            const params = new URLSearchParams();
+            params.append("page", LogsView._state.page);
+            params.append("page_size", LogsView._state.pageSize);
+            
+            const { filters } = LogsView._state;
+            if (filters.startTime) {
+                params.append("start_time", filters.startTime.toISOString());
+            }
+            if (filters.endTime) {
+                params.append("end_time", filters.endTime.toISOString());
+            }
+            if (filters.provider) {
+                params.append("provider", filters.provider);
+            }
+            if (filters.apiKey) {
+                params.append("api_key", filters.apiKey);
+            }
+            if (filters.model) {
+                params.append("model", filters.model);
+            }
+            if (filters.success !== null) {
+                // 后端期望 true/false 字符串
+                params.append("success", filters.success ? "true" : "false");
+            }
+            
+            const url = `/v1/logs?${params.toString()}`;
             const res = await fetch(url, { headers });
             const data = await res.json().catch(() => ({}));
 
@@ -227,6 +461,16 @@ const LogsView = {
             modelTd.appendChild(
                 UI.el("div", "text-body-medium text-md-on-surface break-all", log.model || "-")
             );
+            // 如果是失败请求，在模型下方显示错误摘要
+            if (!log.success) {
+                const errorMsg = LogsView._extractErrorMessage(log);
+                if (errorMsg) {
+                    const errorEl = UI.el("div", "text-body-small text-md-error mt-1 break-all line-clamp-2");
+                    errorEl.textContent = errorMsg;
+                    errorEl.title = errorMsg; // 完整错误信息作为 tooltip
+                    modelTd.appendChild(errorEl);
+                }
+            }
 
             // 用时/首字
             const timeTd = UI.el("td", "px-3 py-3 text-center align-top");
@@ -320,6 +564,15 @@ const LogsView = {
             leftTop.appendChild(
                 UI.el("span", "text-body-small text-md-on-surface-variant", `#${log.id} | ${log.model || "-"}`)
             );
+            // 如果是失败请求，显示错误摘要
+            if (!log.success) {
+                const errorMsg = LogsView._extractErrorMessage(log);
+                if (errorMsg) {
+                    const errorEl = UI.el("div", "text-body-small text-md-error mt-1 line-clamp-2");
+                    errorEl.textContent = errorMsg;
+                    leftTop.appendChild(errorEl);
+                }
+            }
             topRow.appendChild(leftTop);
             
             const rightTop = UI.el("div", "flex items-center gap-2");
@@ -622,7 +875,7 @@ const LogsView = {
     },
 
     _renderPagination(contentEl) {
-        const { page, totalPages, total } = LogsView._state;
+        const { page, totalPages, total, pageSize } = LogsView._state;
 
         const footer = UI.card(
             "filled",
@@ -639,28 +892,90 @@ const LogsView = {
         footer.appendChild(info);
 
         const actions = UI.el("div", "flex items-center gap-2");
-        const prevBtn = UI.btn("上一页", () => {
+        
+        // 首页按钮
+        const firstBtn = UI.iconBtn("first_page", null, "standard", { tooltip: "首页" });
+        firstBtn.onclick = () => {
+            if (LogsView._state.page > 1) {
+                LogsView._state.page = 1;
+                LogsView._loadPage(contentEl, 1, true);
+            }
+        };
+        if (page <= 1) firstBtn.disabled = true;
+        actions.appendChild(firstBtn);
+        
+        // 上一页按钮
+        const prevBtn = UI.iconBtn("chevron_left", null, "standard", { tooltip: "上一页" });
+        prevBtn.onclick = () => {
             if (LogsView._state.page > 1) {
                 LogsView._state.page -= 1;
                 LogsView._loadPage(contentEl, LogsView._state.page, true);
             }
-        }, "text", "chevron_left");
-        const nextBtn = UI.btn("下一页", () => {
+        };
+        if (page <= 1) prevBtn.disabled = true;
+        actions.appendChild(prevBtn);
+        
+        // 页码输入
+        const pageInputGroup = UI.el("div", "flex items-center gap-1");
+        const pageInput = UI.el("input", "w-16 px-2 py-1 text-center rounded-md border border-md-outline bg-md-surface text-md-on-surface text-body-medium");
+        pageInput.type = "number";
+        pageInput.min = 1;
+        pageInput.max = totalPages || 1;
+        pageInput.value = page;
+        pageInput.onkeydown = (e) => {
+            if (e.key === "Enter") {
+                let newPage = parseInt(pageInput.value, 10);
+                if (isNaN(newPage) || newPage < 1) newPage = 1;
+                if (totalPages && newPage > totalPages) newPage = totalPages;
+                if (newPage !== LogsView._state.page) {
+                    LogsView._state.page = newPage;
+                    LogsView._loadPage(contentEl, newPage, true);
+                }
+            }
+        };
+        pageInput.onblur = () => {
+            pageInput.value = LogsView._state.page;
+        };
+        pageInputGroup.appendChild(pageInput);
+        pageInputGroup.appendChild(UI.el("span", "text-body-medium text-md-on-surface-variant", `/ ${totalPages || 1}`));
+        actions.appendChild(pageInputGroup);
+        
+        // 跳转按钮
+        const goBtn = UI.el("button", "px-2 py-1 text-label-small rounded-md bg-md-surface-container-high text-md-on-surface hover:bg-md-surface-container-highest transition-colors");
+        goBtn.textContent = "跳转";
+        goBtn.onclick = () => {
+            let newPage = parseInt(pageInput.value, 10);
+            if (isNaN(newPage) || newPage < 1) newPage = 1;
+            if (totalPages && newPage > totalPages) newPage = totalPages;
+            if (newPage !== LogsView._state.page) {
+                LogsView._state.page = newPage;
+                LogsView._loadPage(contentEl, newPage, true);
+            }
+        };
+        actions.appendChild(goBtn);
+        
+        // 下一页按钮
+        const nextBtn = UI.iconBtn("chevron_right", null, "standard", { tooltip: "下一页" });
+        nextBtn.onclick = () => {
             if (LogsView._state.totalPages > 0 && LogsView._state.page < LogsView._state.totalPages) {
                 LogsView._state.page += 1;
                 LogsView._loadPage(contentEl, LogsView._state.page, true);
             }
-        }, "text", "chevron_right");
-
-        if (page <= 1) {
-            prevBtn.disabled = true;
-        }
-        if (!totalPages || page >= totalPages) {
-            nextBtn.disabled = true;
-        }
-
-        actions.appendChild(prevBtn);
+        };
+        if (!totalPages || page >= totalPages) nextBtn.disabled = true;
         actions.appendChild(nextBtn);
+        
+        // 末页按钮
+        const lastBtn = UI.iconBtn("last_page", null, "standard", { tooltip: "末页" });
+        lastBtn.onclick = () => {
+            if (LogsView._state.totalPages > 0 && LogsView._state.page < LogsView._state.totalPages) {
+                LogsView._state.page = LogsView._state.totalPages;
+                LogsView._loadPage(contentEl, LogsView._state.totalPages, true);
+            }
+        };
+        if (!totalPages || page >= totalPages) lastBtn.disabled = true;
+        actions.appendChild(lastBtn);
+
         footer.appendChild(actions);
 
         contentEl.appendChild(footer);
@@ -715,6 +1030,71 @@ const LogsView = {
                 return pre;
             }
         }
+    },
+
+    _extractErrorMessage(log) {
+        // 优先从 retry_path 提取最后一个错误
+        if (log.retry_path) {
+            try {
+                const retryData = JSON.parse(log.retry_path);
+                if (Array.isArray(retryData) && retryData.length > 0) {
+                    const lastRetry = retryData[retryData.length - 1];
+                    if (lastRetry.error) {
+                        // 截取前 200 字符作为摘要
+                        const error = lastRetry.error;
+                        return error.length > 200 ? error.substring(0, 200) + "..." : error;
+                    }
+                }
+            } catch {
+                // 解析失败，继续尝试其他来源
+            }
+        }
+
+        // 从 upstream_response_body 提取错误
+        if (log.upstream_response_body) {
+            try {
+                const body = JSON.parse(log.upstream_response_body);
+                // OpenAI 格式的错误
+                if (body.error) {
+                    const msg = body.error.message || body.error.code || JSON.stringify(body.error);
+                    return msg.length > 200 ? msg.substring(0, 200) + "..." : msg;
+                }
+                // Gemini 格式的错误
+                if (body.error?.message) {
+                    const msg = body.error.message;
+                    return msg.length > 200 ? msg.substring(0, 200) + "..." : msg;
+                }
+                // 其他格式：直接返回 message 或 detail
+                if (body.message) {
+                    return body.message.length > 200 ? body.message.substring(0, 200) + "..." : body.message;
+                }
+                if (body.detail) {
+                    const detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail);
+                    return detail.length > 200 ? detail.substring(0, 200) + "..." : detail;
+                }
+            } catch {
+                // 不是 JSON，可能是纯文本错误
+                const text = log.upstream_response_body;
+                if (text && text.length > 0) {
+                    return text.length > 200 ? text.substring(0, 200) + "..." : text;
+                }
+            }
+        }
+
+        // 从 response_body 提取错误
+        if (log.response_body) {
+            try {
+                const body = JSON.parse(log.response_body);
+                if (body.error) {
+                    const msg = body.error.message || body.error.code || JSON.stringify(body.error);
+                    return msg.length > 200 ? msg.substring(0, 200) + "..." : msg;
+                }
+            } catch {
+                // 忽略
+            }
+        }
+
+        return null;
     },
 
     _createStatusChip(success, statusCode, isFlagged) {

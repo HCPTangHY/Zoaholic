@@ -8,6 +8,9 @@ const AppConfig = {
     
     // 当前用户信息 - 从 localStorage 加载或为空
     currentUser: null,
+    _authFailureHandled: false,
+    _revalidatingAuth: false,
+    _interceptorInstalled: false,
     
     navItems: [
         { id: "dashboard", label: "控制台总览", icon: "dashboard" },
@@ -31,6 +34,7 @@ const AppConfig = {
                 role: localStorage.getItem("zoaholic_user_role") || "user",
                 balance: 0
             };
+            AppConfig._authFailureHandled = false;
             return true;
         }
         return false;
@@ -86,6 +90,15 @@ const AppConfig = {
     },
 
     /**
+     * 处理鉴权失败（统一退出登录）
+     */
+    handleAuthFailure() {
+        if (AppConfig._authFailureHandled) return;
+        AppConfig._authFailureHandled = true;
+        AppConfig.logout();
+    },
+
+    /**
      * 登录
      * @param {string} apiKey - API Key
      * @param {string} role - 用户角色
@@ -98,6 +111,7 @@ const AppConfig = {
             role: role,
             balance: 0
         };
+        AppConfig._authFailureHandled = false;
     },
 
     /**
@@ -107,6 +121,7 @@ const AppConfig = {
         localStorage.removeItem("zoaholic_api_key");
         localStorage.removeItem("zoaholic_user_role");
         AppConfig.currentUser = null;
+        AppConfig._authFailureHandled = false;
         // 刷新页面以显示登录界面
         window.location.reload();
     },
@@ -125,6 +140,24 @@ const AppConfig = {
         return AppConfig.currentUser && 
                (AppConfig.currentUser.role === "admin" || 
                 (AppConfig.currentUser.role && AppConfig.currentUser.role.includes("admin")));
+    },
+
+    /**
+     * 拦截 fetch，处理 401/403 自动登出
+     */
+    installAuthInterceptor() {
+        if (AppConfig._interceptorInstalled) return;
+        AppConfig._interceptorInstalled = true;
+
+        const originalFetch = window.fetch;
+        window.fetch = async (...args) => {
+            const response = await originalFetch(...args);
+            if (response && (response.status === 401 || response.status === 403)) {
+                // 尝试只处理一次，避免重复弹框
+                AppConfig.handleAuthFailure();
+            }
+            return response;
+        };
     }
 };
 

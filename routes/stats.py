@@ -597,19 +597,70 @@ async def get_logs(
     request: Request,
     page: int = Query(1, ge=1, description="Page number (starting from 1)"),
     page_size: int = Query(20, ge=1, le=200, description="Number of items per page"),
+    start_time: Optional[str] = Query(None, description="Start time filter (ISO 8601 or Unix timestamp)"),
+    end_time: Optional[str] = Query(None, description="End time filter (ISO 8601 or Unix timestamp)"),
+    provider: Optional[str] = Query(None, description="Provider/channel filter (fuzzy match)"),
+    api_key: Optional[str] = Query(None, description="API key/token filter (fuzzy match)"),
+    model: Optional[str] = Query(None, description="Model name filter (fuzzy match)"),
+    success: Optional[bool] = Query(None, description="Filter by success status"),
     token: str = Depends(verify_admin_api_key),
 ):
     """
     获取请求日志（RequestStat）分页列表，仅管理员可访问。
+    支持时间范围筛选和模糊搜索。
     """
     if DISABLE_DATABASE:
         raise HTTPException(status_code=503, detail="Database is disabled.")
 
     async with async_session() as session:
-        # 统计总数（只统计 LLM 请求：POST /v1/chat/completions）
-        count_query = select(func.count(RequestStat.id)).where(
-            RequestStat.endpoint == "POST /v1/chat/completions"
-        )
+        # 构建基础查询条件
+        conditions = [RequestStat.endpoint == "POST /v1/chat/completions"]
+        
+        # 时间筛选
+        if start_time:
+            try:
+                start_dt = parse_datetime_input(start_time)
+                conditions.append(RequestStat.timestamp >= start_dt)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid start_time: {e}")
+        
+        if end_time:
+            try:
+                end_dt = parse_datetime_input(end_time)
+                conditions.append(RequestStat.timestamp <= end_dt)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid end_time: {e}")
+        
+        from sqlalchemy import or_
+        # 模糊搜索：渠道（兼容 provider_id 与 provider 字段）
+        if provider:
+            conditions.append(
+                or_(
+                    RequestStat.provider_id.ilike(f"%{provider}%"),
+                    RequestStat.provider.ilike(f"%{provider}%")
+                )
+            )
+        
+        # 模糊搜索：令牌（API key 名称或分组，及原始 api_key）
+        if api_key:
+            conditions.append(
+                or_(
+                    RequestStat.api_key_name.ilike(f"%{api_key}%"),
+                    RequestStat.api_key_group.ilike(f"%{api_key}%"),
+                    RequestStat.api_key.ilike(f"%{api_key}%")
+                )
+            )
+        
+        # 模型名模糊匹配
+        if model:
+            conditions.append(RequestStat.model.ilike(f"%{model}%"))
+        
+        # 成功/失败筛选
+        if success is not None:
+            conditions.append(RequestStat.success == success)
+        
+        # 统计总数
+        count_query = select(func.count(RequestStat.id)).where(*conditions)
         result = await session.execute(count_query)
         total = result.scalar() or 0
 
@@ -630,7 +681,7 @@ async def get_logs(
 
         query = (
             select(RequestStat)
-            .where(RequestStat.endpoint == "POST /v1/chat/completions")
+            .where(*conditions)
             .order_by(RequestStat.timestamp.desc())
             .offset(offset)
             .limit(page_size)

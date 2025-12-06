@@ -7,7 +7,6 @@ const ChatView = {
     _models: [],
     _selectedModel: "",
     _temperature: 0.7,
-    _maxTokens: 2000,
     _stream: true,
     _messages: [],
     _apiKey: "",
@@ -128,7 +127,6 @@ const ChatView = {
                 model: ChatView._selectedModel,
                 messages: ChatView._messages,
                 temperature: ChatView._temperature,
-                max_tokens: ChatView._maxTokens,
                 stream: ChatView._stream
             };
 
@@ -176,6 +174,7 @@ const ChatView = {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let assistantContent = "";
+        let reasoningContent = "";
 
         // 创建助手消息卡片（流式模式）
         const wrapper = UI.el("div", "message-wrapper");
@@ -183,6 +182,36 @@ const ChatView = {
         wrapper.appendChild(roleLabel);
         
         const card = UI.el("div", "message-card");
+        
+        // 创建思维链容器（初始隐藏）
+        const thinkingSection = UI.el("div", "thinking-section hidden");
+        const thinkingHeader = UI.el("div", "thinking-header");
+        const thinkingToggle = UI.el("button", "thinking-toggle");
+        thinkingToggle.appendChild(UI.icon("psychology"));
+        thinkingToggle.appendChild(UI.el("span", "", "思维过程"));
+        const thinkingIcon = UI.icon("expand_more", "thinking-icon");
+        thinkingToggle.appendChild(thinkingIcon);
+        thinkingHeader.appendChild(thinkingToggle);
+        
+        const thinkingContent = UI.el("div", "thinking-content collapsed");
+        thinkingContent.innerHTML = '<span class="typing-cursor"></span>';
+        
+        thinkingToggle.onclick = () => {
+            const isCollapsed = thinkingContent.classList.contains("collapsed");
+            if (isCollapsed) {
+                thinkingContent.classList.remove("collapsed");
+                thinkingIcon.textContent = "expand_less";
+            } else {
+                thinkingContent.classList.add("collapsed");
+                thinkingIcon.textContent = "expand_more";
+            }
+        };
+        
+        thinkingSection.appendChild(thinkingHeader);
+        thinkingSection.appendChild(thinkingContent);
+        card.appendChild(thinkingSection);
+        
+        // 创建回复内容区域
         const content = UI.el("div", "message-content");
         content.innerHTML = '<span class="typing-cursor"></span>';
         card.appendChild(content);
@@ -211,9 +240,19 @@ const ChatView = {
 
                     try {
                         const data = JSON.parse(dataStr);
-                        const delta = data.choices?.[0]?.delta?.content;
-                        if (delta) {
-                            assistantContent += delta;
+                        const delta = data.choices?.[0]?.delta;
+                        
+                        // 处理思维链内容
+                        if (delta?.reasoning_content) {
+                            reasoningContent += delta.reasoning_content;
+                            thinkingSection.classList.remove("hidden");
+                            thinkingContent.innerHTML = ChatView._formatContent(reasoningContent) + '<span class="typing-cursor"></span>';
+                            msgList.scrollTop = msgList.scrollHeight;
+                        }
+                        
+                        // 处理最终回复内容
+                        if (delta?.content) {
+                            assistantContent += delta.content;
                             content.innerHTML = ChatView._formatContent(assistantContent) + '<span class="typing-cursor"></span>';
                             msgList.scrollTop = msgList.scrollHeight;
                         }
@@ -223,7 +262,10 @@ const ChatView = {
                 }
             }
 
-            // 移除光标并添加操作栏
+            // 移除光标
+            if (reasoningContent) {
+                thinkingContent.innerHTML = ChatView._formatContent(reasoningContent);
+            }
             content.innerHTML = ChatView._formatContent(assistantContent);
             
             // 添加操作栏
@@ -251,7 +293,15 @@ const ChatView = {
             
             card.appendChild(actionBar);
             
-            ChatView._messages.push({ role: "assistant", content: assistantContent });
+            // 保存消息（包含思维链内容）
+            const message = {
+                role: "assistant",
+                content: assistantContent
+            };
+            if (reasoningContent) {
+                message.reasoning_content = reasoningContent;
+            }
+            ChatView._messages.push(message);
         } catch (e) {
             console.error("[ChatView] Stream error:", e);
             content.innerHTML = ChatView._formatContent(assistantContent) || `<span class="text-md-error">流式响应中断</span>`;
@@ -532,7 +582,6 @@ const ChatView = {
                 model: ChatView._selectedModel,
                 messages: ChatView._messages,
                 temperature: ChatView._temperature,
-                max_tokens: ChatView._maxTokens,
                 stream: ChatView._stream
             };
             
@@ -604,7 +653,6 @@ const ChatView = {
                 model: ChatView._selectedModel,
                 messages: ChatView._messages,
                 temperature: ChatView._temperature,
-                max_tokens: ChatView._maxTokens,
                 stream: ChatView._stream
             };
             
@@ -852,9 +900,6 @@ const ChatView = {
 
         settingsPanel.appendChild(createSlider("Temperature", 0, 2, 0.1, ChatView._temperature, (v) => {
             ChatView._temperature = v;
-        }));
-        settingsPanel.appendChild(createSlider("Max Tokens", 100, 8000, 100, ChatView._maxTokens, (v) => {
-            ChatView._maxTokens = v;
         }));
 
         settingsPanel.appendChild(UI.divider("my-4"));
