@@ -12,7 +12,7 @@ Claude Thinking 模式插件
 - 会自动去掉 -thinking 后缀，添加预填充，并转换响应流
 
 关键设计：
-- 使用 contextvars 在请求和响应拦截器之间共享状态
+- 使用 request_info 在请求和响应拦截器之间共享状态（避免 contextvars 跨异步边界丢失）
 - 预填充 <thinking> 后，上游响应不会再返回 <thinking> 标签
 - 转换器初始状态为 inside_thinking=True，等待 </thinking> 标签
 """
@@ -21,9 +21,9 @@ import re
 import json
 import asyncio
 from typing import Any, Dict, Optional, Tuple
-from contextvars import ContextVar
 
 from core.log_config import logger
+from core.middleware import request_info
 from core.plugins import (
     register_request_interceptor,
     unregister_request_interceptor,
@@ -54,11 +54,6 @@ EXTENSIONS = [
 # 常量
 THINK_OPEN = "<thinking>"
 THINK_CLOSE = "</thinking>"
-
-# 使用 contextvars 在请求和响应之间共享状态
-# 每个请求都在自己的协程中处理，contextvars 可以隔离不同请求的状态
-_thinking_mode_ctx: ContextVar[bool] = ContextVar("claude_thinking_mode", default=False)
-_transformer_ctx: ContextVar[Optional["ThinkingStreamTransformer"]] = ContextVar("claude_thinking_transformer", default=None)
 
 
 def is_thinking_claude_model(model: Any) -> bool:
@@ -175,18 +170,18 @@ class ThinkingStreamTransformer:
         }
     
     def emit_reasoning(self, parsed: Dict[str, Any], text: str) -> Optional[str]:
-        """生成 reasoning_content 输出"""
+        """生成 reasoning_content 输出（单条 SSE 事件，带空行分隔）"""
         if not text:
             return None
         out = self.build_patched_data(parsed, {"reasoning_content": text})
-        return f"data: {json.dumps(out)}\n"
+        return f"data: {json.dumps(out)}\n\n"
     
     def emit_content(self, parsed: Dict[str, Any], text: str) -> Optional[str]:
-        """生成 content 输出"""
+        """生成 content 输出（单条 SSE 事件，带空行分隔）"""
         if not text:
             return None
         out = self.build_patched_data(parsed, {"content": text})
-        return f"data: {json.dumps(out)}\n"
+        return f"data: {json.dumps(out)}\n\n"
     
     def handle_text_chunk(self, parsed: Dict[str, Any], text: str) -> list:
         """
@@ -238,6 +233,41 @@ class ThinkingStreamTransformer:
                     outputs.append(out)
         
         return outputs
+
+    def _sanitize_and_forward_tool_calls(self, parsed: Dict[str, Any]) -> Optional[list]:
+        """将 function_call 统一转为 tool_calls，如存在工具调用则单独透传，后续仍继续处理文本。"""
+        choices = parsed.get("choices", [])
+        if not choices:
+            return None
+        
+        ch0 = choices[0] or {}
+        delta = ch0.get("delta")
+        if not isinstance(delta, dict):
+            return None
+        
+        # 统一将 function_call 转为 tool_calls，便于下游统一处理
+        if "function_call" in delta and "tool_calls" not in delta:
+            fn_call = delta.get("function_call") or {}
+            tc = [{
+                "index": 0,
+                "id": fn_call.get("id"),
+                "type": "function",
+                "function": {
+                    "name": fn_call.get("name", ""),
+                    "arguments": fn_call.get("arguments", ""),
+                }
+            }]
+            delta.pop("function_call", None)
+            delta["tool_calls"] = tc
+        
+        # 如有 tool_calls，先透传工具事件（单条 SSE），再移除以免干扰思维链/正文处理
+        if "tool_calls" in delta:
+            tool_calls = delta.get("tool_calls")
+            out = self.build_patched_data(parsed, {"tool_calls": tool_calls})
+            delta.pop("tool_calls", None)
+            return [f"data: {json.dumps(out)}\n\n"]
+        
+        return None
     
     async def transform_line(self, line: str) -> list:
         """
@@ -270,54 +300,61 @@ class ThinkingStreamTransformer:
             outputs.append(line + "\n")
             return outputs
         
-        # 非 data: 行直接透传
-        if not trimmed or not line.startswith("data:"):
-            return [line + "\n"]
-        
-        # 异步解析 JSON（避免阻塞事件循环）
-        # 安全地移除 "data: " 或 "data:" 前缀
+        # 支持既有 SSE 前缀，也支持纯 JSON 行（上游可能已经去掉 data:）
+        # 先尝试提取 payload，再解析 JSON；解析失败则透传原始行
         if line.startswith("data: "):
-            json_str = line[6:]  # 移除 "data: " (6个字符)
+            json_str = line[6:]
+        elif line.startswith("data:"):
+            json_str = line[5:]
         else:
-            json_str = line[5:]  # 移除 "data:" (5个字符)
+            json_str = line
         
         json_str = json_str.strip()
+        # 某些上游会在行尾追加逗号，便于 JSON.parse 批量处理，这里兼容去尾逗号
+        if json_str.endswith(","):
+            json_str = json_str[:-1].rstrip()
         if not json_str:
             return [line + "\n"]
         try:
             parsed = await asyncio.to_thread(json.loads, json_str)
         except json.JSONDecodeError:
             return [line + "\n"]
+
+        outputs = []
+        # 先处理工具调用：如存在则单独透传，再继续处理思维链/正文
+        tool_call_out = self._sanitize_and_forward_tool_calls(parsed)
+        if tool_call_out:
+            outputs.extend(tool_call_out)
         
         # 获取 delta
         choices = parsed.get("choices", [])
         if not choices:
-            return [line + "\n"]
+            return outputs if outputs else [line + "\n"]
         
         delta = choices[0].get("delta", {})
         if not isinstance(delta, dict):
-            return [line + "\n"]
+            return outputs if outputs else [line + "\n"]
         
         # 检查是否有 usage 信息需要透传（重要：用于 token 计费）
         usage = parsed.get("usage")
         if usage:
-            # 带有 usage 的消息直接透传，确保计费信息不丢失
+            if outputs:
+                outputs.append(line + "\n")
+                return outputs
             return [line + "\n"]
         
-        has_rc = isinstance(delta.get("reasoning_content"), str)
-        has_c = isinstance(delta.get("content"), str)
+        # 仅当存在文本字段时才进行思维链处理，保持与反代逻辑一致
+        rc = delta.get("reasoning_content")
+        ct = delta.get("content")
+        has_rc = isinstance(rc, str)
+        has_ct = isinstance(ct, str)
         
-        if not has_rc and not has_c:
-            return [line + "\n"]
-        
-        outputs = []
-        # 先处理 reasoning_content，再处理 content
         if has_rc:
-            outputs.extend(self.handle_text_chunk(parsed, delta["reasoning_content"]))
-        if has_c:
-            outputs.extend(self.handle_text_chunk(parsed, delta["content"]))
+            outputs.extend(self.handle_text_chunk(parsed, rc))
+        if has_ct:
+            outputs.extend(self.handle_text_chunk(parsed, ct))
         
-        return outputs
+        return outputs or [line + "\n"]
     
     def flush(self) -> list:
         """刷新剩余的 pending 内容"""
@@ -352,10 +389,6 @@ async def claude_thinking_request_interceptor(
     """
     model = payload.get("model", "")
     
-    # 每次请求开始时都重置状态，确保不会残留旧值
-    _thinking_mode_ctx.set(False)
-    _transformer_ctx.set(None)
-    
     if not is_thinking_claude_model(model):
         return url, headers, payload
     
@@ -371,15 +404,13 @@ async def claude_thinking_request_interceptor(
     # 调整 token 预算
     adjust_reasoning_and_completion_tokens(payload)
     
-    # 设置 thinking 模式标记，供响应拦截器使用
-    _thinking_mode_ctx.set(True)
-    
-    # 创建转换器实例，供响应拦截器使用
-    transformer = ThinkingStreamTransformer()
-    _transformer_ctx.set(transformer)
-    
-    logger.debug(f"[claude_thinking] Modified payload: model={payload['model']}, "
-                 f"max_completion_tokens={payload.get('max_completion_tokens')}")
+    # 使用 request_info 存储状态（代替 contextvars，避免跨异步边界丢失）
+    try:
+        current_info = request_info.get()
+        current_info["_claude_thinking_enabled"] = True
+        current_info["_claude_thinking_transformer"] = ThinkingStreamTransformer()
+    except Exception as e:
+        logger.error(f"[claude_thinking] Failed to set request_info: {e}")
     
     return url, headers, payload
 
@@ -397,19 +428,20 @@ async def claude_thinking_response_interceptor(
     
     转换 SSE 流中的 </thinking> 前后的内容
     """
-    # 快速退出：检查是否为 thinking 模式（最优先）
-    if not _thinking_mode_ctx.get():
+    # 从 request_info 读取状态
+    try:
+        current_info = request_info.get()
+        thinking_enabled = current_info.get("_claude_thinking_enabled", False)
+        transformer = current_info.get("_claude_thinking_transformer")
+    except Exception as e:
+        logger.error(f"[claude_thinking_response] Failed to get request_info: {e}")
         return response_chunk
     
-    if not is_stream:
+    # 快速退出：检查是否为 thinking 模式
+    if not thinking_enabled or not transformer or not is_stream:
         return response_chunk
     
     if not isinstance(response_chunk, str):
-        return response_chunk
-    
-    # 获取转换器
-    transformer = _transformer_ctx.get()
-    if not transformer:
         return response_chunk
     
     # 处理响应块（异步处理每一行）
@@ -431,12 +463,13 @@ async def claude_thinking_response_interceptor(
                 output_lines.extend(transformed)
         
         result = "".join(output_lines)
+            
     except Exception as e:
         # 如果处理过程中出现任何错误，返回原始响应
-        logger.error(f"[claude_thinking] Error processing response chunk: {e}")
+        logger.error(f"[claude_thinking_response] Error processing response chunk: {e}", exc_info=True)
         return response_chunk
     
-    # 如果收到 [DONE]，刷新并重置状态
+    # 如果收到 [DONE]，刷新状态
     if "data: [DONE]" in response_chunk:
         try:
             flush_outputs = transformer.flush()
@@ -445,10 +478,8 @@ async def claude_thinking_response_interceptor(
                 done_idx = result.find("data: [DONE]")
                 if done_idx != -1:
                     result = result[:done_idx] + "".join(flush_outputs) + result[done_idx:]
-        finally:
-            # 确保无论如何都重置状态，避免污染后续请求
-            _thinking_mode_ctx.set(False)
-            _transformer_ctx.set(None)
+        except Exception as e:
+            logger.error(f"[claude_thinking] Error flushing transformer: {e}")
     
     return result
 

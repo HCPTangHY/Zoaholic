@@ -174,14 +174,19 @@ async def process_request(
 
     current_info = request_info_getter()
     
-    # 记录发送到上游的请求体（如果配置了保留时间）
+    # 记录发送到上游的请求头和请求体（如果配置了保留时间）
     if current_info.get("raw_data_expires_at"):
         try:
+            # 记录上游请求头（过滤敏感头信息）
+            safe_upstream_headers = {k: v for k, v in headers.items()
+                                    if k.lower() not in ("authorization", "x-api-key", "api-key")}
+            current_info["upstream_request_headers"] = json.dumps(safe_upstream_headers, ensure_ascii=False)
+            
             # 使用深度截断，保留结构同时限制大小
             upstream_payload = {k: v for k, v in payload.items() if k != 'file'}
             current_info["upstream_request_body"] = truncate_for_logging(upstream_payload)
         except Exception as e:
-            logger.error(f"Error saving upstream request body: {str(e)}")
+            logger.error(f"Error saving upstream request data: {str(e)}")
     # 确保日志中一定记录模型名（使用当前请求对象上的 model）
     if hasattr(request, "model") and getattr(request, "model", None):
         current_info["model"] = request.model

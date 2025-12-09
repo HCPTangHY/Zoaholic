@@ -42,6 +42,7 @@ class RequestStat(Base):
     retry_path = Column(Text, nullable=True)  # 重试路径JSON格式
     request_headers = Column(Text, nullable=True)  # 用户请求头JSON格式
     request_body = Column(Text, nullable=True)  # 用户请求体
+    upstream_request_headers = Column(Text, nullable=True)  # 发送到上游的请求头JSON格式
     upstream_request_body = Column(Text, nullable=True)  # 发送到上游的请求体
     upstream_response_body = Column(Text, nullable=True)  # 上游返回的原始响应体
     response_body = Column(Text, nullable=True)  # 返回给用户的响应体

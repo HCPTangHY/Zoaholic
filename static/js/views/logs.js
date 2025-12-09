@@ -680,9 +680,9 @@ const LogsView = {
             detailContainer.appendChild(retrySection);
         }
 
-        // 请求头
+        // 用户请求头
         if (log.request_headers) {
-            const headersSection = LogsView._createCollapsibleSection("请求头", () => {
+            const headersSection = LogsView._createCollapsibleSection("用户请求头", () => {
                 try {
                     const headersData = JSON.parse(log.request_headers);
                     const pre = UI.el("pre", "text-body-small font-mono bg-md-surface-container p-3 rounded-md overflow-x-auto max-h-48 overflow-y-auto");
@@ -710,6 +710,21 @@ const LogsView = {
                 }
             });
             detailContainer.appendChild(bodySection);
+        }
+
+        // 上游请求头
+        if (log.upstream_request_headers) {
+            const upstreamHeadersSection = LogsView._createCollapsibleSection("上游请求头", () => {
+                try {
+                    const headersData = JSON.parse(log.upstream_request_headers);
+                    const pre = UI.el("pre", "text-body-small font-mono bg-md-surface-container p-3 rounded-md overflow-x-auto max-h-48 overflow-y-auto");
+                    pre.textContent = JSON.stringify(headersData, null, 2);
+                    return pre;
+                } catch {
+                    return UI.el("span", "text-body-small text-md-on-surface-variant", log.upstream_request_headers);
+                }
+            });
+            detailContainer.appendChild(upstreamHeadersSection);
         }
 
         // 上游请求体
@@ -822,9 +837,9 @@ const LogsView = {
             }));
         }
 
-        // 请求头
+        // 用户请求头
         if (log.request_headers) {
-            section.appendChild(LogsView._createCollapsibleSection("请求头", () => {
+            section.appendChild(LogsView._createCollapsibleSection("用户请求头", () => {
                 try {
                     const headersData = JSON.parse(log.request_headers);
                     const pre = UI.el("pre", "text-xs font-mono bg-md-surface-container p-2 rounded overflow-x-auto max-h-32 overflow-y-auto");
@@ -848,6 +863,20 @@ const LogsView = {
                     const pre = UI.el("pre", "text-xs font-mono bg-md-surface-container p-2 rounded overflow-x-auto max-h-40 overflow-y-auto whitespace-pre-wrap");
                     pre.textContent = log.request_body;
                     return pre;
+                }
+            }));
+        }
+
+        // 上游请求头
+        if (log.upstream_request_headers) {
+            section.appendChild(LogsView._createCollapsibleSection("上游请求头", () => {
+                try {
+                    const headersData = JSON.parse(log.upstream_request_headers);
+                    const pre = UI.el("pre", "text-xs font-mono bg-md-surface-container p-2 rounded overflow-x-auto max-h-32 overflow-y-auto");
+                    pre.textContent = JSON.stringify(headersData, null, 2);
+                    return pre;
+                } catch {
+                    return UI.el("span", "text-body-small", log.upstream_request_headers);
                 }
             }));
         }
