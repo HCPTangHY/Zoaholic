@@ -2,11 +2,12 @@ name: Build and Release PEX
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
 
 jobs:
   build:
+    if: startsWith(github.event.head_commit.message, 'v')
     strategy:
       matrix:
         include:
@@ -51,7 +52,9 @@ jobs:
 
       - name: Get Version
         id: get_version
-        run: echo "VERSION=$(cat VERSION)" >> $GITHUB_ENV
+        run: |
+          VERSION=$(grep "^version = " pyproject.toml | awk -F'"' '{print $2}')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
 
       - name: Build Linux PEX
         if: matrix.platform == 'linux'
@@ -62,7 +65,7 @@ jobs:
           --platform linux_x86_64-cp-3.10.12-cp310 \
           --interpreter-constraint '==3.10.*' \
           --no-strip-pex-env \
-          -o uni-api-linux-x86_64-${VERSION}.pex
+          -o zoaholic-linux-x86_64-${VERSION}.pex
 
       - name: Build MacOS PEX
         if: matrix.platform == 'macos'
@@ -70,7 +73,7 @@ jobs:
           pex -r pyproject.toml \
           -c uvicorn \
           --inject-args 'main:app --host 0.0.0.0 --port 8000' \
-          -o uni-api-macos-arm64-${VERSION}.pex
+          -o zoaholic-macos-arm64-${VERSION}.pex
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
@@ -81,4 +84,4 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            uni-api-${{ matrix.platform }}-${{ matrix.arch }}-${{ env.VERSION }}.pex
+            zoaholic-${{ matrix.platform }}-${{ matrix.arch }}-${{ env.VERSION }}.pex
