@@ -429,3 +429,88 @@
   border-radius: 3px;
   font-size: 13px;
 }
+
+/* ========== Mobile Chat View Styles ========== */
+/* Optimized layout for chat on mobile devices */
+
+@media (max-width: 767px) {
+  /* Chat mobile container */
+  .chat-mobile-container {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+    gap: 0;
+    padding: 0;
+  }
+  
+  /* Message area takes remaining space and scrolls */
+  .chat-mobile-container .chat-messages-area {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  
+  /* Input area fixed at bottom */
+  .chat-mobile-container .chat-input-area {
+    flex-shrink: 0;
+    position: relative;
+    background: var(--md-color-surface);
+    border-top: 1px solid var(--md-color-outline-variant);
+  }
+  
+  /* Compact message cards on mobile */
+  .chat-mobile-container .message-wrapper {
+    margin-bottom: 12px;
+  }
+  
+  .chat-mobile-container .message-card {
+    padding: 12px 16px;
+    border-radius: 10px;
+  }
+  
+  .chat-mobile-container .message-content {
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  
+  /* Action bar always visible on mobile (touch devices) */
+  .chat-mobile-container .action-bar {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0);
+    position: static;
+    margin-top: 8px;
+    padding: 2px 0;
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    justify-content: flex-start;
+  }
+  
+  .chat-mobile-container .action-bar .icon-btn {
+    width: 32px;
+    height: 32px;
+    background-color: var(--md-surface-container);
+    border-radius: 8px;
+  }
+  
+  /* Thinking section compact on mobile */
+  .chat-mobile-container .thinking-section {
+    margin-bottom: 12px;
+  }
+  
+  .chat-mobile-container .thinking-content {
+    font-size: 13px;
+    padding: 10px 12px;
+    max-height: 200px;
+  }
+  
+  /* Role label smaller on mobile */
+  .chat-mobile-container .role-label {
+    font-size: 12px;
+    padding-left: 2px;
+  }
+}

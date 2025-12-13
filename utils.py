@@ -579,21 +579,6 @@ async def error_handling_wrapper(
 def post_all_models(api_index, config, api_list, models_list):
     all_models = []
     unique_models = set()
-    # 构建别名归一化映射（alias -> upstream 以及 upstream -> alias）
-    alias_keys = set()
-    upstream_to_alias = {}
-    alias_to_upstream = {}
-    for provider_item in config.get("providers", []):
-        model_dict = get_model_dict(provider_item)  # alias -> upstream
-        for alias, upstream in model_dict.items():
-            alias_keys.add(alias)
-            alias_to_upstream[alias] = upstream
-            if upstream != alias:
-                upstream_to_alias[upstream] = alias
-
-    def normalize_model_name(name: str) -> str:
-        """将上游原名统一转换为展示别名；若无映射，则保持原名"""
-        return upstream_to_alias.get(name, name)
 
     # 允许分组集合：仅返回与当前 API Key 分组有交集的渠道模型
     api_key_groups = safe_get(config, 'api_keys', api_index, 'groups', default=['default'])
@@ -606,23 +591,13 @@ def post_all_models(api_index, config, api_list, models_list):
     if config['api_keys'][api_index]['model']:
         for model in config['api_keys'][api_index]['model']:
             if model == "all":
-                # 如果模型名为 all，则返回所有模型（统一为别名并去重），并按分组过滤
-                all_models = get_all_models(config, allowed_groups)
-                final_models = []
-                seen = set()
-                for item in all_models:
-                    disp = normalize_model_name(item["id"])
-                    if disp not in seen:
-                        seen.add(disp)
-                        item["id"] = disp
-                        final_models.append(item)
-                return final_models
+                # 如果模型名为 all，则返回所有模型并去重，按分组过滤
+                return get_all_models(config, allowed_groups)
             if "/" in model:
                 provider = model.split("/")[0]
                 model = model.split("/")[1]
                 if model == "*":
                     if provider.startswith("sk-") and provider in api_list:
-                        # 将聚合器返回的上游名转换为展示别名，避免出现“本名+重定向名”重复
                         # 分组过滤：仅当本地聚合器 Key 与当前请求 Key 分组有交集时才包含
                         try:
                             local_index = api_list.index(provider)
@@ -635,11 +610,10 @@ def post_all_models(api_index, config, api_list, models_list):
                             p_groups = ['default']
                         if allowed_groups.intersection(set(p_groups)):
                             for model_item in models_list[provider]:
-                                disp = normalize_model_name(model_item)
-                                if disp not in unique_models:
-                                    unique_models.add(disp)
+                                if model_item not in unique_models:
+                                    unique_models.add(model_item)
                                     model_info = {
-                                        "id": disp,
+                                        "id": model_item,
                                         "object": "model",
                                         "created": 1720524448858,
                                         "owned_by": "Zoaholic"
@@ -662,11 +636,12 @@ def post_all_models(api_index, config, api_list, models_list):
                                 continue
 
                             model_dict = get_model_dict(provider_item)
-                            # 剔除被重定向的上游原名，仅保留展示别名
+                            # 识别被重定向的上游原名（出现在映射值中且与键不同的项）
                             upstream_candidates = {v for k, v in model_dict.items() if v != k}
                             # 如果渠道配置了 model_prefix，只展示带前缀的模型名
                             prefix = provider_item.get('model_prefix', '').strip()
                             for model_item in model_dict.keys():
+                                # 过滤掉作为别名映射上游的模型名
                                 if model_item in upstream_candidates:
                                     continue
                                 # 如果有前缀，只返回带前缀的模型名
@@ -679,12 +654,10 @@ def post_all_models(api_index, config, api_list, models_list):
                                         "object": "model",
                                         "created": 1720524448858,
                                         "owned_by": "Zoaholic"
-                                        # "owned_by": provider_item['provider']
                                     }
                                     all_models.append(model_info)
                 else:
                     if provider.startswith("sk-") and provider in api_list:
-                        # 支持别名/上游名两种写法，统一输出为展示别名
                         # 分组过滤：仅当本地聚合器 Key 与当前请求 Key 分组有交集时才包含
                         try:
                             local_index = api_list.index(provider)
@@ -697,13 +670,12 @@ def post_all_models(api_index, config, api_list, models_list):
                             p_groups = ['default']
 
                         if allowed_groups.intersection(set(p_groups)):
-                            upstream_name = alias_to_upstream.get(model, model)
-                            if upstream_name in models_list[provider]:
-                                disp = normalize_model_name(upstream_name)
-                                if disp not in unique_models:
-                                    unique_models.add(disp)
+                            # 直接使用配置的模型名，不做归一化
+                            if model in models_list[provider]:
+                                if model not in unique_models:
+                                    unique_models.add(model)
                                     model_info = {
-                                        "id": disp,
+                                        "id": model,
                                         "object": "model",
                                         "created": 1720524448858,
                                         "owned_by": "Zoaholic"
@@ -726,11 +698,12 @@ def post_all_models(api_index, config, api_list, models_list):
                                 continue
 
                             model_dict = get_model_dict(provider_item)
-                            # 剔除被重定向的上游原名后再进行精确匹配
+                            # 识别被重定向的上游原名（出现在映射值中且与键不同的项）
                             upstream_candidates = {v for k, v in model_dict.items() if v != k}
                             # 如果渠道配置了 model_prefix，只展示带前缀的模型名
                             prefix = provider_item.get('model_prefix', '').strip()
                             for model_item in model_dict.keys():
+                                # 过滤掉作为别名映射上游的模型名
                                 if model_item in upstream_candidates:
                                     continue
                                 # 如果有前缀，只返回带前缀的模型名
@@ -750,29 +723,29 @@ def post_all_models(api_index, config, api_list, models_list):
             if model.startswith("sk-") and model in api_list:
                 continue
 
-            disp = normalize_model_name(model)
-            if disp not in unique_models:
-                unique_models.add(disp)
+            # 直接使用配置的模型名，不做归一化
+            if model not in unique_models:
+                unique_models.add(model)
                 model_info = {
-                    "id": disp,
+                    "id": model,
                     "object": "model",
                     "created": 1720524448858,
                     "owned_by": "Zoaholic"
                 }
                 all_models.append(model_info)
 
-    # 最终统一：仍为上游原名的 id 转换为展示别名，并做去重
-    final_models = []
-    seen = set()
-    for item in all_models:
-        disp = normalize_model_name(item["id"])
-        if disp not in seen:
-            seen.add(disp)
-            item["id"] = disp
-            final_models.append(item)
-    return final_models
+    return all_models
 
 def get_all_models(config, allowed_groups=None):
+    """
+    获取所有模型列表。
+    
+    逻辑：
+    1. 遍历所有可用渠道
+    2. 对每个渠道，读取 model_dict
+    3. 过滤掉作为别名映射上游的模型名（只保留别名）
+    4. 遍历全部渠道后，去重
+    """
     all_models = []
     unique_models = set()
     
@@ -793,14 +766,16 @@ def get_all_models(config, allowed_groups=None):
 
         # 使用映射缓存（若不存在则回退到实时计算）
         model_dict = provider.get("_model_dict_cache") or get_model_dict(provider)
-        # 识别被重定向的上游原名（出现在映射值中的项且与键不同）
+        
+        # 识别被重定向的上游原名（出现在映射值中且与键不同的项）
+        # 这些上游模型名不应该出现在模型列表中，只展示别名
         upstream_candidates = {v for k, v in model_dict.items() if v != k}
         
         # 如果渠道配置了 model_prefix，只展示带前缀的模型名
         prefix = provider.get('model_prefix', '').strip()
         
         for model in model_dict.keys():
-            # 仅返回展示别名，过滤掉被重定向的上游原名
+            # 过滤掉作为别名映射上游的模型名
             if model in upstream_candidates:
                 continue
             # 如果有前缀，只返回带前缀的模型名，过滤掉不带前缀的原始模型名

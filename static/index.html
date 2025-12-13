@@ -307,6 +307,15 @@
             #content-viewport {
                 overflow: visible;
             }
+            
+            /* Special handling for chat view on mobile */
+            #content-viewport.chat-view-active {
+                overflow: hidden !important;
+                display: flex;
+                flex-direction: column;
+                height: calc(100vh - 64px - 80px) !important; /* viewport - top bar - bottom nav */
+                padding: 0 !important;
+            }
         }
         
         @media (min-width: 768px) {

@@ -104,6 +104,14 @@ const Views = {
             return;
         }
 
+        // 清理之前视图的特殊状态
+        if (Views.currentView === "chat" && ChatView._cleanup) {
+            ChatView._cleanup();
+        }
+        
+        // 移除可能存在的 chat-view-active 类
+        viewport.classList.remove("chat-view-active");
+
         // 清空视口
         viewport.innerHTML = "";
         

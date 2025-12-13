@@ -802,11 +802,22 @@ const ChatView = {
         // 初始化
         await ChatView._init();
 
+        // 检测是否为移动端
+        const isMobile = window.innerWidth < 768;
+
         // 布局说明：
-        // - 移动端：整体页面由 body 滚动，这里只做简单的纵向布局
+        // - 移动端：固定高度，消息区域可滚动，输入框固定底部
         // - 桌面端：左侧参数面板 + 右侧聊天区域并排
         container.classList.remove("gap-6", "min-h-full");
-        container.classList.add("flex-col", "md:flex-row", "gap-4", "pb-0");
+        
+        if (isMobile) {
+            // 移动端：启用固定高度布局（消息区滚动 + 输入区固定底部）
+            container.classList.remove("pb-4", "md:pb-0");
+            container.classList.add("chat-mobile-container");
+            container.parentElement?.classList.add("chat-view-active");
+        } else {
+            container.classList.add("flex-col", "md:flex-row", "gap-4", "pb-0");
+        }
 
         // Settings Panel - hidden on mobile
         const settingsPanel = UI.card("filled", "w-full md:w-80 flex-shrink-0 md:h-full overflow-y-auto hidden md:block");
@@ -938,11 +949,23 @@ const ChatView = {
 
         container.appendChild(settingsPanel);
 
-        // Chat Area - use flex-1 and min-h-0 for proper flex behavior
-        const chatArea = UI.card("outlined", "flex-1 flex flex-col min-h-0 overflow-hidden");
+        // Chat Area
+        // 移动端不使用 UI.card()（默认 p-6/圆角会干扰高度计算）
+        let chatArea;
+        if (isMobile) {
+            chatArea = UI.el("div", "flex-1 flex flex-col min-h-0 overflow-hidden");
+        } else {
+            chatArea = UI.card("outlined", "flex-1 flex flex-col min-h-0 overflow-hidden");
+        }
 
         // Message list with proper scrolling
-        const msgList = UI.el("div", "flex-1 overflow-y-auto p-4 md:p-6 space-y-4 bg-md-surface-container-low");
+        const msgListClasses = isMobile
+            ? "flex-1 overflow-y-auto p-3 space-y-4 bg-md-surface-container-low"
+            : "flex-1 overflow-y-auto p-4 md:p-6 space-y-4 bg-md-surface-container-low";
+        const msgList = UI.el("div", msgListClasses);
+        if (isMobile) {
+            msgList.classList.add("chat-messages-area");
+        }
         msgList.style.webkitOverflowScrolling = "touch"; // Smooth scrolling on iOS
 
         const renderMessage = (role, text, messageIndex = null) => {
@@ -1023,16 +1046,40 @@ const ChatView = {
         chatArea.appendChild(msgList);
 
         // Input Area
-        const inputArea = UI.el("div", "p-4 border-t border-md-outline-variant bg-md-surface");
-        const form = UI.el("form", "flex gap-3");
+        const inputAreaClasses = isMobile
+            ? "p-3 border-t border-md-outline-variant bg-md-surface chat-input-area"
+            : "p-4 border-t border-md-outline-variant bg-md-surface";
+        const inputArea = UI.el("div", inputAreaClasses);
+        const form = UI.el("form", "flex gap-2 md:gap-3");
+
+        // 移动端：把“侧边模型选择/参数面板”入口放在输入框旁边（可见且易触达）
+        if (isMobile) {
+            const settingsBtn = UI.iconBtn(
+                "tune",
+                () => ChatView._showMobileSettings(),
+                "standard",
+                { tooltip: "配置参数" }
+            );
+            settingsBtn.type = "button";
+            form.appendChild(settingsBtn);
+        }
 
         const chatInput = document.createElement("input");
         chatInput.type = "text";
-        chatInput.className = "flex-1 md-input md-input-large md-input-pill md-input-surface-container text-body-large";
+        chatInput.className = isMobile
+            ? "flex-1 md-input md-input-compact md-input-pill md-input-surface-container text-body-medium"
+            : "flex-1 md-input md-input-large md-input-pill md-input-surface-container text-body-large";
         chatInput.placeholder = ChatView._apiKey ? "输入消息..." : "请先登录...";
         chatInput.disabled = !ChatView._apiKey;
 
-        const sendBtn = UI.btn("发送", null, "filled", "send");
+        // 移动端：发送按钮使用图标
+        let sendBtn;
+        if (isMobile) {
+            sendBtn = UI.el("button", "w-10 h-10 rounded-full bg-md-primary flex items-center justify-center flex-shrink-0 disabled:opacity-38 disabled:cursor-not-allowed");
+            sendBtn.appendChild(UI.icon("send", "text-md-on-primary text-lg"));
+        } else {
+            sendBtn = UI.btn("发送", null, "filled", "send");
+        }
         sendBtn.type = "submit";
         sendBtn.disabled = !ChatView._apiKey;
 
@@ -1064,5 +1111,144 @@ const ChatView = {
         inputArea.appendChild(form);
         chatArea.appendChild(inputArea);
         container.appendChild(chatArea);
+
+        // 清理：离开聊天页面时移除特殊类
+        ChatView._cleanup = () => {
+            container.parentElement?.classList.remove("chat-view-active");
+        };
+    },
+
+    /**
+     * 移动端设置面板（Side Sheet）：提供“侧边模型选择/参数”入口
+     */
+    _showMobileSettings() {
+        const isMobile = window.innerWidth < 768;
+        const width = isMobile ? "max-w-full" : "max-w-lg";
+
+        UI.sideSheet(
+            "配置参数",
+            () => {
+                const root = UI.el("div", "flex flex-col gap-4");
+
+                // API Key 状态
+                const apiKeyStatus = UI.el("div", "p-3 rounded-md-sm");
+                if (ChatView._apiKey) {
+                    const keyPreview = ChatView._apiKey.length > 15
+                        ? `${ChatView._apiKey.slice(0, 7)}...${ChatView._apiKey.slice(-4)}`
+                        : ChatView._apiKey;
+                    apiKeyStatus.className = "p-3 rounded-md-sm bg-md-success-container";
+                    const row = UI.el("div", "flex items-center gap-2 text-md-on-success-container text-label-medium");
+                    row.appendChild(UI.icon("check_circle", "text-sm"));
+                    row.appendChild(document.createTextNode(`API Key: ${keyPreview}`));
+                    apiKeyStatus.appendChild(row);
+                } else {
+                    apiKeyStatus.className = "p-3 rounded-md-sm bg-md-error-container";
+                    const row = UI.el("div", "flex items-center gap-2 text-md-on-error-container text-label-medium");
+                    row.appendChild(UI.icon("error", "text-sm"));
+                    row.appendChild(document.createTextNode("未配置 API Key，请先登录"));
+                    apiKeyStatus.appendChild(row);
+                }
+                root.appendChild(apiKeyStatus);
+
+                const getModelOptions = () => (
+                    ChatView._models.length > 0
+                        ? ChatView._models.map(m => ({ value: m, label: m }))
+                        : [{ value: "", label: "请先获取模型列表" }]
+                );
+
+                // 模型选择
+                const modelSelect = UI.select("模型选择", getModelOptions(), ChatView._selectedModel || "");
+                modelSelect.select.onchange = (e) => {
+                    ChatView._selectedModel = e.target.value;
+                };
+                root.appendChild(modelSelect.wrapper);
+
+                // 刷新模型列表
+                const refreshBtn = UI.btn("刷新模型列表", async () => {
+                    refreshBtn.setLoading(true);
+                    await ChatView._fetchModels();
+                    refreshBtn.setLoading(false);
+
+                    if (!ChatView._selectedModel && ChatView._models.length > 0) {
+                        ChatView._selectedModel = ChatView._models[0];
+                    }
+
+                    modelSelect.select.innerHTML = "";
+                    getModelOptions().forEach(opt => {
+                        const option = document.createElement("option");
+                        option.value = opt.value;
+                        option.textContent = opt.label;
+                        if (opt.value === ChatView._selectedModel) {
+                            option.selected = true;
+                        }
+                        modelSelect.select.appendChild(option);
+                    });
+
+                    UI.snackbar(`已获取 ${ChatView._models.length} 个模型`, null, null, { variant: "success" });
+                }, "text", "refresh");
+                refreshBtn.classList.add("w-full");
+                root.appendChild(refreshBtn);
+
+                // Temperature
+                const tempWrap = UI.el("div", "");
+                const tempHeader = UI.el("div", "flex justify-between items-center mb-2");
+                tempHeader.appendChild(UI.el("label", "text-label-large text-md-on-surface-variant", "Temperature"));
+                const tempDisplay = UI.el("span", "text-label-medium font-mono text-md-primary bg-md-primary-container px-2 py-0.5 rounded-md-xs", String(ChatView._temperature));
+                tempHeader.appendChild(tempDisplay);
+
+                const tempRange = document.createElement("input");
+                tempRange.type = "range";
+                tempRange.min = "0";
+                tempRange.max = "2";
+                tempRange.step = "0.1";
+                tempRange.value = String(ChatView._temperature);
+                tempRange.className = "md-range";
+                tempRange.oninput = (e) => {
+                    ChatView._temperature = parseFloat(e.target.value);
+                    tempDisplay.textContent = String(ChatView._temperature);
+                };
+
+                tempWrap.appendChild(tempHeader);
+                tempWrap.appendChild(tempRange);
+                root.appendChild(tempWrap);
+
+                // Stream 开关
+                const streamSwitch = UI.switch("Stream Response", ChatView._stream);
+                streamSwitch.querySelector("input").onchange = (e) => {
+                    ChatView._stream = e.target.checked;
+                };
+                root.appendChild(streamSwitch);
+
+                root.appendChild(UI.divider("my-2"));
+
+                // 清空对话按钮
+                const clearBtn = UI.btn("清空对话", () => {
+                    ChatView._messages = [];
+                    if (ChatView._msgList) {
+                        ChatView._msgList.innerHTML = "";
+
+                        const welcomeWrapper = UI.el("div", "flex w-full justify-center py-8");
+                        const welcomeCard = UI.el("div", "text-center p-6 bg-md-surface-container rounded-md-lg max-w-md");
+                        welcomeCard.appendChild(UI.icon("chat", "text-4xl text-md-primary mb-3"));
+                        welcomeCard.appendChild(UI.el("h3", "text-title-medium text-md-on-surface mb-2", "欢迎使用 Zoaholic Playground"));
+                        welcomeCard.appendChild(UI.el("p", "text-body-medium text-md-on-surface-variant",
+                            ChatView._apiKey
+                                ? "选择模型并开始对话吧！"
+                                : "请先登录以获取 API Key，然后开始对话。"
+                        ));
+                        welcomeWrapper.appendChild(welcomeCard);
+                        ChatView._msgList.appendChild(welcomeWrapper);
+                    }
+                    UI.snackbar("对话已清空", null, null, { variant: "info" });
+                }, "outlined", "delete");
+                clearBtn.classList.add("w-full");
+                root.appendChild(clearBtn);
+
+                return root;
+            },
+            () => true,
+            "完成",
+            { width, cancelText: "关闭" }
+        );
     }
 };

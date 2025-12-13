@@ -21,6 +21,12 @@ def get_model_dict(provider):
     """
     构建模型别名到上游模型名的映射字典。
     
+    YAML 配置格式：
+    - 字符串：直接使用，别名和上游都是自己
+      例：`- gemini-2.5-pro` → alias="gemini-2.5-pro", upstream="gemini-2.5-pro"
+    - 字典：`{upstream: alias}` 格式，key 是上游模型名，value 是对外展示的别名
+      例：`- gemini-2.5-pro: my-alias` → upstream="gemini-2.5-pro", alias="my-alias"
+    
     如果 provider 配置了 model_prefix，会同时生成：
     - 带前缀的别名 -> 上游模型（用于模型列表展示和带前缀请求匹配）
     - 不带前缀的别名 -> 上游模型（用于不带前缀请求的路由匹配）
@@ -44,11 +50,14 @@ def get_model_dict(provider):
             
         if isinstance(model, dict):
             # dict 模型格式: {upstream: alias}
+            # key = 上游模型名
+            # value = 对外展示的别名
             for upstream, alias in model.items():
                 alias_str = str(alias)
+                upstream_str = str(upstream)
                 if prefix:
-                    model_dict[f"{prefix}{alias_str}"] = upstream  # 带前缀别名 -> 上游
-                model_dict[alias_str] = upstream  # 原始别名 -> 上游（用于路由匹配）
+                    model_dict[f"{prefix}{alias_str}"] = upstream_str  # 带前缀别名 -> 上游
+                model_dict[alias_str] = upstream_str  # 原始别名 -> 上游（用于路由匹配）
                 
     return model_dict
 
