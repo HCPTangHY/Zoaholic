@@ -193,6 +193,10 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
         'prompt',
         'size',
         'max_completion_tokens',  # 将在下面转换为 maxOutputTokens
+        'extra_body',  # OpenAI 扩展字段，在下面单独处理转换
+        'thinking',  # OpenAI/Claude 思考配置
+        'chat_template_kwargs',  # OpenAI 特有字段
+        'min_p',  # OpenAI 特有字段
     ]
     generation_config = {}
 
@@ -267,6 +271,39 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
                 "Text",
                 "Image",
             ]
+
+    # 处理 OpenAI extra_body.google 配置，转换 snake_case 到 camelCase 后合并到 generationConfig
+    request_data = request.model_dump(exclude_unset=True)
+    extra_body = request_data.get('extra_body')
+    
+    if isinstance(extra_body, dict):
+        google_config = extra_body.get('google', {})
+        if isinstance(google_config, dict) and google_config:
+            def _snake_to_camel(s: str) -> str:
+                """将 snake_case 转换为 camelCase"""
+                parts = s.split('_')
+                return parts[0] + ''.join(word.capitalize() for word in parts[1:])
+            
+            def _convert_keys(obj):
+                """递归转换字典所有键从 snake_case 到 camelCase"""
+                if isinstance(obj, dict):
+                    return {_snake_to_camel(k): _convert_keys(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [_convert_keys(item) for item in obj]
+                else:
+                    return obj
+            
+            def _deep_merge(target, source):
+                """深度合并两个字典"""
+                for key, value in source.items():
+                    if key in target and isinstance(target[key], dict) and isinstance(value, dict):
+                        _deep_merge(target[key], value)
+                    else:
+                        target[key] = value
+            
+            converted_config = _convert_keys(google_config)
+            # 合并到 generationConfig 中（extra_body.google.thinking_config -> generationConfig.thinkingConfig）
+            _deep_merge(payload["generationConfig"], converted_config)
 
     if "gemini-2.5" in original_model and "gemini-2.5-flash-image" not in original_model:
         # 从请求模型名中检测思考预算设置
