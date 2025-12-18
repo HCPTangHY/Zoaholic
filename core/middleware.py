@@ -133,6 +133,21 @@ class StatsMiddleware:
                 return True
         return False
 
+    def _normalize_endpoint(self, method: str, path: str) -> str:
+        """归一化端点路径，将带模型名的路径转换为模板格式"""
+        # 处理 Gemini 风格路径: /v1beta/models/{model}:generateContent
+        if "/models/" in path and ":" in path:
+            # 提取前缀和动作
+            # /v1beta/models/gemini-pro:generateContent -> /v1beta/models/{model}:generateContent
+            parts = path.split("/models/", 1)
+            prefix = parts[0]
+            suffix = parts[1]
+            if ":" in suffix:
+                action = suffix.split(":", 1)[1]
+                return f"{method} {prefix}/models/{{model}}:{action}"
+        
+        return f"{method} {path}"
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
@@ -147,14 +162,14 @@ class StatsMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # 非 /v1 路径不做统计和鉴权
-        if not path.startswith("/v1"):
-            await self.app(scope, receive, send)
-            return
-
         # 方言端点使用自己的认证逻辑，跳过中间件认证但仍初始化 request_info
         # 方言路由处理器会使用 DialectDefinition.extract_token 进行认证
         is_dialect = self._is_dialect_endpoint(path)
+
+        # 非 /v1 路径且非方言端点不做统计和鉴权
+        if not path.startswith("/v1") and not is_dialect:
+            await self.app(scope, receive, send)
+            return
 
         # 获取 app 实例
         app = scope.get("app")
@@ -241,7 +256,7 @@ class StatsMiddleware:
         request_info_data = {
             "request_id": request_id,
             "start_time": start_time,
-            "endpoint": f"{method} {path}",
+            "endpoint": self._normalize_endpoint(method, path),
             "client_ip": client_ip,
             "process_time": 0,
             "first_response_time": -1,

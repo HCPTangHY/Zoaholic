@@ -280,13 +280,96 @@ async def process_request(
 
 
 def _filter_passthrough_headers(original_headers: Optional[Dict[str, str]]) -> Dict[str, Any]:
-    """过滤入口请求头中的认证字段，避免把用户 token 透传到上游"""
-    drop_names = {"authorization", "x-api-key", "api-key", "x-goog-api-key"}
+    """过滤入口请求头中的认证字段和需要移除的头，避免透传错误信息到上游"""
+    drop_names = {
+        "authorization", "x-api-key", "api-key", "x-goog-api-key",  # 认证相关
+        "host",  # 必须移除，否则上游服务（如 Deno Deploy）会路由错误
+        "content-length",  # 由 httpx 自动计算
+        "accept-encoding",  # 移除压缩请求，避免返回 gzip 压缩的响应导致乱码
+    }
     return {
         k: v
         for k, v in (original_headers or {}).items()
-        if k.lower() not in drop_names and k.lower() != "content-length"
+        if k.lower() not in drop_names
     }
+
+
+async def _fetch_passthrough_stream(client, url, headers, payload, timeout):
+    """
+    透传模式的流式响应处理
+    
+    直接转发上游 SSE 流，不做任何格式转换
+    """
+    json_payload = await asyncio.to_thread(json.dumps, payload)
+    async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
+        error_message = await check_response(response, "passthrough_stream")
+        if error_message:
+            yield error_message
+            return
+        
+        async for chunk in response.aiter_text():
+            yield chunk
+
+
+async def _fetch_passthrough_response(client, url, headers, payload, timeout):
+    """
+    透传模式的非流式响应处理
+    
+    直接转发上游 JSON 响应，不做任何格式转换
+    """
+    json_payload = await asyncio.to_thread(json.dumps, payload)
+    response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
+    
+    error_message = await check_response(response, "passthrough_non_stream")
+    if error_message:
+        yield error_message
+        return
+    
+    response_bytes = await response.aread()
+    yield response_bytes.decode("utf-8")
+
+
+async def _passthrough_error_wrapper(generator, channel_id):
+    """
+    透传模式的简单错误包装器
+    
+    只检测 HTTP 错误（由 check_response 完成），不做 JSON 解析
+    直接透传所有内容
+    """
+    from time import time as time_now
+    start_time = time_now()
+    first_response_time = None
+    
+    async def wrapped():
+        nonlocal first_response_time
+        first_chunk = True
+        async for chunk in generator:
+            if first_chunk:
+                first_response_time = time_now() - start_time
+                first_chunk = False
+                
+                # 检查是否是错误响应
+                if isinstance(chunk, dict) and 'error' in chunk:
+                    raise HTTPException(
+                        status_code=chunk.get('status_code', 500),
+                        detail=str(chunk.get('details', chunk))
+                    )
+            
+            yield chunk
+    
+    # 获取第一个 chunk 以计算首次响应时间
+    gen = wrapped()
+    try:
+        first = await gen.__anext__()
+    except StopAsyncIteration:
+        raise HTTPException(status_code=502, detail="Upstream server returned an empty response.")
+    
+    async def final_gen():
+        yield first
+        async for chunk in gen:
+            yield chunk
+    
+    return final_gen(), first_response_time or (time_now() - start_time)
 
 
 async def process_request_passthrough(
@@ -384,24 +467,13 @@ async def process_request_passthrough(
             last_message_role = safe_get(request, "messages", -1, "role", default=None)
 
             if request.stream:
-                generator = fetch_response_stream(
-                    client,
-                    url,
-                    headers,
-                    payload,
-                    engine,
-                    original_model,
-                    timeout_value,
-                    enabled_plugins=enabled_plugins,
+                # 透传模式：使用原始流处理，不做格式转换
+                generator = _fetch_passthrough_stream(
+                    client, url, headers, payload, timeout_value
                 )
-                wrapped_generator, first_response_time = await error_handling_wrapper(
-                    generator,
-                    channel_id,
-                    engine,
-                    request.stream,
-                    app.state.error_triggers,
-                    keepalive_interval=keepalive_interval,
-                    last_message_role=last_message_role,
+                # 使用简单的透传错误包装器，不做 JSON 解析
+                wrapped_generator, first_response_time = await _passthrough_error_wrapper(
+                    generator, channel_id
                 )
                 response = LoggingStreamingResponse(
                     wrapped_generator,
@@ -411,60 +483,26 @@ async def process_request_passthrough(
                     debug=is_debug,
                 )
             else:
-                generator = fetch_response(
-                    client,
-                    url,
-                    headers,
-                    payload,
-                    engine,
-                    original_model,
-                    timeout_value,
+                # 透传模式：使用原始响应处理，不做格式转换
+                generator = _fetch_passthrough_response(
+                    client, url, headers, payload, timeout_value
                 )
-                wrapped_generator, first_response_time = await error_handling_wrapper(
-                    generator,
-                    channel_id,
-                    engine,
-                    request.stream,
-                    app.state.error_triggers,
-                    last_message_role=last_message_role,
+                # 使用简单的透传错误包装器，不做 JSON 解析
+                wrapped_generator, first_response_time = await _passthrough_error_wrapper(
+                    generator, channel_id
                 )
 
-                # 处理音频和其他二进制响应
-                if endpoint == "/v1/audio/speech":
-                    if isinstance(wrapped_generator, bytes):
-                        response = Response(content=wrapped_generator, media_type="audio/mpeg")
-                    else:
-                        first_element = await anext(wrapped_generator)
-                        first_element = first_element.lstrip("data: ")
-                        decoded_element = await asyncio.to_thread(json.loads, first_element)
-                        encoded_element = await asyncio.to_thread(json.dumps, decoded_element)
+                async def passthrough_iter():
+                    async for chunk in wrapped_generator:
+                        yield chunk
 
-                        async def non_stream_iter():
-                            yield encoded_element
-
-                        response = LoggingStreamingResponse(
-                            non_stream_iter(),
-                            media_type="application/json",
-                            current_info=current_info,
-                            app=app,
-                            debug=is_debug,
-                        )
-                else:
-                    first_element = await anext(wrapped_generator)
-                    first_element = first_element.lstrip("data: ")
-                    decoded_element = await asyncio.to_thread(json.loads, first_element)
-                    encoded_element = await asyncio.to_thread(json.dumps, decoded_element)
-
-                    async def non_stream_iter():
-                        yield encoded_element
-
-                    response = LoggingStreamingResponse(
-                        non_stream_iter(),
-                        media_type="application/json",
-                        current_info=current_info,
-                        app=app,
-                        debug=is_debug,
-                    )
+                response = LoggingStreamingResponse(
+                    passthrough_iter(),
+                    media_type="application/json",
+                    current_info=current_info,
+                    app=app,
+                    debug=is_debug,
+                )
 
             current_info["first_response_time"] = first_response_time
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError,

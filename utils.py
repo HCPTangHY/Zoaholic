@@ -734,6 +734,8 @@ def post_all_models(api_index, config, api_list, models_list):
                 }
                 all_models.append(model_info)
 
+    # 按模型 ID 进行 Unicode 排序
+    all_models.sort(key=lambda x: x["id"])
     return all_models
 
 def get_all_models(config, allowed_groups=None):
@@ -791,6 +793,8 @@ def get_all_models(config, allowed_groups=None):
                 }
                 all_models.append(model_info)
     
+    # 按模型 ID 进行 Unicode 排序
+    all_models.sort(key=lambda x: x["id"])
     return all_models
 
 async def query_channel_key_stats(

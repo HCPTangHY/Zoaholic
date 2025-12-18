@@ -151,6 +151,17 @@ async def parse_gemini_request(
     if not messages:
         messages = [Message(role="user", content="")]
 
+    # 提取所有未显式处理的字段到 extra_body.google
+    # 这样可以确保像 thinkingConfig 这样的字段能透传到上游
+    google_extra = {
+        k: v for k, v in native_body.items()
+        if k not in ("contents", "systemInstruction", "generationConfig", "tools", "model", "stream")
+    }
+    # 合并 generationConfig 中的额外字段
+    for k, v in gen_config.items():
+        if k not in ("temperature", "maxOutputTokens", "topP", "topK"):
+            google_extra[k] = v
+
     return RequestModel(
         model=model,
         messages=messages,
@@ -160,6 +171,7 @@ async def parse_gemini_request(
         top_k=gen_config.get("topK"),
         tools=tools,
         stream=stream_flag,
+        extra_body={"google": google_extra} if google_extra else None,
     )
 
 

@@ -124,12 +124,13 @@ class PluginLoader:
         
         return info
     
-    def load_from_file(self, file_path: str) -> Optional[PluginInfo]:
+    def load_from_file(self, file_path: str, overwrite: bool = False) -> Optional[PluginInfo]:
         """
         从文件加载单个插件
         
         Args:
             file_path: Python 文件路径
+            overwrite: 是否覆盖已加载的同名插件
             
         Returns:
             PluginInfo 或 None（加载失败时）
@@ -151,8 +152,15 @@ class PluginLoader:
         
         # 检查是否已加载
         if plugin_name in self._plugins:
-            logger.warning(f"Plugin already loaded: {plugin_name}")
-            return self._plugins[plugin_name]
+            if not overwrite:
+                logger.warning(f"Plugin already loaded: {plugin_name}")
+                return self._plugins[plugin_name]
+            else:
+                logger.info(f"Overwriting existing plugin: {plugin_name}")
+                self.unload_plugin(plugin_name)
+                # 从插件列表中移除，以便重新加载
+                if plugin_name in self._plugins:
+                    del self._plugins[plugin_name]
         
         try:
             # 动态加载模块
@@ -300,13 +308,14 @@ class PluginLoader:
         
         return loaded_plugins
     
-    def load_from_module(self, module_path: str, plugin_name: Optional[str] = None) -> Optional[PluginInfo]:
+    def load_from_module(self, module_path: str, plugin_name: Optional[str] = None, overwrite: bool = False) -> Optional[PluginInfo]:
         """
         动态加载 Python 模块作为插件
         
         Args:
             module_path: 模块路径，如 "my_package.my_plugin"
             plugin_name: 可选的插件名称
+            overwrite: 是否覆盖已加载的同名插件
             
         Returns:
             PluginInfo 或 None
@@ -314,8 +323,14 @@ class PluginLoader:
         name = plugin_name or module_path.split(".")[-1]
         
         if name in self._plugins:
-            logger.warning(f"Plugin already loaded: {name}")
-            return self._plugins[name]
+            if not overwrite:
+                logger.warning(f"Plugin already loaded: {name}")
+                return self._plugins[name]
+            else:
+                logger.info(f"Overwriting existing dynamic plugin: {name}")
+                self.unload_plugin(name)
+                if name in self._plugins:
+                    del self._plugins[name]
         
         try:
             module = importlib.import_module(module_path)

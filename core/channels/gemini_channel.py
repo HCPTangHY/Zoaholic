@@ -51,6 +51,10 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
     headers = {
         'Content-Type': 'application/json'
     }
+    
+    # 使用 x-goog-api-key 头部认证，避免 URL 参数中的特殊字符问题
+    if api_key:
+        headers['x-goog-api-key'] = api_key
 
     # 获取映射后的实际模型ID
     model_dict = get_model_dict(provider)
@@ -58,8 +62,11 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
 
     if request.stream:
         gemini_stream = "streamGenerateContent"
+        # 流式请求需要 alt=sse 参数才能返回 SSE 格式
+        sse_param = "?alt=sse"
     else:
         gemini_stream = "generateContent"
+        sse_param = ""
     url = provider['base_url']
     parsed_url = urlparse(url)
     if "/v1beta" in parsed_url.path:
@@ -67,7 +74,8 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
     else:
         api_version = "v1"
 
-    url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path.split('/models')[0].rstrip('/')}/models/{original_model}:{gemini_stream}?key={api_key}"
+    # 不再在 URL 中放置 key，改用请求头认证
+    url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path.split('/models')[0].rstrip('/')}/models/{original_model}:{gemini_stream}{sse_param}"
 
     messages = []
     systemInstruction = None
@@ -197,6 +205,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
         'thinking',  # OpenAI/Claude 思考配置
         'chat_template_kwargs',  # OpenAI 特有字段
         'min_p',  # OpenAI 特有字段
+        'reasoning_effort',
     ]
     generation_config = {}
 
@@ -280,7 +289,9 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
         google_config = extra_body.get('google', {})
         if isinstance(google_config, dict) and google_config:
             def _snake_to_camel(s: str) -> str:
-                """将 snake_case 转换为 camelCase"""
+                """将 snake_case 转换为 camelCase，但保留已经是 camelCase 的键"""
+                if any(c.isupper() for c in s) and '_' not in s:
+                    return s
                 parts = s.split('_')
                 return parts[0] + ''.join(word.capitalize() for word in parts[1:])
             
@@ -471,9 +482,12 @@ async def fetch_gemini_models(client, provider):
     if isinstance(api_key, list):
         api_key = api_key[0] if api_key else None
     
-    # Gemini 使用 URL 参数传递 API key
-    url = f"{base_url}/models?key={api_key}"
-    headers = {'Content-Type': 'application/json'}
+    # 使用请求头认证，避免 URL 参数中的特殊字符问题
+    url = f"{base_url}/models"
+    headers = {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': api_key,
+    }
     
     response = await client.get(url, headers=headers)
     response.raise_for_status()

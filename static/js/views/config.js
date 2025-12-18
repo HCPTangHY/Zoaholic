@@ -4,8 +4,10 @@
  */
 const ConfigView = {
     _apiConfig: null,
+    _container: null,
 
     render(container) {
+        ConfigView._container = container;
         const header = UI.el("div", "flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6");
         const titleSection = UI.el("div");
         titleSection.appendChild(UI.el("h2", "text-display-small text-md-on-surface", "渠道配置"));
@@ -20,6 +22,27 @@ const ConfigView = {
         container.appendChild(loading);
 
         ConfigView._loadProviders(container, loading);
+    },
+
+    /**
+     * 刷新视图并尝试恢复滚动位置
+     */
+    refresh() {
+        const viewport = document.getElementById("content-viewport");
+        const scrollTop = viewport ? viewport.scrollTop : 0;
+        
+        if (ConfigView._container) {
+            ConfigView.render(ConfigView._container);
+            
+            // 恢复滚动位置
+            if (viewport) {
+                requestAnimationFrame(() => {
+                    viewport.scrollTop = scrollTop;
+                });
+            }
+        } else {
+            Views.render("config");
+        }
     },
 
     async _loadProviders(container, loading) {
@@ -877,7 +900,7 @@ const ConfigView = {
                 return;
             }
             ConfigView._apiConfig = bodyConfig;
-            Views.render("config");
+            ConfigView.refresh();
             UI.snackbar(`已删除渠道 "${name}"`, null, null, { variant: "success" });
         } catch (e) {
             UI.snackbar(`删除失败: ${e.message}`, null, null, { variant: "error" });
@@ -908,7 +931,7 @@ const ConfigView = {
                 return;
             }
             ConfigView._apiConfig = bodyConfig;
-            Views.render("config");
+            ConfigView.refresh();
             UI.snackbar(enabled ? "渠道已启用" : "渠道已禁用", null, null, { variant: "success" });
         } catch (e) {
             UI.snackbar(`操作失败: ${e.message}`, null, null, { variant: "error" });
@@ -952,7 +975,7 @@ const ConfigView = {
             }
             ConfigView._apiConfig = bodyConfig;
             // 更新列表显示以应用按优先级的默认排序
-            Views.render("config");
+            ConfigView.refresh();
             UI.snackbar(`优先级已更新为 ${newWeight}`, null, null, { variant: "success" });
         } catch (e) {
             UI.snackbar(`更新优先级失败: ${e.message}`, null, null, { variant: "error" });
@@ -1264,7 +1287,7 @@ Object.assign(ConfigView, {
                         const indexLabel = UI.el(
                             "span",
                             "w-6 text-right text-body-small text-md-on-surface-variant flex-shrink-0",
-                            String(index + 1)
+                            String(index)
                         );
         
                         // 输入框 - 禁用的 key 添加删除线样式
@@ -1679,7 +1702,7 @@ Object.assign(ConfigView, {
      * 获取模型 - 打开 MD3 模态框，复选模型列表（含全选 / 全不选 / 模糊搜索）
      */
     async _openFetchModelsDialog(providerData, renderModelChips, fetchBtn) {
-        if (!providerData.api_keys.length || !providerData.api_keys.some(k => k && k.trim())) {
+        if (!providerData.api_keys.length || !providerData.api_keys.some(k => k && k.key && k.key.trim())) {
             UI.snackbar("请先填写至少一个 API Key", null, null, { variant: "error" });
             return;
         }
@@ -1695,13 +1718,15 @@ Object.assign(ConfigView, {
         let fetchedModels = [];
 
         try {
+            // 获取第一个可用的 API key（对象格式，取 .key 属性）
+            const firstKey = providerData.api_keys.find(k => k && k.key && k.key.trim());
             const res = await fetch("/v1/channels/fetch_models", {
                 method: "POST",
                 headers,
                 body: JSON.stringify({
                     engine: providerData.engine,
                     base_url: providerData.base_url,
-                    api_key: providerData.api_keys[0],
+                    api_key: firstKey?.key || "",
                 }),
             });
             if (!res.ok) {
@@ -2665,7 +2690,7 @@ Object.assign(ConfigView, {
                 return false;
             }
             ConfigView._apiConfig = bodyConfig;
-            Views.render("config");
+            ConfigView.refresh();
             UI.snackbar("配置已保存", null, null, { variant: "success" });
             return true;
         } catch (e) {

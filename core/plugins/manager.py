@@ -127,13 +127,14 @@ class PluginManager:
         
         return result
     
-    def load_plugin(self, path_or_module: str, activate: bool = True) -> Optional[PluginInfo]:
+    def load_plugin(self, path_or_module: str, activate: bool = True, overwrite: bool = True) -> Optional[PluginInfo]:
         """
         加载单个插件
         
         Args:
             path_or_module: 文件路径或模块路径
             activate: 是否激活插件
+            overwrite: 是否覆盖已存在的同名插件（默认为 True，支持热插拔覆写）
             
         Returns:
             PluginInfo 或 None
@@ -142,9 +143,9 @@ class PluginManager:
         
         # 判断是文件路径还是模块路径
         if path_or_module.endswith(".py") or "/" in path_or_module or "\\" in path_or_module:
-            info = self._loader.load_from_file(path_or_module)
+            info = self._loader.load_from_file(path_or_module, overwrite=overwrite)
         else:
-            info = self._loader.load_from_module(path_or_module)
+            info = self._loader.load_from_module(path_or_module, overwrite=overwrite)
         
         if info and info.enabled and activate:
             self._activate_plugin(info)

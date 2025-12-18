@@ -614,7 +614,7 @@ async def get_logs(
 
     async with async_session() as session:
         # 构建基础查询条件
-        conditions = [RequestStat.endpoint == "POST /v1/chat/completions"]
+        conditions = []
         
         # 时间筛选
         if start_time:

@@ -198,14 +198,7 @@ async def upload_plugin(
             plugin_name = filename[:-3]  # 移除 .py 后缀
             target_path = PLUGINS_DIR / filename
             
-            # 检查是否已存在
-            if target_path.exists():
-                raise HTTPException(
-                    status_code=409, 
-                    detail=f"Plugin file '{filename}' already exists"
-                )
-            
-            # 保存文件
+            # 保存文件（支持覆盖已存在的文件）
             content = await file.read()
             target_path.write_bytes(content)
             
@@ -259,11 +252,9 @@ async def upload_plugin(
                     plugin_name = plugin_dir.name
                     target_path = PLUGINS_DIR / plugin_name
                     
+                    # 如果目标目录已存在，先删除旧目录以支持覆盖
                     if target_path.exists():
-                        raise HTTPException(
-                            status_code=409, 
-                            detail=f"Plugin directory '{plugin_name}' already exists"
-                        )
+                        shutil.rmtree(target_path, ignore_errors=True)
                     
                     # 复制目录
                     shutil.copytree(plugin_dir, target_path)
@@ -288,11 +279,9 @@ async def upload_plugin(
                     plugin_name = filename[:-4]  # 移除 .zip 后缀
                     target_path = PLUGINS_DIR / plugin_name
                     
+                    # 如果目标目录已存在，先删除旧目录以支持覆盖
                     if target_path.exists():
-                        raise HTTPException(
-                            status_code=409, 
-                            detail=f"Plugin directory '{plugin_name}' already exists"
-                        )
+                        shutil.rmtree(target_path, ignore_errors=True)
                     
                     target_path.mkdir(parents=True, exist_ok=True)
                     

@@ -207,5 +207,3 @@ def _apply_overrides(
                 _deep_merge(payload[key], value)
             else:
                 payload[key] = value
-
-    logger.debug(f"[passthrough] overrides applied for model={request_model}, upstream={original_model}")

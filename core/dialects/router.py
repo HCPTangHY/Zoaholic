@@ -136,7 +136,7 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
             original_headers=headers,
         )
 
-        if resp.headers.get("x-zoaholic-passthrough") == "1":
+        if resp.headers.get("x-zoaholic-passthrough"):
             return resp
 
         if resp.media_type == "text/event-stream" and hasattr(resp, "body_iterator"):
