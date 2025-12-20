@@ -654,13 +654,17 @@ end_of_line = "\n\n"
 # end_of_line = "\r"
 # end_of_line = "\n"
 
-async def generate_sse_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, stop=None):
+async def generate_sse_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, stop=None, thought_signature=None):
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
 
     delta_content = {"role": "assistant", "content": content} if content else {}
     if reasoning_content:
         delta_content = {"role": "assistant", "content": "", "reasoning_content": reasoning_content}
+    
+    # 注入签名信息到 delta
+    if thought_signature:
+        delta_content["thought_signature"] = thought_signature
 
     sample_data = {
         "id": f"chatcmpl-{random_str}",
@@ -681,8 +685,10 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
     if function_call_content:
         sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"function":{"arguments": function_call_content}}]}
     if tools_id and function_call_name:
-        sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"id": tools_id,"type":"function","function":{"name": function_call_name, "arguments":""}}]}
-        # sample_data["choices"][0]["delta"] = {"tool_calls":[{"index":0,"function":{"id": tools_id, "name": function_call_name}}]}
+        tc = {"index": 0, "id": tools_id, "type": "function", "function": {"name": function_call_name, "arguments": ""}}
+        if thought_signature:
+            tc["extra_content"] = {"google": {"thoughtSignature": thought_signature}}
+        sample_data["choices"][0]["delta"] = {"tool_calls": [tc]}
     if role:
         sample_data["choices"][0]["delta"] = {"role": role, "content": ""}
     if total_tokens:
@@ -700,7 +706,7 @@ async def generate_sse_response(timestamp, model, content=None, tools_id=None, f
 
     return sse_response
 
-async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, image_base64=None):
+async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, image_base64=None, thought_signature=None):
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
     message = {
@@ -710,6 +716,9 @@ async def generate_no_stream_response(timestamp, model, content=None, tools_id=N
     }
     if reasoning_content:
         message["reasoning_content"] = reasoning_content
+    
+    if thought_signature:
+        message["thought_signature"] = thought_signature
 
     sample_data = {
         "id": f"chatcmpl-{random_str}",
@@ -752,7 +761,8 @@ async def generate_no_stream_response(timestamp, model, content=None, tools_id=N
                             "function": {
                                 "name": function_call_name,
                                 "arguments": arguments_json
-                            }
+                            },
+                            "extra_content": {"google": {"thoughtSignature": thought_signature}} if thought_signature else None
                         }
                     ],
                     "refusal": None

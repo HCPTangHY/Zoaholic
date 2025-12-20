@@ -7,7 +7,7 @@ OpenAI 兼容格式本身就是系统 Canonical 形式，因此：
 - endpoints: Chat Completions 端点
 """
 
-from typing import Any, Dict, TYPE_CHECKING
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from core.models import RequestModel
 
