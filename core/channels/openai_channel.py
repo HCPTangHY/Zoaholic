@@ -209,7 +209,7 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
                 payload["tools"].append({
                     "type": "function",
                     "function": {
-                        "name": "googleSearch",
+      "name": "googleSearch",
                         "description": "googleSearch"
                     }
                 })
@@ -223,6 +223,45 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
                 payload[key] = value
 
     return url, headers, payload
+
+
+async def fetch_openai_response(client, url, headers, payload, model, timeout):
+    """处理 OpenAI 兼容 API 的非流式响应"""
+    json_payload = await asyncio.to_thread(json.dumps, payload)
+    response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
+    
+    error_message = await check_response(response, "fetch_openai_response")
+    if error_message:
+        yield error_message
+        return
+
+    response_bytes = await response.aread()
+    response_json = await asyncio.to_thread(json.loads, response_bytes)
+
+    # 兼容原 core/response.py 中的特殊逻辑
+    if "dashscope.aliyuncs.com" in url and "multimodal-generation" in url:
+        content = safe_get(response_json, "output", "choices", 0, "message", "content", 0, default=None)
+        yield content
+    elif "embedContent" in url:
+        content = safe_get(response_json, "embedding", "values", default=[])
+        response_embedContent = {
+            "object": "list",
+            "data": [
+                {
+                    "object": "embedding",
+                    "embedding": content,
+                    "index": 0
+                }
+            ],
+            "model": model,
+            "usage": {
+                "prompt_tokens": 0,
+                "total_tokens": 0
+            }
+        }
+        yield response_embedContent
+    else:
+        yield response_json
 
 
 async def fetch_gpt_response_stream(client, url, headers, payload, model, timeout):
@@ -263,6 +302,12 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
                         done_received = True
                         break
                     line = await asyncio.to_thread(json.loads, result)
+                    
+                    # 检查返回的 JSON 是否包含错误信息
+                    if 'error' in line:
+                        yield {"error": "OpenAI Stream Error", "status_code": 400, "details": line}
+                        return
+                        
                     line['id'] = f"chatcmpl-{random_str}"
 
                     # v1/responses
@@ -427,6 +472,7 @@ def register():
         description="OpenAI 兼容 API",
         request_adapter=get_gpt_payload,
         passthrough_adapter=get_openai_passthrough_meta,
+        response_adapter=fetch_openai_response,
         stream_adapter=fetch_gpt_response_stream,
         models_adapter=fetch_openai_models,
     )

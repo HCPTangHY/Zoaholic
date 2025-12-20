@@ -538,9 +538,40 @@ async def error_handling_wrapper(
 
         if isinstance(first_item_str, dict) and 'error' in first_item_str and first_item_str.get('error') != {"message": "","type": "","param": "","code": None}:
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException
-            status_code = first_item_str.get('status_code', 500)
-            detail = first_item_str.get('details', f"{first_item_str}")
-            raise HTTPException(status_code=status_code, detail=f"{detail}"[:5000])  # 增加错误信息长度限制
+            status_code = first_item_str.get('status_code')
+            detail = first_item_str.get('details')
+            
+            error_obj = first_item_str.get('error')
+            
+            # 针对 check_response 返回的格式进行深度提取
+            if isinstance(detail, dict) and 'error' in detail:
+                inner_error = detail.get('error')
+                if isinstance(inner_error, dict):
+                    detail = inner_error.get('message') or detail
+                elif isinstance(inner_error, str):
+                    detail = inner_error
+            
+            # 针对标准的 OpenAI 错误格式 { "error": { "message": "...", "code": ... } }
+            if not detail and isinstance(error_obj, dict):
+                detail = error_obj.get('message')
+                if not status_code:
+                    status_code = error_obj.get('code')
+            
+            if not detail:
+                detail = str(first_item_str)
+                
+            if not status_code:
+                status_code = 400
+            
+            # 确保 status_code 是有效的 HTTP 状态码
+            try:
+                status_code = int(status_code)
+                if status_code < 100 or status_code > 599:
+                    status_code = 400
+            except (TypeError, ValueError):
+                status_code = 400
+            
+            raise HTTPException(status_code=status_code, detail=f"{detail}"[:5000])
 
         if isinstance(first_item_str, dict) and safe_get(first_item_str, "choices", 0, "error", default=None):
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException

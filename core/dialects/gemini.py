@@ -275,6 +275,20 @@ async def render_gemini_stream(canonical_sse_chunk: str) -> str:
     return f"data: {json.dumps(gemini_chunk, ensure_ascii=False)}\n\n"
 
 
+def parse_gemini_usage(data: Any) -> Optional[Dict[str, int]]:
+    """从 Gemini 格式中提取 usage"""
+    if not isinstance(data, dict):
+        return None
+    usage = data.get("usageMetadata")
+    if usage:
+        prompt = usage.get("promptTokenCount", 0)
+        completion = usage.get("candidatesTokenCount", 0)
+        total = usage.get("totalTokenCount", prompt + completion)
+        if prompt or completion:
+            return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+    return None
+
+
 # ============== 自定义端点处理函数 ==============
 
 
@@ -315,6 +329,7 @@ def register() -> None:
             parse_request=parse_gemini_request,
             render_response=render_gemini_response,
             render_stream=render_gemini_stream,
+            parse_usage=parse_gemini_usage,
             target_engine="gemini",
             extract_token=extract_gemini_token,
             endpoints=[

@@ -82,6 +82,30 @@ async def get_cloudflare_payload(request, engine, provider, api_key=None):
     return url, headers, payload
 
 
+async def fetch_cloudflare_response(client, url, headers, payload, model, timeout):
+    """处理 Cloudflare Workers AI 非流式响应"""
+    json_payload = await asyncio.to_thread(json.dumps, payload)
+    response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
+    
+    error_message = await check_response(response, "fetch_cloudflare_response")
+    if error_message:
+        yield error_message
+        return
+
+    response_bytes = await response.aread()
+    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    
+    # Cloudflare Workers AI 返回格式通常是 {"result": {"response": "..."}}
+    # 我们将其转换为 OpenAI 兼容格式
+    from ..utils import generate_no_stream_response
+    content = response_json.get("result", {}).get("response", "")
+    timestamp = int(datetime.timestamp(datetime.now()))
+    
+    yield await generate_no_stream_response(
+        timestamp, model, content=content, role="assistant"
+    )
+
+
 async def fetch_cloudflare_response_stream(client, url, headers, payload, model, timeout):
     """处理 Cloudflare Workers AI 流式响应"""
     from ..log_config import logger
@@ -133,5 +157,6 @@ def register():
         auth_header="Authorization: Bearer {api_key}",
         description="Cloudflare Workers AI",
         request_adapter=get_cloudflare_payload,
+        response_adapter=fetch_cloudflare_response,
         stream_adapter=fetch_cloudflare_response_stream,
     )

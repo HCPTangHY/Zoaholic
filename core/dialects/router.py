@@ -31,34 +31,6 @@ async def _read_response_bytes(resp: "Response") -> bytes:
     return getattr(resp, "body", None) or b""
 
 
-def _update_usage_from_openai_chunk(current_info: Dict[str, Any], chunk_text: str) -> None:
-    """从 Canonical(OpenAI) chunk 中提取 token 统计"""
-    if not isinstance(chunk_text, str):
-        return
-    from core.utils import safe_get
-    for line in chunk_text.split("\n"):
-        line = line.strip()
-        if not line or line.startswith(":"):
-            continue
-        if line.startswith("data:"):
-            line = line[5:].strip()
-        if not line or line.startswith("[DONE]") or line.startswith("OK"):
-            continue
-        try:
-            resp_json = json.loads(line)
-            input_tokens = safe_get(resp_json, "message", "usage", "input_tokens", default=0)
-            if not input_tokens:
-                input_tokens = safe_get(resp_json, "usage", "prompt_tokens", default=0)
-            output_tokens = safe_get(resp_json, "usage", "completion_tokens", default=0)
-            total_tokens = (input_tokens or 0) + (output_tokens or 0)
-            if total_tokens:
-                current_info["prompt_tokens"] = input_tokens or 0
-                current_info["completion_tokens"] = output_tokens or 0
-                current_info["total_tokens"] = total_tokens
-        except Exception:
-            continue
-
-
 def _create_dialect_verify_api_key(dialect_id: str):
     """为方言创建 API key 验证依赖"""
     from core.auth import security, _extract_token
@@ -136,7 +108,7 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
             original_headers=headers,
         )
 
-        if resp.headers.get("x-zoaholic-passthrough"):
+        if resp.headers.get("x-zoaholic-passthrough") or resp.status_code != 200:
             return resp
 
         if resp.media_type == "text/event-stream" and hasattr(resp, "body_iterator"):
@@ -147,29 +119,33 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
             async def convert_stream():
                 async for chunk in resp.body_iterator:
                     chunk_text = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
-                    _update_usage_from_openai_chunk(current_info, chunk_text)
                     converted = await dialect.render_stream(chunk_text) if dialect.render_stream else chunk_text
                     if converted:
                         yield converted
 
             return LoggingStreamingResponse(convert_stream(), media_type="text/event-stream",
-                                            current_info=current_info, app=app, debug=debug)
+                                            current_info=current_info, app=app, debug=debug,
+                                            dialect_id=dialect_id)
 
         body_bytes = await _read_response_bytes(resp)
+        body_text = body_bytes.decode("utf-8") if body_bytes else "{}"
+        
         try:
-            canonical_json = json.loads(body_bytes.decode("utf-8") or "{}")
+            canonical_json = json.loads(body_text)
         except Exception:
             canonical_json = {}
 
-        converted_json = await dialect.render_response(canonical_json, canonical_request.model) if dialect.render_response else canonical_json
         current_info = getattr(resp, "current_info", {}) or {}
+        
+        converted_json = await dialect.render_response(canonical_json, canonical_request.model) if dialect.render_response else canonical_json
 
         async def converted_iter():
             yield json.dumps(converted_json, ensure_ascii=False)
 
         return LoggingStreamingResponse(converted_iter(), media_type="application/json",
                                         current_info=current_info, app=getattr(resp, "app", None),
-                                        debug=getattr(resp, "debug", False))
+                                        debug=getattr(resp, "debug", False),
+                                        dialect_id=dialect_id)
 
     return handler
 

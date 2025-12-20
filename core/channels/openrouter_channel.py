@@ -91,6 +91,21 @@ async def get_openrouter_payload(request, engine, provider, api_key=None):
     return url, headers, payload
 
 
+async def fetch_openrouter_response(client, url, headers, payload, model, timeout):
+    """处理 OpenRouter 非流式响应"""
+    json_payload = await asyncio.to_thread(json.dumps, payload)
+    response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
+    
+    error_message = await check_response(response, "fetch_openrouter_response")
+    if error_message:
+        yield error_message
+        return
+
+    response_bytes = await response.aread()
+    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    yield response_json
+
+
 async def fetch_openrouter_response_stream(client, url, headers, payload, model, timeout):
     """处理 OpenRouter 流式响应"""
     from ..log_config import logger
@@ -199,6 +214,7 @@ def register():
         auth_header="Authorization: Bearer {api_key}",
         description="OpenRouter (Multi-provider gateway)",
         request_adapter=get_openrouter_payload,
+        response_adapter=fetch_openrouter_response,
         stream_adapter=fetch_openrouter_response_stream,
         models_adapter=fetch_openrouter_models,
     )

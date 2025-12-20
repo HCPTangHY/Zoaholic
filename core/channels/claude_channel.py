@@ -14,6 +14,7 @@ from ..utils import (
     get_model_dict,
     get_base64_image,
     generate_sse_response,
+    generate_no_stream_response,
     end_of_line,
 )
 from ..response import check_response
@@ -215,7 +216,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
 
     miss_fields = [
         'model',
-        'messages',
+       'messages',
         'presence_penalty',
         'frequency_penalty',
         'n',
@@ -291,6 +292,40 @@ async def get_claude_payload(request, engine, provider, api_key=None):
     return url, headers, payload
 
 
+async def fetch_claude_response(client, url, headers, payload, model, timeout):
+    """处理 Claude 非流式响应"""
+    timestamp = int(datetime.timestamp(datetime.now()))
+    json_payload = await asyncio.to_thread(json.dumps, payload)
+    response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
+    
+    error_message = await check_response(response, "fetch_claude_response")
+    if error_message:
+        yield error_message
+        return
+
+    response_bytes = await response.aread()
+    response_json = await asyncio.to_thread(json.loads, response_bytes)
+
+    content = safe_get(response_json, "content", 0, "text")
+
+    prompt_tokens = safe_get(response_json, "usage", "input_tokens")
+    output_tokens = safe_get(response_json, "usage", "output_tokens")
+    total_tokens = (prompt_tokens or 0) + (output_tokens or 0)
+
+    role = safe_get(response_json, "role")
+
+    function_call_name = safe_get(response_json, "content", 1, "name", default=None)
+    function_call_content = safe_get(response_json, "content", 1, "input", default=None)
+    tools_id = safe_get(response_json, "content", 1, "id", default=None)
+
+    yield await generate_no_stream_response(
+        timestamp, model, content=content, tools_id=tools_id, 
+        function_call_name=function_call_name, function_call_content=function_call_content, 
+        role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, 
+        completion_tokens=output_tokens
+    )
+
+
 async def fetch_claude_response_stream(client, url, headers, payload, model, timeout):
     """处理 Claude 流式响应"""
     timestamp = int(datetime.timestamp(datetime.now()))
@@ -354,6 +389,7 @@ def register():
         auth_header="x-api-key: {api_key}",
         description="Anthropic Claude API",
         request_adapter=get_claude_payload,
+        response_adapter=fetch_claude_response,
         stream_adapter=fetch_claude_response_stream,
-        models_adapter=None,  # Claude 不提供公开的模型列表 API
+        models_adapter=None,
     )

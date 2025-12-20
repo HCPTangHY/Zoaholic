@@ -1565,6 +1565,7 @@ Object.assign(ConfigView, {
         modelSection.appendChild(modelChipsContainer);
 
         // 手动输入模型：多个用逗号或空格分隔
+        const manualInputRow = UI.el("div", "flex items-start gap-2 mb-4");
         const manualInputWrap = UI.textField(
             "手动输入模型名称",
             "例如 gpt-4o mini, claude-3-sonnet 或用空格分隔",
@@ -1575,6 +1576,8 @@ Object.assign(ConfigView, {
                 variant: "outlined"
             }
         );
+        manualInputWrap.wrapper.classList.remove("mb-4");
+        manualInputWrap.wrapper.classList.add("flex-1");
         const manualInput = manualInputWrap.input;
 
         const applyManualInput = () => {
@@ -1611,7 +1614,12 @@ Object.assign(ConfigView, {
             }
         });
 
-        modelSection.appendChild(manualInputWrap.wrapper);
+        const addManualBtn = UI.btn("添加", applyManualInput, "tonal", "add");
+        addManualBtn.style.marginTop = "4px"; // 稍微向下偏移以对齐输入框
+
+        manualInputRow.appendChild(manualInputWrap.wrapper);
+        manualInputRow.appendChild(addManualBtn);
+        modelSection.appendChild(manualInputRow);
         form.appendChild(modelSection);
         
         // 获取模型 - 打开模态框

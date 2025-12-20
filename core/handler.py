@@ -350,9 +350,35 @@ async def _passthrough_error_wrapper(generator, channel_id):
                 
                 # 检查是否是错误响应
                 if isinstance(chunk, dict) and 'error' in chunk:
+                    status_code = chunk.get('status_code', 500)
+                    detail = chunk.get('details')
+                    error_obj = chunk.get('error')
+                    
+                    if isinstance(detail, dict) and 'error' in detail:
+                        inner = detail.get('error')
+                        if isinstance(inner, dict):
+                            detail = inner.get('message') or detail
+                        elif isinstance(inner, str):
+                            detail = inner
+                    
+                    if not detail and isinstance(error_obj, dict):
+                        detail = error_obj.get('message')
+                        if not status_code or status_code == 500:
+                            status_code = error_obj.get('code') or status_code
+                    
+                    if not detail:
+                        detail = str(chunk)
+                        
+                    try:
+                        status_code = int(status_code)
+                        if status_code < 100 or status_code > 599:
+                            status_code = 500
+                    except (TypeError, ValueError):
+                        status_code = 500
+                        
                     raise HTTPException(
-                        status_code=chunk.get('status_code', 500),
-                        detail=str(chunk.get('details', chunk))
+                        status_code=status_code,
+                        detail=str(detail)
                     )
             
             yield chunk
@@ -442,6 +468,7 @@ async def process_request_passthrough(
 
     current_info = request_info_getter()
     channel_id = f"{provider['provider']}"
+    current_info["dialect_id"] = passthrough_ctx.dialect_id
 
     if current_info.get("raw_data_expires_at"):
         safe_upstream_headers = {

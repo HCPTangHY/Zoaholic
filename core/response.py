@@ -8,12 +8,11 @@
 import json
 import asyncio
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Any
 
 from .log_config import logger
 from .middleware import request_info
-from .utils import safe_get, generate_sse_response, generate_no_stream_response, end_of_line, truncate_for_logging
-from .plugins.interceptors import apply_response_interceptors
+from .utils import safe_get, truncate_for_logging
 
 
 async def check_response(response, error_log):
@@ -58,16 +57,9 @@ async def check_response(response, error_log):
 def _wrap_response_aiter_text(response):
     """
     包装 httpx response 的 aiter_text 方法，自动记录上游原始响应
-    
-    这是一个内部函数，通过 monkey-patch response.aiter_text 实现
-    不需要修改任何 channel adapter 代码
-    
-    Args:
-        response: httpx 响应对象
     """
     original_aiter_text = response.aiter_text
     
-    # 在包装时就捕获 current_info，避免异步生成器迭代时上下文丢失
     try:
         captured_info = request_info.get()
     except Exception:
@@ -86,7 +78,6 @@ def _wrap_response_aiter_text(response):
         
         try:
             async for chunk in original_aiter_text():
-                # 记录原始上游响应
                 if total_size < max_size:
                     upstream_chunks.append(chunk)
                     total_size += len(chunk.encode('utf-8'))
@@ -98,20 +89,16 @@ def _wrap_response_aiter_text(response):
             logger.error(f"Error during upstream response iteration: {str(e)}")
             raise
         finally:
-            # 使用 finally 确保在任何情况下都保存数据（包括客户端断开连接）
             if upstream_chunks and captured_info:
                 try:
                     upstream_response = "".join(upstream_chunks)
-                    # 使用深度截断，保留结构同时限制大小
                     captured_info["upstream_response_body"] = truncate_for_logging(upstream_response)
                 except Exception as e:
                     logger.error(f"Error saving upstream response body: {str(e)}")
     
-    # 替换原始方法
     try:
         response.aiter_text = logging_aiter_text
     except AttributeError:
-        # 如果 response 使用 __slots__，尝试使用 object.__setattr__
         try:
             object.__setattr__(response, 'aiter_text', logging_aiter_text)
         except Exception as e:
@@ -121,9 +108,6 @@ def _wrap_response_aiter_text(response):
 def _save_upstream_response_for_non_stream(response):
     """
     保存非流式响应的原始上游响应体
-    
-    Args:
-        response: httpx 响应对象（已读取完毕）
     """
     try:
         captured_info = request_info.get()
@@ -134,9 +118,7 @@ def _save_upstream_response_for_non_stream(response):
         return
     
     try:
-        # 非流式响应的内容已经存储在 response._content 中
         if hasattr(response, '_content') and response._content:
-            # 使用深度截断，保留结构同时限制大小
             captured_info["upstream_response_body"] = truncate_for_logging(response._content)
     except Exception as e:
         logger.error(f"Error saving upstream response for non-stream: {str(e)}")
@@ -144,153 +126,37 @@ def _save_upstream_response_for_non_stream(response):
 
 async def fetch_response(client, url, headers, payload, engine, model, timeout=200):
     """
-    处理非流式 API 响应
-    
-    Args:
-        client: httpx 异步客户端
-        url: 请求 URL
-        headers: 请求头
-        payload: 请求体
-        engine: 引擎类型
-        model: 模型名称
-        timeout: 超时时间
-        
-    Yields:
-        响应数据
+    处理非流式 API 响应，通过渠道适配器进行分发
     """
-    response = None
+    from .channels import get_channel
+    
+    channel = get_channel(engine)
+    if channel and channel.response_adapter:
+        async for chunk in channel.response_adapter(client, url, headers, payload, model, timeout):
+            # 如果适配器返回的是字典且包含 error，则它是一个预处理过的错误
+            if isinstance(chunk, dict) and "error" in chunk:
+                yield chunk
+                return
+            yield chunk
+        return
+
+    # 回退逻辑：如果渠道没有适配器，执行默认的 OpenAI 兼容逻辑
     if payload.get("file"):
         file = payload.pop("file")
         response = await client.post(url, headers=headers, data=payload, files={"file": file}, timeout=timeout)
     else:
         json_payload = await asyncio.to_thread(json.dumps, payload)
         response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
-    error_message = await check_response(response, "fetch_response")
+    
+    error_message = await check_response(response, "fetch_response_fallback")
     if error_message:
         yield error_message
         return
     
-    # 对于非流式响应，直接记录原始响应体
     _save_upstream_response_for_non_stream(response)
-
+    
     if engine == "tts":
         yield response.read()
-
-    elif engine == "gemini" or engine == "vertex-gemini" or engine == "aws":
-        response_bytes = await response.aread()
-        response_json = await asyncio.to_thread(json.loads, response_bytes)
-
-        if isinstance(response_json, str):
-            import ast
-            parsed_data = ast.literal_eval(str(response_json))
-        elif isinstance(response_json, list):
-            parsed_data = response_json
-        elif isinstance(response_json, dict):
-            parsed_data = [response_json]
-        else:
-            logger.error(f"error fetch_response: Unknown response_json type: {type(response_json)}")
-            parsed_data = response_json
-
-        content = ""
-        reasoning_content = ""
-        image_base64 = ""
-        parts_list = safe_get(parsed_data, 0, "candidates", 0, "content", "parts", default=[])
-        for item in parts_list:
-            chunk = safe_get(item, "text")
-            b64_json = safe_get(item, "inlineData", "data", default="")
-            if b64_json:
-                image_base64 = b64_json
-            is_think = safe_get(item, "thought", default=False)
-            if chunk:
-                if is_think:
-                    reasoning_content += chunk
-                else:
-                    content += chunk
-
-        usage_metadata = safe_get(parsed_data, -1, "usageMetadata")
-        prompt_tokens = safe_get(usage_metadata, "promptTokenCount", default=0)
-        candidates_tokens = safe_get(usage_metadata, "candidatesTokenCount", default=0)
-        total_tokens = safe_get(usage_metadata, "totalTokenCount", default=0)
-
-        role = safe_get(parsed_data, -1, "candidates", 0, "content", "role")
-        if role == "model":
-            role = "assistant"
-        else:
-            logger.error(f"Unknown role: {role}, parsed_data: {parsed_data}")
-            role = "assistant"
-
-        has_think = safe_get(parsed_data, 0, "candidates", 0, "content", "parts", 0, "thought", default=False)
-        if has_think:
-            function_message_parts_index = -1
-        else:
-            function_message_parts_index = 0
-        function_call_name = safe_get(parsed_data, -1, "candidates", 0, "content", "parts", function_message_parts_index, "functionCall", "name", default=None)
-        function_call_content = safe_get(parsed_data, -1, "candidates", 0, "content", "parts", function_message_parts_index, "functionCall", "args", default=None)
-
-        timestamp = int(datetime.timestamp(datetime.now()))
-        yield await generate_no_stream_response(timestamp, model, content=content, tools_id=None, function_call_name=function_call_name, function_call_content=function_call_content, role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=candidates_tokens, reasoning_content=reasoning_content, image_base64=image_base64)
-
-    elif engine == "claude" or engine == "vertex-claude":
-        response_bytes = await response.aread()
-        response_json = await asyncio.to_thread(json.loads, response_bytes)
-
-        content = safe_get(response_json, "content", 0, "text")
-
-        prompt_tokens = safe_get(response_json, "usage", "input_tokens")
-        output_tokens = safe_get(response_json, "usage", "output_tokens")
-        total_tokens = prompt_tokens + output_tokens
-
-        role = safe_get(response_json, "role")
-
-        function_call_name = safe_get(response_json, "content", 1, "name", default=None)
-        function_call_content = safe_get(response_json, "content", 1, "input", default=None)
-        tools_id = safe_get(response_json, "content", 1, "id", default=None)
-
-        timestamp = int(datetime.timestamp(datetime.now()))
-        yield await generate_no_stream_response(timestamp, model, content=content, tools_id=tools_id, function_call_name=function_call_name, function_call_content=function_call_content, role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=output_tokens)
-
-    elif engine == "azure":
-        response_bytes = await response.aread()
-        response_json = await asyncio.to_thread(json.loads, response_bytes)
-        # 删除 content_filter_results
-        if "choices" in response_json:
-            for choice in response_json["choices"]:
-                if "content_filter_results" in choice:
-                    del choice["content_filter_results"]
-
-        # 删除 prompt_filter_results
-        if "prompt_filter_results" in response_json:
-            del response_json["prompt_filter_results"]
-
-        yield response_json
-
-    elif "dashscope.aliyuncs.com" in url and "multimodal-generation" in url:
-        response_bytes = await response.aread()
-        response_json = await asyncio.to_thread(json.loads, response_bytes)
-        content = safe_get(response_json, "output", "choices", 0, "message", "content", 0, default=None)
-        yield content
-
-    elif "embedContent" in url:
-        response_bytes = await response.aread()
-        response_json = await asyncio.to_thread(json.loads, response_bytes)
-        content = safe_get(response_json, "embedding", "values", default=[])
-        response_embedContent = {
-            "object": "list",
-            "data": [
-                {
-                    "object": "embedding",
-                    "embedding": content,
-                    "index": 0
-                }
-            ],
-            "model": model,
-            "usage": {
-                "prompt_tokens": 0,
-                "total_tokens": 0
-            }
-        }
-
-        yield response_embedContent
     else:
         response_bytes = await response.aread()
         response_json = await asyncio.to_thread(json.loads, response_bytes)
@@ -309,27 +175,19 @@ async def fetch_response_stream(
 ):
     """
     通过渠道注册中心获取流式响应适配器并处理响应流
-    
-    Args:
-        client: httpx 异步客户端
-        url: 请求 URL
-        headers: 请求头
-        payload: 请求体
-        engine: 引擎类型
-        model: 模型名称
-        timeout: 超时时间
-        enabled_plugins: 该渠道启用的插件列表（用于过滤响应拦截器）
-        
-    Yields:
-        SSE 格式的响应数据
     """
     from .channels import get_channel
+    from .plugins.interceptors import apply_response_interceptors
     
     channel = get_channel(engine)
     if channel and channel.stream_adapter:
-        # 上游原始响应通过 check_response 中的 _wrap_response_aiter_text 自动记录
         async for chunk in channel.stream_adapter(client, url, headers, payload, model, timeout):
-            # 应用响应拦截器（插件可在此修改响应内容）
+            # 如果适配器返回的是字典且包含 error，则它是一个预处理过的错误
+            if isinstance(chunk, dict) and "error" in chunk:
+                yield chunk
+                continue
+                
+            # 应用响应拦截器
             chunk = await apply_response_interceptors(chunk, engine, model, is_stream=True, enabled_plugins=enabled_plugins)
             yield chunk
         

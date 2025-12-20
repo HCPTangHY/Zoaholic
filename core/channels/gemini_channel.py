@@ -373,7 +373,7 @@ async def gemini_json_process(response_json):
     image_base64 = None
 
     json_data = safe_get(response_json, "candidates", 0, "content", default=None)
-    finishReason = safe_get(response_json, "candidates", 0 , "finishReason", default=None)
+    finishReason = safe_get(response_json, "candidates", 0, "finishReason", default=None)
     if finishReason:
         promptTokenCount = safe_get(response_json, "usageMetadata", "promptTokenCount", default=0)
         candidatesTokenCount = safe_get(response_json, "usageMetadata", "candidatesTokenCount", default=0)
@@ -394,9 +394,93 @@ async def gemini_json_process(response_json):
     function_full_response = safe_get(json_data, "parts", 0, "functionCall", "args", default="")
     function_full_response = await asyncio.to_thread(json.dumps, function_full_response) if function_full_response else None
 
-    blockReason = safe_get(json_data, 0, "promptFeedback", "blockReason", default=None)
+    #提取 blockReason
+    blockReason = safe_get(response_json, "promptFeedback", "blockReason", default=None)
+    if not blockReason:
+        blockReason = safe_get(response_json, "candidates", 0, "blockReason", default=None)
 
     return is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount
+
+
+async def fetch_gemini_response(client, url, headers, payload, model, timeout):
+    """处理 Gemini 非流式响应"""
+    timestamp = int(datetime.timestamp(datetime.now()))
+    json_payload = await asyncio.to_thread(json.dumps, payload)
+    response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
+    
+    error_message = await check_response(response, "fetch_gemini_response")
+    if error_message:
+        yield error_message
+        return
+
+    response_bytes = await response.aread()
+    response_json = await asyncio.to_thread(json.loads, response_bytes)
+
+    if isinstance(response_json, str):
+        import ast
+        parsed_data = ast.literal_eval(str(response_json))
+    elif isinstance(response_json, list):
+        parsed_data = response_json
+    elif isinstance(response_json, dict):
+        parsed_data = [response_json]
+    else:
+        parsed_data = response_json
+
+    # 检查 blockReason
+    if isinstance(parsed_data, list) and len(parsed_data) > 0:
+        first_resp = parsed_data[0]
+        is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount = await gemini_json_process(first_resp)
+        
+        if blockReason and blockReason != "STOP":
+            yield {"error": f"Gemini Blocked: {blockReason}", "status_code": 400, "details": first_resp}
+            return
+        
+        if not safe_get(first_resp, "candidates") and blockReason:
+            yield {"error": f"Gemini Blocked: {blockReason}", "status_code": 400, "details": first_resp}
+            return
+
+    content = ""
+    reasoning_content = ""
+    image_base64 = ""
+    parts_list = safe_get(parsed_data, 0, "candidates", 0, "content", "parts", default=[])
+    for item in parts_list:
+        chunk = safe_get(item, "text")
+        b64_json = safe_get(item, "inlineData", "data", default="")
+        if b64_json:
+            image_base64 = b64_json
+        is_think = safe_get(item, "thought", default=False)
+        if chunk:
+            if is_think:
+                reasoning_content += chunk
+            else:
+                content += chunk
+
+    usage_metadata = safe_get(parsed_data, -1, "usageMetadata")
+    prompt_tokens = safe_get(usage_metadata, "promptTokenCount", default=0)
+    candidates_tokens = safe_get(usage_metadata, "candidatesTokenCount", default=0)
+    total_tokens = safe_get(usage_metadata, "totalTokenCount", default=0)
+
+    role = safe_get(parsed_data, -1, "candidates", 0, "content", "role")
+    if role == "model":
+        role = "assistant"
+    elif not role:
+        role = "assistant"
+
+    has_think = safe_get(parsed_data, 0, "candidates", 0, "content", "parts", 0, "thought", default=False)
+    if has_think:
+        function_message_parts_index = -1
+    else:
+        function_message_parts_index = 0
+    function_call_name = safe_get(parsed_data, -1, "candidates", 0, "content", "parts", function_message_parts_index, "functionCall", "name", default=None)
+    function_call_content = safe_get(parsed_data, -1, "candidates", 0, "content", "parts", function_message_parts_index, "functionCall", "args", default=None)
+
+    yield await generate_no_stream_response(
+        timestamp, model, content=content, tools_id=None, 
+        function_call_name=function_call_name, function_call_content=function_call_content, 
+        role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, 
+        completion_tokens=candidates_tokens, reasoning_content=reasoning_content, 
+        image_base64=image_base64
+    )
 
 
 async def fetch_gemini_response_stream(client, url, headers, payload, model, timeout):
@@ -459,9 +543,12 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
                     sse_string = await generate_sse_response(timestamp, model, content=None, tools_id="chatcmpl-9inWv0yEtgn873CxMBzHeCeiHctTV", function_call_name=None, function_call_content=function_full_response)
                     yield sse_string
 
-                if parts_json == "[]" or blockReason == "PROHIBITED_CONTENT":
-                    sse_string = await generate_sse_response(timestamp, model, stop="PROHIBITED_CONTENT")
-                    yield sse_string
+                if parts_json == "[]" or (blockReason and blockReason != "STOP"):
+                    yield {"error": f"Gemini Blocked: {blockReason or 'Empty Response'}", "status_code": 400, "details": response_json}
+                    return
+                elif finishReason and finishReason != "STOP":
+                    yield {"error": f"Gemini Finish Reason: {finishReason}", "status_code": 400, "details": response_json}
+                    return
                 elif finishReason:
                     sse_string = await generate_sse_response(timestamp, model, stop="stop")
                     yield sse_string
@@ -518,6 +605,7 @@ def register():
         auth_header="x-goog-api-key: {api_key}",
         description="Google Gemini API",
         request_adapter=get_gemini_payload,
+        response_adapter=fetch_gemini_response,
         stream_adapter=fetch_gemini_response_stream,
         models_adapter=fetch_gemini_models,
     )

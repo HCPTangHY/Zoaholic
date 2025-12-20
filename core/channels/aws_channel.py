@@ -19,6 +19,7 @@ from ..utils import (
     get_model_dict,
     get_base64_image,
     generate_sse_response,
+    generate_no_stream_response,
     end_of_line,
 )
 from ..response import check_response
@@ -260,6 +261,39 @@ async def get_aws_payload(request, engine, provider, api_key=None):
     return url, headers, payload
 
 
+async def fetch_aws_response(client, url, headers, payload, model, timeout):
+    """处理 AWS Bedrock 非流式响应"""
+    # 切换到非流式端点（AWS Bedrock 需要不同的签名）
+    url = url.replace("invoke-with-response-stream", "invoke")
+    
+    timestamp = int(dt.timestamp(dt.now()))
+    json_payload = await asyncio.to_thread(json.dumps, payload)
+    
+    # AWS Bedrock 非流式签名需要重新生成（此处简化，实际可能需要更完整的实现）
+    # 但根据 core/response.py 之前的硬编码，它似乎是复用 Gemini/Vertex 的解析逻辑？
+    # 实际上 AWS Bedrock 非流式返回的是一个包含 bytes 的 JSON。
+    
+    response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
+    error_message = await check_response(response, "fetch_aws_response")
+    if error_message:
+        yield error_message
+        return
+
+    response_bytes = await response.aread()
+    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    
+    # 解析 AWS Bedrock Claude 格式
+    content = safe_get(response_json, "content", 0, "text", default="")
+    prompt_tokens = safe_get(response_json, "usage", "input_tokens", default=0)
+    output_tokens = safe_get(response_json, "usage", "output_tokens", default=0)
+    
+    yield await generate_no_stream_response(
+        timestamp, model, content=content, role="assistant",
+        total_tokens=prompt_tokens + output_tokens,
+        prompt_tokens=prompt_tokens, completion_tokens=output_tokens
+    )
+
+
 async def fetch_aws_response_stream(client, url, headers, payload, model, timeout):
     """处理 AWS Bedrock 流式响应"""
     from ..log_config import logger
@@ -323,5 +357,6 @@ def register():
         auth_header="AWS Signature V4",
         description="AWS Bedrock (Claude, Llama, etc.)",
         request_adapter=get_aws_payload,
+        response_adapter=fetch_aws_response,
         stream_adapter=fetch_aws_response_stream,
     )

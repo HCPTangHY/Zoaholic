@@ -141,6 +141,32 @@ async def get_azure_payload(request, engine, provider, api_key=None):
     return url, headers, payload
 
 
+async def fetch_azure_response(client, url, headers, payload, model, timeout):
+    """处理 Azure OpenAI 非流式响应"""
+    json_payload = await asyncio.to_thread(json.dumps, payload)
+    response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
+    
+    error_message = await check_response(response, "fetch_azure_response")
+    if error_message:
+        yield error_message
+        return
+
+    response_bytes = await response.aread()
+    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    
+    # 删除 content_filter_results
+    if "choices" in response_json:
+        for choice in response_json["choices"]:
+            if "content_filter_results" in choice:
+                del choice["content_filter_results"]
+
+    # 删除 prompt_filter_results
+    if "prompt_filter_results" in response_json:
+        del response_json["prompt_filter_results"]
+
+    yield response_json
+
+
 async def fetch_azure_response_stream(client, url, headers, payload, model, timeout):
     """处理 Azure OpenAI 流式响应"""
     timestamp = int(datetime.timestamp(datetime.now()))
@@ -211,6 +237,7 @@ def register():
         auth_header="api-key: {api_key}",
         description="Azure OpenAI Service",
         request_adapter=get_azure_payload,
+        response_adapter=fetch_azure_response,
         stream_adapter=fetch_azure_response_stream,
-        models_adapter=None,  # Azure 模型通过部署名称访问，不需要列表 API
+        models_adapter=None,
     )

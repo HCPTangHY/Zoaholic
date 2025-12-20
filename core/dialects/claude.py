@@ -305,6 +305,20 @@ async def render_claude_stream(canonical_sse_chunk: str) -> str:
     return f"event: content_block_delta\ndata: {json.dumps(claude_event, ensure_ascii=False)}\n\n"
 
 
+def parse_claude_usage(data: Any) -> Optional[Dict[str, int]]:
+    """从 Claude 格式中提取 usage"""
+    if not isinstance(data, dict):
+        return None
+    usage = data.get("usage")
+    if usage:
+        prompt = usage.get("input_tokens", 0)
+        completion = usage.get("output_tokens", 0)
+        total = prompt + completion
+        if prompt or completion:
+            return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+    return None
+
+
 def register() -> None:
     """注册 Claude 方言"""
     register_dialect(
@@ -315,6 +329,7 @@ def register() -> None:
             parse_request=parse_claude_request,
             render_response=render_claude_response,
             render_stream=render_claude_stream,
+            parse_usage=parse_claude_usage,
             target_engine="claude",
             endpoints=[
                 # POST /v1/messages - Claude 消息接口

@@ -41,6 +41,23 @@ async def render_openai_stream(canonical_sse_chunk: str) -> str:
     return canonical_sse_chunk
 
 
+def parse_openai_usage(data: Any) -> Optional[Dict[str, int]]:
+    """从 OpenAI 格式中提取 usage"""
+    if not isinstance(data, dict):
+        return None
+    usage = data.get("usage")
+    if not usage:
+        usage = data.get("message", {}).get("usage")
+    
+    if usage:
+        prompt = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+        completion = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+        total = usage.get("total_tokens") or (prompt + completion)
+        if prompt or completion:
+            return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+    return None
+
+
 # ============== 自定义端点处理函数 ==============
 
 
@@ -77,6 +94,7 @@ def register() -> None:
             parse_request=parse_openai_request,
             render_response=render_openai_response,
             render_stream=render_openai_stream,
+            parse_usage=parse_openai_usage,
             target_engine="openai",
             endpoints=[
                 # POST /v1/chat/completions - Chat Completions

@@ -34,6 +34,7 @@ class LoggingStreamingResponse(Response):
         current_info=None,
         app=None,
         debug=False,
+        dialect_id=None,
     ):
         super().__init__(content=None, status_code=status_code, headers=headers, media_type=media_type)
         self.body_iterator = content
@@ -41,6 +42,7 @@ class LoggingStreamingResponse(Response):
         self.current_info = current_info or {}
         self.app = app
         self.debug = debug
+        self.dialect_id = dialect_id or self.current_info.get("dialect_id")
 
         # Remove Content-Length header if it exists
         if "content-length" in self.headers:
@@ -154,26 +156,36 @@ class LoggingStreamingResponse(Response):
                     resp = await asyncio.to_thread(json.loads, line)
                     
                     # 检测正文开始时间（首个非空 content，不含 reasoning_content）
-                    # 所有渠道的响应已被 channel adapter 转换为 OpenAI 兼容格式
+                    # 注意：如果是在方言转换后，choices 结构可能已变，这里优先支持 OpenAI 风格探测
                     if not content_start_recorded:
-                        content = safe_get(resp, "choices", 0, "delta", "content", default=None)
-                        # 检查是否有实际内容（非空字符串）
-                        if content and content.strip():
-                            self.current_info["content_start_time"] = time() - self.current_info.get("start_time", time())
-                            content_start_recorded = True
+                        choices = resp.get("choices")
+                        if choices and isinstance(choices, list) and len(choices) > 0:
+                            content = safe_get(choices[0], "delta", "content", default=None)
+                            if content and content.strip():
+                                self.current_info["content_start_time"] = time() - self.current_info.get("start_time", time())
+                                content_start_recorded = True
                     
-                    # Claude API 的 usage 字段
-                    input_tokens = safe_get(resp, "message", "usage", "input_tokens", default=0)
-                    # OpenAI 兼容的 usage 字段
-                    if not input_tokens:
-                        input_tokens = safe_get(resp, "usage", "prompt_tokens", default=0)
-                    output_tokens = safe_get(resp, "usage", "completion_tokens", default=0)
-                    total_tokens = input_tokens + output_tokens
+                    # 使用方言注册的 usage 解析方法
+                    from core.dialects.registry import get_dialect
+                    
+                    # 优先使用显式指定的方言，否则从 current_info 获取，默认 openai
+                    d_id = self.dialect_id or self.current_info.get("dialect_id") or "openai"
+                    dialect = get_dialect(d_id)
+                    
+                    usage_info = None
+                    if dialect and dialect.parse_usage:
+                        usage_info = dialect.parse_usage(resp)
+                    
+                    # 如果当前方言未解析出 usage 且不是 openai，尝试用 openai 格式保底（处理 Canonical 转换后的情况）
+                    if not usage_info and d_id != "openai":
+                        o_dialect = get_dialect("openai")
+                        if o_dialect and o_dialect.parse_usage:
+                            usage_info = o_dialect.parse_usage(resp)
 
-                    if total_tokens > 0:
-                        self.current_info["prompt_tokens"] = input_tokens
-                        self.current_info["completion_tokens"] = output_tokens
-                        self.current_info["total_tokens"] = total_tokens
+                    if usage_info:
+                        self.current_info["prompt_tokens"] = usage_info.get("prompt_tokens", 0)
+                        self.current_info["completion_tokens"] = usage_info.get("completion_tokens", 0)
+                        self.current_info["total_tokens"] = usage_info.get("total_tokens", 0)
                 except Exception as e:
                     # 仅在调试模式下记录解析错误，避免正常运行时的噪音
                     if self.debug:

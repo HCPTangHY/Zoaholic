@@ -650,10 +650,10 @@ const LogsView = {
 
     _createDetailRow(log) {
         const tr = UI.el("tr", "detail-row bg-md-surface-container-low");
-        const td = UI.el("td", "px-4 py-4", "");
+        const td = UI.el("td", "px-4 py-4 max-w-0", "");
         td.colSpan = 11;
 
-        const detailContainer = UI.el("div", "flex flex-col gap-4");
+        const detailContainer = UI.el("div", "flex flex-col gap-4 w-full overflow-hidden");
 
         // 基本信息卡片
         const basicInfo = UI.el("div", "grid grid-cols-2 md:grid-cols-4 gap-4");
@@ -796,7 +796,7 @@ const LogsView = {
         header.appendChild(titleEl);
         header.appendChild(icon);
         
-        const content = UI.el("div", "hidden px-4 py-3 border-t border-md-outline-variant");
+        const content = UI.el("div", "hidden px-4 py-3 border-t border-md-outline-variant overflow-x-auto w-full");
         content.appendChild(contentRenderer());
         
         header.onclick = (e) => {
@@ -1022,7 +1022,7 @@ const LogsView = {
     },
 
     _renderResponseBody(responseBody) {
-        const pre = UI.el("pre", "text-body-small font-mono bg-md-surface-container p-3 rounded-md overflow-x-auto max-h-64 overflow-y-auto whitespace-pre-wrap");
+        const pre = UI.el("pre", "text-body-small font-mono bg-md-surface-container p-3 rounded-md overflow-x-auto max-h-64 overflow-y-auto whitespace-pre-wrap break-all");
         
         try {
             // 首先尝试解析为单个 JSON 对象（非流式响应）

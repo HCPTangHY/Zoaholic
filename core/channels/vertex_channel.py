@@ -333,6 +333,7 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
         'stream_options',
         'prompt',
         'size',
+        'max_tokens',  # will use max_output_tokens
     ]
     generation_config = {}
 
@@ -582,6 +583,45 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
     return url, headers, payload
 
 
+async def fetch_vertex_gemini_response(client, url, headers, payload, model, timeout):
+    """处理 Vertex Gemini 非流式响应"""
+    # Vertex Gemini 非流式与标准 Gemini 类似
+    from .gemini_channel import fetch_gemini_response
+    async for chunk in fetch_gemini_response(client, url, headers, payload, model, timeout):
+        yield chunk
+
+
+async def fetch_vertex_claude_response(client, url, headers, payload, model, timeout):
+    """处理 Vertex Claude 非流式响应"""
+    # 切换到非流式端点
+    url = url.replace("streamRawPredict", "rawPredict")
+    
+    timestamp = int(datetime.timestamp(datetime.now()))
+    json_payload = await asyncio.to_thread(json.dumps, payload)
+    response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
+    
+    error_message = await check_response(response, "fetch_vertex_claude_response")
+    if error_message:
+        yield error_message
+        return
+
+    response_bytes = await response.aread()
+    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    
+    # Vertex Claude 格式解析与标准 Claude 类似
+    content = safe_get(response_json, "content", 0, "text")
+    prompt_tokens = safe_get(response_json, "usage", "input_tokens")
+    output_tokens = safe_get(response_json, "usage", "output_tokens")
+    total_tokens = (prompt_tokens or 0) + (output_tokens or 0)
+    role = safe_get(response_json, "role")
+
+    from ..utils import generate_no_stream_response
+    yield await generate_no_stream_response(
+        timestamp, model, content=content, role=role,
+        total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=output_tokens
+    )
+
+
 async def fetch_vertex_claude_response_stream(client, url, headers, payload, model, timeout):
     """处理 Vertex Claude 流式响应"""
     from ..log_config import logger
@@ -667,8 +707,9 @@ def register():
         auth_header="Authorization: Bearer {access_token}",
         description="Google Vertex AI (Gemini)",
         request_adapter=get_vertex_gemini_payload,
-        stream_adapter=fetch_gemini_response_stream,  # 复用 Gemini 流式响应处理
-        models_adapter=None,  # Vertex 需要 OAuth2 认证，模型列表通过 GCP 控制台管理
+        response_adapter=fetch_vertex_gemini_response,
+        stream_adapter=fetch_gemini_response_stream,
+        models_adapter=None,
     )
     
     # 注册 Vertex Claude
@@ -679,6 +720,7 @@ def register():
         auth_header="Authorization: Bearer {access_token}",
         description="Google Vertex AI (Claude)",
         request_adapter=get_vertex_claude_payload,
+        response_adapter=fetch_vertex_claude_response,
         stream_adapter=fetch_vertex_claude_response_stream,
-        models_adapter=None,  # Vertex 需要 OAuth2 认证，模型列表通过 GCP 控制台管理
+        models_adapter=None,
     )

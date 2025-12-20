@@ -42,6 +42,11 @@ ExtractToken = Callable[[Any], Awaitable[Optional[str]]]
 # EndpointHandler: 自定义端点处理函数
 EndpointHandler = Callable[..., Awaitable[Any]]
 
+# ParseUsage: (native_data) -> Optional[Dict[str, int]]
+# 从原生响应（dict）或 SSE 行（str）中提取 usage
+# 返回: {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
+ParseUsage = Callable[[Union[Dict[str, Any], str]], Optional[Dict[str, int]]]
+
 
 @dataclass
 class EndpointDefinition:
@@ -102,6 +107,7 @@ class DialectDefinition:
     target_engine: Optional[str] = None
     sanitize_response: Optional[SanitizeResponse] = None
     extract_token: Optional[ExtractToken] = None
+    parse_usage: Optional[ParseUsage] = None
 
     # 端点定义：用于自动路由注册
     endpoints: List[EndpointDefinition] = field(default_factory=list)
