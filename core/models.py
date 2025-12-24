@@ -3,22 +3,25 @@ from pydantic import BaseModel, Field, model_validator, ConfigDict
 from typing import List, Dict, Optional, Union, Tuple, Literal, Any
 
 class FunctionParameter(BaseModel):
-    type: str
-    properties: Dict[str, Dict[str, Any]]
-    required: List[str] = None
-    defs: Dict[str, Any] = Field(default=None, alias="$defs")
+    type: Optional[str] = None
+    properties: Optional[Dict[str, Any]] = None
+    required: Optional[List[str]] = Field(default_factory=list)
+    defs: Optional[Dict[str, Any]] = Field(default=None, alias="$defs")
 
-    class Config:
-        population_by_name = True
+    model_config = ConfigDict(extra='allow', populate_by_name=True)
 
 class Function(BaseModel):
     name: str
-    description: str = Field(default=None)
-    parameters: Optional[FunctionParameter] = Field(default=None, exclude=None)
+    description: Optional[str] = Field(default=None)
+    parameters: Optional[FunctionParameter] = Field(default=None)
+    
+    model_config = ConfigDict(extra='allow')
 
 class Tool(BaseModel):
-    type: str
-    function: Function
+    type: Optional[str] = None
+    function: Optional[Function] = None
+    
+    model_config = ConfigDict(extra='allow')
 
     @classmethod
     def parse_raw(cls, json_str: str) -> 'Tool':
@@ -45,6 +48,8 @@ class ContentItem(BaseModel):
     type: str
     text: Optional[str] = None
     image_url: Optional[ImageUrl] = None
+    
+    model_config = ConfigDict(extra='allow')
 
 class Message(BaseModel):
     role: str
@@ -53,8 +58,7 @@ class Message(BaseModel):
     tool_calls: Optional[List[ToolCall]] = None
     tool_call_id: Optional[str] = None
 
-    class Config:
-        extra = "allow"  # 允许额外的字段
+    model_config = ConfigDict(extra='allow')
 
 class FunctionChoice(BaseModel):
     name: str
@@ -124,19 +128,34 @@ class RequestModel(BaseRequest):
         return ""
 
     def model_dump(self, **kwargs):
+        # 强制排除 defs 字段，因为它不是标准的 OpenAI 参数，且容易引起严格网关报错
+        exclude = kwargs.get('exclude') or set()
+        if isinstance(exclude, set):
+            exclude.add('defs')
+            kwargs['exclude'] = exclude
+        elif isinstance(exclude, dict):
+            exclude['defs'] = True
+            kwargs['exclude'] = exclude
+        
         data = super().model_dump(**kwargs)
 
         # 检查并处理 tools 字段
         if 'tools' in data and data['tools']:
             for tool in data['tools']:
-                if 'function' in tool:
+                if isinstance(tool, dict) and 'function' in tool:
                     function_data = tool['function']
-                    # 如果 parameters 为空或没有 properties，则移除
-                    if 'parameters' in function_data and (
-                        function_data['parameters'] is None or
-                        not function_data['parameters'].get('properties')
-                    ):
-                        function_data.pop('parameters', None)
+                    # 确保 parameters 结构合规
+                    if 'parameters' not in function_data or function_data['parameters'] is None:
+                        function_data['parameters'] = {"type": "object", "properties": {}}
+                    elif isinstance(function_data['parameters'], dict):
+                        params = function_data['parameters']
+                        # 再次确保移除内部别名字段
+                        params.pop('defs', None)
+                        params.pop('$defs', None)
+                        if not params.get('properties'):
+                            params['properties'] = {}
+                        if not params.get('type'):
+                            params['type'] = "object"
 
         return data
 

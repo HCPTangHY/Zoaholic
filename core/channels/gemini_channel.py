@@ -228,21 +228,53 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
 
     def process_tool_parameters(data):
         if isinstance(data, dict):
-            # 移除 Gemini 不支持的 'additionalProperties'
-            data.pop("additionalProperties", None)
+            # 1. 移除 Gemini 不支持的字段
+            unsupported_fields = [
+                "additionalProperties",
+                "exclusiveMinimum",
+                "exclusiveMaximum",
+                "minLength",
+                "maxLength",
+                "pattern",
+                "$schema",
+                "dependencies",
+                "dependentRequired",
+                "dependentSchemas",
+                "unevaluatedItems",
+                "unevaluatedProperties",
+            ]
+            for field in unsupported_fields:
+                data.pop(field, None)
 
-            # 将 'default' 值移入 'description'
+            # 2. 核心修复：确保 required 中的属性在 properties 中确实存在
+            properties = data.get("properties")
+            required = data.get("required")
+            
+            if isinstance(required, list):
+                if isinstance(properties, dict):
+                    # 只保留在 properties 中存在的必填项
+                    data["required"] = [field for field in required if field in properties]
+                    if not data["required"]:
+                        data.pop("required")
+                else:
+                    # 如果没有 properties，则不能有 required
+                    data.pop("required", None)
+
+            # 3. 将 'default' 值移入 'description' (Gemini 部分模型对 default 支持不佳)
             if "default" in data:
                 default_value = data.pop("default")
                 description = data.get("description", "")
                 data["description"] = f"{description}\nDefault: {default_value}"
 
-            # 递归处理
-            for value in data.values():
-                process_tool_parameters(value)
-        elif isinstance(data, list):
-            for item in data:
-                process_tool_parameters(item)
+            # 4. 递归处理嵌套的 properties
+            if isinstance(properties, dict):
+                for val in properties.values():
+                    process_tool_parameters(val)
+            
+            # 处理 items (针对 array 类型)
+            items = data.get("items")
+            if isinstance(items, dict):
+                process_tool_parameters(items)
 
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
@@ -256,19 +288,34 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
                     if "parameters" in function_def:
                         process_tool_parameters(function_def["parameters"])
 
-                    if function_def["name"] != "googleSearch" and function_def["name"] != "googleSearch":
+                    if function_def["name"] not in ["googleSearch", "google_search"]:
                         processed_tools.append({"function": function_def})
 
                 if processed_tools:
+                    tool_config = {"function_calling_config": {"mode": "AUTO"}}
+                    
+                    # 处理 tool_choice (OpenAI 风格 -> Gemini 风格)
+                    tc = request.tool_choice
+                    if tc:
+                        if tc == "required":
+                            tool_config["function_calling_config"]["mode"] = "ANY"
+                        elif tc == "none":
+                            tool_config["function_calling_config"]["mode"] = "NONE"
+                        elif isinstance(tc, dict) and tc.get("type") == "function":
+                            fn_name = tc.get("function", {}).get("name")
+                            if fn_name:
+                                tool_config["function_calling_config"]["mode"] = "ANY"
+                                tool_config["function_calling_config"]["allowed_function_names"] = [fn_name]
+                        elif hasattr(tc, "type") and tc.type == "function" and tc.function:
+                            fn_name = tc.function.name
+                            tool_config["function_calling_config"]["mode"] = "ANY"
+                            tool_config["function_calling_config"]["allowed_function_names"] = [fn_name]
+
                     payload.update({
                         "tools": [{
                             "function_declarations": [tool["function"] for tool in processed_tools]
                         }],
-                        "tool_config": {
-                            "function_calling_config": {
-                                "mode": "AUTO"
-                            }
-                        }
+                        "tool_config": tool_config
                     })
             elif field == "temperature":
                 if "gemini-2.5-flash-image" in original_model:
@@ -381,7 +428,14 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
 
 
 async def gemini_json_process(response_json):
-    """处理 Gemini JSON 响应"""
+    """处理 Gemini JSON 响应
+    
+    遍历所有 parts 收集：
+    - thought=True 的部分作为 reasoning_content
+    - 普通文本作为 content
+    - inlineData 作为图片
+    - functionCall 作为函数调用
+    """
     from ..log_config import logger
     
     promptTokenCount = 0
@@ -389,19 +443,51 @@ async def gemini_json_process(response_json):
     totalTokenCount = 0
     image_base64 = None
     thought_signature = None
+    
+    # 收集所有内容
+    reasoning_parts = []
+    content_parts = []
+    function_call_name = None
+    function_full_response = None
 
     json_data = safe_get(response_json, "candidates", 0, "content", default=None)
     finishReason = safe_get(response_json, "candidates", 0, "finishReason", default=None)
     
-    # 提取签名 (Google 规范：可能在任何 part 中，通常在第一个 FC 或最后一个文本块)
     parts_data = safe_get(json_data, "parts", default=[])
-    if parts_data:
-        # 遍历 parts 寻找签名
-        for p in parts_data:
-            sig = p.get("thoughtSignature")
-            if sig:
-                thought_signature = sig
-                break
+    
+    # 遍历所有 parts
+    for part in parts_data:
+        if not isinstance(part, dict):
+            continue
+            
+        # 提取签名 (可能在任何 part 中)
+        sig = part.get("thoughtSignature")
+        if sig:
+            thought_signature = sig
+        
+        # 处理思考内容 (thought=True)
+        if part.get("thought") is True:
+            text = part.get("text", "")
+            if text:
+                reasoning_parts.append(text)
+            continue
+        
+        # 处理普通文本
+        if "text" in part and not part.get("thought"):
+            text = part.get("text", "")
+            if text:
+                content_parts.append(text)
+        
+        # 处理图片
+        if "inlineData" in part:
+            b64_json = safe_get(part, "inlineData", "data", default="")
+            if b64_json:
+                image_base64 = b64_json
+        
+        # 处理函数调用 (只取第一个)
+        if "functionCall" in part and function_call_name is None:
+            function_call_name = safe_get(part, "functionCall", "name", default=None)
+            function_full_response = safe_get(part, "functionCall", "args", default=None)
 
     if finishReason:
         promptTokenCount = safe_get(response_json, "usageMetadata", "promptTokenCount", default=0)
@@ -410,20 +496,14 @@ async def gemini_json_process(response_json):
         if finishReason != "STOP":
             logger.error(f"finishReason: {finishReason}")
 
-    content = reasoning_content = safe_get(json_data, "parts", 0, "text", default="")
-    b64_json = safe_get(json_data, "parts", 0, "inlineData", "data", default="")
-    if b64_json:
-        image_base64 = b64_json
+    # 合并收集到的内容
+    reasoning_content = "".join(reasoning_parts)
+    content = "".join(content_parts)
+    
+    # 判断是否有思考内容
+    is_thinking = bool(reasoning_parts)
 
-    is_thinking = safe_get(json_data, "parts", 0, "thought", default=False)
-    if is_thinking:
-        content = safe_get(json_data, "parts", 1, "text", default="")
-
-    function_call_name = safe_get(json_data, "parts", 0, "functionCall", "name", default=None)
-    function_full_response = safe_get(json_data, "parts", 0, "functionCall", "args", default="")
-    function_full_response = await asyncio.to_thread(json.dumps, function_full_response) if function_full_response else None
-
-    #提取 blockReason
+    # 提取 blockReason
     blockReason = safe_get(response_json, "promptFeedback", "blockReason", default=None)
     if not blockReason:
         blockReason = safe_get(response_json, "candidates", 0, "blockReason", default=None)
@@ -468,48 +548,27 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
             yield {"error": f"Gemini Blocked: {blockReason}", "status_code": 400, "details": first_resp}
             return
 
-    content = ""
-    reasoning_content = ""
-    image_base64 = ""
-    parts_list = safe_get(parsed_data, 0, "candidates", 0, "content", "parts", default=[])
-    for item in parts_list:
-        chunk = safe_get(item, "text")
-        b64_json = safe_get(item, "inlineData", "data", default="")
-        if b64_json:
-            image_base64 = b64_json
-        is_think = safe_get(item, "thought", default=False)
-        if chunk:
-            if is_think:
-                reasoning_content += chunk
-            else:
-                content += chunk
+        # 获取 usage (可能在最后一个响应对象中)
+        last_resp = parsed_data[-1]
+        usage_metadata = safe_get(last_resp, "usageMetadata")
+        prompt_tokens = safe_get(usage_metadata, "promptTokenCount", default=promptTokenCount)
+        candidates_tokens = safe_get(usage_metadata, "candidatesTokenCount", default=candidatesTokenCount)
+        total_tokens = safe_get(usage_metadata, "totalTokenCount", default=totalTokenCount)
 
-    usage_metadata = safe_get(parsed_data, -1, "usageMetadata")
-    prompt_tokens = safe_get(usage_metadata, "promptTokenCount", default=0)
-    candidates_tokens = safe_get(usage_metadata, "candidatesTokenCount", default=0)
-    total_tokens = safe_get(usage_metadata, "totalTokenCount", default=0)
+        role = safe_get(first_resp, "candidates", 0, "content", "role")
+        if role == "model":
+            role = "assistant"
+        elif not role:
+            role = "assistant"
 
-    role = safe_get(parsed_data, -1, "candidates", 0, "content", "role")
-    if role == "model":
-        role = "assistant"
-    elif not role:
-        role = "assistant"
-
-    has_think = safe_get(parsed_data, 0, "candidates", 0, "content", "parts", 0, "thought", default=False)
-    if has_think:
-        function_message_parts_index = -1
-    else:
-        function_message_parts_index = 0
-    function_call_name = safe_get(parsed_data, -1, "candidates", 0, "content", "parts", function_message_parts_index, "functionCall", "name", default=None)
-    function_call_content = safe_get(parsed_data, -1, "candidates", 0, "content", "parts", function_message_parts_index, "functionCall", "args", default=None)
-
-    yield await generate_no_stream_response(
-        timestamp, model, content=content, tools_id=None, 
-        function_call_name=function_call_name, function_call_content=function_call_content, 
-        role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, 
-        completion_tokens=candidates_tokens, reasoning_content=reasoning_content, 
-        image_base64=image_base64, thought_signature=thought_signature
-    )
+        yield await generate_no_stream_response(
+            timestamp, model, content=content, tools_id=None, 
+            function_call_name=function_call_name, function_call_content=function_full_response, 
+            role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, 
+            completion_tokens=candidates_tokens, reasoning_content=reasoning_content, 
+            image_base64=image_base64, thought_signature=thought_signature
+        )
+        return
 
 
 async def fetch_gemini_response_stream(client, url, headers, payload, model, timeout):

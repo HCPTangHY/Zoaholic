@@ -65,6 +65,19 @@ def _create_dialect_verify_api_key(dialect_id: str):
             from fastapi import HTTPException
             raise HTTPException(status_code=403, detail="Invalid or missing API Key")
         
+        # 更新 request_info 中的 API key 信息，确保统计记录正确的 key
+        try:
+            from core.middleware import request_info
+            from utils import safe_get
+            info = request_info.get()
+            if info:
+                info["api_key"] = token
+                config = app.state.config
+                info["api_key_name"] = safe_get(config, "api_keys", api_index, "name", default=None)
+                info["api_key_group"] = safe_get(config, "api_keys", api_index, "group", default=None)
+        except Exception:
+            pass
+
         return api_index
 
     return verify

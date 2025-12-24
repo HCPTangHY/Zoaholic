@@ -187,7 +187,7 @@ class StatsMiddleware:
         if is_dialect:
             # 方言端点：token/api_index 将由路由处理器填充
             token = "dialect-pending"
-            api_index = 0
+            api_index = None
         else:
             # 标准端点：执行完整认证
             token = get_api_key_from_headers(headers)
@@ -336,10 +336,7 @@ class StatsMiddleware:
                     request_model = await asyncio.to_thread(UnifiedRequest.model_validate, parsed_body)
                     request_model = request_model.data
                     if self.debug:
-                        logger.info(
-                            "request_model: %s",
-                            json.dumps(request_model.model_dump(exclude_unset=True), indent=2, ensure_ascii=False),
-                        )
+                        pass
                     model = request_model.model
                     current_info["model"] = model
 
@@ -385,11 +382,8 @@ class StatsMiddleware:
                             return
                 except ValidationError as e:
                     # 不在中间件返回 422，避免对非统一请求路由造成影响
-                    logger.error(
-                        "Invalid request body for UnifiedRequest: %s, errors: %s",
-                        json.dumps(parsed_body, indent=2, ensure_ascii=False),
-                        e.errors(),
-                    )
+                    # 也不打印庞大的 Payload，防止日志刷屏
+                    pass
 
             # 包装 send 以捕获流式响应
             response_started = False

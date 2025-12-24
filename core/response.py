@@ -84,7 +84,10 @@ def _wrap_response_aiter_text(response):
                 
                 yield chunk
         except GeneratorExit:
-            pass
+            # 调用者关闭生成器时触发（如客户端断开连接）
+            # 需要重新抛出以确保上层正确处理
+            logger.debug("Generator closed by caller (GeneratorExit)")
+            raise
         except Exception as e:
             logger.error(f"Error during upstream response iteration: {str(e)}")
             raise

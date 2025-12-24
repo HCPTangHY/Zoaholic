@@ -170,10 +170,23 @@ async def parse_claude_request(
                     for tr in tool_result_blocks:
                         tool_use_id = tr.get("tool_use_id") or tr.get("toolUseId")
                         tr_content = tr.get("content") or ""
+                        # 如果是列表（多块内容），提取所有文本内容
+                        if isinstance(tr_content, list):
+                            text_acc = []
+                            for block in tr_content:
+                                if isinstance(block, dict):
+                                    if block.get("type") == "text":
+                                        text_acc.append(block.get("text", ""))
+                                    elif "text" in block:
+                                        text_acc.append(str(block["text"]))
+                                elif isinstance(block, str):
+                                    text_acc.append(block)
+                            tr_content = "\n".join(text_acc)
+
                         messages.append(
                             Message(
                                 role="tool",
-                                content=tr_content if isinstance(tr_content, str) else str(tr_content),
+                                content=str(tr_content),
                                 tool_call_id=tool_use_id,
                             )
                         )
@@ -232,17 +245,47 @@ async def render_claude_response(
     model: str,
 ) -> Dict[str, Any]:
     """
-    Canonical(OpenAI 风格) -> Claude native response（简化版）
+    Canonical(OpenAI 风格) -> Claude native response
     """
     choices = canonical_response.get("choices") or []
-    content_text = ""
+    content = []
+    stop_reason = "end_turn"
+    
     if choices:
         msg = choices[0].get("message") or {}
-        content_text = msg.get("content") or ""
-        if isinstance(content_text, list):
-            content_text = "".join(
-                str(i.get("text", "")) for i in content_text if isinstance(i, dict)
-            )
+        
+        # 1. 思维链 (Thinking)
+        reasoning = msg.get("reasoning_content")
+        if reasoning:
+            content.append({"type": "thinking", "thinking": reasoning})
+
+        # 2. 文本内容
+        text = msg.get("content")
+        if text:
+            content.append({"type": "text", "text": text})
+            
+        # 2. 工具调用
+        tool_calls = msg.get("tool_calls") or []
+        if tool_calls:
+            stop_reason = "tool_use"
+            for tc in tool_calls:
+                fn = tc.get("function") or {}
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except:
+                    args = {}
+                content.append({
+                    "type": "tool_use",
+                    "id": tc.get("id"),
+                    "name": fn.get("name"),
+                    "input": args
+                })
+
+        finish_reason = choices[0].get("finish_reason")
+        if finish_reason == "tool_calls":
+            stop_reason = "tool_use"
+        elif finish_reason == "stop":
+            stop_reason = "end_turn"
 
     usage = canonical_response.get("usage") or {}
     prompt_tokens = usage.get("prompt_tokens", 0) or 0
@@ -252,8 +295,8 @@ async def render_claude_response(
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [{"type": "text", "text": content_text}],
-        "stop_reason": "end_turn",
+        "content": content,
+        "stop_reason": stop_reason,
         "usage": {
             "input_tokens": prompt_tokens,
             "output_tokens": completion_tokens,
@@ -263,9 +306,7 @@ async def render_claude_response(
 
 async def render_claude_stream(canonical_sse_chunk: str) -> str:
     """
-    Canonical SSE -> Claude SSE（简化版）
-
-    将 OpenAI delta chunk 包装为 Claude content_block_delta 事件。
+    Canonical SSE -> Claude SSE
     """
     if not isinstance(canonical_sse_chunk, str):
         return canonical_sse_chunk
@@ -287,22 +328,90 @@ async def render_claude_stream(canonical_sse_chunk: str) -> str:
         return ""
 
     delta = choices[0].get("delta") or {}
-    content = delta.get("content") or ""
+    
+    # 1. 处理思维链 (Thinking)
     reasoning = delta.get("reasoning_content") or ""
-    text_delta = reasoning or content
-    if not text_delta:
-        return ""
+    if reasoning:
+        claude_event = {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "thinking_delta",
+                "thinking": reasoning,
+            },
+        }
+        return f"event: content_block_delta\ndata: {json.dumps(claude_event, ensure_ascii=False)}\n\n"
 
-    claude_event = {
-        "type": "content_block_delta",
-        "index": 0,
-        "delta": {
-            "type": "text_delta",
-            "text": text_delta,
-        },
-    }
+    # 2. 处理文本
+    content = delta.get("content") or ""
+    if content:
+        claude_event = {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "text_delta",
+                "text": content,
+            },
+        }
+        return f"event: content_block_delta\ndata: {json.dumps(claude_event, ensure_ascii=False)}\n\n"
 
-    return f"event: content_block_delta\ndata: {json.dumps(claude_event, ensure_ascii=False)}\n\n"
+    # 2. 处理工具调用开始
+    tool_calls = delta.get("tool_calls") or []
+    if tool_calls:
+        tc = tool_calls[0]
+        # 如果有 name，说明是新的 block 开始
+        if tc.get("function", {}).get("name"):
+            event_start = {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tc.get("id"),
+                    "name": tc["function"]["name"],
+                    "input": {}
+                }
+            }
+            # 如果同时有 arguments，追加一个 delta
+            if tc["function"].get("arguments"):
+                event_delta = {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": tc["function"]["arguments"]
+                    }
+                }
+                return f"event: content_block_start\ndata: {json.dumps(event_start, ensure_ascii=False)}\n\n" + \
+                       f"event: content_block_delta\ndata: {json.dumps(event_delta, ensure_ascii=False)}\n\n"
+            return f"event: content_block_start\ndata: {json.dumps(event_start, ensure_ascii=False)}\n\n"
+        
+        # 只有 arguments，则是 delta
+        elif tc.get("function", {}).get("arguments"):
+            event_delta = {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": tc["function"]["arguments"]
+                }
+            }
+            return f"event: content_block_delta\ndata: {json.dumps(event_delta, ensure_ascii=False)}\n\n"
+
+    # 3. 处理完成
+    if choices[0].get("finish_reason"):
+        event_msg_delta = {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "tool_use" if choices[0].get("finish_reason") == "tool_calls" else "end_turn",
+                "stop_sequence": None
+            },
+            "usage": {
+               "output_tokens": canonical.get("usage", {}).get("completion_tokens", 0)
+            }
+        }
+        return f"event: message_delta\ndata: {json.dumps(event_msg_delta, ensure_ascii=False)}\n\n"
+
+    return ""
 
 
 def parse_claude_usage(data: Any) -> Optional[Dict[str, int]]:

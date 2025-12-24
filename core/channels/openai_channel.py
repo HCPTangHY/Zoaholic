@@ -116,8 +116,8 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
                         "arguments": tool_call.function.arguments
                     }
                 })
-                if provider.get("tools"):
-                    messages.append({"role": msg.role, "tool_calls": tool_calls_list})
+            if provider.get("tools") is not False:
+                messages.append({"role": msg.role, "tool_calls": tool_calls_list})
         elif tool_call_id:
             if provider.get("tools"):
                 messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content})

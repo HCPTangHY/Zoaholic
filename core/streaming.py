@@ -131,7 +131,8 @@ class LoggingStreamingResponse(Response):
                 yield chunk
                 continue
 
-            chunk_text = chunk.decode("utf-8")
+            # 使用 errors="replace" 避免解码错误导致流终止
+            chunk_text = chunk.decode("utf-8", errors="replace")
             if self.debug:
                 logger.info(chunk_text.encode("utf-8").decode("unicode_escape"))
 

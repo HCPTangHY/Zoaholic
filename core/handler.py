@@ -168,10 +168,6 @@ async def process_request(
     url, headers, payload = await get_payload(request, engine, provider, api_key)
     headers.update(safe_get(provider, "preferences", "headers", default={}))  # add custom headers
     
-    if is_debug:
-        logger.info(url)
-        logger.info(json.dumps(headers, indent=4, ensure_ascii=False))
-        logger.info(json.dumps({k: v for k, v in payload.items() if k != 'file'}, indent=4, ensure_ascii=False))
 
     current_info = request_info_getter()
     
@@ -300,16 +296,57 @@ async def _fetch_passthrough_stream(client, url, headers, payload, timeout):
     透传模式的流式响应处理
     
     直接转发上游 SSE 流，不做任何格式转换
+    
+    注意：使用特殊的超时配置，read timeout 设置为 None 以支持
+    Google Search grounding 等需要长时间处理的操作。
     """
+    # 为流式请求创建特殊的超时配置
+    # read timeout 设置为 None，因为：
+    # 1. Gemini 使用 Google Search 时，搜索可能需要较长时间
+    # 2. 思考模式下，模型思考时可能有较长的静默期
+    # 3. 我们依赖 connect/write timeout 来处理真正的网络问题
+    stream_timeout = httpx.Timeout(
+        connect=15.0,
+        read=None,  # 无限等待读取，支持 Google Search 等长时间操作
+        write=60.0,
+        pool=10.0,
+    )
+    
     json_payload = await asyncio.to_thread(json.dumps, payload)
-    async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
+    async with client.stream('POST', url, headers=headers, content=json_payload, timeout=stream_timeout) as response:
         error_message = await check_response(response, "passthrough_stream")
         if error_message:
             yield error_message
             return
         
-        async for chunk in response.aiter_text():
-            yield chunk
+        # 使用 aiter_bytes 替代 aiter_text，然后手动解码
+        # 这样可以更好地处理边界情况和避免编码问题导致流中断
+        buffer = b""
+        async for raw_chunk in response.aiter_bytes():
+            # 合并缓冲区和新数据
+            buffer += raw_chunk
+            
+            # 尝试解码为文本
+            try:
+                # 使用 errors="replace" 避免编码错误导致流终止
+                text = buffer.decode("utf-8", errors="replace")
+                buffer = b""  # 成功解码后清空缓冲区
+                if text:
+                    yield text
+            except UnicodeDecodeError:
+                # 如果解码失败（可能是不完整的 UTF-8 序列），保留缓冲区等待更多数据
+                # 但如果缓冲区太大，强制输出避免内存问题
+                if len(buffer) > 10 * 1024:  # 10KB
+                    text = buffer.decode("utf-8", errors="replace")
+                    buffer = b""
+                    if text:
+                        yield text
+        
+        # 处理剩余的缓冲区数据
+        if buffer:
+            text = buffer.decode("utf-8", errors="replace")
+            if text:
+                yield text
 
 
 async def _fetch_passthrough_response(client, url, headers, payload, timeout):
@@ -463,9 +500,7 @@ async def process_request_passthrough(
     )
 
     if is_debug:
-        logger.info(url)
-        logger.info(json.dumps(headers, indent=4, ensure_ascii=False))
-        logger.info(json.dumps({k: v for k, v in payload.items() if k != "file"}, indent=4, ensure_ascii=False))
+        pass
 
     current_info = request_info_getter()
     channel_id = f"{provider['provider']}"
