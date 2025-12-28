@@ -13,6 +13,7 @@ from ..utils import (
     safe_get,
     get_model_dict,
     get_base64_image,
+    get_tools_mode,
     generate_sse_response,
     generate_no_stream_response,
     end_of_line,
@@ -142,14 +143,17 @@ async def get_claude_payload(request, engine, provider, api_key=None):
             tool_call_id = msg.tool_call_id
 
         if tool_calls:
+            tools_mode = get_tools_mode(provider)
             tool_calls_list = []
-            tool_call = tool_calls[0]
-            tool_calls_list.append({
-                "type": "tool_use",
-                "id": tool_call.id,
-                "name": tool_call.function.name,
-                "input": json.loads(tool_call.function.arguments),
-            })
+            # 根据 tools_mode 决定处理多少个工具调用
+            calls_to_process = tool_calls if tools_mode == "parallel" else tool_calls[:1]
+            for tool_call in calls_to_process:
+                tool_calls_list.append({
+                    "type": "tool_use",
+                    "id": tool_call.id,
+                    "name": tool_call.function.name,
+                    "input": json.loads(tool_call.function.arguments),
+                })
             messages.append({"role": msg.role, "content": tool_calls_list})
         elif tool_call_id:
             messages.append({"role": "user", "content": [{
@@ -229,7 +233,8 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         if field not in miss_fields and value is not None:
             payload[field] = value
 
-    if request.tools and provider.get("tools"):
+    tools_mode = get_tools_mode(provider)
+    if request.tools and tools_mode != "none":
         tools = payload.get("tools", [])  # 保留已有的工具（如插件添加的）
         for tool in request.tools:
             # 检查是否已经是 Claude 服务器端工具格式（如 web_search_20250305）
@@ -269,7 +274,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                         "type": "any"
                     }
 
-    if provider.get("tools") is False:
+    if tools_mode == "none":
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
 

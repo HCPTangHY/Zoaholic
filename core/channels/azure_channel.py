@@ -13,6 +13,7 @@ from ..utils import (
     safe_get,
     get_model_dict,
     get_base64_image,
+    get_tools_mode,
     generate_sse_response,
     end_of_line,
 )
@@ -91,20 +92,24 @@ async def get_azure_payload(request, engine, provider, api_key=None):
             tool_call_id = msg.tool_call_id
 
         if tool_calls:
-            tool_calls_list = []
-            for tool_call in tool_calls:
-                tool_calls_list.append({
-                    "id": tool_call.id,
-                    "type": tool_call.type,
-                    "function": {
-                        "name": tool_call.function.name,
-                        "arguments": tool_call.function.arguments
-                    }
-                })
-                if provider.get("tools"):
-                    messages.append({"role": msg.role, "tool_calls": tool_calls_list})
+            tools_mode = get_tools_mode(provider)
+            if tools_mode != "none":
+                tool_calls_list = []
+                # 根据 tools_mode 决定处理多少个工具调用
+                calls_to_process = tool_calls if tools_mode == "parallel" else tool_calls[:1]
+                for tool_call in calls_to_process:
+                    tool_calls_list.append({
+                        "id": tool_call.id,
+                        "type": tool_call.type,
+                        "function": {
+                            "name": tool_call.function.name,
+                            "arguments": tool_call.function.arguments
+                        }
+                    })
+                messages.append({"role": msg.role, "tool_calls": tool_calls_list})
         elif tool_call_id:
-            if provider.get("tools"):
+            tools_mode = get_tools_mode(provider)
+            if tools_mode != "none":
                 messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content})
         else:
             messages.append({"role": msg.role, "content": content})
@@ -126,7 +131,8 @@ async def get_azure_payload(request, engine, provider, api_key=None):
             else:
                 payload[field] = value
 
-    if provider.get("tools") is False or "o1" in original_model or "chatgpt-4o-latest" in original_model or "grok" in original_model:
+    tools_mode = get_tools_mode(provider)
+    if tools_mode == "none" or "o1" in original_model or "chatgpt-4o-latest" in original_model or "grok" in original_model:
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
 
