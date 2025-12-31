@@ -386,12 +386,10 @@ def parse_gemini_usage(data: Any) -> Optional[Dict[str, int]]:
 # ============== 自定义端点处理函数 ==============
 
 
-async def _get_gemini_models(api_index: int):
+async def _get_gemini_models(api_index: int, app):
     """获取格式化后的 Gemini 模型列表"""
-    from routes.deps import get_app
     from utils import post_all_models
 
-    app = get_app()
     models = post_all_models(api_index, app.state.config, app.state.api_list, app.state.models_list)
     
     gemini_models = []
@@ -424,7 +422,7 @@ async def list_gemini_models_handler(
     Gemini 模型列表端点 - GET /v1/models & /v1beta/models
     """
     from fastapi.responses import JSONResponse
-    gemini_models = await _get_gemini_models(api_index)
+    gemini_models = await _get_gemini_models(api_index, request.app)
     return JSONResponse(content={"models": gemini_models})
 
 
@@ -446,7 +444,7 @@ async def get_gemini_model_handler(
     # 支持带 models/ 前缀的查询
     target_name = model_id if model_id.startswith("models/") else f"models/{model_id}"
     
-    models = await _get_gemini_models(api_index)
+    models = await _get_gemini_models(api_index, request.app)
     for m in models:
         if m["name"] == target_name:
             return JSONResponse(content=m)

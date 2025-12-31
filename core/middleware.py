@@ -331,7 +331,8 @@ class StatsMiddleware:
 
         try:
             # 如果能解析为 UnifiedRequest，则执行模型记录/限流/审查
-            if parsed_body and should_attempt_unified_request(parsed_body):
+            # 注意：方言端点的 api_index 为 None，跳过限流（方言路由自己处理认证）
+            if parsed_body and should_attempt_unified_request(parsed_body) and api_index is not None:
                 try:
                     request_model = await asyncio.to_thread(UnifiedRequest.model_validate, parsed_body)
                     request_model = request_model.data
