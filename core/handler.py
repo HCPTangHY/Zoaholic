@@ -519,6 +519,16 @@ async def process_request_passthrough(
         current_info["model"] = request.model
 
     current_info["provider_id"] = channel_id
+    if api_key:
+        try:
+            # 从 provider_api_circular_list 中获取所有 keys
+            circular_list = provider_api_circular_list.get(provider['provider'])
+            if circular_list and hasattr(circular_list, 'items'):
+                api_keys_list = circular_list.items
+                if api_key in api_keys_list:
+                    current_info["provider_key_index"] = api_keys_list.index(api_key)
+        except (ValueError, TypeError, AttributeError):
+            pass
 
     proxy = safe_get(app.state.config, "preferences", "proxy", default=None)
     proxy = safe_get(provider, "preferences", "proxy", default=proxy)
@@ -651,9 +661,10 @@ class ModelRequestHandler:
         if not safe_get(config, 'api_keys', api_index, 'model'):
             raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
 
+        # 调度算法优先级：API Key preferences > 全局 preferences > 默认值
         scheduling_algorithm = safe_get(
-            config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM", 
-            default="fixed_priority"
+            config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM",
+            default=safe_get(config, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
         )
 
         # 估算请求 token 数

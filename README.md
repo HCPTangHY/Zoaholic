@@ -248,14 +248,14 @@ api_keys:
       AUTO_RETRY: true
       rate_limit: 60/min
 
-  # 普通用户 Key（加权负载均衡）
+  # 普通用户 Key
   - api: sk-user-key
     model:
-      - gcp1/*: 5  # 权重 5
-      - gcp2/*: 3  # 权重 3
-      - gcp3/*: 2  # 权重 2
+      - gcp1/*
+      - gcp2/*
+      - gcp3/*
     preferences:
-      SCHEDULING_ALGORITHM: weighted_round_robin
+      SCHEDULING_ALGORITHM: weighted_round_robin  # 配合渠道 weight 使用
       credits: 10  # 余额限制
       created_at: 2024-01-01T00:00:00+08:00
 
@@ -463,13 +463,14 @@ api_keys:
       ENABLE_MODERATION: true # 是否开启消息道德审查
 
   # 渠道级加权负载均衡示例
+  # 权重在渠道配置的 preferences.weight 中设置，然后在 API Key 使用 weighted_round_robin 调度
   - api: sk-KjjI60Yd0JFWtxxxxxxxxxxxxxxwmRWpWpQRo
     model:
-      - gcp1/*: 5 # 权重仅支持正整数，数字越大被选中的概率越高
-      - gcp2/*: 3
-      - gcp3/*: 2
+      - gcp1/*  # 渠道 gcp1 需设置 preferences.weight: 5
+      - gcp2/*  # 渠道 gcp2 需设置 preferences.weight: 3
+      - gcp3/*  # 渠道 gcp3 需设置 preferences.weight: 2
     preferences:
-      SCHEDULING_ALGORITHM: weighted_round_robin # 基于权重的轮询算法，或 lottery 抽奖式调度
+      SCHEDULING_ALGORITHM: weighted_round_robin # 基于渠道权重的轮询算法，或 lottery 抽奖式调度
       AUTO_RETRY: true
       credits: 10 # 余额上限（美元），为 0 表示不可使用
       created_at: 2024-01-01T00:00:00+08:00 # 费用统计起始时间

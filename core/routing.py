@@ -385,43 +385,67 @@ async def get_right_order_providers(
     if scheduling_algorithm == "random":
         matching_providers = random.sample(matching_providers, num_matching_providers)
 
-    weights = safe_get(config, 'api_keys', api_index, "weights")
-
-    if weights:
-        intersection = None
-        all_providers = set(provider['provider'] + "/" + request_model for provider in matching_providers)
-        if all_providers:
-            weight_keys = set(weights.keys())
-            provider_rules = []
-            for model_rule in weight_keys:
-                provider_rules.extend(await get_provider_rules(model_rule, config, request_model, app))
-            provider_list = get_provider_list(provider_rules, config, request_model, app)
-            weight_keys = set([provider['provider'] + "/" + request_model for provider in provider_list])
-
-            # 计算交集
-            intersection = all_providers.intersection(weight_keys)
-            if len(intersection) == 1:
-                intersection = None
-
-        if intersection:
-            filtered_weights = {
-                k.split("/")[0]: v for k, v in weights.items()
-                if k.split("/")[0] + "/" + request_model in intersection
-            }
-
-            if scheduling_algorithm == "weighted_round_robin":
-                weighted_provider_name_list = weighted_round_robin(filtered_weights)
-            elif scheduling_algorithm == "lottery":
-                weighted_provider_name_list = lottery_scheduling(filtered_weights)
-            else:
-                weighted_provider_name_list = list(filtered_weights.keys())
-
-            new_matching_providers = []
-            for provider_name in weighted_provider_name_list:
+    # 使用渠道级别的 preferences.weight 进行排序
+    # 权重高的渠道排在前面（降序排列）
+    def get_provider_weight(provider):
+        return provider.get('preferences', {}).get('weight', 0) or 0
+    
+    # 核心修复：显式按权重降序排列原始列表
+    # 1. 确保在 fixed_priority 模式下权重高的优先
+    # 2. 确保在 weighted_round_robin 初始比例相等时权重高的优先（消除 YAML 位置影响）
+    matching_providers.sort(key=get_provider_weight, reverse=True)
+    
+    # 检查是否有任何渠道配置了权重
+    has_channel_weights = any(get_provider_weight(p) > 0 for p in matching_providers)
+    
+    if has_channel_weights:
+        # 当有渠道权重时，如果是默认调度算法（fixed_priority），自动切换到加权轮询
+        effective_algorithm = scheduling_algorithm
+        if scheduling_algorithm == "fixed_priority":
+            effective_algorithm = "weighted_round_robin"
+        
+        if effective_algorithm == "weighted_round_robin":
+            # 构建权重字典
+            channel_weights = {}
+            for provider in matching_providers:
+                weight = get_provider_weight(provider)
+                if weight > 0:
+                    channel_weights[provider['provider']] = weight
+            
+            if channel_weights:
+                weighted_provider_name_list = weighted_round_robin(channel_weights)
+                new_matching_providers = []
+                for provider_name in weighted_provider_name_list:
+                    for provider in matching_providers:
+                        if provider['provider'] == provider_name:
+                            new_matching_providers.append(provider)
+                # 将没有权重的渠道追加到末尾
                 for provider in matching_providers:
-                    if provider['provider'] == provider_name:
+                    if provider['provider'] not in channel_weights:
                         new_matching_providers.append(provider)
-            matching_providers = new_matching_providers
+                matching_providers = new_matching_providers
+        elif effective_algorithm == "lottery":
+            # 构建权重字典
+            channel_weights = {}
+            for provider in matching_providers:
+                weight = get_provider_weight(provider)
+                if weight > 0:
+                    channel_weights[provider['provider']] = weight
+            
+            if channel_weights:
+                weighted_provider_name_list = lottery_scheduling(channel_weights)
+                new_matching_providers = []
+                for provider_name in weighted_provider_name_list:
+                    for provider in matching_providers:
+                        if provider['provider'] == provider_name:
+                            new_matching_providers.append(provider)
+                # 将没有权重的渠道追加到末尾
+                for provider in matching_providers:
+                    if provider['provider'] not in channel_weights:
+                        new_matching_providers.append(provider)
+                matching_providers = new_matching_providers
+        # effective_algorithm 不会是 fixed_priority（因为上面已经转换为 weighted_round_robin）
+        # 这里不需要 else 分支，所有有权重的情况都会走到上面两个分支
 
     if is_debug:
         import json

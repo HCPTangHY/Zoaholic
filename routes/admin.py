@@ -49,13 +49,20 @@ async def api_config_update(
     app = get_app()
     updated = False
 
-    # 支持同时更新 providers 和 api_keys 段，保持与 /v1/api_config 返回结构一致
+    # 支持同时更新 providers、api_keys 和 preferences 段，保持与 /v1/api_config 返回结构一致
     if "providers" in config:
         app.state.config["providers"] = config["providers"]
         updated = True
 
     if "api_keys" in config:
         app.state.config["api_keys"] = config["api_keys"]
+        updated = True
+
+    # 更新全局 preferences（包括 SCHEDULING_ALGORITHM 等设置）
+    if "preferences" in config:
+        if "preferences" not in app.state.config:
+            app.state.config["preferences"] = {}
+        app.state.config["preferences"].update(config["preferences"])
         updated = True
 
     if updated:

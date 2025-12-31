@@ -181,7 +181,6 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
     api_keys_db = config_data['api_keys']
 
     for index, api_key in enumerate(config_data['api_keys']):
-        weights_dict = {}
         models = []
         
         # 规范化 API Key 分组字段，支持单值与多值
@@ -206,24 +205,11 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
         if api_key.get('model'):
             for model in api_key.get('model'):
                 if isinstance(model, dict):
-                    key, value = list(model.items())[0]
-                    provider_name = key.split("/")[0]
-                    model_name = key.split("/")[1]
-
-                    for provider_item in config_data["providers"]:
-                        if provider_item['provider'] != provider_name:
-                            continue
-                        model_dict = get_model_dict(provider_item)
-                        if model_name in model_dict.keys():
-                            weights_dict.update({provider_name + "/" + model_name: int(value)})
-                        elif model_name == "*":
-                            weights_dict.update({provider_name + "/" + model_name: int(value) for model_item in model_dict.keys()})
-
+                    # 只提取模型名，忽略权重值（权重现在在渠道级别配置）
+                    key = list(model.keys())[0]
                     models.append(key)
                 if isinstance(model, str):
                     models.append(model)
-            if weights_dict:
-                config_data['api_keys'][index]['weights'] = weights_dict
             config_data['api_keys'][index]['model'] = models
             api_keys_db[index]['model'] = models
         else:

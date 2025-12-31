@@ -94,6 +94,26 @@ const SettingsView = {
         };
         availabilityCard.appendChild(cooldownWrap.wrapper);
 
+        // 全局调度算法
+        const scheduleSelect = UI.select(
+            "全局调度算法",
+            [
+                { value: "fixed_priority", label: "固定优先级 (fixed_priority) - 始终使用第一个可用渠道" },
+                { value: "round_robin", label: "轮询 (round_robin) - 按顺序依次请求" },
+                { value: "weighted_round_robin", label: "加权轮询 (weighted_round_robin) - 按渠道权重分配" },
+                { value: "lottery", label: "抽奖 (lottery) - 按权重随机选择" },
+                { value: "random", label: "随机 (random) - 完全随机" },
+                { value: "smart_round_robin", label: "智能轮询 (smart_round_robin) - 基于历史成功率" },
+            ],
+            preferences.SCHEDULING_ALGORITHM || "fixed_priority",
+            (val) => { preferences.SCHEDULING_ALGORITHM = val; }
+        );
+        // 添加说明文字
+        const scheduleHelperText = UI.el("div", "text-body-small text-md-on-surface-variant mt-1",
+            "提示：当渠道配置了优先级(weight)时，建议使用「加权轮询」或「抽奖」算法");
+        scheduleSelect.wrapper.appendChild(scheduleHelperText);
+        availabilityCard.appendChild(scheduleSelect.wrapper);
+
         availabilitySection.appendChild(availabilityCard);
         form.appendChild(availabilitySection);
 
@@ -198,9 +218,14 @@ const SettingsView = {
             cleanPreferences.log_raw_data_retention_hours = Math.max(0, parseInt(preferences.log_raw_data_retention_hours) || 0);
         }
 
+        // 调度算法
+        if (preferences.SCHEDULING_ALGORITHM) {
+            cleanPreferences.SCHEDULING_ALGORITHM = preferences.SCHEDULING_ALGORITHM;
+        }
+
         // 保留其他未在界面中编辑的字段
         Object.keys(preferences).forEach(key => {
-            if (!["max_retry_count", "cooldown_period", "rate_limit", "log_raw_data_retention_hours"].includes(key)) {
+            if (!["max_retry_count", "cooldown_period", "rate_limit", "log_raw_data_retention_hours", "SCHEDULING_ALGORITHM"].includes(key)) {
                 cleanPreferences[key] = preferences[key];
             }
         });
