@@ -372,8 +372,33 @@ model_handler: Optional[ModelRequestHandler] = None
 
 
 
-# 添加静态文件挂载
-app.mount("/", StaticFiles(directory="./static", html=True), name="static")
+# SPA 前端路由 fallback - 所有未匹配的前端路由都返回 index.html
+from fastapi.responses import FileResponse
+
+SPA_ROUTES = ["/channels", "/playground", "/admin", "/settings", "/logs", "/login"]
+
+# 缓存控制头：index.html 不缓存，静态资源（带 hash）长期缓存
+HTML_NO_CACHE_HEADERS = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
+ASSET_CACHE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}  # 1 年
+
+@app.get("/{path:path}")
+async def spa_fallback(path: str):
+    # 检查是否是前端 SPA 路由
+    if path == "" or any(path.startswith(route.lstrip("/")) for route in SPA_ROUTES):
+        return FileResponse("./static/index.html", headers=HTML_NO_CACHE_HEADERS)
+    # 尝试返回静态文件
+    static_file = f"./static/{path}"
+    if os.path.isfile(static_file):
+        # 带 hash 的静态资源可以长期缓存
+        if "/assets/" in path or path.endswith((".js", ".css", ".woff2", ".woff", ".ttf")):
+            return FileResponse(static_file, headers=ASSET_CACHE_HEADERS)
+        return FileResponse(static_file)
+    # 默认返回 index.html
+    return FileResponse("./static/index.html", headers=HTML_NO_CACHE_HEADERS)
+
+# 添加静态文件挂载（用于 assets、icons 等静态资源）
+app.mount("/assets", StaticFiles(directory="./static/assets"), name="assets")
+app.mount("/icons", StaticFiles(directory="./static/icons"), name="icons")
 
 if __name__ == '__main__':
     import uvicorn

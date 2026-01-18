@@ -190,14 +190,15 @@ export default function Dashboard() {
             <Activity className="w-4 h-4 text-blue-500" />
             模型请求量分布
           </h3>
-          <div className="h-64 flex">
+          <div className="h-64">
             <ResponsiveContainer width="100%" height="100%">
               <PieChart>
                 <Pie
                   data={modelStats.slice(0, 5)}
-                  innerRadius={60}
-                  outerRadius={100}
-                  paddingAngle={5}
+                  cx="35%"
+                  innerRadius={50}
+                  outerRadius={80}
+                  paddingAngle={3}
                   dataKey="count"
                   nameKey="model"
                 >
@@ -206,7 +207,13 @@ export default function Dashboard() {
                   ))}
                 </Pie>
                 <Tooltip contentStyle={tooltipStyle} itemStyle={{ color: tooltipStyle.color }} />
-                <Legend layout="vertical" align="right" verticalAlign="middle" />
+                <Legend 
+                  layout="vertical" 
+                  align="right" 
+                  verticalAlign="middle"
+                  wrapperStyle={{ paddingLeft: '10px', fontSize: '12px', maxWidth: '45%' }}
+                  formatter={(value: string) => <span className="text-foreground truncate block max-w-[120px]" title={value}>{value}</span>}
+                />
               </PieChart>
             </ResponsiveContainer>
           </div>

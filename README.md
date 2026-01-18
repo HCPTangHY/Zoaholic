@@ -132,6 +132,10 @@ Zoaholic 兼容 uni-api 的 `api.yaml` 配置格式。详细的高级配置选�
 
 - [uni-api](https://github.com/yym68686/uni-api) - 本项目的优秀上游基础
 
+## 🛠️ 开发工具
+
+本项目使用 [Lim Code](https://github.com/Lianues/Lim-Code) 进行开发。
+
 ## 📄 许可证
 
 MIT License

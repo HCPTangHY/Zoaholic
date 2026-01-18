@@ -48,6 +48,7 @@ interface ChannelOption {
   id: string;
   type_name: string;
   default_base_url: string;
+  description?: string;
 }
 
 interface PluginOption {
@@ -103,7 +104,14 @@ export default function Channels() {
 
       if (configRes.ok) {
         const data = await configRes.json();
-        setProviders(data.providers || data.api_config?.providers || []);
+        const rawProviders = data.providers || data.api_config?.providers || [];
+        // 按权重降序排序
+        const sortedProviders = [...rawProviders].sort((a, b) => {
+          const weightA = a.preferences?.weight ?? a.weight ?? 0;
+          const weightB = b.preferences?.weight ?? b.weight ?? 0;
+          return weightB - weightA;
+        });
+        setProviders(sortedProviders);
       }
       if (typesRes.ok) {
         const data = await typesRes.json();
@@ -412,6 +420,15 @@ export default function Channels() {
     alert('已复制渠道配置，请修改后保存');
   };
 
+  // 排序函数
+  const sortByWeight = (list: any[]) => {
+    return [...list].sort((a, b) => {
+      const weightA = a.preferences?.weight ?? a.weight ?? 0;
+      const weightB = b.preferences?.weight ?? b.weight ?? 0;
+      return weightB - weightA;
+    });
+  };
+
   const handleUpdateWeight = async (idx: number, newWeight: number) => {
     const newProviders = [...providers];
     if (!newProviders[idx].preferences) newProviders[idx].preferences = {};
@@ -424,7 +441,8 @@ export default function Channels() {
         body: JSON.stringify({ providers: newProviders }),
       });
       if (res.ok) {
-        setProviders(newProviders);
+        // 更新后重新排序
+        setProviders(sortByWeight(newProviders));
       }
     } catch (err) {
       console.error('Failed to update weight');
@@ -489,7 +507,8 @@ export default function Channels() {
       });
 
       if (res.ok) {
-        setProviders(newProviders);
+        // 保存后重新排序
+        setProviders(sortByWeight(newProviders));
         setIsModalOpen(false);
       } else {
         alert("保存失败");
@@ -539,30 +558,30 @@ export default function Channels() {
           )}
         </div>
 
-        <div className="flex items-center justify-between pt-3 border-t border-border">
-          <div className="flex items-center gap-2">
+        <div className="flex items-center justify-between pt-3 border-t border-border gap-2">
+          <div className="flex items-center gap-1.5 flex-shrink-0">
             <span className="text-xs text-muted-foreground">权重:</span>
             <input 
               type="number" 
               value={weight} 
               onChange={e => handleUpdateWeight(idx, parseInt(e.target.value) || 0)}
-              className="w-14 bg-muted border border-border rounded px-2 py-1 text-center font-mono text-xs text-foreground"
+              className="w-12 bg-muted border border-border rounded px-1.5 py-1 text-center font-mono text-xs text-foreground"
             />
           </div>
-          <div className="flex items-center gap-1">
-            <button onClick={() => openTestDialog(p)} className="p-2 text-blue-600 dark:text-blue-400 hover:bg-blue-500/10 rounded-md" title="测试">
+          <div className="flex items-center gap-0.5 flex-shrink-0">
+            <button onClick={() => openTestDialog(p)} className="p-1.5 text-blue-600 dark:text-blue-400 hover:bg-blue-500/10 rounded-md transition-colors" title="测试">
               <Play className="w-4 h-4" />
             </button>
-            <button onClick={() => handleToggleProvider(idx)} className={`p-2 rounded-md ${isEnabled ? 'text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10' : 'text-muted-foreground hover:bg-muted'}`} title={isEnabled ? '禁用' : '启用'}>
+            <button onClick={() => handleToggleProvider(idx)} className={`p-1.5 rounded-md transition-colors ${isEnabled ? 'text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10' : 'text-muted-foreground hover:bg-muted'}`} title={isEnabled ? '禁用' : '启用'}>
               <Power className="w-4 h-4" />
             </button>
-            <button onClick={() => handleCopyProvider(p)} className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="复制">
+            <button onClick={() => handleCopyProvider(p)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors" title="复制">
               <Files className="w-4 h-4" />
             </button>
-            <button onClick={() => openModal(p, idx)} className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="编辑">
+            <button onClick={() => openModal(p, idx)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors" title="编辑">
               <Edit className="w-4 h-4" />
             </button>
-            <button onClick={() => handleDeleteProvider(idx)} className="p-2 text-red-600 dark:text-red-500 hover:bg-red-500/10 rounded-md" title="删除">
+            <button onClick={() => handleDeleteProvider(idx)} className="p-1.5 text-red-600 dark:text-red-500 hover:bg-red-500/10 rounded-md transition-colors" title="删除">
               <Trash2 className="w-4 h-4" />
             </button>
           </div>
@@ -602,16 +621,15 @@ export default function Channels() {
         ) : providers.length === 0 ? (
           <div className="p-12 text-center text-muted-foreground">暂无渠道配置，点击右上角添加。</div>
         ) : (
-          <table className="w-full text-left border-collapse">
+          <table className="w-full text-left border-collapse table-fixed">
             <thead className="bg-muted border-b border-border text-muted-foreground text-sm font-medium">
               <tr>
-                <th className="px-6 py-4">名称</th>
-                <th className="px-6 py-4">分组</th>
-                <th className="px-6 py-4">类型</th>
-                <th className="px-6 py-4">插件</th>
-                <th className="px-6 py-4 text-center">状态</th>
-                <th className="px-6 py-4 text-center">优先级</th>
-                <th className="px-6 py-4 text-right">操作</th>
+                <th className="px-4 py-3 w-[18%]">名称</th>
+                <th className="px-4 py-3 w-[15%]">分组 / 类型</th>
+                <th className="px-4 py-3 w-[12%]">插件</th>
+                <th className="px-4 py-3 w-[10%] text-center">状态</th>
+                <th className="px-4 py-3 w-[10%] text-center">权重</th>
+                <th className="px-4 py-3 w-[35%] text-right">操作</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border text-sm">
@@ -622,46 +640,47 @@ export default function Channels() {
                 const weight = p.preferences?.weight ?? p.weight ?? 0;
                 
                 return (
-                  <tr key={idx} className={`transition-colors group ${isEnabled ? 'hover:bg-muted/50' : 'bg-muted/30 opacity-60'}`}>
-                    <td className="px-6 py-4 flex items-center gap-3">
-                      <ProviderLogo name={p.provider} />
-                      <span className={`font-medium ${isEnabled ? 'text-foreground' : 'text-muted-foreground'}`}>{p.provider}</span>
-                    </td>
-                    <td className="px-6 py-4">
-                      <div className="flex gap-1">
-                        {groups.map((g: string, i: number) => (
-                          <span key={i} className="flex items-center gap-1 bg-muted text-foreground px-2 py-0.5 rounded text-xs"><Folder className="w-3 h-3" />{g}</span>
-                        ))}
+                  <tr key={idx} className={`transition-colors ${isEnabled ? 'hover:bg-muted/50' : 'bg-muted/30 opacity-60'}`}>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-2">
+                        <ProviderLogo name={p.provider} />
+                        <span className={`font-medium truncate ${isEnabled ? 'text-foreground' : 'text-muted-foreground'}`}>{p.provider}</span>
                       </div>
                     </td>
-                    <td className="px-6 py-4">
-                      <span className="flex items-center gap-1 font-mono text-muted-foreground"><MemoryStick className="w-3.5 h-3.5" />{p.engine || 'openai'}</span>
-                    </td>
-                    <td className="px-6 py-4">
-                      {plugins.length > 0 ? (
-                        <div className="flex gap-1">
-                          <span className="bg-primary/10 text-primary px-2 py-0.5 rounded text-xs flex items-center gap-1"><Puzzle className="w-3 h-3" /> {plugins[0].split(':')[0]}</span>
-                          {plugins.length > 1 && <span className="text-xs text-muted-foreground">+{plugins.length - 1}</span>}
+                    <td className="px-4 py-3">
+                      <div className="flex flex-col gap-1">
+                        <div className="flex gap-1 flex-wrap">
+                          {groups.slice(0, 2).map((g: string, i: number) => (
+                            <span key={i} className="bg-muted text-foreground px-1.5 py-0.5 rounded text-xs truncate max-w-[80px]" title={g}>{g}</span>
+                          ))}
+                          {groups.length > 2 && <span className="text-xs text-muted-foreground">+{groups.length - 2}</span>}
                         </div>
+                        <span className="text-xs text-muted-foreground font-mono">{p.engine || 'openai'}</span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      {plugins.length > 0 ? (
+                        <span className="bg-primary/10 text-primary px-1.5 py-0.5 rounded text-xs">
+                          {plugins.length} 个
+                        </span>
                       ) : <span className="text-muted-foreground/50">—</span>}
                     </td>
-                    <td className="px-6 py-4 text-center">
-                      <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${isEnabled ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-500' : 'bg-red-500/10 text-red-600 dark:text-red-500'}`}>
-                        {isEnabled ? <CheckCircle2 className="w-3.5 h-3.5" /> : <X className="w-3.5 h-3.5" />}
-                        {isEnabled ? '启用' : '已禁用'}
+                    <td className="px-4 py-3 text-center">
+                      <span className={`inline-flex items-center justify-center w-6 h-6 rounded-full ${isEnabled ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-500' : 'bg-red-500/10 text-red-600 dark:text-red-500'}`} title={isEnabled ? '已启用' : '已禁用'}>
+                        {isEnabled ? <CheckCircle2 className="w-4 h-4" /> : <X className="w-4 h-4" />}
                       </span>
                     </td>
-                    <td className="px-6 py-4 text-center">
+                    <td className="px-4 py-3 text-center">
                       <input 
                         type="number" 
                         value={weight} 
                         onChange={e => handleUpdateWeight(idx, parseInt(e.target.value) || 0)}
                         onClick={e => e.stopPropagation()}
-                        className="w-16 bg-muted border border-border rounded px-2 py-1 text-center font-mono text-sm text-foreground focus:border-primary outline-none"
+                        className="w-14 bg-muted border border-border rounded px-1 py-1 text-center font-mono text-sm text-foreground focus:border-primary outline-none"
                       />
                     </td>
-                    <td className="px-6 py-4 text-right">
-                      <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <td className="px-4 py-3 text-right">
+                      <div className="flex items-center justify-end gap-1">
                         <button onClick={() => openTestDialog(p)} className="p-1.5 text-blue-600 dark:text-blue-400 hover:bg-blue-500/10 rounded-md transition-colors" title="测试">
                           <Play className="w-4 h-4" />
                         </button>
@@ -722,7 +741,7 @@ export default function Channels() {
                           if (sel?.default_base_url && !formData.base_url) updateFormData('base_url', sel.default_base_url);
                         }} className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm outline-none text-foreground">
                           <option value="">默认 (自动推断)</option>
-                          {channelTypes.map(c => <option key={c.id} value={c.id}>{c.type_name}</option>)}
+                          {channelTypes.map(c => <option key={c.id} value={c.id}>{c.description || c.id}</option>)}
                         </select>
                       </div>
                     </div>

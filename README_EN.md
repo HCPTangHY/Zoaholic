@@ -75,3 +75,7 @@ If you need the original upstream project, please visit:
 - GitHub: https://github.com/yym68686/uni-api
 
 Zoaholic builds upon this solid foundation to add Multi-dialect routing, a Plugin engine, and a React GUI.
+
+## Development Tools
+
+This project is developed using [Lim Code](https://github.com/Lianues/Lim-Code).

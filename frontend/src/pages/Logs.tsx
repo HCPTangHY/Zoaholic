@@ -1,31 +1,42 @@
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { 
-  Search, RefreshCw, Filter, Clock, Zap, AlertCircle, 
-  CheckCircle2, ArrowDownToLine, Trash2, X, FileText,
-  ChevronDown, Database, Eye, Terminal
+  RefreshCw, Filter, ChevronDown, ChevronRight, FileText,
+  Clock, ArrowDownToLine, CheckCircle2, XCircle,
+  Globe, Key, Server, Hash, RotateCcw, Eye, EyeOff,
+  Flag, Users, Timer, Zap, AlertTriangle
 } from 'lucide-react';
-import * as Dialog from '@radix-ui/react-dialog';
 
+// 匹配后端 LogEntry 模型
 interface LogEntry {
-  id: string;
+  id: number;
   timestamp: string;
-  level: string;
-  status_code: number;
-  ip: string;
-  api_key_name?: string;
-  model: string;
-  provider: string;
-  process_time: number;
+  endpoint?: string;
+  client_ip?: string;
+  provider?: string;
+  model?: string;
+  api_key_prefix?: string;
+  process_time?: number;
   first_response_time?: number;
-  content_start_time?: number;
-  prompt_tokens: number;
-  completion_tokens: number;
-  total_tokens: number;
-  stream: boolean;
-  error_type?: string;
-  request?: any;
-  response?: any;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  success: boolean;
+  status_code?: number;
+  is_flagged: boolean;
+  // 扩展字段
+  provider_id?: string;
+  provider_key_index?: number;
+  api_key_name?: string;
+  api_key_group?: string;
+  retry_count?: number;
+  retry_path?: string;
+  request_headers?: string;
+  request_body?: string;
+  upstream_request_body?: string;
+  upstream_response_body?: string;
+  response_body?: string;
+  raw_data_expires_at?: string;
 }
 
 export default function Logs() {
@@ -33,30 +44,38 @@ export default function Logs() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [hasMore, setHasMore] = useState(true);
+  const [totalCount, setTotalCount] = useState(0);
+  
+  // Pagination
+  const [page, setPage] = useState(1);
+  const [pageSize] = useState(50);
   
   // Search & Filter States
-  const [searchQuery, setSearchQuery] = useState('');
-  const [filterLevel, setFilterLevel] = useState('ALL');
   const [filterModel, setFilterModel] = useState('');
   const [filterProvider, setFilterProvider] = useState('');
-  const [limit, setLimit] = useState(50);
+  const [filterSuccess, setFilterSuccess] = useState<string>('ALL');
   const [showFilters, setShowFilters] = useState(false);
   
-  // View Details State
-  const [selectedLog, setSelectedLog] = useState<LogEntry | null>(null);
+  // Accordion State - 展开的日志ID集合
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
 
-  const fetchLogs = async (isLoadMore = false) => {
+  const fetchLogs = async (resetPage = false) => {
     if (!apiKey) return;
     setLoading(true);
     
+    const currentPage = resetPage ? 1 : page;
+    if (resetPage) setPage(1);
+    
     try {
       const queryParams = new URLSearchParams({
-        limit: limit.toString(),
+        page: currentPage.toString(),
+        page_size: pageSize.toString(),
       });
-      if (searchQuery) queryParams.append('search', searchQuery);
-      if (filterLevel !== 'ALL') queryParams.append('level', filterLevel);
+      
       if (filterModel) queryParams.append('model', filterModel);
       if (filterProvider) queryParams.append('provider', filterProvider);
+      if (filterSuccess === 'SUCCESS') queryParams.append('success', 'true');
+      if (filterSuccess === 'FAILED') queryParams.append('success', 'false');
 
       const res = await fetch(`/v1/logs?${queryParams.toString()}`, {
         headers: { Authorization: `Bearer ${apiKey}` }
@@ -64,9 +83,10 @@ export default function Logs() {
       
       if (res.ok) {
         const data = await res.json();
-        const fetchedLogs = data.logs || [];
+        const fetchedLogs = data.items || [];
         setLogs(fetchedLogs);
-        setHasMore(fetchedLogs.length === limit);
+        setTotalCount(data.total || 0);
+        setHasMore(currentPage * pageSize < (data.total || 0));
       }
     } catch (err) {
       console.error('Failed to fetch logs:', err);
@@ -76,25 +96,43 @@ export default function Logs() {
   };
 
   useEffect(() => {
-    fetchLogs();
-  }, [filterLevel, filterModel, filterProvider, limit]);
+    fetchLogs(true);
+  }, [filterModel, filterProvider, filterSuccess]);
 
-  const handleSearch = (e: React.FormEvent) => {
-    e.preventDefault();
-    fetchLogs();
+  const loadMore = () => {
+    setPage(prev => prev + 1);
+  };
+
+  useEffect(() => {
+    if (page > 1) {
+      fetchLogs();
+    }
+  }, [page]);
+
+  // Toggle accordion
+  const toggleExpand = (id: number) => {
+    setExpandedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
   };
 
   // ========== Helpers ==========
-  const getStatusColor = (code: number) => {
-    if (code >= 200 && code < 300) return 'text-emerald-600 dark:text-emerald-500 bg-emerald-500/10 border-emerald-500/20';
-    if (code >= 400 && code < 500) return 'text-yellow-600 dark:text-yellow-500 bg-yellow-500/10 border-yellow-500/20';
+  const getStatusColor = (success: boolean, code?: number) => {
+    if (success) return 'text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 border-emerald-500/20';
+    if (code && code >= 400 && code < 500) return 'text-yellow-600 dark:text-yellow-500 bg-yellow-500/10 border-yellow-500/20';
     return 'text-red-600 dark:text-red-500 bg-red-500/10 border-red-500/20';
   };
 
   const calculateSpeed = (log: LogEntry) => {
     if (!log.completion_tokens || !log.process_time) return null;
     
-    let startTime = log.content_start_time || log.first_response_time || 0;
+    const startTime = log.first_response_time || 0;
     const genTime = log.process_time - startTime;
     if (genTime <= 0) return null;
 
@@ -104,57 +142,276 @@ export default function Logs() {
     else if (speed >= 40) color = 'text-emerald-600 dark:text-emerald-400';
     else if (speed < 15) color = 'text-yellow-600 dark:text-yellow-500';
 
-    return <span className={color}>{speed.toFixed(1)} t/s</span>;
+    return { speed: speed.toFixed(1), color };
   };
 
-  // Mobile Log Card
-  const LogCard = ({ log }: { log: LogEntry }) => (
-    <div className="bg-card border border-border rounded-xl p-4 space-y-3">
-      <div className="flex items-start justify-between">
-        <div className="flex-1 min-w-0">
-          <div className="font-medium text-foreground truncate" title={log.model}>{log.model}</div>
-          <div className="text-xs text-muted-foreground">{log.provider || '未知渠道'}</div>
-        </div>
-        <span className={`px-2 py-1 rounded font-mono text-xs font-medium border ${getStatusColor(log.status_code)}`}>
-          {log.status_code}
-        </span>
-      </div>
+  const formatTimestamp = (ts: string) => {
+    try {
+      const date = new Date(ts);
+      return date.toLocaleString('zh-CN', {
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      });
+    } catch {
+      return ts;
+    }
+  };
 
-      <div className="grid grid-cols-2 gap-3 text-sm">
-        <div>
-          <div className="text-xs text-muted-foreground mb-0.5">时间</div>
-          <div className="font-mono text-foreground text-xs">{log.timestamp}</div>
-        </div>
-        <div>
-          <div className="text-xs text-muted-foreground mb-0.5">耗时</div>
-          <div className="font-mono text-foreground">{log.process_time.toFixed(2)}s</div>
-        </div>
-        <div>
-          <div className="text-xs text-muted-foreground mb-0.5">Tokens</div>
-          <div className="font-mono text-foreground">
-            <span className="text-muted-foreground">{log.prompt_tokens}</span>+<span className="text-blue-600 dark:text-blue-400">{log.completion_tokens}</span>={log.total_tokens}
+  const formatFullTimestamp = (ts: string) => {
+    try {
+      const date = new Date(ts);
+      return date.toLocaleString('zh-CN');
+    } catch {
+      return ts;
+    }
+  };
+
+  // 单条日志的手风琴组件
+  const LogAccordionItem = ({ log }: { log: LogEntry }) => {
+    const isExpanded = expandedIds.has(log.id);
+    const speedInfo = calculateSpeed(log);
+    
+    return (
+      <div className="bg-card border border-border rounded-xl overflow-hidden">
+        {/* Header - 折叠状态显示关键信息 */}
+        <div 
+          className="cursor-pointer hover:bg-muted/50 transition-colors"
+          onClick={() => toggleExpand(log.id)}
+        >
+          {/* 第一行：核心信息 */}
+          <div className="flex items-center gap-2 sm:gap-3 p-3 sm:p-4">
+            {/* 展开图标 */}
+            <div className="flex-shrink-0 text-muted-foreground">
+              {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+            </div>
+            
+            {/* 状态图标 */}
+            <div className="flex-shrink-0">
+              {log.success ? (
+                <CheckCircle2 className="w-5 h-5 text-emerald-500" />
+              ) : (
+                <XCircle className="w-5 h-5 text-red-500" />
+              )}
+            </div>
+            
+            {/* 时间 */}
+            <div className="flex-shrink-0 text-xs sm:text-sm font-mono text-muted-foreground w-[85px] sm:w-[100px]">
+              {formatTimestamp(log.timestamp)}
+            </div>
+            
+            {/* 模型 & 渠道 */}
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-foreground text-sm truncate" title={log.model || '-'}>
+                {log.model || '-'}
+              </div>
+              <div className="text-xs text-muted-foreground truncate">
+                {log.provider || '未知'}
+                {log.provider_key_index !== undefined && <span className="opacity-60"> [{log.provider_key_index}]</span>}
+              </div>
+            </div>
+            
+            {/* 标记 & 重试 */}
+            <div className="hidden sm:flex items-center gap-1.5 flex-shrink-0">
+              {log.is_flagged && (
+                <span className="text-yellow-500" title="已标记">
+                  <Flag className="w-4 h-4" />
+                </span>
+              )}
+              {(log.retry_count ?? 0) > 0 && (
+                <span className="text-orange-500 flex items-center gap-0.5 text-xs" title={`重试 ${log.retry_count} 次`}>
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  {log.retry_count}
+                </span>
+              )}
+            </div>
+            
+            {/* 状态码 */}
+            <div className="flex-shrink-0">
+              <span className={`px-1.5 sm:px-2 py-0.5 sm:py-1 rounded text-xs font-mono font-medium border ${getStatusColor(log.success, log.status_code)}`}>
+                {log.status_code || '-'}
+              </span>
+            </div>
+          </div>
+          
+          {/* 第二行：详细指标 */}
+          <div className="flex items-center gap-2 sm:gap-4 px-3 sm:px-4 pb-3 sm:pb-4 pt-0 text-xs flex-wrap">
+            {/* API Key */}
+            <div className="flex items-center gap-1 text-muted-foreground" title={`API Key: ${log.api_key_name || log.api_key_prefix || '-'}`}>
+              <Key className="w-3.5 h-3.5" />
+              <span className="max-w-[80px] sm:max-w-[120px] truncate">{log.api_key_name || log.api_key_prefix || '-'}</span>
+            </div>
+            
+            {/* 分组 */}
+            {log.api_key_group && (
+              <div className="hidden sm:flex items-center gap-1 text-muted-foreground">
+                <Users className="w-3.5 h-3.5" />
+                <span>{log.api_key_group}</span>
+              </div>
+            )}
+            
+            {/* IP */}
+            <div className="hidden lg:flex items-center gap-1 text-muted-foreground font-mono">
+              <Globe className="w-3.5 h-3.5" />
+              <span>{log.client_ip || '-'}</span>
+            </div>
+            
+            <div className="flex-1" />
+            
+            {/* Tokens */}
+            <div className="flex items-center gap-1 font-mono">
+              <span className="text-muted-foreground">{log.prompt_tokens || 0}</span>
+              <span className="text-muted-foreground/50">+</span>
+              <span className="text-blue-600 dark:text-blue-400">{log.completion_tokens || 0}</span>
+              <span className="text-muted-foreground/50">=</span>
+              <span className="text-foreground">{log.total_tokens || 0}</span>
+            </div>
+            
+            {/* 耗时 */}
+            <div className="flex items-center gap-1 text-muted-foreground" title={`总耗时: ${log.process_time?.toFixed(2)}s, 首响: ${log.first_response_time?.toFixed(2) || '-'}s`}>
+              <Clock className="w-3.5 h-3.5" />
+              <span className="font-mono">{log.process_time?.toFixed(2) || '-'}s</span>
+              {log.first_response_time !== undefined && (
+                <span className="text-muted-foreground/60 hidden sm:inline">(首响 {log.first_response_time.toFixed(2)}s)</span>
+              )}
+            </div>
+            
+            {/* 速度 */}
+            {speedInfo && (
+              <div className={`flex items-center gap-1 font-mono ${speedInfo.color}`} title="生成速度">
+                <Zap className="w-3.5 h-3.5" />
+                <span>{speedInfo.speed} t/s</span>
+              </div>
+            )}
           </div>
         </div>
-        <div>
-          <div className="text-xs text-muted-foreground mb-0.5">速度</div>
-          <div className="font-mono">{calculateSpeed(log) || '-'}</div>
-        </div>
+        
+        {/* Expanded Content - 展开后显示原始数据 */}
+        {isExpanded && (
+          <div className="border-t border-border bg-muted/30 p-4 space-y-4">
+            {/* 补充信息 */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 text-sm">
+              <InfoItem label="日志 ID" value={String(log.id)} mono />
+              <InfoItem label="完整时间" value={formatFullTimestamp(log.timestamp)} />
+              <InfoItem label="Endpoint" value={log.endpoint || '-'} mono />
+              <InfoItem label="客户端 IP" value={log.client_ip || '-'} mono />
+              <InfoItem label="Provider ID" value={log.provider_id || '-'} />
+              {log.raw_data_expires_at && (
+                <InfoItem label="数据过期" value={formatFullTimestamp(log.raw_data_expires_at)} />
+              )}
+            </div>
+            
+            {/* 重试路径 */}
+            {log.retry_path && (
+              <div className="space-y-1">
+                <div className="text-xs font-medium text-muted-foreground flex items-center gap-1">
+                  <RotateCcw className="w-3.5 h-3.5" /> 重试路径
+                </div>
+                <pre className="bg-background border border-border p-3 rounded-lg text-xs font-mono text-foreground overflow-x-auto">
+                  {log.retry_path}
+                </pre>
+              </div>
+            )}
+            
+            {/* 请求/响应数据 - 手风琴形式并列 */}
+            <div className="space-y-2">
+              {/* 1. 请求头 */}
+              <JsonAccordion 
+                title="请求头" 
+                data={log.request_headers} 
+                icon={<FileText className="w-4 h-4" />}
+              />
+              
+              {/* 2. 用户请求体 */}
+              <JsonAccordion 
+                title="用户请求体" 
+                data={log.request_body} 
+                icon={<Eye className="w-4 h-4" />}
+              />
+              
+              {/* 3. 上游请求体 */}
+              <JsonAccordion 
+                title="上游请求体" 
+                data={log.upstream_request_body} 
+                icon={<Server className="w-4 h-4" />}
+              />
+              
+              {/* 4. 上游响应体 */}
+              <JsonAccordion 
+                title="上游响应体" 
+                data={log.upstream_response_body} 
+                icon={<Server className="w-4 h-4" />}
+              />
+              
+              {/* 5. 用户响应体 */}
+              <JsonAccordion 
+                title="用户响应体" 
+                data={log.response_body} 
+                icon={<EyeOff className="w-4 h-4" />}
+              />
+            </div>
+          </div>
+        )}
       </div>
+    );
+  };
 
-      <div className="flex items-center justify-between pt-2 border-t border-border">
-        <div className="text-xs text-muted-foreground">
-          <span>{log.api_key_name || '-'}</span> · <span className="font-mono">{log.ip}</span>
-        </div>
-        <button 
-          onClick={() => setSelectedLog(log)}
-          className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors"
-          title="查看详情"
-        >
-          <Eye className="w-4 h-4" />
-        </button>
+  // 信息项组件
+  const InfoItem = ({ label, value, mono }: { label: string; value: string; mono?: boolean }) => (
+    <div className="space-y-0.5">
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className={`text-sm text-foreground truncate ${mono ? 'font-mono' : ''}`} title={value}>
+        {value}
       </div>
     </div>
   );
+
+  // JSON 手风琴展示块组件
+  const JsonAccordion = ({ title, data, icon, defaultOpen = false }: { title: string; data?: string; icon?: React.ReactNode; defaultOpen?: boolean }) => {
+    const [isOpen, setIsOpen] = useState(defaultOpen);
+    
+    if (!data) return null;
+    
+    let formatted: string;
+    try {
+      const parsed = JSON.parse(data);
+      formatted = JSON.stringify(parsed, null, 2);
+    } catch {
+      formatted = data;
+    }
+    
+    // 计算预览文本
+    const previewText = formatted.length > 80 ? formatted.substring(0, 80) + '...' : formatted;
+    
+    return (
+      <div className="border border-border rounded-lg overflow-hidden">
+        <div 
+          className="flex items-center gap-2 px-3 py-2 bg-muted/50 cursor-pointer hover:bg-muted transition-colors"
+          onClick={() => setIsOpen(!isOpen)}
+        >
+          <div className="flex-shrink-0 text-muted-foreground">
+            {isOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+          </div>
+          <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+            {icon}
+            {title}
+          </div>
+          {!isOpen && (
+            <div className="flex-1 text-xs font-mono text-muted-foreground/60 truncate ml-2">
+              {previewText.replace(/\n/g, ' ')}
+            </div>
+          )}
+        </div>
+        {isOpen && (
+          <pre className="bg-background p-3 text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap max-h-80 overflow-y-auto border-t border-border">
+            {formatted}
+          </pre>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div className="space-y-4 sm:space-y-6 animate-in fade-in duration-500 font-sans pb-12 h-full flex flex-col">
@@ -165,7 +422,7 @@ export default function Logs() {
           <p className="text-muted-foreground mt-1 text-sm sm:text-base">监控 API 请求详情与性能</p>
         </div>
         <button 
-          onClick={() => fetchLogs()} 
+          onClick={() => fetchLogs(true)} 
           className="p-2 text-muted-foreground hover:text-foreground bg-card border border-border rounded-lg transition-colors"
         >
           <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
@@ -174,17 +431,6 @@ export default function Logs() {
 
       {/* Toolbar */}
       <div className="bg-card border border-border p-3 sm:p-4 rounded-xl shadow-sm space-y-3 flex-shrink-0">
-        <form onSubmit={handleSearch} className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-          <input 
-            type="text"
-            value={searchQuery}
-            onChange={e => setSearchQuery(e.target.value)}
-            placeholder="搜索 ID, Key, IP..."
-            className="w-full bg-background border border-border focus:border-primary pl-10 pr-4 py-2 rounded-lg text-sm text-foreground"
-          />
-        </form>
-
         {/* Mobile Filter Toggle */}
         <button 
           onClick={() => setShowFilters(!showFilters)}
@@ -198,19 +444,18 @@ export default function Logs() {
         {/* Filters - Always show on desktop, toggle on mobile */}
         <div className={`flex flex-col sm:flex-row gap-3 ${showFilters ? 'block' : 'hidden md:flex'}`}>
           <select 
-            value={filterLevel} 
-            onChange={e => setFilterLevel(e.target.value)}
+            value={filterSuccess} 
+            onChange={e => setFilterSuccess(e.target.value)}
             className="bg-background border border-border text-sm px-3 py-2 rounded-lg text-foreground flex-1 sm:flex-none"
           >
-            <option value="ALL">所有等级</option>
-            <option value="INFO">INFO (2xx)</option>
-            <option value="WARNING">WARNING (4xx)</option>
-            <option value="ERROR">ERROR (5xx)</option>
+            <option value="ALL">所有状态</option>
+            <option value="SUCCESS">成功</option>
+            <option value="FAILED">失败</option>
           </select>
 
           <input 
             type="text" 
-            placeholder="Model 过滤"
+            placeholder="模型过滤"
             value={filterModel}
             onChange={e => setFilterModel(e.target.value)}
             className="bg-background border border-border text-sm px-3 py-2 rounded-lg text-foreground flex-1 sm:w-32 sm:flex-none"
@@ -218,157 +463,41 @@ export default function Logs() {
 
           <input 
             type="text" 
-            placeholder="Provider"
+            placeholder="渠道过滤"
             value={filterProvider}
             onChange={e => setFilterProvider(e.target.value)}
             className="bg-background border border-border text-sm px-3 py-2 rounded-lg text-foreground flex-1 sm:w-32 sm:flex-none"
           />
+          
+          <div className="text-xs text-muted-foreground self-center">
+            共 {totalCount} 条记录
+          </div>
         </div>
       </div>
 
-      {/* Mobile Card List */}
-      <div className="md:hidden space-y-3 flex-1 overflow-auto">
+      {/* Logs List - Accordion */}
+      <div className="flex-1 overflow-auto space-y-2">
         {logs.length === 0 && !loading ? (
-          <div className="flex flex-col items-center justify-center p-12 text-muted-foreground">
+          <div className="flex flex-col items-center justify-center p-16 text-muted-foreground bg-card border border-border rounded-xl">
             <FileText className="w-12 h-12 mb-4 opacity-50" />
             <p>未找到匹配的日志</p>
           </div>
         ) : (
-          logs.map((log) => <LogCard key={log.id} log={log} />)
+          logs.map((log) => <LogAccordionItem key={log.id} log={log} />)
         )}
         
+        {/* Load More */}
         {hasMore && logs.length > 0 && (
           <button 
-            onClick={() => setLimit(prev => prev + 50)} 
-            className="w-full text-sm text-muted-foreground hover:text-foreground font-medium flex items-center justify-center gap-1.5 py-4 bg-card border border-border rounded-xl"
+            onClick={loadMore} 
+            disabled={loading}
+            className="w-full text-sm text-muted-foreground hover:text-foreground font-medium flex items-center justify-center gap-1.5 py-4 bg-card border border-border rounded-xl disabled:opacity-50 transition-colors"
           >
-            <ArrowDownToLine className="w-4 h-4" /> 加载更多 ({logs.length})
+            <ArrowDownToLine className="w-4 h-4" /> 
+            {loading ? '加载中...' : `加载更多 (${logs.length}/${totalCount})`}
           </button>
         )}
       </div>
-
-      {/* Desktop Table */}
-      <div className="hidden md:flex flex-1 bg-card border border-border rounded-xl overflow-hidden shadow-sm flex-col">
-        {logs.length === 0 && !loading ? (
-          <div className="flex flex-col items-center justify-center p-16 text-muted-foreground">
-            <FileText className="w-12 h-12 mb-4 opacity-50" />
-            <p>未找到匹配的日志</p>
-          </div>
-        ) : (
-          <div className="flex-1 overflow-auto">
-            <table className="w-full text-left text-sm border-collapse">
-              <thead className="bg-muted text-muted-foreground font-medium sticky top-0 z-10 shadow-sm">
-                <tr>
-                  <th className="px-6 py-4">时间 / ID</th>
-                  <th className="px-6 py-4">Key / IP</th>
-                  <th className="px-6 py-4">模型 / 渠道</th>
-                  <th className="px-6 py-4">Tokens (P+C=T)</th>
-                  <th className="px-6 py-4">耗时 / 速度</th>
-                  <th className="px-6 py-4 text-center">状态</th>
-                  <th className="px-6 py-4 text-right">操作</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-border">
-                {logs.map((log, i) => (
-                  <tr key={log.id} className="hover:bg-muted/50 transition-colors">
-                    <td className="px-6 py-4">
-                      <div className="font-mono text-foreground">{log.timestamp}</div>
-                      <div className="text-xs text-muted-foreground/60 mt-1 truncate max-w-[120px]" title={log.id}>
-                        {log.id}
-                      </div>
-                    </td>
-                    <td className="px-6 py-4">
-                      <div className="text-foreground">{log.api_key_name || '-'}</div>
-                      <div className="text-xs text-muted-foreground font-mono mt-1">{log.ip}</div>
-                    </td>
-                    <td className="px-6 py-4">
-                      <div className="text-foreground font-medium max-w-[150px] truncate" title={log.model}>{log.model}</div>
-                      <div className="text-xs text-muted-foreground mt-1">{log.provider || '未知渠道'}</div>
-                    </td>
-                    <td className="px-6 py-4 font-mono text-foreground">
-                      <span className="text-muted-foreground">{log.prompt_tokens}</span> + <span className="text-blue-600 dark:text-blue-400">{log.completion_tokens}</span> = {log.total_tokens}
-                    </td>
-                    <td className="px-6 py-4">
-                      <div className="text-foreground font-mono">{log.process_time.toFixed(2)}s</div>
-                      <div className="text-xs font-mono mt-1">
-                        {calculateSpeed(log)}
-                      </div>
-                    </td>
-                    <td className="px-6 py-4 text-center">
-                      <span className={`px-2 py-1 rounded font-mono font-medium border ${getStatusColor(log.status_code)}`}>
-                        {log.status_code}
-                      </span>
-                    </td>
-                    <td className="px-6 py-4 text-right">
-                      <button 
-                        onClick={() => setSelectedLog(log)}
-                        className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors"
-                        title="查看详情"
-                      >
-                        <Eye className="w-4 h-4" />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-
-        {/* Pagination / Load More */}
-        {hasMore && logs.length > 0 && (
-          <div className="p-4 bg-muted border-t border-border text-center">
-            <button 
-              onClick={() => setLimit(prev => prev + 50)} 
-              className="text-sm text-muted-foreground hover:text-foreground font-medium flex items-center justify-center gap-1.5 mx-auto"
-            >
-              <ArrowDownToLine className="w-4 h-4" /> 加载更多 (当前: {logs.length})
-            </button>
-          </div>
-        )}
-      </div>
-
-      {/* Log Detail Modal - Responsive */}
-      <Dialog.Root open={!!selectedLog} onOpenChange={() => setSelectedLog(null)}>
-        <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[95vw] sm:w-[90vw] md:w-[800px] max-h-[85vh] bg-background border border-border rounded-xl shadow-2xl z-50 flex flex-col">
-            <div className="p-4 sm:p-5 border-b border-border flex justify-between items-center bg-muted/30">
-              <Dialog.Title className="text-lg font-bold text-foreground flex items-center gap-2">
-                <Terminal className="w-5 h-5 text-primary" /> 日志详情
-              </Dialog.Title>
-              <Dialog.Close className="text-muted-foreground hover:text-foreground"><X className="w-5 h-5" /></Dialog.Close>
-            </div>
-
-            <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4 sm:space-y-6">
-              {/* Meta Info */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4 bg-muted p-3 sm:p-4 rounded-lg border border-border">
-                <div><div className="text-xs text-muted-foreground mb-1">Status</div><div className="font-mono text-foreground">{selectedLog?.status_code}</div></div>
-                <div><div className="text-xs text-muted-foreground mb-1">Time</div><div className="font-mono text-foreground">{selectedLog?.process_time.toFixed(2)}s</div></div>
-                <div><div className="text-xs text-muted-foreground mb-1">First Response</div><div className="font-mono text-foreground">{selectedLog?.first_response_time ? `${selectedLog.first_response_time.toFixed(2)}s` : '-'}</div></div>
-                <div><div className="text-xs text-muted-foreground mb-1">Stream</div><div className="text-foreground">{selectedLog?.stream ? 'Yes' : 'No'}</div></div>
-              </div>
-
-              {/* Request Data */}
-              <div className="space-y-2">
-                <h3 className="text-sm font-semibold text-foreground">Request Data</h3>
-                <pre className="bg-muted border border-border p-3 sm:p-4 rounded-lg text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap max-h-48 sm:max-h-60">
-                  {selectedLog?.request ? JSON.stringify(selectedLog.request, null, 2) : 'No request data available'}
-                </pre>
-              </div>
-
-              {/* Response Data */}
-              <div className="space-y-2">
-                <h3 className="text-sm font-semibold text-foreground">Response / Error Data</h3>
-                <pre className="bg-muted border border-border p-3 sm:p-4 rounded-lg text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap max-h-48 sm:max-h-60">
-                  {selectedLog?.response ? JSON.stringify(selectedLog.response, null, 2) : 'No response data available'}
-                </pre>
-              </div>
-            </div>
-          </Dialog.Content>
-        </Dialog.Portal>
-      </Dialog.Root>
-
     </div>
   );
 }
