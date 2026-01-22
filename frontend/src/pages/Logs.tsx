@@ -3,8 +3,8 @@ import { useAuthStore } from '../store/authStore';
 import { 
   RefreshCw, Filter, ChevronDown, ChevronRight, FileText,
   Clock, ArrowDownToLine, CheckCircle2, XCircle,
-  Globe, Key, Server, Hash, RotateCcw, Eye, EyeOff,
-  Flag, Users, Timer, Zap, AlertTriangle
+  Globe, Key, Server, RotateCcw, Eye, EyeOff,
+  Flag, Users, Zap, AlertTriangle
 } from 'lucide-react';
 
 // 匹配后端 LogEntry 模型
@@ -169,6 +169,112 @@ export default function Logs() {
     }
   };
 
+  const formatJsonBestEffort = (raw: string) => {
+    const input = String(raw ?? '').trim();
+    if (!input) return { formatted: '', isJson: false };
+
+    try {
+      let parsed: any = JSON.parse(input);
+
+      // 处理“双重序列化”的情况："{...}" / "[...]"
+      if (typeof parsed === 'string') {
+        const inner = parsed.trim();
+        try {
+          parsed = JSON.parse(inner);
+        } catch {
+          return { formatted: parsed, isJson: false };
+        }
+      }
+
+      if (parsed === null) return { formatted: 'null', isJson: true };
+      if (typeof parsed === 'object') return { formatted: JSON.stringify(parsed, null, 2), isJson: true };
+      return { formatted: String(parsed), isJson: false };
+    } catch {
+      return { formatted: raw, isJson: false };
+    }
+  };
+
+  const getHttpCodeColor = (code?: number | null) => {
+    if (code == null) return 'text-muted-foreground bg-muted/30 border-border';
+    if (code >= 200 && code < 300) return 'text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 border-emerald-500/20';
+    if (code >= 400 && code < 500) return 'text-yellow-600 dark:text-yellow-500 bg-yellow-500/10 border-yellow-500/20';
+    return 'text-red-600 dark:text-red-500 bg-red-500/10 border-red-500/20';
+  };
+
+  type RetryHop = { provider?: string; status_code?: number | null; error?: string };
+
+  const RetryPathView = ({ retryPathJson }: { retryPathJson: string }) => {
+    const [openIndex, setOpenIndex] = useState<number | null>(null);
+
+    let items: RetryHop[] | null = null;
+    try {
+      const parsed = JSON.parse(retryPathJson);
+      if (Array.isArray(parsed)) items = parsed;
+    } catch {
+      items = null;
+    }
+
+    if (!items) {
+      return (
+        <pre className="bg-background border border-border p-3 rounded-lg text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap">
+          {retryPathJson}
+        </pre>
+      );
+    }
+
+    if (items.length === 0) {
+      return <div className="text-sm text-muted-foreground">无重试记录</div>;
+    }
+
+    return (
+      <div className="space-y-2">
+        {items.map((hop, idx) => {
+          const provider = hop.provider || '-';
+          const code = hop.status_code;
+          const error = hop.error || '';
+          const isOpen = openIndex === idx;
+          const preview = error.length > 120 ? `${error.slice(0, 120)}...` : error;
+
+          return (
+            <div key={`${provider}-${idx}`} className="border border-border rounded-lg overflow-hidden bg-background">
+              <button
+                type="button"
+                onClick={() => setOpenIndex(prev => (prev === idx ? null : idx))}
+                className="w-full text-left px-3 py-2 flex items-start gap-2 hover:bg-muted/50 transition-colors"
+              >
+                <div className="flex-shrink-0 text-xs font-mono text-muted-foreground mt-0.5">
+                  #{idx + 1}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-sm font-medium text-foreground truncate" title={provider}>{provider}</span>
+                    <span className={`px-2 py-0.5 rounded text-xs font-mono border ${getHttpCodeColor(code)}`}>
+                      {code ?? '-'}
+                    </span>
+                    {error && (
+                      <span className="text-xs text-muted-foreground flex items-center gap-1">
+                        <AlertTriangle className="w-3.5 h-3.5" />
+                        <span className="truncate max-w-[520px]">{isOpen ? '展开查看错误详情' : preview}</span>
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="flex-shrink-0 text-muted-foreground mt-0.5">
+                  {isOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                </div>
+              </button>
+              {isOpen && error && (
+                <pre className="border-t border-border p-3 text-xs font-mono text-foreground whitespace-pre-wrap max-h-72 overflow-y-auto">
+                  {error}
+                </pre>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
   // 单条日志的手风琴组件
   const LogAccordionItem = ({ log }: { log: LogEntry }) => {
     const isExpanded = expandedIds.has(log.id);
@@ -309,9 +415,7 @@ export default function Logs() {
                 <div className="text-xs font-medium text-muted-foreground flex items-center gap-1">
                   <RotateCcw className="w-3.5 h-3.5" /> 重试路径
                 </div>
-                <pre className="bg-background border border-border p-3 rounded-lg text-xs font-mono text-foreground overflow-x-auto">
-                  {log.retry_path}
-                </pre>
+                <RetryPathView retryPathJson={log.retry_path} />
               </div>
             )}
             
@@ -373,14 +477,8 @@ export default function Logs() {
     const [isOpen, setIsOpen] = useState(defaultOpen);
     
     if (!data) return null;
-    
-    let formatted: string;
-    try {
-      const parsed = JSON.parse(data);
-      formatted = JSON.stringify(parsed, null, 2);
-    } catch {
-      formatted = data;
-    }
+
+    const { formatted } = formatJsonBestEffort(data);
     
     // 计算预览文本
     const previewText = formatted.length > 80 ? formatted.substring(0, 80) + '...' : formatted;
