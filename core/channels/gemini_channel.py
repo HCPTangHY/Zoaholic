@@ -489,7 +489,45 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
     return url, headers, normalize_gemini_payload(payload)
 
 
-async def gemini_json_process(response_json):
+def _extract_gemini_block_message(response_json: dict) -> str | None:
+    if not isinstance(response_json, dict):
+        return None
+    return (
+        safe_get(response_json, "promptFeedback", "blockReasonMessage", default=None)
+        or safe_get(response_json, "promptFeedback", "blockReason", default=None)
+        or safe_get(response_json, "candidates", 0, "blockReason", default=None)
+    )
+
+
+def _normalize_gemini_http_error(error_message: dict) -> dict:
+    """把 Gemini/FirebaseVertex 的 HTTP 错误归一化成可直接返回给用户的 message。"""
+    if not isinstance(error_message, dict):
+        return {"error": "Gemini HTTP Error", "status_code": 400, "details": str(error_message)}
+
+    status_code = error_message.get("status_code") or 400
+    details = error_message.get("details")
+
+    message = None
+    if isinstance(details, dict):
+        message = (
+            _extract_gemini_block_message(details)
+            or safe_get(details, "error", "message", default=None)
+            or safe_get(details, "message", default=None)
+        )
+    elif isinstance(details, str):
+        message = details
+
+    if not message:
+        message = str(details) if details is not None else str(error_message)
+
+    return {
+        "error": error_message.get("error", "Gemini HTTP Error"),
+        "status_code": int(status_code) if str(status_code).isdigit() else 400,
+        "details": message,
+    }
+
+
+def gemini_json_process(response_json):
     """处理 Gemini JSON 响应
     
     遍历所有 parts 收集：
@@ -581,7 +619,7 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
     
     error_message = await check_response(response, "fetch_gemini_response")
     if error_message:
-        yield error_message
+        yield _normalize_gemini_http_error(error_message)
         return
 
     response_bytes = await response.aread()
@@ -603,11 +641,13 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
         is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature = await gemini_json_process(first_resp)
         
         if blockReason and blockReason != "STOP":
-            yield {"error": f"Gemini Blocked: {blockReason}", "status_code": 400, "details": first_resp}
+            msg = _extract_gemini_block_message(first_resp) or blockReason
+            yield {"error": f"Gemini Blocked: {blockReason}", "status_code": 400, "details": msg}
             return
         
         if not safe_get(first_resp, "candidates") and blockReason:
-            yield {"error": f"Gemini Blocked: {blockReason}", "status_code": 400, "details": first_resp}
+            msg = _extract_gemini_block_message(first_resp) or blockReason
+            yield {"error": f"Gemini Blocked: {blockReason}", "status_code": 400, "details": msg}
             return
 
         # 获取 usage (可能在最后一个响应对象中)
@@ -630,7 +670,7 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
             yield {
                 "error": "Gemini image generation failed: no image was generated",
                 "status_code": 502,
-                "details": {"reason": "no_image_generated", "model": model}
+                "details": "Gemini image generation failed: no image was generated",
             }
             return
         
@@ -639,7 +679,7 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
             yield {
                 "error": "Gemini returned empty response",
                 "status_code": 502,
-                "details": {"reason": "empty_response", "model": model}
+                "details": "Gemini returned empty response",
             }
             return
 
@@ -648,6 +688,29 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
             role = "assistant"
         elif not role:
             role = "assistant"
+
+        # 检查是否需要处理图像
+        # 对于包含 -image 的模型（如 gemini-3-pro-image），我们通常希望将其作为 Markdown 返回到聊天中
+        if image_base64 and ("-image" in model.lower() or "image-generation" in model.lower()):
+            try:
+                from ..log_config import logger
+                logger.info(f"[Gemini] Processing image for non-stream response, model={model}")
+                
+                # 发送 SSE 注释作为 keepalive 并不适用这里，因为是非流式
+                # 上传到图床
+                image_url = await upload_image_to_0x0st("data:image/png;base64," + image_base64, max_size_mb=50.0)
+                
+                if image_url and image_url.startswith("http"):
+                    content = (content or "") + f"\n\n![image]({image_url})"
+                    image_base64 = None # 清除，防止 generate_no_stream_response 返回图像 API 格式
+                else:
+                    # 上传失败，返回 data URI 格式的 base64
+                    content = (content or "") + f"\n\n![image](data:image/png;base64,{image_base64})"
+                    image_base64 = None
+            except Exception as e:
+                from ..log_config import logger
+                logger.error(f"[Gemini] Error processing image in non-stream: {e}")
+                # 出错时保持原样，由 generate_no_stream_response 处理
 
         yield await generate_no_stream_response(
             timestamp, model, content=content, tools_id=None, 
@@ -666,7 +729,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_gemini_response_stream")
         if error_message:
-            yield error_message
+            yield _normalize_gemini_http_error(error_message)
             return
         buffer = ""
         promptTokenCount = 0
@@ -730,7 +793,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
                     yield sse_string
 
                 if image_base64:
-                    if "gemini-2.5-flash-image" not in model and "gemini-3-pro-image" not in model:
+                    if "-image" not in model.lower() and "image-generation" not in model.lower():
                         yield await generate_no_stream_response(timestamp, model, content=content, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=totalTokenCount, prompt_tokens=promptTokenCount, completion_tokens=candidatesTokenCount, image_base64=image_base64, thought_signature=thought_signature)
                     else:
                         try:
@@ -781,11 +844,12 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
                     yield sse_string
 
                 if parts_json == "[]" or (blockReason and blockReason != "STOP"):
-                    yield {"error": f"Gemini Blocked: {blockReason or 'Empty Response'}", "status_code": 400, "details": response_json}
+                    msg = _extract_gemini_block_message(response_json) or (blockReason or "Empty Response")
+                    yield {"error": f"Gemini Blocked: {blockReason or 'Empty Response'}", "status_code": 400, "details": msg}
                     return
                 elif finishReason and finishReason not in ["STOP", "MAX_TOKENS"]:
                     # 非正常结束原因（如 SAFETY, RECITATION 等）
-                    yield {"error": f"Gemini Finish Reason: {finishReason}", "status_code": 400, "details": response_json}
+                    yield {"error": f"Gemini Finish Reason: {finishReason}", "status_code": 400, "details": f"{finishReason}"}
                     return
                 elif finishReason:
                     # 正常结束（STOP 或 MAX_TOKENS）
@@ -813,7 +877,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
             yield {
                 "error": "Gemini image generation failed: no image was generated",
                 "status_code": 502,
-                "details": error_detail
+                "details": "Gemini image generation failed: no image was generated",
             }
             return
         
@@ -823,7 +887,7 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
             yield {
                 "error": "Gemini returned empty response",
                 "status_code": 502,
-                "details": {"reason": "empty_response", "model": model, "stream_finished_normally": stream_finished_normally}
+                "details": "Gemini returned empty response",
             }
             return
 
@@ -842,34 +906,72 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
 
 
 async def fetch_gemini_models(client, provider):
-    """获取 Gemini API 的模型列表"""
+    """获取 Gemini API 的模型列表。
+
+    Gemini 的 `models.list` 接口默认只返回一页（通常约 50 条）。这里显式拉取分页，直到没有 nextPageToken。
+    """
+    from ..log_config import logger
+
     base_url = provider.get('base_url', 'https://generativelanguage.googleapis.com/v1beta').rstrip('/')
     api_key = provider.get('api')
     if isinstance(api_key, list):
         api_key = api_key[0] if api_key else None
-    
-    # 使用请求头认证，避免 URL 参数中的特殊字符问题
+
     url = f"{base_url}/models"
+
     headers = {
         'Content-Type': 'application/json',
+        # 使用请求头认证，避免 URL 参数中的特殊字符问题
         'x-goog-api-key': api_key,
     }
-    
-    response = await client.get(url, headers=headers)
-    response.raise_for_status()
-    
-    data = response.json()
-    models = []
-    if isinstance(data, dict) and 'models' in data:
-        # Gemini 返回格式: {"models": [{"name": "models/gemini-pro", ...}]}
-        for m in data['models']:
+
+    # 尽量减少请求次数：优先用更大的 pageSize；同时加上上限防止异常循环
+    page_size = 1000
+    max_pages = 20
+    max_total = 5000
+
+    models: list[str] = []
+    seen: set[str] = set()
+
+    page_token: str | None = None
+    for _ in range(max_pages):
+        params: dict[str, str | int] = {'pageSize': page_size}
+        if page_token:
+            params['pageToken'] = page_token
+
+        response = await client.get(url, headers=headers, params=params)
+        response.raise_for_status()
+
+        data = response.json()
+        if not isinstance(data, dict):
+            break
+
+        # Gemini 返回格式: {"models": [{"name": "models/gemini-pro", ...}], "nextPageToken": "..."}
+        for m in data.get('models', []) or []:
+            if not isinstance(m, dict):
+                continue
             name = m.get('name', '')
+            if not isinstance(name, str):
+                continue
+
             # 移除 "models/" 前缀
             if name.startswith('models/'):
                 name = name[7:]
-            if name:
-                models.append(name)
-    
+
+            name = name.strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            models.append(name)
+
+            if len(models) >= max_total:
+                logger.warning(f"[Gemini] models list truncated at {max_total} items")
+                return models
+
+        page_token = data.get('nextPageToken') or data.get('next_page_token')
+        if not page_token:
+            break
+
     return models
 
 

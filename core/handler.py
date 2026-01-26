@@ -848,11 +848,17 @@ class ModelRequestHandler:
                 current_retry_count += 1
                 
                 # 获取完整的错误详情
-                if isinstance(e, HTTPException):
-                    full_error = str(e.detail) if hasattr(e, 'detail') else str(e)
+                error_details = getattr(e, "detail", None) if isinstance(e, HTTPException) else None
+                if isinstance(error_details, (dict, list)):
+                    try:
+                        full_error = json.dumps(error_details, ensure_ascii=False)
+                    except Exception:
+                        full_error = str(error_details)
+                elif isinstance(e, HTTPException):
+                    full_error = str(error_details) if error_details is not None else str(e)
                 else:
                     full_error = str(e)
-                
+
                 retry_path.append({
                     "provider": provider_name,
                     "error": full_error[:2000],  # 增加错误信息长度限制到 2000 字符
@@ -892,7 +898,8 @@ class ModelRequestHandler:
                     error_message = "Local protocol error"
                 elif isinstance(e, HTTPException):
                     status_code = e.status_code
-                    error_message = str(e.detail)
+                    # 错误解析应尽量由各渠道适配器完成，这里只做通用兜底。
+                    error_message = str(getattr(e, "detail", None) or str(e))
                 else:
                     status_code = 500  # Internal Server Error
                     error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
@@ -994,7 +1001,10 @@ class ModelRequestHandler:
                         current_info["process_time"] = process_time
                     # 写入失败统计
                     background_tasks.add_task(update_stats, current_info, app=self.app)
-                    return openai_error_response(f"Error: Current provider response failed: {error_message}", status_code)
+                    return openai_error_response(
+                        f"Error: Current provider response failed: {error_message}",
+                        status_code,
+                    )
 
         # 所有重试都失败
         current_info = self.request_info_getter()
@@ -1012,4 +1022,7 @@ class ModelRequestHandler:
             current_info["process_time"] = process_time
         # 写入失败统计
         background_tasks.add_task(update_stats, current_info, app=self.app)
-        return openai_error_response(f"All {request_data.model} error: {error_message}", status_code)
+        return openai_error_response(
+            f"All {request_data.model} error: {error_message}",
+            status_code,
+        )

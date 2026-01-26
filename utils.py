@@ -526,9 +526,9 @@ async def error_handling_wrapper(
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException
             status_code = first_item_str.get('status_code')
             detail = first_item_str.get('details')
-            
+
             error_obj = first_item_str.get('error')
-            
+
             # 针对 check_response 返回的格式进行深度提取
             if isinstance(detail, dict) and 'error' in detail:
                 inner_error = detail.get('error')
@@ -536,19 +536,16 @@ async def error_handling_wrapper(
                     detail = inner_error.get('message') or detail
                 elif isinstance(inner_error, str):
                     detail = inner_error
-            
+
             # 针对标准的 OpenAI 错误格式 { "error": { "message": "...", "code": ... } }
             if not detail and isinstance(error_obj, dict):
                 detail = error_obj.get('message')
                 if not status_code:
                     status_code = error_obj.get('code')
-            
-            if not detail:
-                detail = str(first_item_str)
-                
+
             if not status_code:
                 status_code = 400
-            
+
             # 确保 status_code 是有效的 HTTP 状态码
             try:
                 status_code = int(status_code)
@@ -556,8 +553,25 @@ async def error_handling_wrapper(
                     status_code = 400
             except (TypeError, ValueError):
                 status_code = 400
-            
-            raise HTTPException(status_code=status_code, detail=f"{detail}"[:5000])
+
+            # 生成可读 message（不向客户端透传 details）
+            message = None
+            details_payload = detail if detail is not None else first_item_str
+
+            # 这里保持“通用”提取逻辑，不做渠道字段硬编码。
+            if isinstance(details_payload, dict):
+                message = (
+                    safe_get(details_payload, "error", "message", default=None)
+                    or safe_get(details_payload, "message", default=None)
+                )
+
+            if not message and isinstance(error_obj, dict):
+                message = error_obj.get("message")
+
+            if not message:
+                message = str(detail) if detail is not None else str(first_item_str)
+
+            raise HTTPException(status_code=status_code, detail=f"{message}"[:5000])
 
         if isinstance(first_item_str, dict) and safe_get(first_item_str, "choices", 0, "error", default=None):
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException

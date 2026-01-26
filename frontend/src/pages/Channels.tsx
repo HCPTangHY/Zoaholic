@@ -3,7 +3,8 @@ import { useAuthStore } from '../store/authStore';
 import { 
   Plus, Edit, Brain, Trash2, ArrowRight, RefreshCw, 
   Server, X, CheckCircle2, Settings2, Copy, ToggleRight, ToggleLeft,
-  Folder, MemoryStick, Puzzle, Network, CopyCheck, Power, Files, Play
+  Folder, MemoryStick, Puzzle, Network, CopyCheck, Power, Files, Play,
+  Search, Check
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as Switch from '@radix-ui/react-switch';
@@ -90,6 +91,11 @@ export default function Channels() {
   const [headersJson, setHeadersJson] = useState('');
   const [overridesJson, setOverridesJson] = useState('');
   const [modelDisplayKey, setModelDisplayKey] = useState(0);
+
+  const [isFetchModelsOpen, setIsFetchModelsOpen] = useState(false);
+  const [fetchedModels, setFetchedModels] = useState<string[]>([]);
+  const [selectedModels, setSelectedModels] = useState<Set<string>>(() => new Set());
+  const [modelSearchQuery, setModelSearchQuery] = useState('');
 
   const { apiKey } = useAuthStore();
 
@@ -294,14 +300,16 @@ export default function Channels() {
     }
   };
 
-  const handleFetchModels = async () => {
+  const openFetchModelsDialog = async () => {
     const firstKey = formData?.api_keys.find(k => k.key.trim() && !k.disabled);
     if (!formData?.base_url || !firstKey) {
-      alert("请先填写 Base URL 和至少一个启用的 API Key");
+      alert('请先填写 Base URL 和至少一个启用的 API Key');
       return;
     }
 
     setFetchingModels(true);
+    setModelSearchQuery('');
+
     try {
       const res = await fetch('/v1/channels/fetch_models', {
         method: 'POST',
@@ -313,15 +321,71 @@ export default function Channels() {
         }),
       });
 
-      if (!res.ok) throw new Error('Fetch failed');
-      const data = await res.json();
-      const fetchedModels = Array.isArray(data) ? data : data.models || (data.data || []).map((m: any) => m.id).filter(Boolean);
-      updateFormData('models', Array.from(new Set([...(formData?.models || []), ...fetchedModels])));
-    } catch (err) {
-      alert("获取模型失败。");
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        alert(`获取模型失败: ${err.detail || err.error || err.message || res.status}`);
+        return;
+      }
+
+      const data = (await res.json()) as any;
+
+      const rawModels: unknown[] = Array.isArray(data)
+        ? data
+        : Array.isArray(data?.models)
+          ? data.models
+          : Array.isArray(data?.data)
+            ? data.data.map((m: any) => m?.id)
+            : [];
+
+      const models: string[] = rawModels
+        .map(m => String(m))
+        .filter((m): m is string => Boolean(m));
+
+      const uniqueModels: string[] = Array.from(new Set(models));
+      if (uniqueModels.length === 0) {
+        alert('未获取到任何模型');
+        return;
+      }
+
+      setFetchedModels(uniqueModels);
+      const existing = new Set(formData.models);
+      setSelectedModels(new Set(uniqueModels.filter(m => existing.has(m))));
+      setIsFetchModelsOpen(true);
+    } catch (err: any) {
+      alert(`获取模型失败: ${err?.message || '网络错误'}`);
     } finally {
       setFetchingModels(false);
     }
+  };
+
+  const toggleModelSelect = (model: string) => {
+    const newSet = new Set(selectedModels);
+    if (newSet.has(model)) newSet.delete(model);
+    else newSet.add(model);
+    setSelectedModels(newSet);
+  };
+
+  const filteredFetchedModels = fetchedModels.filter(m => {
+    if (!modelSearchQuery) return true;
+    const q = modelSearchQuery.toLowerCase();
+    const display = getModelDisplayName(m);
+    return m.toLowerCase().includes(q) || display.toLowerCase().includes(q);
+  });
+
+  const selectAllVisible = () => {
+    setSelectedModels(new Set(filteredFetchedModels));
+  };
+
+  const deselectAllVisible = () => {
+    const visible = new Set(filteredFetchedModels);
+    const newSet = new Set(selectedModels);
+    visible.forEach(m => newSet.delete(m));
+    setSelectedModels(newSet);
+  };
+
+  const confirmFetchModels = () => {
+    updateFormData('models', Array.from(selectedModels));
+    setIsFetchModelsOpen(false);
   };
 
   const copyAllModels = () => {
@@ -331,18 +395,18 @@ export default function Channels() {
     setTimeout(() => setCopiedModels(false), 2000);
   };
 
-  const getAliasMap = () => {
+  function getAliasMap(): Map<string, string> {
     const map = new Map<string, string>();
     formData?.mappings.forEach(m => {
       if (m.from && m.to) map.set(m.to, m.from);
     });
     return map;
-  };
+  }
 
-  const getModelDisplayName = (model: string) => {
+  function getModelDisplayName(model: string): string {
     const aliasMap = getAliasMap();
     return aliasMap.get(model) || model;
-  };
+  }
 
   const formatJsonOnBlur = (value: string, setter: (v: string) => void, fieldName: string) => {
     if (!value.trim()) return;
@@ -819,7 +883,7 @@ export default function Channels() {
                           {copiedModels ? '已复制' : '复制'}
                         </button>
                         <button onClick={() => updateFormData('models', [])} className="text-xs bg-red-500/10 text-red-600 dark:text-red-500 px-2 py-1 rounded">清空</button>
-                        <button onClick={handleFetchModels} disabled={fetchingModels} className="text-xs bg-primary/10 text-primary px-2 py-1 rounded flex items-center gap-1">
+                        <button onClick={openFetchModelsDialog} disabled={fetchingModels} className="text-xs bg-primary/10 text-primary px-2 py-1 rounded flex items-center gap-1">
                           <RefreshCw className={`w-3 h-3 ${fetchingModels ? 'animate-spin' : ''}`} /> 获取
                         </button>
                       </div>
@@ -977,6 +1041,83 @@ export default function Channels() {
               <Dialog.Close className="px-4 py-2 text-sm font-medium text-foreground bg-muted hover:bg-muted/80 rounded-lg">取消</Dialog.Close>
               <button onClick={handleSave} className="px-4 py-2 text-sm font-medium text-primary-foreground bg-primary hover:bg-primary/90 rounded-lg flex items-center gap-1.5">
                 <CheckCircle2 className="w-4 h-4" /> 保存配置
+              </button>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+
+      {/* ========== Fetch Models Dialog ========== */}
+      <Dialog.Root open={isFetchModelsOpen} onOpenChange={setIsFetchModelsOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 bg-black/60 z-[60]" />
+          <Dialog.Content className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] max-w-[95vw] max-h-[80vh] bg-background border border-border rounded-xl shadow-2xl z-[70] flex flex-col">
+            <div className="p-5 border-b border-border">
+              <Dialog.Title className="text-lg font-bold text-foreground">选择模型</Dialog.Title>
+              <Dialog.Description className="text-sm text-muted-foreground mt-1">
+                当前渠道: {formData?.provider || '未命名'}
+              </Dialog.Description>
+            </div>
+
+            <div className="p-4 border-b border-border">
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                <input
+                  type="text"
+                  value={modelSearchQuery}
+                  onChange={e => setModelSearchQuery(e.target.value)}
+                  placeholder="搜索模型名称..."
+                  className="w-full bg-muted border border-border pl-10 pr-4 py-2.5 rounded-full text-sm text-foreground"
+                />
+              </div>
+            </div>
+
+            <div className="p-4 border-b border-border flex items-center justify-between">
+              <span className="text-sm text-muted-foreground">
+                显示 {filteredFetchedModels.length} / {fetchedModels.length} 个模型，已选 {selectedModels.size} 个
+              </span>
+              <div className="flex gap-2">
+                <button onClick={selectAllVisible} className="text-sm text-primary hover:underline">全选</button>
+                <button onClick={deselectAllVisible} className="text-sm text-muted-foreground hover:text-foreground">全不选</button>
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto max-h-[360px]">
+              {filteredFetchedModels.map(model => {
+                const isSelected = selectedModels.has(model);
+                const isExisting = !!formData?.models.includes(model);
+                const displayName = getModelDisplayName(model);
+                const hasAlias = displayName !== model;
+
+                return (
+                  <div
+                    key={model}
+                    onClick={() => toggleModelSelect(model)}
+                    className="px-4 py-2.5 flex items-center hover:bg-muted cursor-pointer border-b border-border last:border-b-0"
+                    title={hasAlias ? `上游: ${model}` : undefined}
+                  >
+                    <div className={`w-5 h-5 rounded border-2 flex items-center justify-center mr-3 transition-colors ${isSelected ? 'bg-primary border-primary' : 'border-muted-foreground/50'}`}>
+                      {isSelected && <Check className="w-3 h-3 text-primary-foreground" />}
+                    </div>
+
+                    <span className="flex-1 font-mono text-sm text-foreground truncate">
+                      {displayName}
+                      {hasAlias && <span className="text-muted-foreground"> ({model})</span>}
+                    </span>
+
+                    {isExisting && <span className="text-xs bg-primary/20 text-primary px-2 py-0.5 rounded">已添加</span>}
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="p-4 border-t border-border flex justify-end gap-3">
+              <Dialog.Close className="px-4 py-2 text-sm font-medium text-foreground bg-muted hover:bg-muted/80 rounded-lg">取消</Dialog.Close>
+              <button
+                onClick={confirmFetchModels}
+                className="px-4 py-2 text-sm font-medium text-primary-foreground bg-primary hover:bg-primary/90 rounded-lg"
+              >
+                确认选择 ({selectedModels.size})
               </button>
             </div>
           </Dialog.Content>
