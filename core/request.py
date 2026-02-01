@@ -13,8 +13,6 @@ from .utils import (
 )
 from .plugins.interceptors import apply_request_interceptors
 
-import inspect
-
 
 def _prepend_system_prompt(request: RequestModel, system_prompt: str) -> RequestModel:
     """
@@ -120,11 +118,7 @@ async def get_payload(request: RequestModel, engine, provider, api_key=None):
     
     if channel and channel.request_adapter:
         # 先由具体渠道适配器构建 URL / headers / payload
-        # 兼容：request_adapter 可能是同步函数（返回 tuple），也可能是 async 函数（返回 awaitable）
-        adapter_result = channel.request_adapter(request, engine, provider, api_key)
-        if inspect.isawaitable(adapter_result):
-            adapter_result = await adapter_result
-        url, headers, payload = adapter_result
+        url, headers, payload = await channel.request_adapter(request, engine, provider, api_key)
 
         # 统一应用参数覆写（支持 all/*、模型别名、原始模型名，且深度合并）
         overrides = safe_get(provider, "preferences", "post_body_parameter_overrides", default={})

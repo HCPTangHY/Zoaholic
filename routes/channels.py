@@ -4,6 +4,8 @@ Channels 管理路由
 
 import os
 import json
+
+from core.env import env_bool
 import httpx
 from time import time
 from typing import Optional
@@ -17,7 +19,7 @@ from utils import safe_get
 from routes.deps import rate_limit_dependency, verify_admin_api_key, get_app
 
 router = APIRouter()
-is_debug = bool(os.getenv("DEBUG", False))
+is_debug = env_bool("DEBUG", False)
 
 
 @router.get("/v1/channels", dependencies=[Depends(rate_limit_dependency)])

@@ -11,6 +11,8 @@
 
 import os
 import asyncio
+
+from core.env import env_bool
 from asyncio import Semaphore
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any
@@ -21,17 +23,18 @@ from sqlalchemy.sql import sqltypes
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.log_config import logger
-from db import Base, RequestStat, ChannelStat, db_engine, async_session, DISABLE_DATABASE
+from db import Base, RequestStat, ChannelStat, AppConfig, AdminUser, db_engine, async_session, DISABLE_DATABASE, DB_TYPE
 
 # SQLite 写入重试配置
 SQLITE_MAX_RETRIES = 3
 SQLITE_RETRY_DELAY = 0.5  # 初始重试延迟（秒）
 
-is_debug = bool(os.getenv("DEBUG", False))
+is_debug = env_bool("DEBUG", False)
 
 # 根据数据库类型，动态创建信号量
 # SQLite 需要严格的串行写入，而 PostgreSQL 可以处理高并发
-if os.getenv("DB_TYPE", "sqlite").lower() == 'sqlite':
+# 这里使用 db.py 的解析结果（支持 DATABASE_URL 自动识别）
+if (DB_TYPE or "sqlite").lower() == 'sqlite':
     db_semaphore = Semaphore(1)
     logger.info("Database semaphore configured for SQLite (1 concurrent writer).")
 else:  # For postgres
@@ -141,23 +144,33 @@ async def create_tables():
         await conn.run_sync(Base.metadata.create_all)
 
         # 检查并添加缺失的列 - 扩展此简易迁移以支持 SQLite 和 PostgreSQL
-        db_type = os.getenv("DB_TYPE", "sqlite").lower()
+        db_type = (DB_TYPE or "sqlite").lower()
         if db_type in ["sqlite", "postgres"]:
             def check_and_add_columns(connection):
                 inspector = inspect(connection)
-                for table in [RequestStat, ChannelStat]:
+                for table in [RequestStat, ChannelStat, AppConfig, AdminUser]:
                     table_name = table.__tablename__
                     existing_columns = {col['name'] for col in inspector.get_columns(table_name)}
 
                     for column_name, column in table.__table__.columns.items():
                         if column_name not in existing_columns:
-                            # 适配 PostgreSQL 和 SQLite 的类型映射
+                            # 适配 PostgreSQL / SQLite 的类型映射
+                            # 注意：JSON/JSONB 在不同方言下 compile 结果不同，
+                            # 且 CockroachDB 对 JSONB 的兼容也可能返回 JSON。
                             col_type = column.type.compile(connection.dialect)
+
+                            # SQLite 允许 DEFAULT；Postgres/Cockroach 对 JSON 默认值较敏感，这里统一不加默认
                             default = _get_default_sql(column.default) if db_type == "sqlite" else ""
 
                             # 使用标准的 ALTER TABLE 语法
-                            connection.execute(text(f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {col_type}{default}'))
-                            logger.info(f"Added column '{column_name}' to table '{table_name}'.")
+                            connection.execute(
+                                text(
+                                    f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {col_type}{default}'
+                                )
+                            )
+                            logger.info(
+                                f"Added column '{column_name}' ({col_type}) to table '{table_name}'."
+                            )
 
             await conn.run_sync(check_and_add_columns)
 

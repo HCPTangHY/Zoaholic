@@ -7,6 +7,8 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException, Request, UploadFile, File, Form
 
+from core.env import env_bool
+
 from core.models import TextToSpeechRequest, AudioTranscriptionRequest
 from routes.deps import rate_limit_dependency, verify_api_key, get_model_handler
 
@@ -47,8 +49,7 @@ async def audio_transcriptions(
     
     兼容 OpenAI Whisper API 格式
     """
-    import os
-    is_debug = bool(os.getenv("DEBUG", False))
+    is_debug = env_bool("DEBUG", False)
     
     try:
         # 手动解析表单数据

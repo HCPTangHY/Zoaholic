@@ -134,23 +134,6 @@ def apply_passthrough_modifications(
     if modifications.get("overrides"):
         _apply_overrides(new_payload, modifications["overrides"], request_model, original_model)
 
-    # 兼容性：部分上游/网关要求 Responses API 显式设置 store=false
-    # 否则会报错："Store must be set to false"
-    if dialect_id == "openai-responses":
-        new_payload["store"] = False
-        # 部分上游对 /v1/responses 参数严格校验（尤其是推理模型），直接拒绝 top_p 等字段
-        for k in (
-            "top_p",
-            "temperature",
-            "presence_penalty",
-            "frequency_penalty",
-            "n",
-            "logprobs",
-            "top_logprobs",
-            "stream_options",
-        ):
-            new_payload.pop(k, None)
-
     return new_payload
 
 

@@ -7,6 +7,7 @@ node_modules
 .wrangler
 .pytest_cache
 *.jpg
+# *.json
 !vercel.json
 # *.png
 *.db
@@ -20,13 +21,6 @@ postgres_data/
 alembic/
 alembic.ini
 
-frontend/node_modules/
-dist/
-static/
-.git/
-.python-version
-uv.lock
-
 .github/
 test/
 .dockerignore
@@ -34,6 +28,11 @@ test/
 docker-compose.yml
 Dockerfile
 Dockerfile.debug
+
+# local built frontend output (will be built in Dockerfile)
+static/
+frontend/dist/
+
 *.md
 *.toml
 !pyproject.toml

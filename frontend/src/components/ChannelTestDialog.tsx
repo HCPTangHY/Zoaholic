@@ -21,7 +21,7 @@ interface ChannelTestDialogProps {
 }
 
 export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestDialogProps) {
-  const { apiKey } = useAuthStore();
+  const { token } = useAuthStore();
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [results, setResults] = useState<Map<string, TestResult>>(new Map());
   const [searchKeyword, setSearchKeyword] = useState('');
@@ -34,9 +34,9 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
   useEffect(() => {
     if (!provider) return;
 
-    const rawModels = Array.isArray(provider.model) ? provider.model : 
-                      Array.isArray(provider.models) ? provider.models : [];
-    
+    const rawModels = Array.isArray(provider.model) ? provider.model :
+      Array.isArray(provider.models) ? provider.models : [];
+
     // 构建别名映射：上游 -> 别名
     const aliasMap = new Map<string, string>();
     const modelInfos: ModelInfo[] = [];
@@ -53,7 +53,7 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
     });
 
     setModels(modelInfos);
-    
+
     // 初始化结果
     const initialResults = new Map<string, TestResult>();
     modelInfos.forEach(m => {
@@ -84,7 +84,7 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
 
   const testSingleModel = async (modelInfo: ModelInfo) => {
     const { display, upstream } = modelInfo;
-    
+
     setResults(prev => {
       const newResults = new Map(prev);
       newResults.set(display, { status: 'testing', latency: null, error: null });
@@ -96,7 +96,7 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`
+          'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify({
           engine: provider.engine || 'openai',
@@ -184,7 +184,7 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
     setTimeout(() => setCopiedModel(null), 2000);
   };
 
-  const filteredModels = models.filter(m => 
+  const filteredModels = models.filter(m =>
     !searchKeyword || m.display.toLowerCase().includes(searchKeyword.toLowerCase())
   );
 
@@ -201,7 +201,7 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
     switch (result.status) {
       case 'pending': return <span className="text-zinc-500">等待测试</span>;
       case 'testing': return <span className="text-blue-400">正在测试...</span>;
-      case 'success': 
+      case 'success':
         return (
           <span className="text-emerald-400">
             {result.latency !== null && <span className="font-mono">{result.latency}ms</span>}
@@ -236,14 +236,14 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
           {/* Controls */}
           <div className="p-4 border-b border-zinc-800 flex flex-wrap items-center gap-3">
             {!isRunning ? (
-              <button 
+              <button
                 onClick={startAllTests}
                 className="bg-primary hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 text-sm font-medium transition-colors"
               >
                 <Play className="w-4 h-4" /> 全部测试
               </button>
             ) : (
-              <button 
+              <button
                 onClick={stopTest}
                 className="bg-red-500/20 border border-red-500/50 text-red-400 hover:bg-red-500/30 px-4 py-2 rounded-lg flex items-center gap-2 text-sm font-medium transition-colors"
               >
@@ -286,12 +286,12 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
               <ul className="divide-y divide-zinc-800">
                 {filteredModels.map(modelInfo => {
                   const result = results.get(modelInfo.display) || { status: 'pending', latency: null, error: null };
-                  const displayText = modelInfo.display !== modelInfo.upstream 
-                    ? `${modelInfo.display} (${modelInfo.upstream})` 
+                  const displayText = modelInfo.display !== modelInfo.upstream
+                    ? `${modelInfo.display} (${modelInfo.upstream})`
                     : modelInfo.display;
 
                   return (
-                    <li 
+                    <li
                       key={modelInfo.display}
                       className="flex items-center h-14 px-4 hover:bg-zinc-800/50 transition-colors cursor-pointer group"
                       onClick={() => copyModelName(modelInfo.display)}
@@ -336,8 +336,8 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
           {/* Footer */}
           <div className="p-4 border-t border-zinc-800 bg-zinc-900/50 flex-shrink-0">
             <div className="text-xs text-zinc-500 text-center">
-              共 {models.length} 个模型 · 
-              {Array.from(results.values()).filter(r => r.status === 'success').length} 成功 · 
+              共 {models.length} 个模型 ·
+              {Array.from(results.values()).filter(r => r.status === 'success').length} 成功 ·
               {Array.from(results.values()).filter(r => r.status === 'error').length} 失败
             </div>
           </div>

@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../store/authStore';
 import {
-  Key, Plus, RefreshCw, Copy, Trash2, Edit, Save, X, Search, 
+  Key, Plus, RefreshCw, Copy, Trash2, Edit, Save, X, Search,
   Folder, Clock, CheckCircle2, AlertCircle, AlertTriangle,
   Wand2, Wallet, Brain, Download, Check, CopyCheck
 } from 'lucide-react';
@@ -30,15 +30,15 @@ interface ApiKeyState {
 }
 
 export default function Admin() {
-  const { apiKey } = useAuthStore();
+  const { token } = useAuthStore();
   const [keys, setKeys] = useState<ApiKeyData[]>([]);
   const [keyStates, setKeyStates] = useState<Record<string, ApiKeyState>>({});
   const [loading, setLoading] = useState(true);
-  
+
   // Edit Sheet
   const [isSheetOpen, setIsSheetOpen] = useState(false);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
-  
+
   // Form State
   const [formApi, setFormApi] = useState('');
   const [formName, setFormName] = useState('');
@@ -46,7 +46,7 @@ export default function Admin() {
   const [formGroups, setFormGroups] = useState<string[]>(['default']);
   const [formModels, setFormModels] = useState<string[]>([]);
   const [formCredits, setFormCredits] = useState('');
-  
+
   // Input states
   const [groupInput, setGroupInput] = useState('');
   const [modelInput, setModelInput] = useState('');
@@ -65,10 +65,10 @@ export default function Admin() {
 
   // ========== Data Loading ==========
   const fetchData = async () => {
-    if (!apiKey) return;
+    if (!token) return;
     setLoading(true);
     try {
-      const headers = { Authorization: `Bearer ${apiKey}` };
+      const headers = { Authorization: `Bearer ${token}` };
       const [configRes, statesRes] = await Promise.all([
         fetch('/v1/api_config', { headers }),
         fetch('/v1/api_keys_states', { headers })
@@ -110,7 +110,7 @@ export default function Admin() {
       setFormApi(source.api || '');
       setFormName(source.name || source.preferences?.name || '');
       setFormRole(source.role || '');
-      
+
       // Parse groups
       let groups: string[] = ['default'];
       if (Array.isArray(source.groups) && source.groups.length > 0) {
@@ -121,7 +121,7 @@ export default function Admin() {
         groups = [source.preferences.group];
       }
       setFormGroups(groups);
-      
+
       setFormModels(Array.isArray(source.model) ? [...source.model] : []);
       setFormCredits(source.preferences?.credits !== undefined ? String(source.preferences.credits) : '');
     } else {
@@ -132,7 +132,7 @@ export default function Admin() {
       setFormModels([]);
       setFormCredits('');
     }
-    
+
     setIsSheetOpen(true);
   };
 
@@ -140,7 +140,7 @@ export default function Admin() {
   const generateKey = async () => {
     try {
       const res = await fetch('/v1/generate-api-key', {
-        headers: { Authorization: `Bearer ${apiKey}` }
+        headers: { Authorization: `Bearer ${token}` }
       });
       const data = await res.json();
       if (data.api_key) {
@@ -191,28 +191,28 @@ export default function Admin() {
     const groups = formGroups.length > 0 ? formGroups : ['default'];
     setFetchingModels(true);
     setModelSearchQuery('');
-    
+
     try {
       const res = await fetch('/v1/channels/models_by_groups', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ groups })
       });
-      
+
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         alert(`获取模型失败: ${err.detail || res.status}`);
         return;
       }
-      
+
       const data = await res.json();
       const models = (data.models || []).map((m: any) => m.id || m).filter(Boolean);
-      
+
       if (models.length === 0) {
         alert('当前分组下没有可用模型');
         return;
       }
-      
+
       setFetchedModels(models);
       // Pre-select existing models
       const existing = new Set(formModels);
@@ -236,14 +236,14 @@ export default function Admin() {
   };
 
   const selectAllVisible = () => {
-    const filtered = fetchedModels.filter(m => 
+    const filtered = fetchedModels.filter(m =>
       !modelSearchQuery || m.toLowerCase().includes(modelSearchQuery.toLowerCase())
     );
     setSelectedModels(new Set(filtered));
   };
 
   const deselectAllVisible = () => {
-    const filtered = new Set(fetchedModels.filter(m => 
+    const filtered = new Set(fetchedModels.filter(m =>
       !modelSearchQuery || m.toLowerCase().includes(modelSearchQuery.toLowerCase())
     ));
     const newSet = new Set(selectedModels);
@@ -258,7 +258,7 @@ export default function Admin() {
     setIsFetchModelsOpen(false);
   };
 
-  const filteredFetchedModels = fetchedModels.filter(m => 
+  const filteredFetchedModels = fetchedModels.filter(m =>
     !modelSearchQuery || m.toLowerCase().includes(modelSearchQuery.toLowerCase())
   );
 
@@ -270,12 +270,12 @@ export default function Admin() {
     }
 
     const target: any = { api: formApi.trim() };
-    
+
     if (formName.trim()) target.name = formName.trim();
     if (formRole.trim()) target.role = formRole.trim();
     target.groups = formGroups.length > 0 ? formGroups : ['default'];
     if (formModels.length > 0) target.model = formModels;
-    
+
     // Preferences
     const prefs: any = {};
     if (formCredits.trim()) {
@@ -299,7 +299,7 @@ export default function Admin() {
     try {
       const res = await fetch('/v1/api_config/update', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ api_keys: newKeys })
       });
       if (res.ok) {
@@ -319,12 +319,12 @@ export default function Admin() {
     const keyObj = keys[index];
     const name = keyObj.name || keyObj.api?.slice(0, 12) + '...';
     if (!confirm(`确定要删除 API Key "${name}" 吗？`)) return;
-    
+
     const newKeys = keys.filter((_, i) => i !== index);
     try {
       const res = await fetch('/v1/api_config/update', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ api_keys: newKeys })
       });
       if (res.ok) {
@@ -355,7 +355,7 @@ export default function Admin() {
     try {
       const res = await fetch(`/v1/add_credits?paid_key=${encodeURIComponent(creditsTargetKey)}&amount=${amount}`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${apiKey}` }
+        headers: { Authorization: `Bearer ${token}` }
       });
       if (res.ok) {
         setIsCreditsOpen(false);
@@ -445,9 +445,9 @@ export default function Admin() {
                 const name = keyObj.name || keyObj.preferences?.name || '未命名密钥';
                 const groups = keyObj.groups || (keyObj.group ? [keyObj.group] : ['default']);
                 const models = keyObj.model || [];
-                const modelText = models.length === 0 ? '默认: all' : 
+                const modelText = models.length === 0 ? '默认: all' :
                   (models.length === 1 && models[0] === 'all') ? '全部模型 (all)' :
-                  models.length > 3 ? `${models.slice(0, 3).join(', ')} 等 ${models.length} 条` : models.join(', ');
+                    models.length > 3 ? `${models.slice(0, 3).join(', ')} 等 ${models.length} 条` : models.join(', ');
 
                 return (
                   <tr key={idx} className="hover:bg-muted/50 transition-colors group">
@@ -534,7 +534,7 @@ export default function Admin() {
 
                 <div>
                   <label className="text-sm font-medium text-foreground mb-1.5 block">Key 名称</label>
-                  <input 
+                  <input
                     type="text" value={formName} onChange={e => setFormName(e.target.value)}
                     placeholder="例如 生产环境Key、测试用Key"
                     className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm text-foreground"
@@ -545,7 +545,7 @@ export default function Admin() {
                 <div>
                   <label className="text-sm font-medium text-foreground mb-1.5 block">API Key</label>
                   <div className="flex gap-2">
-                    <input 
+                    <input
                       type="text" value={formApi} onChange={e => setFormApi(e.target.value)}
                       placeholder="sk-xxx..."
                       className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
@@ -559,7 +559,7 @@ export default function Admin() {
 
                 <div>
                   <label className="text-sm font-medium text-foreground mb-1.5 block">角色 (role)</label>
-                  <input 
+                  <input
                     type="text" value={formRole} onChange={e => setFormRole(e.target.value)}
                     placeholder="例如 admin, paid 或 user"
                     className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm text-foreground"
@@ -579,7 +579,7 @@ export default function Admin() {
                     ))}
                   </div>
                   <div className="flex gap-2">
-                    <input 
+                    <input
                       type="text" value={groupInput} onChange={e => setGroupInput(e.target.value)}
                       onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addGroup(); } }}
                       placeholder="输入分组名..."
@@ -598,7 +598,7 @@ export default function Admin() {
 
                 <div>
                   <label className="text-sm font-medium text-foreground mb-1.5 block">额度 (credits)</label>
-                  <input 
+                  <input
                     type="number" value={formCredits} onChange={e => setFormCredits(e.target.value)}
                     placeholder="留空或负数表示不限制"
                     className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm text-foreground"
@@ -615,8 +615,8 @@ export default function Admin() {
 
                 {/* Actions */}
                 <div className="flex items-center gap-2">
-                  <button 
-                    onClick={openFetchModelsDialog} 
+                  <button
+                    onClick={openFetchModelsDialog}
                     disabled={fetchingModels}
                     className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm flex items-center gap-1.5 disabled:opacity-50"
                   >
@@ -632,8 +632,8 @@ export default function Admin() {
                   ) : (
                     <div className="flex flex-wrap gap-2">
                       {formModels.map((m, idx) => (
-                        <span 
-                          key={idx} 
+                        <span
+                          key={idx}
                           className="bg-background border border-border text-foreground text-xs font-mono px-2 py-1 rounded flex items-center gap-1 cursor-pointer hover:bg-muted"
                           onClick={() => copyToClipboard(m)}
                           title="点击复制"
@@ -652,7 +652,7 @@ export default function Admin() {
                 <div>
                   <label className="text-sm font-medium text-foreground mb-1.5 block">手动输入模型规则</label>
                   <div className="flex gap-2">
-                    <input 
+                    <input
                       type="text" value={modelInput} onChange={e => setModelInput(e.target.value)}
                       onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addModelsFromInput(); } }}
                       placeholder="例如 all, gpt-4o 用空格/逗号分隔"
@@ -689,7 +689,7 @@ export default function Admin() {
             <div className="p-4 border-b border-border">
               <div className="relative">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                <input 
+                <input
                   type="text" value={modelSearchQuery} onChange={e => setModelSearchQuery(e.target.value)}
                   placeholder="搜索模型名称..."
                   className="w-full bg-muted border border-border pl-10 pr-4 py-2.5 rounded-full text-sm text-foreground"
@@ -712,8 +712,8 @@ export default function Admin() {
                 const isSelected = selectedModels.has(model);
                 const isExisting = formModels.includes(model);
                 return (
-                  <div 
-                    key={model} 
+                  <div
+                    key={model}
                     onClick={() => toggleModelSelect(model)}
                     className="px-4 py-2.5 flex items-center hover:bg-muted cursor-pointer border-b border-border last:border-b-0"
                   >
@@ -745,14 +745,14 @@ export default function Admin() {
             <Dialog.Title className="text-lg font-bold text-foreground flex items-center gap-2 mb-4">
               <Wallet className="w-5 h-5 text-emerald-500" /> 为 API Key 添加额度
             </Dialog.Title>
-            
+
             <div className="text-sm text-muted-foreground break-all bg-muted p-3 rounded-lg font-mono border border-border mb-4">
               目标: {creditsTargetKey.slice(0, 15)}...
             </div>
 
             <div className="mb-6">
               <label className="text-sm font-medium text-foreground mb-1.5 block">增加额度</label>
-              <input 
+              <input
                 type="number" value={creditsAmount} onChange={e => setCreditsAmount(e.target.value)}
                 placeholder="例如 100"
                 autoFocus

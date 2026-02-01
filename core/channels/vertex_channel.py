@@ -368,7 +368,6 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
         'logit_bias',
         'extra_body',
         'thinking',
-        'stop',  # OpenAI stop -> Vertex generation_config.stop_sequences
     ]
     generation_config = {}
 
@@ -423,16 +422,6 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
                 process_tool_parameters(items)
 
     for field, value in request.model_dump(exclude_unset=True).items():
-        # OpenAI stop 参数：Vertex Gemini 不支持顶层 stop，需映射到 generation_config.stop_sequences
-        if field == "stop" and value is not None:
-            if isinstance(value, str):
-                generation_config["stop_sequences"] = [value]
-            elif isinstance(value, (list, tuple)):
-                generation_config["stop_sequences"] = [str(x) for x in value if x is not None]
-            else:
-                generation_config["stop_sequences"] = [str(value)]
-            continue
-
         if field not in miss_fields and value is not None:
             if field == "tools":
                 processed_tools = []

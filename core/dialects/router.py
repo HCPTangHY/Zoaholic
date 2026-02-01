@@ -37,41 +37,77 @@ def _create_dialect_verify_api_key(dialect_id: str):
     from core.auth import security, _extract_token
     from fastapi.security import HTTPAuthorizationCredentials
 
+    def _resolve_admin_api_index(app) -> int | None:
+        """当客户端使用 admin JWT 访问方言端点时，将其映射到配置中的 admin api_key 索引。"""
+        api_keys_db = getattr(app.state, "api_keys_db", None) or []
+        if isinstance(api_keys_db, list):
+            for i, item in enumerate(api_keys_db):
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role", "")).lower()
+                if "admin" in role:
+                    return i
+            if len(api_keys_db) == 1:
+                return 0
+        return None
+
     async def verify(
         request: Request,
         credentials: HTTPAuthorizationCredentials = Depends(security),
     ) -> int:
         app = request.app
         api_list = app.state.api_list
-        
+
         dialect = get_dialect(dialect_id)
-        token = None
-        
+        token: str | None = None
+
         # 优先使用方言自定义的 token 提取器
         if dialect and dialect.extract_token:
             token = await dialect.extract_token(request)
-        
+
         # 否则使用默认提取器
         if not token:
             token = await _extract_token(request, credentials)
-        
+
         if not token:
             from fastapi import HTTPException
             raise HTTPException(status_code=403, detail="Invalid or missing API Key")
-        
+
+        api_index: int | None = None
+        token_for_stats = token
+
+     # 1) 先尝试按普通 api_key 校验
         try:
             api_index = api_list.index(token)
         except ValueError:
+            api_index = None
+
+        # 2) 兼容管理控制台的 admin JWT：映射到 admin api_key
+        if api_index is None:
+            try:
+                from core.jwt_utils import is_admin_jwt
+
+                if is_admin_jwt(token):
+                    admin_index = _resolve_admin_api_index(app)
+                    if admin_index is not None:
+                        api_index = admin_index
+                        # 统计/计费使用实际 api_key（而不是 JWT 字符串）
+                        token_for_stats = api_list[api_index]
+            except Exception:
+                api_index = None
+
+        if api_index is None:
             from fastapi import HTTPException
             raise HTTPException(status_code=403, detail="Invalid or missing API Key")
-        
+
         # 更新 request_info 中的 API key 信息，确保统计记录正确的 key
         try:
             from core.middleware import request_info
             from utils import safe_get
+
             info = request_info.get()
             if info:
-                info["api_key"] = token
+                info["api_key"] = token_for_stats
                 config = app.state.config
                 info["api_key_name"] = safe_get(config, "api_keys", api_index, "name", default=None)
                 info["api_key_group"] = safe_get(config, "api_keys", api_index, "group", default=None)

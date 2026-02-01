@@ -1,38 +1,39 @@
-# Stage 1: Build Frontend
-FROM node:20-slim AS frontend-builder
+# ===============
+# Stage 1: Frontend build
+# ===============
+FROM node:20-slim AS frontend_builder
 WORKDIR /app/frontend
-# 仅复制 package.json 和 lock 文件以利用缓存
-COPY frontend/package*.json ./
-RUN npm install
-# 复制所有前端源码并构建
+
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-# Stage 2: Build Backend
+# ===============
+# Stage 2: Python deps
+# ===============
 FROM python:3.11 AS builder
 WORKDIR /app
+
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 COPY pyproject.toml uv.lock ./
-# 导出并安装依赖到系统 Python
+# 使用 uv export 导出依赖列表，然后安装到系统 Python
 RUN uv export --frozen --no-dev --no-hashes -o requirements.txt && \
     uv pip install --system --no-cache -r requirements.txt
 
-# Stage 3: Final Image
+# ===============
+# Stage 3: Runtime
+# ===============
 FROM python:3.11-slim-bullseye
+
 EXPOSE 8000
 WORKDIR /home
 
-# 复制从 builder 阶段安装的 site-packages
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY . .
 
-# 复制前端编译产物
-COPY --from=frontend-builder /app/static ./static
+# 将前端产物放入后端 static/ 目录（FastAPI 直接挂载）
+COPY --from=frontend_builder /app/static ./static
 
-# 仅复制后端运行所需的代码
-COPY core/ ./core/
-COPY routes/ ./routes/
-COPY plugins/ ./plugins/
-COPY main.py db.py utils.py pyproject.toml ./
-
-# 设置入口
-ENTRYPOINT ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Render 会注入 $PORT；用 shell 形式让变量生效
+CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]

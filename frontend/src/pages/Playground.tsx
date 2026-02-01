@@ -24,7 +24,7 @@ interface ExternalClient {
 }
 
 export default function Playground() {
-  const { apiKey } = useAuthStore();
+  const { token } = useAuthStore();
 
   const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState('');
@@ -43,10 +43,10 @@ export default function Playground() {
   const [editValue, setEditValue] = useState('');
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [showExternalClients, setShowExternalClients] = useState(false);
-  
+
   const [externalClients, setExternalClients] = useState<ExternalClient[]>([]);
   const [activeClient, setActiveClient] = useState<ExternalClient | null>(null);
-  
+
   const [showMobileSettings, setShowMobileSettings] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -54,7 +54,9 @@ export default function Playground() {
 
   const getExternalLink = (template: string) => {
     const address = window.location.origin;
-    return template.replace('{key}', apiKey || '').replace('{address}', address);
+    // 外部客户端链接仍使用管理员 API Key（不是 JWT）。
+    // 这里从后端 /auth/me 获取（前端不直接存储 admin_api_key）。
+    return template.replace('{key}', '').replace('{address}', address);
   };
 
   useEffect(() => {
@@ -71,15 +73,15 @@ export default function Playground() {
   };
 
   const fetchPreferences = async () => {
-    if (!apiKey) return;
+    if (!token) return;
     try {
       const res = await fetch('/v1/api_config', {
-        headers: { Authorization: `Bearer ${apiKey}` }
+        headers: { Authorization: `Bearer ${token}` }
       });
       if (res.ok) {
         const data = await res.json();
         const prefs = data.api_config?.preferences || data.preferences || {};
-        
+
         if (prefs.external_clients && Array.isArray(prefs.external_clients)) {
           setExternalClients(prefs.external_clients);
         }
@@ -90,11 +92,11 @@ export default function Playground() {
   };
 
   const fetchModels = async () => {
-    if (!apiKey) return;
+    if (!token) return;
     setLoadingModels(true);
     try {
       const res = await fetch('/v1/models', {
-        headers: { Authorization: `Bearer ${apiKey}` }
+        headers: { Authorization: `Bearer ${token}` }
       });
       if (res.ok) {
         const data = await res.json();
@@ -112,12 +114,12 @@ export default function Playground() {
   };
 
   const sendMessage = async (newMessages: ChatMessage[]) => {
-    if (!apiKey || !selectedModel) return;
+    if (!token || !selectedModel) return;
 
     setIsGenerating(true);
     const msgList = [...newMessages];
 
-    const requestMessages = systemPrompt 
+    const requestMessages = systemPrompt
       ? [{ role: 'system', content: systemPrompt }, ...msgList]
       : msgList;
 
@@ -126,7 +128,7 @@ export default function Playground() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`
+          'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify({
           model: selectedModel,
@@ -141,7 +143,7 @@ export default function Playground() {
       if (stream) {
         const reader = res.body?.getReader();
         const decoder = new TextDecoder();
-        
+
         const assistantIndex = msgList.length;
         setMessages([...msgList, { role: 'assistant', content: '', reasoning_content: '', isTyping: true }]);
 
@@ -278,7 +280,7 @@ export default function Playground() {
             <span className="font-medium text-foreground">{activeClient.name}</span>
             <span className="text-xs text-muted-foreground bg-muted px-2 py-0.5 rounded">外部客户端</span>
           </div>
-          <button 
+          <button
             onClick={() => setActiveClient(null)}
             className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors"
             title="关闭并返回"
@@ -299,7 +301,7 @@ export default function Playground() {
     <div className="flex h-full animate-in fade-in duration-500 font-sans relative">
       {/* Left: Chat Area */}
       <div className="flex-1 flex flex-col min-w-0 bg-background">
-        
+
         {/* Chat Header */}
         <div className="h-14 border-b border-border flex items-center px-4 md:px-6 justify-between bg-card/80 backdrop-blur-sm z-10 flex-shrink-0">
           <div className="flex items-center gap-2 text-foreground font-bold">
@@ -308,10 +310,10 @@ export default function Playground() {
             <span className="sm:hidden">Playground</span>
           </div>
           <div className="flex items-center gap-2">
-            {apiKey ? (
+            {token ? (
               <span className="hidden sm:flex items-center gap-1 text-xs bg-emerald-500/10 text-emerald-600 dark:text-emerald-500 px-2 py-1 rounded-md border border-emerald-500/20">
                 <CheckCircle2 className="w-3 h-3" />
-                <span className="font-mono">{apiKey.slice(0, 4)}...{apiKey.slice(-4)}</span>
+                <span className="font-mono">JWT 已登录</span>
               </span>
             ) : (
               <span className="hidden sm:flex items-center gap-1 text-xs bg-red-500/10 text-red-600 dark:text-red-500 px-2 py-1 rounded-md border border-red-500/20">
@@ -348,10 +350,10 @@ export default function Playground() {
                 </div>
 
                 <div className={`p-4 rounded-xl border transition-colors ${msg.role === 'user' ? 'bg-muted/50 border-border text-foreground' : 'bg-transparent border-transparent text-foreground'}`}>
-                  
+
                   {msg.reasoning_content && (
                     <div className="mb-4 bg-muted/50 border border-border rounded-lg overflow-hidden">
-                      <button 
+                      <button
                         onClick={() => toggleThinking(idx)}
                         className="w-full flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground bg-muted hover:text-foreground transition-colors"
                       >
@@ -433,14 +435,14 @@ export default function Playground() {
                 e.target.style.height = `${Math.min(e.target.scrollHeight, 200)}px`;
               }}
               onKeyDown={handleKeyDown}
-              placeholder={apiKey ? "输入消息 (Shift + Enter 换行)..." : "请先配置 API Key..."}
-              disabled={!apiKey || isGenerating}
+              placeholder={token ? "输入消息 (Shift + Enter 换行)..." : "请先登录..."}
+              disabled={!token || isGenerating}
               className="w-full bg-transparent text-foreground p-4 pr-12 text-sm max-h-[200px] resize-none focus:outline-none placeholder:text-muted-foreground disabled:opacity-50"
               rows={1}
             />
-            <button 
+            <button
               onClick={handleSend}
-              disabled={!inputValue.trim() || isGenerating || !apiKey}
+              disabled={!inputValue.trim() || isGenerating || !token}
               className="absolute right-3 bottom-3 p-2 bg-primary hover:bg-primary/90 text-primary-foreground rounded-lg disabled:opacity-50 disabled:hover:bg-primary transition-all shadow-md"
             >
               {isGenerating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
@@ -462,11 +464,11 @@ export default function Playground() {
         </div>
 
         <div className="flex-1 overflow-y-auto p-4 space-y-6">
-          
+
           {/* System Prompt */}
           <div className="space-y-2">
             <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-1.5"><Brain className="w-3.5 h-3.5" /> System Prompt</label>
-            <textarea 
+            <textarea
               value={systemPrompt}
               onChange={e => setSystemPrompt(e.target.value)}
               placeholder="你是一个有帮助的 AI 助手..."
@@ -499,12 +501,12 @@ export default function Playground() {
                 <label className="text-xs font-semibold text-muted-foreground flex items-center gap-1"><Thermometer className="w-3.5 h-3.5" /> Temperature</label>
                 <span className="text-xs font-mono bg-muted px-1.5 py-0.5 rounded text-foreground">{temperature}</span>
               </div>
-              <input 
-                type="range" 
-                min="0" max="2" step="0.1" 
+              <input
+                type="range"
+                min="0" max="2" step="0.1"
                 value={temperature}
                 onChange={e => setTemperature(parseFloat(e.target.value))}
-                className="w-full accent-primary" 
+                className="w-full accent-primary"
               />
             </div>
           </div>
@@ -519,7 +521,7 @@ export default function Playground() {
 
           {/* External Clients Accordion */}
           <div className="border border-border rounded-lg bg-muted/50 overflow-hidden">
-            <button 
+            <button
               onClick={() => setShowExternalClients(!showExternalClients)}
               className="w-full flex items-center justify-between p-3 text-sm font-medium text-foreground hover:bg-muted transition-colors"
             >
@@ -564,19 +566,19 @@ export default function Playground() {
               </Dialog.Close>
             </div>
             <div className="p-4 space-y-5">
-              {/* API Key Status */}
-              <div className={`p-3 rounded-lg flex items-center gap-2 ${apiKey ? 'bg-emerald-500/10 border border-emerald-500/20' : 'bg-red-500/10 border border-red-500/20'}`}>
-                {apiKey ? (
-                  <><CheckCircle2 className="w-4 h-4 text-emerald-500" /><span className="text-sm text-emerald-600 dark:text-emerald-400">API Key: {apiKey.slice(0, 6)}...{apiKey.slice(-4)}</span></>
+              {/* Auth Status */}
+              <div className={`p-3 rounded-lg flex items-center gap-2 ${token ? 'bg-emerald-500/10 border border-emerald-500/20' : 'bg-red-500/10 border border-red-500/20'}`}>
+                {token ? (
+                  <><CheckCircle2 className="w-4 h-4 text-emerald-500" /><span className="text-sm text-emerald-600 dark:text-emerald-400">已登录（JWT）</span></>
                 ) : (
-                  <><AlertCircle className="w-4 h-4 text-red-500" /><span className="text-sm text-red-600 dark:text-red-400">未配置 API Key，请先登录</span></>
+                  <><AlertCircle className="w-4 h-4 text-red-500" /><span className="text-sm text-red-600 dark:text-red-400">未登录，请先登录</span></>
                 )}
               </div>
 
               {/* System Prompt */}
               <div className="space-y-2">
                 <label className="text-xs font-semibold text-muted-foreground uppercase">System Prompt</label>
-                <textarea 
+                <textarea
                   value={systemPrompt}
                   onChange={e => setSystemPrompt(e.target.value)}
                   placeholder="你是一个有帮助的 AI 助手..."
@@ -608,12 +610,12 @@ export default function Playground() {
                   <label className="text-xs font-semibold text-muted-foreground uppercase">Temperature</label>
                   <span className="text-xs font-mono bg-muted px-1.5 py-0.5 rounded text-foreground">{temperature}</span>
                 </div>
-                <input 
-                  type="range" 
-                  min="0" max="2" step="0.1" 
+                <input
+                  type="range"
+                  min="0" max="2" step="0.1"
                   value={temperature}
                   onChange={e => setTemperature(parseFloat(e.target.value))}
-                  className="w-full accent-primary" 
+                  className="w-full accent-primary"
                 />
               </div>
 
@@ -627,7 +629,7 @@ export default function Playground() {
 
               {/* Third-party Clients */}
               <div className="border border-border rounded-lg overflow-hidden">
-                <button 
+                <button
                   onClick={() => setShowExternalClients(!showExternalClients)}
                   className="w-full flex items-center justify-between p-3 text-sm font-medium text-foreground bg-muted"
                 >

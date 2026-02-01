@@ -8,6 +8,8 @@
 
 import os
 import json
+
+from core.env import env_bool
 import uuid
 import asyncio
 import contextvars
@@ -102,7 +104,7 @@ class StatsMiddleware:
     def __init__(self, app: ASGIApp, debug: Optional[bool] = None):
         self.app = app
         if debug is None:
-            self.debug = bool(os.getenv("DEBUG", False))
+            self.debug = env_bool("DEBUG", False)
         else:
             self.debug = debug
         

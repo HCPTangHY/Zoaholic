@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Body
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 
+from core.env import env_bool
 from utils import update_config
 from routes.deps import rate_limit_dependency, verify_admin_api_key, get_app
 
@@ -66,8 +67,14 @@ async def api_config_update(
         updated = True
 
     if updated:
+        # 线上默认不写回本地文件（Render 等往往是只读/临时文件系统）
+        save_to_file = env_bool("SYNC_CONFIG_TO_FILE", False)
         app.state.config, app.state.api_keys_db, app.state.api_list = await update_config(
-            app.state.config, use_config_url=False, skip_model_fetch=True
+            app.state.config,
+            use_config_url=False,
+            skip_model_fetch=True,
+            save_to_file=save_to_file,
+            save_to_db=True,
         )
 
     return JSONResponse(content={"message": "API config updated"})

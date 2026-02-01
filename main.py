@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from core.log_config import logger
 from routes import api_router
+from core.env import env_bool
 from core.utils import parse_rate_limit, ThreadSafeCircularList, ApiKeyRateLimitRegistry
 from core.client_manager import ClientManager
 from core.channel_manager import ChannelManager
@@ -39,7 +40,8 @@ from core.stats import (
 from core.plugins import get_plugin_manager
 
 DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 600))
-is_debug = bool(os.getenv("DEBUG", False))
+# DEBUG 环境变量支持 true/false/1/0/yes/no
+is_debug = env_bool("DEBUG", False)
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
 
 # 从 pyproject.toml 读取版本号
@@ -149,6 +151,8 @@ async def lifespan(app: FastAPI):
     if app and not hasattr(app.state, 'config'):
         # logger.warning("Config not found, attempting to reload")
         app.state.config, app.state.api_keys_db, app.state.api_list = await load_config(app)
+        # 用于前端判断是否需要进入初始化向导
+        app.state.needs_setup = not bool(app.state.api_list)
         # from ruamel.yaml.timestamp import TimeStamp
         # def json_default(obj):
         #     if isinstance(obj, TimeStamp):
@@ -171,25 +175,19 @@ async def lifespan(app: FastAPI):
                 )
         app.state.global_rate_limit = parse_rate_limit(safe_get(app.state.config, "preferences", "rate_limit", default="999999/min"))
 
-        app.state.admin_api_key = []
-        for item in app.state.api_keys_db:
-            if "admin" in item.get("role", ""):
-                app.state.admin_api_key.append(item.get("api"))
-        if app.state.admin_api_key == []:
-            if len(app.state.api_keys_db) >= 1:
-                app.state.admin_api_key = [app.state.api_keys_db[0].get("api")]
-            else:
-                from utils import yaml_error_message
-                if yaml_error_message:
-                    raise HTTPException(
-                        status_code=500,
-                        detail={"error": yaml_error_message}
-                    )
-                else:
-                    raise HTTPException(
-                        status_code=500,
-                        detail={"error": "No API key found in api.yaml"}
-                    )
+        # 如果没有任何 API key，则标记需要初始化并允许服务启动（用于 /setup 初始化向导）
+        if not app.state.api_keys_db or not app.state.api_list:
+            app.state.needs_setup = True
+            app.state.admin_api_key = []
+        else:
+            app.state.admin_api_key = []
+            for item in app.state.api_keys_db:
+                if "admin" in item.get("role", ""):
+                    app.state.admin_api_key.append(item.get("api"))
+            if app.state.admin_api_key == []:
+                # 兼容旧配置：如果没显式标记 admin，就默认第一把 key 为 admin
+                if len(app.state.api_keys_db) >= 1:
+                    app.state.admin_api_key = [app.state.api_keys_db[0].get("api")]
 
         app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
         app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", 99999)
@@ -383,9 +381,20 @@ ASSET_CACHE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}  
 
 @app.get("/{path:path}")
 async def spa_fallback(path: str):
+    index_html = "./static/index.html"
+
     # 检查是否是前端 SPA 路由
     if path == "" or any(path.startswith(route.lstrip("/")) for route in SPA_ROUTES):
-        return FileResponse("./static/index.html", headers=HTML_NO_CACHE_HEADERS)
+        if os.path.isfile(index_html):
+            return FileResponse(index_html, headers=HTML_NO_CACHE_HEADERS)
+        # 未构建前端时，不要 500；提示用户如何生成
+        return JSONResponse(
+            status_code=404,
+            content={
+                "detail": "Frontend is not built. Run `cd frontend && npm install && npm run build` or deploy via Docker image.",
+            },
+        )
+
     # 尝试返回静态文件
     static_file = f"./static/{path}"
     if os.path.isfile(static_file):
@@ -393,12 +402,25 @@ async def spa_fallback(path: str):
         if "/assets/" in path or path.endswith((".js", ".css", ".woff2", ".woff", ".ttf")):
             return FileResponse(static_file, headers=ASSET_CACHE_HEADERS)
         return FileResponse(static_file)
-    # 默认返回 index.html
-    return FileResponse("./static/index.html", headers=HTML_NO_CACHE_HEADERS)
+
+    # 默认返回 index.html（若存在）
+    if os.path.isfile(index_html):
+        return FileResponse(index_html, headers=HTML_NO_CACHE_HEADERS)
+
+    return JSONResponse(
+        status_code=404,
+        content={
+            "detail": "Frontend is not built.",
+        },
+    )
 
 # 添加静态文件挂载（用于 assets、icons 等静态资源）
-app.mount("/assets", StaticFiles(directory="./static/assets"), name="assets")
-app.mount("/icons", StaticFiles(directory="./static/icons"), name="icons")
+# 注意：当仅提交源代码且未构建前端时，static 目录可能只有 .gitkeep。
+# 因此这里只在目录存在时才挂载，避免启动时报错。
+if os.path.isdir("./static/assets"):
+    app.mount("/assets", StaticFiles(directory="./static/assets"), name="assets")
+if os.path.isdir("./static/icons"):
+    app.mount("/icons", StaticFiles(directory="./static/icons"), name="icons")
 
 if __name__ == '__main__':
     import uvicorn
