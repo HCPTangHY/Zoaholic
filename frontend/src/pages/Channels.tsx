@@ -1,7 +1,7 @@
 import { useEffect, useState, KeyboardEvent, ClipboardEvent } from 'react';
 import { useAuthStore } from '../store/authStore';
-import { 
-  Plus, Edit, Brain, Trash2, ArrowRight, RefreshCw, 
+import {
+  Plus, Edit, Brain, Trash2, ArrowRight, RefreshCw,
   Server, X, CheckCircle2, Settings2, Copy, ToggleRight, ToggleLeft,
   Folder, MemoryStick, Puzzle, Network, CopyCheck, Power, Files, Play,
   Search, Check
@@ -76,11 +76,11 @@ export default function Channels() {
   const [channelTypes, setChannelTypes] = useState<ChannelOption[]>([]);
   const [allPlugins, setAllPlugins] = useState<PluginOption[]>([]);
   const [loading, setLoading] = useState(true);
-  
+
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [originalIndex, setOriginalIndex] = useState<number | null>(null);
   const [formData, setFormData] = useState<ProviderFormData | null>(null);
-  
+
   const [groupInput, setGroupInput] = useState('');
   const [modelInput, setModelInput] = useState('');
   const [fetchingModels, setFetchingModels] = useState(false);
@@ -97,11 +97,11 @@ export default function Channels() {
   const [selectedModels, setSelectedModels] = useState<Set<string>>(() => new Set());
   const [modelSearchQuery, setModelSearchQuery] = useState('');
 
-  const { apiKey } = useAuthStore();
+  const { token } = useAuthStore();
 
   const fetchInitialData = async () => {
     try {
-      const headers = { Authorization: `Bearer ${apiKey}` };
+      const headers = { Authorization: `Bearer ${token}` };
       const [configRes, typesRes, pluginsRes] = await Promise.all([
         fetch('/v1/api_config', { headers }),
         fetch('/v1/channels', { headers }),
@@ -143,14 +143,14 @@ export default function Channels() {
     setGroupInput('');
     setModelInput('');
     setShowPluginSheet(false);
-    
+
     if (provider) {
       const parseApiKey = (keyStr: string) => {
         const trimmed = String(keyStr).trim();
         if (trimmed.startsWith('!')) return { key: trimmed.substring(1), disabled: true };
         return { key: trimmed, disabled: false };
       };
-      
+
       let parsedKeys: ApiKeyObj[] = [];
       if (Array.isArray(provider.api)) parsedKeys = provider.api.map(parseApiKey);
       else if (typeof provider.api === 'string' && provider.api.trim()) parsedKeys = [parseApiKey(provider.api.trim())];
@@ -257,7 +257,7 @@ export default function Channels() {
     e.preventDefault();
     const newKeys = [...formData.api_keys];
     newKeys[idx].key = lines[0];
-    
+
     const existingSet = new Set(newKeys.map(k => k.key));
     const newKeyObjs = lines.slice(1).filter(k => !existingSet.has(k)).map(k => ({ key: k, disabled: false }));
 
@@ -313,7 +313,7 @@ export default function Channels() {
     try {
       const res = await fetch('/v1/channels/fetch_models', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           engine: formData.engine,
           base_url: formData.base_url,
@@ -440,7 +440,7 @@ export default function Channels() {
     try {
       const res = await fetch('/v1/api_config/update', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ providers: newProviders }),
       });
       if (res.ok) {
@@ -463,7 +463,7 @@ export default function Channels() {
     try {
       const res = await fetch('/v1/api_config/update', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ providers: newProviders }),
       });
       if (res.ok) {
@@ -501,7 +501,7 @@ export default function Channels() {
     try {
       const res = await fetch('/v1/api_config/update', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ providers: newProviders }),
       });
       if (res.ok) {
@@ -566,7 +566,7 @@ export default function Channels() {
     try {
       const res = await fetch('/v1/api_config/update', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ providers: newProviders }),
       });
 
@@ -625,9 +625,9 @@ export default function Channels() {
         <div className="flex items-center justify-between pt-3 border-t border-border gap-2">
           <div className="flex items-center gap-1.5 flex-shrink-0">
             <span className="text-xs text-muted-foreground">权重:</span>
-            <input 
-              type="number" 
-              value={weight} 
+            <input
+              type="number"
+              value={weight}
               onChange={e => handleUpdateWeight(idx, parseInt(e.target.value) || 0)}
               className="w-12 bg-muted border border-border rounded px-1.5 py-1 text-center font-mono text-xs text-foreground"
             />
@@ -702,7 +702,7 @@ export default function Channels() {
                 const groups = Array.isArray(p.groups) ? p.groups : p.group ? [p.group] : ['default'];
                 const plugins = p.preferences?.enabled_plugins || [];
                 const weight = p.preferences?.weight ?? p.weight ?? 0;
-                
+
                 return (
                   <tr key={idx} className={`transition-colors ${isEnabled ? 'hover:bg-muted/50' : 'bg-muted/30 opacity-60'}`}>
                     <td className="px-4 py-3">
@@ -735,9 +735,9 @@ export default function Channels() {
                       </span>
                     </td>
                     <td className="px-4 py-3 text-center">
-                      <input 
-                        type="number" 
-                        value={weight} 
+                      <input
+                        type="number"
+                        value={weight}
                         onChange={e => handleUpdateWeight(idx, parseInt(e.target.value) || 0)}
                         onClick={e => e.stopPropagation()}
                         className="w-14 bg-muted border border-border rounded px-1 py-1 text-center font-mono text-sm text-foreground focus:border-primary outline-none"
@@ -851,13 +851,13 @@ export default function Channels() {
                     {formData.api_keys.map((keyObj, idx) => (
                       <div key={idx} className={`flex items-center gap-2 px-3 py-2 rounded-lg border ${keyObj.disabled ? 'bg-muted/30 border-border opacity-60' : 'bg-muted/50 border-border'}`}>
                         <span className="text-xs text-muted-foreground w-4 text-right">{idx + 1}</span>
-                        <input 
-                          type="text" 
-                          value={keyObj.key} 
+                        <input
+                          type="text"
+                          value={keyObj.key}
                           onChange={e => updateKey(idx, e.target.value)}
                           onPaste={e => handleKeyPaste(e, idx)}
-                          placeholder="sk-..." 
-                          className={`flex-1 bg-transparent border-none text-sm font-mono outline-none min-w-0 ${keyObj.disabled ? 'text-muted-foreground line-through' : 'text-foreground'}`} 
+                          placeholder="sk-..."
+                          className={`flex-1 bg-transparent border-none text-sm font-mono outline-none min-w-0 ${keyObj.disabled ? 'text-muted-foreground line-through' : 'text-foreground'}`}
                         />
                         <button onClick={() => toggleKeyDisabled(idx)} className={keyObj.disabled ? 'text-muted-foreground' : 'text-emerald-500'} title={keyObj.disabled ? "启用" : "禁用"}>
                           {keyObj.disabled ? <ToggleLeft className="w-5 h-5" /> : <ToggleRight className="w-5 h-5" />}
@@ -879,7 +879,7 @@ export default function Channels() {
                       <span className="text-sm font-medium text-foreground">支持的模型列表 ({formData.models.length})</span>
                       <div className="flex gap-2">
                         <button onClick={copyAllModels} disabled={formData.models.length === 0} className="text-xs bg-muted text-foreground px-2 py-1 rounded flex items-center gap-1 hover:bg-muted/80 disabled:opacity-50">
-                          {copiedModels ? <CopyCheck className="w-3 h-3 text-emerald-500" /> : <Copy className="w-3 h-3" />} 
+                          {copiedModels ? <CopyCheck className="w-3 h-3 text-emerald-500" /> : <Copy className="w-3 h-3" />}
                           {copiedModels ? '已复制' : '复制'}
                         </button>
                         <button onClick={() => updateFormData('models', [])} className="text-xs bg-red-500/10 text-red-600 dark:text-red-500 px-2 py-1 rounded">清空</button>
@@ -894,8 +894,8 @@ export default function Channels() {
                           const displayName = getModelDisplayName(model);
                           const hasAlias = displayName !== model;
                           return (
-                            <span 
-                              key={`${idx}-${modelDisplayKey}`} 
+                            <span
+                              key={`${idx}-${modelDisplayKey}`}
                               className="group bg-background border border-border text-foreground text-xs font-mono px-2 py-1 rounded flex items-center gap-1.5 cursor-pointer hover:bg-muted transition-colors"
                               onClick={() => { navigator.clipboard.writeText(displayName); }}
                               title={hasAlias ? `点击复制: ${displayName} (原名: ${model})` : "点击复制模型名"}
@@ -1002,25 +1002,25 @@ export default function Channels() {
                     </div>
                     <div>
                       <label className="text-sm font-medium text-foreground mb-1.5 block">自定义请求头 (JSON)</label>
-                      <textarea 
-                        value={headersJson} 
-                        onChange={e => setHeadersJson(e.target.value)} 
+                      <textarea
+                        value={headersJson}
+                        onChange={e => setHeadersJson(e.target.value)}
                         onBlur={() => formatJsonOnBlur(headersJson, setHeadersJson, '请求头')}
-                        rows={3} 
-                        placeholder='{"Custom-Header": "Value"}' 
-                        className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm font-mono focus:border-primary outline-none text-foreground" 
+                        rows={3}
+                        placeholder='{"Custom-Header": "Value"}'
+                        className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm font-mono focus:border-primary outline-none text-foreground"
                       />
                       <p className="text-xs text-muted-foreground mt-1">失焦时自动格式化</p>
                     </div>
                     <div>
                       <label className="text-sm font-medium text-foreground mb-1.5 block">请求体覆写 (JSON)</label>
-                      <textarea 
-                        value={overridesJson} 
-                        onChange={e => setOverridesJson(e.target.value)} 
+                      <textarea
+                        value={overridesJson}
+                        onChange={e => setOverridesJson(e.target.value)}
                         onBlur={() => formatJsonOnBlur(overridesJson, setOverridesJson, '请求体覆写')}
-                        rows={3} 
-                        placeholder='{"all": {"temperature": 0.1}}' 
-                        className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm font-mono focus:border-primary outline-none text-foreground" 
+                        rows={3}
+                        placeholder='{"all": {"temperature": 0.1}}'
+                        className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm font-mono focus:border-primary outline-none text-foreground"
                       />
                       <p className="text-xs text-muted-foreground mt-1">失焦时自动格式化</p>
                     </div>
@@ -1032,7 +1032,7 @@ export default function Channels() {
                     </div>
                   </div>
                 </section>
-                
+
                 <div className="h-10"></div>
               </div>
             )}
@@ -1125,7 +1125,7 @@ export default function Channels() {
       </Dialog.Root>
 
       {formData && (
-        <InterceptorSheet 
+        <InterceptorSheet
           open={showPluginSheet}
           onOpenChange={setShowPluginSheet}
           allPlugins={allPlugins}

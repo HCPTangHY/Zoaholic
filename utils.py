@@ -5,13 +5,15 @@ import h2.exceptions
 from time import time
 import time as time_module
 from fastapi import HTTPException
+from fastapi.encoders import jsonable_encoder
 from collections import defaultdict
 from typing import List, Dict, Optional
 from ruamel.yaml import YAML, YAMLError
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select, func, case
-from db import async_session, ChannelStat, DISABLE_DATABASE
+from db import async_session, ChannelStat, AppConfig, DISABLE_DATABASE
+from core.env import env_bool
 
 from core.log_config import logger
 from core.utils import (
@@ -52,6 +54,131 @@ yaml.indent(mapping=2, sequence=4, offset=2)
 API_YAML_PATH = "./api.yaml"
 yaml_error_message = None
 
+
+def _sanitize_config_for_persistence(config_data: dict) -> dict:
+    """清理配置中的运行时字段，返回可持久化的 dict。
+
+    - 移除 providers/api_keys 中以 "_" 开头的运行时字段
+    - 保持其余结构不变
+    """
+
+    import copy
+
+    processed_data = copy.deepcopy(config_data or {})
+
+    for provider in processed_data.get("providers", []) or []:
+        keys_to_remove = [k for k in list(provider.keys()) if str(k).startswith("_")]
+        for k in keys_to_remove:
+            provider.pop(k, None)
+
+    for api_key in processed_data.get("api_keys", []) or []:
+        keys_to_remove = [k for k in list(api_key.keys()) if str(k).startswith("_")]
+        for k in keys_to_remove:
+            api_key.pop(k, None)
+
+    return processed_data
+
+
+def dump_config_to_json_obj(config_data: dict) -> dict:
+    """将配置 dict 转为可写入 JSON/JSONB 的对象。
+
+    使用 jsonable_encoder 处理 datetime 等类型，避免 JSON 序列化失败。
+    """
+
+    processed_data = _sanitize_config_for_persistence(config_data)
+    return jsonable_encoder(processed_data)
+
+
+def dump_config_to_yaml_text(config_data: dict) -> str:
+    """将配置序列化为 YAML 文本（可选：用于导出/排查）。"""
+
+    import io
+
+    processed_data = _sanitize_config_for_persistence(config_data)
+    processed_data = _quote_colon_strings(processed_data)
+
+    buf = io.StringIO()
+    yaml.dump(processed_data, buf)
+    return buf.getvalue()
+
+
+async def save_config_to_db(config_data: dict) -> None:
+    """把配置写入数据库（app_config 表，id=1）。
+
+    主存储为 JSON/JSONB（config_json）。
+    - Postgres/CockroachDB：存 dict（SQLAlchemy JSONB）或存 JSON 字符串（回退）
+    另外会同步存一份 YAML（config_yaml）便于人工排查（可选）。
+    """
+
+    if DISABLE_DATABASE or async_session is None:
+        return
+
+    config_obj = dump_config_to_json_obj(config_data)
+    config_yaml = dump_config_to_yaml_text(config_data)
+
+    # 若底层字段是 Text（例如我们对非 Postgres dialect 做的回退），存 JSON 字符串
+    config_json_value = config_obj
+    try:
+        from db import AppConfig as _AppConfigModel
+        col_type_name = type(_AppConfigModel.__table__.c.config_json.type).__name__.lower()
+        if "text" in col_type_name:
+            import json as _json
+            config_json_value = _json.dumps(config_obj, ensure_ascii=False)
+    except Exception:
+        pass
+
+    async with async_session() as session:
+        existing = await session.get(AppConfig, 1)
+        if existing is None:
+            existing = AppConfig(id=1, config_json=config_json_value, config_yaml=config_yaml)
+            session.add(existing)
+        else:
+            existing.config_json = config_json_value
+            existing.config_yaml = config_yaml
+        await session.commit()
+
+
+async def load_config_from_db() -> Optional[dict]:
+    """从数据库读取配置（若不存在则返回 None）。
+
+    优先读取 config_json；若不存在则兼容旧的 config_yaml。
+    """
+
+    if DISABLE_DATABASE or async_session is None:
+        return None
+
+    async with async_session() as session:
+        row = await session.get(AppConfig, 1)
+        if row is None:
+            return None
+
+        # 1) 优先 JSON/JSONB
+        if getattr(row, "config_json", None):
+            data = row.config_json
+            if isinstance(data, dict):
+                return data
+            # 兼容：若字段是 Text 回退，可能存的是 JSON 字符串
+            if isinstance(data, str) and data.strip():
+                import json as _json
+                try:
+                    parsed = _json.loads(data)
+                    if isinstance(parsed, dict):
+                        return parsed
+                except Exception:
+                    pass
+
+        # 2) 兼容旧 YAML（如果有的话）
+        if getattr(row, "config_yaml", None):
+            try:
+                data = yaml.load(row.config_yaml)
+            except Exception as e:
+                logger.error(f"Failed to parse config_yaml from DB: {e}")
+                return None
+            if isinstance(data, dict):
+                return data
+
+        return None
+
 def _quote_colon_strings(obj):
     """
     递归处理配置数据，对包含冒号的纯字符串进行引号包裹，
@@ -89,7 +216,7 @@ def save_api_yaml(config_data):
     with open(API_YAML_PATH, "w", encoding="utf-8") as f:
         yaml.dump(processed_data, f)
 
-async def update_config(config_data, use_config_url=False, skip_model_fetch=False, save_to_file=True):
+async def update_config(config_data, use_config_url=False, skip_model_fetch=False, save_to_file=True, save_to_db: bool = False):
     for index, provider in enumerate(config_data['providers']):
         if provider.get('project_id'):
             if "google-vertex-ai" not in provider.get("base_url", ""):
@@ -178,6 +305,22 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
         if "api" in api_key:
             config_data['api_keys'][index]["api"] = str(api_key["api"])
 
+        # 兼容 JSON/JSONB：把 created_at 从字符串恢复为 datetime（用于余额/账期逻辑）
+        try:
+            pref = config_data['api_keys'][index].get('preferences') or {}
+            ca = pref.get('created_at')
+            if isinstance(ca, str) and ca.strip():
+                s = ca.strip()
+                if s.endswith('Z'):
+                    s = s[:-1] + '+00:00'
+                dt_obj = datetime.fromisoformat(s)
+                if dt_obj.tzinfo is None:
+                    dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+                pref['created_at'] = dt_obj
+                config_data['api_keys'][index]['preferences'] = pref
+        except Exception:
+            pass
+
     api_keys_db = config_data['api_keys']
 
     for index, api_key in enumerate(config_data['api_keys']):
@@ -220,82 +363,161 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
     api_list = [item["api"] for item in api_keys_db]
     # logger.info(json.dumps(config_data, indent=4, ensure_ascii=False))
 
-    # 管理阶段：只在显式请求保存时（save_to_file=True）才同步写回本地 api.yaml，
-    # 这样 /v1/api_config/update 等管理接口修改后的配置可以持久化，供其他组件/环境复用。
-    # 启动时加载配置不应该触发保存，避免自动添加的字段污染原始配置文件。
+    # 管理阶段：只在显式请求保存时（save_to_file=True）才同步写回本地 api.yaml。
     if not use_config_url and save_to_file:
         save_api_yaml(config_data)
 
+    # 可选：写入数据库（将 DB 作为权威配置）
+    if save_to_db:
+        try:
+            await save_config_to_db(config_data)
+        except Exception as e:
+            logger.warning(f"Failed to save config to DB: {e}")
+
     return config_data, api_keys_db, api_list
 
-# 读取YAML配置文件
+# 读取配置（优先 DB，其次本地文件，再其次 CONFIG_URL）
 async def load_config(app=None):
     import os
-    try:
-        with open(API_YAML_PATH, 'r', encoding='utf-8') as file:
-            conf = yaml.load(file)
+    import base64
 
-        if conf:
-            # 启动时加载配置，不要自动保存文件，避免污染原始配置
-            config, api_keys_db, api_list = await update_config(conf, use_config_url=False, save_to_file=False)
-        else:
-            logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
-            config, api_keys_db, api_list = {}, {}, []
-    except FileNotFoundError:
-        if not os.environ.get('CONFIG_URL'):
-            logger.error("'api.yaml' not found. Please check the file path.")
-        config, api_keys_db, api_list = {}, {}, []
-    except YAMLError as e:
-        logger.error("配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。%s", e)
-        global yaml_error_message
-        yaml_error_message = "配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。"
-        config, api_keys_db, api_list = {}, {}, []
-    except OSError as e:
-        logger.error(f"open 'api.yaml' failed: {e}")
-        config, api_keys_db, api_list = {}, {}, []
+    # 配置来源策略：
+    # - auto（默认）：若数据库可用则优先 DB；否则回退到文件/CONFIG_URL
+    # - db：强制优先 DB（无则回退文件/CONFIG_URL 作为“种子”，并写回 DB）
+    # - file：只读本地 api.yaml（兼容旧行为）
+    # - url：只读 CONFIG_URL
+    config_storage = (os.getenv("CONFIG_STORAGE") or "auto").strip().lower()
+    sync_to_file = env_bool("SYNC_CONFIG_TO_FILE", False)
 
-    if config != {}:
-        return config, api_keys_db, api_list
+    # 0) 先尝试 DB（当数据库可用且策略允许）
+    if config_storage in ("auto", "db"):
+        conf_from_db = await load_config_from_db()
+        if conf_from_db:
+            config, api_keys_db, api_list = await update_config(
+                conf_from_db, use_config_url=False, save_to_file=False
+            )
+            # 可选：把 DB 配置同步回文件（本地环境可能想要）
+            if sync_to_file:
+                try:
+                    save_api_yaml(config)
+                except Exception as e:
+                    logger.warning(f"Failed to sync config to api.yaml: {e}")
+            return config, api_keys_db, api_list
 
-    # 新增： 从环境变量获取配置URL并拉取配置
-    config_url = os.environ.get('CONFIG_URL')
-    if config_url:
+    # 1) 允许从环境变量直接注入配置（适合无文件挂载的 PaaS）
+    # - CONFIG_YAML: 直接 YAML 文本
+    # - CONFIG_YAML_BASE64: base64 编码的 YAML 文本
+    conf_seed = None
+    config_yaml_env = os.getenv("CONFIG_YAML")
+    config_yaml_b64 = os.getenv("CONFIG_YAML_BASE64")
+    if config_storage in ("auto", "db", "file") and (config_yaml_env or config_yaml_b64):
         try:
-            default_config = {
-                "headers": {
-                    "User-Agent": "curl/7.68.0",
-                    "Accept": "*/*",
-                },
-                "http2": True,
-                "verify": True,
-                "follow_redirects": True
-            }
-            # 初始化客户端管理器
-            timeout = httpx.Timeout(
-                connect=15.0,
-                read=100,
-                write=30.0,
-                pool=200
-            )
-            client = httpx.AsyncClient(
-                timeout=timeout,
-                **default_config
-            )
-            response = await client.get(config_url)
-            # logger.info(f"Fetching config from {response.text}")
-            response.raise_for_status()
-            config_data = yaml.load(response.text)
-            # 更新配置
-            # logger.info(config_data)
-            if config_data:
-                # 从 CONFIG_URL 加载的配置，不保存到本地文件
-                config, api_keys_db, api_list = await update_config(config_data, use_config_url=True, save_to_file=False)
-            else:
-                logger.error(f"Error fetching or parsing config from {config_url}")
-                config, api_keys_db, api_list = {}, {}, []
+            yaml_text = config_yaml_env
+            if (not yaml_text) and config_yaml_b64:
+                yaml_text = base64.b64decode(config_yaml_b64).decode("utf-8")
+            if yaml_text:
+                conf_seed = yaml.load(yaml_text)
         except Exception as e:
-            logger.error(f"Error fetching or parsing config from {config_url}: {str(e)}")
-            config, api_keys_db, api_list = {}, {}, []
+            logger.error(f"Failed to load config from env (CONFIG_YAML/BASE64): {e}")
+            conf_seed = None
+
+    # 2) 尝试本地文件 api.yaml（旧方式）
+    if conf_seed is None and config_storage in ("auto", "db", "file"):
+        try:
+            with open(API_YAML_PATH, 'r', encoding='utf-8') as file:
+                conf_seed = yaml.load(file)
+            if not conf_seed:
+                logger.error("配置文件 'api.yaml' 为空。请检查文件内容。")
+                conf_seed = None
+        except FileNotFoundError:
+            if config_storage == "file":
+                logger.error("'api.yaml' not found. Please check the file path.")
+        except YAMLError as e:
+            logger.error("配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。%s", e)
+            global yaml_error_message
+            yaml_error_message = "配置文件 'api.yaml' 格式不正确。请检查 YAML 格式。"
+            conf_seed = None
+        except OSError as e:
+            logger.error(f"open 'api.yaml' failed: {e}")
+            conf_seed = None
+
+    # 3) 尝试 CONFIG_URL
+    if conf_seed is None and config_storage in ("auto", "db", "url"):
+        config_url = os.environ.get('CONFIG_URL')
+        if config_url:
+            try:
+                default_config = {
+                    "headers": {
+                        "User-Agent": "curl/7.68.0",
+                        "Accept": "*/*",
+                    },
+                    "http2": True,
+                    "verify": True,
+                    "follow_redirects": True
+                }
+                timeout = httpx.Timeout(
+                    connect=15.0,
+                    read=100,
+                    write=30.0,
+                    pool=200
+                )
+                client = httpx.AsyncClient(
+                    timeout=timeout,
+                    **default_config
+                )
+                response = await client.get(config_url)
+                response.raise_for_status()
+                conf_seed = yaml.load(response.text)
+            except Exception as e:
+                logger.error(f"Error fetching or parsing config from {config_url}: {str(e)}")
+                conf_seed = None
+
+    if not conf_seed or not isinstance(conf_seed, dict):
+        # 兜底：允许用环境变量提供一个“启动用”的管理员 key，便于在云平台上首次启动后
+        # 通过 /admin 页面或 /v1/api_config/update 完成配置，并把配置持久化到数据库。
+        #
+        # 支持：
+        # - ADMIN_API_KEY=sk-xxxx
+        # - ADMIN_API_KEYS=sk-xxx,sk-yyy
+        admin_keys_raw = (os.getenv("ADMIN_API_KEYS") or os.getenv("ADMIN_API_KEY") or "").strip()
+        if admin_keys_raw:
+            admin_keys = [k.strip() for k in admin_keys_raw.split(",") if k.strip()]
+            if admin_keys:
+                conf_seed = {
+                    "providers": [],
+                    "api_keys": [
+                        {
+                            "api": k,
+                            "role": "admin",
+                            # 保持与原配置结构一致，后续 update_config 会进一步规范化
+                            "model": ["all"],
+                        }
+                        for k in admin_keys
+                    ],
+                    "preferences": {},
+                }
+        if not conf_seed or not isinstance(conf_seed, dict):
+            return {}, {}, []
+
+    # 4) 规范化配置（不写回文件，避免启动时污染）
+    config, api_keys_db, api_list = await update_config(
+        conf_seed, use_config_url=(config_storage == "url"), save_to_file=False
+    )
+
+    # 5) 如果策略允许且数据库可用：把种子配置写入 DB，作为后续“权威配置”
+    if config_storage in ("auto", "db"):
+        try:
+            await save_config_to_db(config)
+        except Exception as e:
+            logger.warning(f"Failed to persist config to DB: {e}")
+
+    # 可选：把最终配置同步回本地 api.yaml
+    if sync_to_file:
+        try:
+            save_api_yaml(config)
+        except Exception as e:
+            logger.warning(f"Failed to sync config to api.yaml: {e}")
+
     return config, api_keys_db, api_list
 
 async def ensure_string(item):

@@ -10,4 +10,7 @@ services:
       - ./data:/home/data
     environment:
       - TZ=Asia/Shanghai
+      - DB_TYPE=sqlite
+      - DB_PATH=/home/data/stats.db
+      # - DATABASE_URL=postgresql://user:pass@host:5432/dbname
       # - CONFIG_URL=http://file_url/api.yaml  # 可选：远程配置

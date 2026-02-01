@@ -45,7 +45,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 import asyncio
 import re
-import inspect
 
 from ..log_config import logger
 
@@ -320,17 +319,12 @@ class InterceptorRegistry:
                     continue
             
             try:
-                callback_result = interceptor.callback(request, engine, provider, api_key, url, headers, payload)
-                if inspect.isawaitable(callback_result):
-                    callback_result = await callback_result
-
-                if callback_result is not None:
-                    if isinstance(callback_result, tuple) and len(callback_result) == 3:
-                        url, headers, payload = callback_result
+                result = await interceptor.callback(request, engine, provider, api_key, url, headers, payload)
+                if result is not None:
+                    if isinstance(result, tuple) and len(result) == 3:
+                        url, headers, payload = result
                     else:
-                        logger.warning(
-                            f"Request interceptor '{interceptor.id}' returned invalid result, expected (url, headers, payload)"
-                        )
+                        logger.warning(f"Request interceptor '{interceptor.id}' returned invalid result, expected (url, headers, payload)")
             except Exception as e:
                 logger.error(f"Request interceptor '{interceptor.id}' error: {e}")
                 # 继续执行其他拦截器
@@ -435,12 +429,9 @@ class InterceptorRegistry:
                     continue
             
             try:
-                callback_result = interceptor.callback(response_chunk, engine, model, is_stream)
-                if inspect.isawaitable(callback_result):
-                    callback_result = await callback_result
-
-                if callback_result is not None:
-                    response_chunk = callback_result
+                result = await interceptor.callback(response_chunk, engine, model, is_stream)
+                if result is not None:
+                    response_chunk = result
             except Exception as e:
                 logger.error(f"Response interceptor '{interceptor.id}' error: {e}")
                 # 继续执行其他拦截器

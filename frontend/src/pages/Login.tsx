@@ -1,59 +1,66 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { useNavigate } from 'react-router-dom';
 import { Activity, Key, LogIn } from 'lucide-react';
 
 export default function Login() {
-  const [apiKey, setApiKey] = useState('');
+  const [username, setUsername] = useState('admin');
+  const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const login = useAuthStore((state) => state.login);
   const navigate = useNavigate();
 
-  const handleLogin = async (e: React.FormEvent) => {
+  // 若后端提示需要初始化，则跳转到 /setup
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const res = await fetch('/setup/status');
+        if (res.ok) {
+          const data = await res.json();
+          if (data?.needs_setup) {
+            navigate('/setup');
+          }
+        }
+      } catch {
+        // ignore
+      }
+    };
+    check();
+  }, [navigate]);
+
+  const handleLogin = async (e: import('react').FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError('');
 
     try {
-      // 1. 先调用 /v1/models 验证 API Key 是否有效
-      const response = await fetch('/v1/models', {
-        headers: { 'Authorization': `Bearer ${apiKey}` },
+      const res = await fetch('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
       });
 
-      if (response.status === 403 || response.status === 401) {
-        setError('API Key 无效或已过期');
-        setLoading(false);
+      const data = await res.json().catch(() => null);
+
+      if (res.status === 404) {
+        // 未初始化
+        navigate('/setup');
         return;
       }
 
-      if (response.status === 429) {
-        setError('请求过于频繁，请稍后再试');
-        setLoading(false);
+      if (!res.ok) {
+        setError(data?.detail || `登录失败: HTTP ${res.status}`);
         return;
       }
 
-      if (!response.ok) {
-        setError(`验证失败: HTTP ${response.status}`);
-        setLoading(false);
+      const token = data?.access_token;
+      if (!token) {
+        setError('登录成功但未返回 token');
         return;
       }
 
-      // 2. 验证成功，尝试获取角色信息（只有 Admin 能访问 /v1/api_config）
-      let role: 'admin' | 'user' = 'user';
-      try {
-        const configRes = await fetch('/v1/api_config', {
-          headers: { 'Authorization': `Bearer ${apiKey}` },
-        });
-        if (configRes.ok) {
-          role = 'admin';
-        }
-      } catch (err) {
-        // 静默处理，不是 Admin 就是 User
-      }
-
-      // 3. 登录成功
-      login(apiKey, role);
+      login(token, 'admin');
       navigate('/');
     } catch (err) {
       setError('网络错误，请检查后端服务是否正常启动');
@@ -78,14 +85,26 @@ export default function Login() {
             <div>
               <label className="text-sm font-medium text-foreground mb-1.5 flex items-center gap-2">
                 <Key className="w-4 h-4" />
-                API Key
+                管理员用户名
+              </label>
+              <input
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="admin"
+                className="w-full bg-background border border-border focus:border-primary focus:ring-1 focus:ring-primary rounded-lg px-4 py-2.5 text-foreground placeholder:text-muted-foreground outline-none transition-all"
+                required
+              />
+
+              <label className="text-sm font-medium text-foreground mb-1.5 flex items-center gap-2 mt-4">
+                <Key className="w-4 h-4" />
+                密码
               </label>
               <input
                 type="password"
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder="sk-..."
-                className="w-full bg-background border border-border focus:border-primary focus:ring-1 focus:ring-primary rounded-lg px-4 py-2.5 text-foreground placeholder:text-muted-foreground outline-none transition-all font-mono"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="请输入密码"
+                className="w-full bg-background border border-border focus:border-primary focus:ring-1 focus:ring-primary rounded-lg px-4 py-2.5 text-foreground placeholder:text-muted-foreground outline-none transition-all"
                 required
               />
             </div>
@@ -94,7 +113,7 @@ export default function Login() {
 
             <button
               type="submit"
-              disabled={loading || !apiKey.trim()}
+              disabled={loading || !username.trim() || !password.trim()}
               className="w-full bg-primary hover:bg-primary/90 text-primary-foreground font-semibold py-2.5 rounded-lg transition-colors flex items-center justify-center gap-2 mt-6 disabled:opacity-50 disabled:pointer-events-none"
             >
               {loading ? <Activity className="w-4 h-4 animate-spin" /> : <LogIn className="w-4 h-4" />}

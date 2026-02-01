@@ -2,26 +2,26 @@ import { create } from 'zustand';
 
 interface AuthState {
   isAuthenticated: boolean;
-  apiKey: string | null;
+  token: string | null; // JWT
   role: 'admin' | 'user' | null;
-  login: (apiKey: string, role: 'admin' | 'user') => void;
+  login: (token: string, role: 'admin' | 'user') => void;
   logout: () => void;
 }
 
 export const useAuthStore = create<AuthState>((set) => ({
-  isAuthenticated: !!localStorage.getItem('zoaholic_api_key'),
-  apiKey: localStorage.getItem('zoaholic_api_key'),
+  isAuthenticated: !!localStorage.getItem('zoaholic_token'),
+  token: localStorage.getItem('zoaholic_token'),
   role: localStorage.getItem('zoaholic_role') as 'admin' | 'user' | null,
 
-  login: (apiKey, role) => {
-    localStorage.setItem('zoaholic_api_key', apiKey);
+  login: (token, role) => {
+    localStorage.setItem('zoaholic_token', token);
     localStorage.setItem('zoaholic_role', role);
-    set({ isAuthenticated: true, apiKey, role });
+    set({ isAuthenticated: true, token, role });
   },
 
   logout: () => {
-    localStorage.removeItem('zoaholic_api_key');
+    localStorage.removeItem('zoaholic_token');
     localStorage.removeItem('zoaholic_role');
-    set({ isAuthenticated: false, apiKey: null, role: null });
+    set({ isAuthenticated: false, token: null, role: null });
   },
 }));

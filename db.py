@@ -1,9 +1,168 @@
 import os
+import ssl as ssl_module
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
 from sqlalchemy import event
+
+from core.env import env_bool
 from sqlalchemy.sql import func
+
+# --- CockroachDB compatibility (asyncpg / SQLAlchemy) ---
+# CockroachDB 并不一定提供 pg_catalog.json 类型（通常只有 jsonb）。
+# SQLAlchemy 的 postgresql+asyncpg 方言会在连接时尝试注册 json/jsonb codec，
+# 在 CockroachDB 上可能报错：ValueError: unknown type: pg_catalog.json
+# 这里对 SQLAlchemy 的 codec 注册逻辑做一个兼容补丁：若 json 类型不存在，则仅注册 jsonb。
+try:
+    import json as _json_module
+    from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg as _PGDialect_asyncpg
+
+    if not getattr(_PGDialect_asyncpg, "_zoaholic_crdb_json_patch", False):
+        _orig_setup = _PGDialect_asyncpg.setup_asyncpg_json_codec
+
+        async def _patched_setup_asyncpg_json_codec(self, asyncpg_connection, *args, **kwargs):
+            try:
+                return await _orig_setup(self, asyncpg_connection, *args, **kwargs)
+            except ValueError as e:
+                msg = str(e)
+                if "unknown type: pg_catalog.json" not in msg:
+                    raise
+
+                # CockroachDB 兼容：没有 pg_catalog.json 时，直接跳过 SQLAlchemy 的 json codec 注册。
+                # asyncpg 对 jsonb 通常仍能使用默认 codec；且我们业务侧也可容忍 json 以文本形式返回。
+                return None
+            except AttributeError:
+                # 某些 SQLAlchemy/asyncpg 组合下传入的连接适配器不暴露 set_type_codec 等方法。
+                # 直接跳过 codec 注册即可。
+                return None
+
+        _PGDialect_asyncpg.setup_asyncpg_json_codec = _patched_setup_asyncpg_json_codec
+        _PGDialect_asyncpg._zoaholic_crdb_json_patch = True
+except Exception:
+    # 兼容：未安装 sqlalchemy/asyncpg 时不处理
+    pass
+
+# Render / Railway 等平台通常提供 DATABASE_URL（多为 postgres://...），这里统一解析。
+DATABASE_URL = (
+    os.getenv("DATABASE_URL")
+    or os.getenv("DB_URL")
+    or os.getenv("SQLALCHEMY_DATABASE_URL")
+)
+
+# DB_TYPE：显式优先；否则根据 DATABASE_URL 自动推断；默认 sqlite
+_DB_TYPE_ENV = (os.getenv("DB_TYPE") or "").strip().lower()
+if _DB_TYPE_ENV:
+    DB_TYPE = _DB_TYPE_ENV
+elif DATABASE_URL:
+    _url = DATABASE_URL.strip().lower()
+    if _url.startswith("postgres://") or _url.startswith("postgresql://"):
+        DB_TYPE = "postgres"
+    elif _url.startswith("sqlite://"):
+        DB_TYPE = "sqlite"
+    else:
+        DB_TYPE = "sqlite"
+else:
+    DB_TYPE = "sqlite"
+
+
+def _normalize_database_url(url: str, db_type: str) -> str:
+    """将常见 DATABASE_URL 规范为 SQLAlchemy async URL。"""
+
+    url = url.strip()
+    db_type = (db_type or "").lower()
+
+    if db_type == "postgres":
+        # Render: postgres://user:pass@host:port/db
+        if url.startswith("postgres://"):
+            return "postgresql+asyncpg://" + url[len("postgres://") :]
+        # 常见: postgresql://...
+        if url.startswith("postgresql://") and "+asyncpg" not in url:
+            return "postgresql+asyncpg://" + url[len("postgresql://") :]
+        return url
+
+    if db_type == "sqlite":
+        # 常见: sqlite:///./data/stats.db
+        if url.startswith("sqlite://") and "+aiosqlite" not in url:
+            return url.replace("sqlite://", "sqlite+aiosqlite://", 1)
+        return url
+
+    return url
+
+
+def _extract_asyncpg_ssl_connect_args(db_url: str) -> tuple[str, dict]:
+    """从 URL query 中提取 PostgreSQL SSL 参数，转换为 asyncpg 可识别的 connect_args。
+
+    背景：
+    - 许多平台/服务提供的 DATABASE_URL 会带 `?sslmode=...`
+    - 但 asyncpg.connect() 不接受 sslmode 这个关键字参数，会导致：
+      `TypeError: connect() got an unexpected keyword argument 'sslmode'`
+
+    处理：
+    - 从 URL 中移除 sslmode/sslrootcert 等参数，避免被 SQLAlchemy 透传给 asyncpg
+    - 根据 sslmode 构造 asyncpg 所需的 `ssl=` 参数（bool 或 SSLContext）
+
+    返回： (clean_url, connect_args)
+    """
+
+    parts = urlsplit(db_url)
+    qsl = parse_qsl(parts.query, keep_blank_values=True)
+
+    sslmode = None
+    sslrootcert = None
+    kept: list[tuple[str, str]] = []
+
+    for k, v in qsl:
+        lk = k.lower()
+        if lk == "sslmode":
+            sslmode = v
+        elif lk == "sslrootcert":
+            sslrootcert = v
+        else:
+            kept.append((k, v))
+
+    connect_args: dict = {}
+
+    if sslmode:
+        mode = str(sslmode).strip().lower()
+
+        # 参考 libpq sslmode 语义：disable / allow / prefer / require / verify-ca / verify-full
+        if mode in ("disable", "false", "0", "off"):
+            connect_args["ssl"] = False
+        elif mode in ("require",):
+            # require：加密但不校验证书
+            ctx = ssl_module.create_default_context(cafile=sslrootcert) if sslrootcert else ssl_module.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl_module.CERT_NONE
+            connect_args["ssl"] = ctx
+        elif mode in ("verify-ca", "verify_ca"):
+            # verify-ca：校验证书链，但不校验主机名
+            ctx = ssl_module.create_default_context(cafile=sslrootcert) if sslrootcert else ssl_module.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl_module.CERT_REQUIRED
+            connect_args["ssl"] = ctx
+        else:
+            # 默认：prefer / allow / verify-full / 其它
+            # verify-full：校验证书链 + 校验主机名（默认 context 就是该语义）
+            ctx = ssl_module.create_default_context(cafile=sslrootcert) if sslrootcert else ssl_module.create_default_context()
+            # 确保 verify-full 语义
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl_module.CERT_REQUIRED
+            connect_args["ssl"] = ctx
+
+    new_query = urlencode(kept, doseq=True)
+    clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+    return clean_url, connect_args
+
+
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text
+
+# PostgreSQL 下使用 JSONB（更高效/可索引）；其它数据库回退到 JSON
+try:
+    from sqlalchemy.dialects.postgresql import JSONB as _PG_JSONB
+except Exception:  # pragma: no cover
+    _PG_JSONB = None
 
 from core.log_config import logger
 
@@ -59,14 +218,63 @@ class ChannelStat(Base):
     success = Column(Boolean, default=False)
     timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 
-DISABLE_DATABASE = os.getenv("DISABLE_DATABASE", "false").lower() == "true"
+
+class AdminUser(Base):
+    """管理员账号（用于首次初始化向导 /setup）。
+
+    说明：
+    - 仅保存一个管理员（id=1）
+    - password_hash 为 PBKDF2-HMAC-SHA256 的字符串格式
+    - jwt_secret：用于签发/校验 JWT（若未设置环境变量 JWT_SECRET，会使用该值）
+    """
+
+    __tablename__ = "admin_user"
+
+    id = Column(Integer, primary_key=True)
+    username = Column(String, nullable=False, index=True)
+    password_hash = Column(String, nullable=False)
+    jwt_secret = Column(String, nullable=True)
+
+
+class AppConfig(Base):
+    """配置存储表（用于将配置入库）。
+
+    说明：
+    - DB 作为权威配置源（source of truth）
+    - PostgreSQL 使用 JSONB，其它数据库使用 JSON
+    - 仅保存“用户配置”（会清理运行时字段，如 _model_dict_cache）
+    """
+
+    __tablename__ = "app_config"
+
+    # 固定单行即可（id=1）
+    id = Column(Integer, primary_key=True)
+
+    # JSON/JSONB 配置
+    # - PostgreSQL: JSONB
+    # - CockroachDB: 通常只有 JSONB（json 类型可能不存在）
+    # - 其它 DB: 回退到 Text/JSON（但当前主要用于 Postgres/Cockroach/SQLite）
+    config_json = Column(_PG_JSONB if _PG_JSONB is not None else Text, nullable=True)
+
+    # 预留：便于人工导出/排查（可选，不参与主流程）
+    config_yaml = Column(Text, nullable=True)
+
+    # 最近更新时间（数据库侧 now）
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+
+# DISABLE_DATABASE=true 可关闭统计数据库（例如无持久化磁盘的免费部署环境）
+DISABLE_DATABASE = env_bool("DISABLE_DATABASE", False)
 db_engine = None
 async_session = None
 
 if not DISABLE_DATABASE:
-    DB_TYPE = os.getenv("DB_TYPE", "sqlite").lower()
-    is_debug = bool(os.getenv("DEBUG", False))
+    is_debug = env_bool("DEBUG", False)
+
+    # 1) 优先使用 DATABASE_URL（适合云平台）
+    # 2) 否则 fallback 到现有 DB_TYPE/DB_* 环境变量
     logger.info(f"Using {DB_TYPE} database.")
+    if DATABASE_URL:
+        logger.info("DATABASE_URL detected, using it for database connection.")
 
     if DB_TYPE == "postgres":
         try:
@@ -74,20 +282,37 @@ if not DISABLE_DATABASE:
         except ImportError:
             raise ImportError("asyncpg is not installed. Please install it with 'pip install asyncpg' to use PostgreSQL.")
 
-        DB_USER = os.getenv("DB_USER", "postgres")
-        DB_PASSWORD = os.getenv("DB_PASSWORD", "mysecretpassword")
-        DB_HOST = os.getenv("DB_HOST", "localhost")
-        DB_PORT = os.getenv("DB_PORT", "5432")
-        DB_NAME = os.getenv("DB_NAME", "postgres")
+        connect_args = {}
+        if DATABASE_URL:
+            db_url = _normalize_database_url(DATABASE_URL, DB_TYPE)
+            # 兼容 ?sslmode=...（asyncpg 不识别 sslmode，需要转换为 ssl 参数）
+            db_url, connect_args = _extract_asyncpg_ssl_connect_args(db_url)
+        else:
+            DB_USER = os.getenv("DB_USER", "postgres")
+            DB_PASSWORD = os.getenv("DB_PASSWORD", "mysecretpassword")
+            DB_HOST = os.getenv("DB_HOST", "localhost")
+            DB_PORT = os.getenv("DB_PORT", "5432")
+            DB_NAME = os.getenv("DB_NAME", "postgres")
+            db_url = f"postgresql+asyncpg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-        db_url = f"postgresql+asyncpg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-        db_engine = create_async_engine(db_url, echo=is_debug)
+        db_engine = create_async_engine(db_url, echo=is_debug, connect_args=connect_args)
 
     elif DB_TYPE == "sqlite":
-        db_path = os.getenv('DB_PATH', './data/stats.db')
-        data_dir = os.path.dirname(db_path)
-        os.makedirs(data_dir, exist_ok=True)
-        db_engine = create_async_engine('sqlite+aiosqlite:///' + db_path, echo=is_debug)
+        if DATABASE_URL:
+            db_url = _normalize_database_url(DATABASE_URL, DB_TYPE)
+            # 尝试为文件型 sqlite 创建目录（:memory: 不处理）
+            if db_url.startswith("sqlite+aiosqlite:///") and ":memory:" not in db_url:
+                raw_path = db_url.split("sqlite+aiosqlite:///", 1)[1].split("?", 1)[0]
+                # 允许 ./data/xxx.db
+                dir_path = os.path.dirname(raw_path)
+                if dir_path:
+                    os.makedirs(dir_path, exist_ok=True)
+            db_engine = create_async_engine(db_url, echo=is_debug)
+        else:
+            db_path = os.getenv("DB_PATH", "./data/stats.db")
+            data_dir = os.path.dirname(db_path)
+            os.makedirs(data_dir, exist_ok=True)
+            db_engine = create_async_engine("sqlite+aiosqlite:///" + db_path, echo=is_debug)
 
         @event.listens_for(db_engine.sync_engine, "connect")
         def set_sqlite_pragma_on_connect(dbapi_connection, connection_record):

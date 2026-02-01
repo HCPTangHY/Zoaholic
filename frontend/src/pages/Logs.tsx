@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../store/authStore';
-import { 
+import {
   RefreshCw, Filter, ChevronDown, ChevronRight, FileText,
   Clock, ArrowDownToLine, CheckCircle2, XCircle,
   Globe, Key, Server, RotateCcw, Eye, EyeOff,
@@ -40,47 +40,47 @@ interface LogEntry {
 }
 
 export default function Logs() {
-  const { apiKey } = useAuthStore();
+  const { token } = useAuthStore();
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [totalCount, setTotalCount] = useState(0);
-  
+
   // Pagination
   const [page, setPage] = useState(1);
   const [pageSize] = useState(50);
-  
+
   // Search & Filter States
   const [filterModel, setFilterModel] = useState('');
   const [filterProvider, setFilterProvider] = useState('');
   const [filterSuccess, setFilterSuccess] = useState<string>('ALL');
   const [showFilters, setShowFilters] = useState(false);
-  
+
   // Accordion State - 展开的日志ID集合
   const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
 
   const fetchLogs = async (resetPage = false) => {
-    if (!apiKey) return;
+    if (!token) return;
     setLoading(true);
-    
+
     const currentPage = resetPage ? 1 : page;
     if (resetPage) setPage(1);
-    
+
     try {
       const queryParams = new URLSearchParams({
         page: currentPage.toString(),
         page_size: pageSize.toString(),
       });
-      
+
       if (filterModel) queryParams.append('model', filterModel);
       if (filterProvider) queryParams.append('provider', filterProvider);
       if (filterSuccess === 'SUCCESS') queryParams.append('success', 'true');
       if (filterSuccess === 'FAILED') queryParams.append('success', 'false');
 
       const res = await fetch(`/v1/logs?${queryParams.toString()}`, {
-        headers: { Authorization: `Bearer ${apiKey}` }
+        headers: { Authorization: `Bearer ${token}` }
       });
-      
+
       if (res.ok) {
         const data = await res.json();
         const fetchedLogs = data.items || [];
@@ -131,7 +131,7 @@ export default function Logs() {
 
   const calculateSpeed = (log: LogEntry) => {
     if (!log.completion_tokens || !log.process_time) return null;
-    
+
     const startTime = log.first_response_time || 0;
     const genTime = log.process_time - startTime;
     if (genTime <= 0) return null;
@@ -279,11 +279,11 @@ export default function Logs() {
   const LogAccordionItem = ({ log }: { log: LogEntry }) => {
     const isExpanded = expandedIds.has(log.id);
     const speedInfo = calculateSpeed(log);
-    
+
     return (
       <div className="bg-card border border-border rounded-xl overflow-hidden">
         {/* Header - 折叠状态显示关键信息 */}
-        <div 
+        <div
           className="cursor-pointer hover:bg-muted/50 transition-colors"
           onClick={() => toggleExpand(log.id)}
         >
@@ -293,7 +293,7 @@ export default function Logs() {
             <div className="flex-shrink-0 text-muted-foreground">
               {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
             </div>
-            
+
             {/* 状态图标 */}
             <div className="flex-shrink-0">
               {log.success ? (
@@ -302,12 +302,12 @@ export default function Logs() {
                 <XCircle className="w-5 h-5 text-red-500" />
               )}
             </div>
-            
+
             {/* 时间 */}
             <div className="flex-shrink-0 text-xs sm:text-sm font-mono text-muted-foreground w-[85px] sm:w-[100px]">
               {formatTimestamp(log.timestamp)}
             </div>
-            
+
             {/* 模型 & 渠道 */}
             <div className="flex-1 min-w-0">
               <div className="font-medium text-foreground text-sm truncate" title={log.model || '-'}>
@@ -318,7 +318,7 @@ export default function Logs() {
                 {log.provider_key_index !== undefined && <span className="opacity-60"> [{log.provider_key_index}]</span>}
               </div>
             </div>
-            
+
             {/* 标记 & 重试 */}
             <div className="hidden sm:flex items-center gap-1.5 flex-shrink-0">
               {log.is_flagged && (
@@ -333,7 +333,7 @@ export default function Logs() {
                 </span>
               )}
             </div>
-            
+
             {/* 状态码 */}
             <div className="flex-shrink-0">
               <span className={`px-1.5 sm:px-2 py-0.5 sm:py-1 rounded text-xs font-mono font-medium border ${getStatusColor(log.success, log.status_code)}`}>
@@ -341,7 +341,7 @@ export default function Logs() {
               </span>
             </div>
           </div>
-          
+
           {/* 第二行：详细指标 */}
           <div className="flex items-center gap-2 sm:gap-4 px-3 sm:px-4 pb-3 sm:pb-4 pt-0 text-xs flex-wrap">
             {/* API Key */}
@@ -349,7 +349,7 @@ export default function Logs() {
               <Key className="w-3.5 h-3.5" />
               <span className="max-w-[80px] sm:max-w-[120px] truncate">{log.api_key_name || log.api_key_prefix || '-'}</span>
             </div>
-            
+
             {/* 分组 */}
             {log.api_key_group && (
               <div className="hidden sm:flex items-center gap-1 text-muted-foreground">
@@ -357,15 +357,15 @@ export default function Logs() {
                 <span>{log.api_key_group}</span>
               </div>
             )}
-            
+
             {/* IP */}
             <div className="hidden lg:flex items-center gap-1 text-muted-foreground font-mono">
               <Globe className="w-3.5 h-3.5" />
               <span>{log.client_ip || '-'}</span>
             </div>
-            
+
             <div className="flex-1" />
-            
+
             {/* Tokens */}
             <div className="flex items-center gap-1 font-mono">
               <span className="text-muted-foreground">{log.prompt_tokens || 0}</span>
@@ -374,7 +374,7 @@ export default function Logs() {
               <span className="text-muted-foreground/50">=</span>
               <span className="text-foreground">{log.total_tokens || 0}</span>
             </div>
-            
+
             {/* 耗时 */}
             <div className="flex items-center gap-1 text-muted-foreground" title={`总耗时: ${log.process_time?.toFixed(2)}s, 首响: ${log.first_response_time?.toFixed(2) || '-'}s`}>
               <Clock className="w-3.5 h-3.5" />
@@ -383,7 +383,7 @@ export default function Logs() {
                 <span className="text-muted-foreground/60 hidden sm:inline">(首响 {log.first_response_time.toFixed(2)}s)</span>
               )}
             </div>
-            
+
             {/* 速度 */}
             {speedInfo && (
               <div className={`flex items-center gap-1 font-mono ${speedInfo.color}`} title="生成速度">
@@ -393,7 +393,7 @@ export default function Logs() {
             )}
           </div>
         </div>
-        
+
         {/* Expanded Content - 展开后显示原始数据 */}
         {isExpanded && (
           <div className="border-t border-border bg-muted/30 p-4 space-y-4">
@@ -408,7 +408,7 @@ export default function Logs() {
                 <InfoItem label="数据过期" value={formatFullTimestamp(log.raw_data_expires_at)} />
               )}
             </div>
-            
+
             {/* 重试路径 */}
             {log.retry_path && (
               <div className="space-y-1">
@@ -418,41 +418,41 @@ export default function Logs() {
                 <RetryPathView retryPathJson={log.retry_path} />
               </div>
             )}
-            
+
             {/* 请求/响应数据 - 手风琴形式并列 */}
             <div className="space-y-2">
               {/* 1. 请求头 */}
-              <JsonAccordion 
-                title="请求头" 
-                data={log.request_headers} 
+              <JsonAccordion
+                title="请求头"
+                data={log.request_headers}
                 icon={<FileText className="w-4 h-4" />}
               />
-              
+
               {/* 2. 用户请求体 */}
-              <JsonAccordion 
-                title="用户请求体" 
-                data={log.request_body} 
+              <JsonAccordion
+                title="用户请求体"
+                data={log.request_body}
                 icon={<Eye className="w-4 h-4" />}
               />
-              
+
               {/* 3. 上游请求体 */}
-              <JsonAccordion 
-                title="上游请求体" 
-                data={log.upstream_request_body} 
+              <JsonAccordion
+                title="上游请求体"
+                data={log.upstream_request_body}
                 icon={<Server className="w-4 h-4" />}
               />
-              
+
               {/* 4. 上游响应体 */}
-              <JsonAccordion 
-                title="上游响应体" 
-                data={log.upstream_response_body} 
+              <JsonAccordion
+                title="上游响应体"
+                data={log.upstream_response_body}
                 icon={<Server className="w-4 h-4" />}
               />
-              
+
               {/* 5. 用户响应体 */}
-              <JsonAccordion 
-                title="用户响应体" 
-                data={log.response_body} 
+              <JsonAccordion
+                title="用户响应体"
+                data={log.response_body}
                 icon={<EyeOff className="w-4 h-4" />}
               />
             </div>
@@ -473,19 +473,19 @@ export default function Logs() {
   );
 
   // JSON 手风琴展示块组件
-  const JsonAccordion = ({ title, data, icon, defaultOpen = false }: { title: string; data?: string; icon?: React.ReactNode; defaultOpen?: boolean }) => {
+  const JsonAccordion = ({ title, data, icon, defaultOpen = false }: { title: string; data?: string; icon?: import('react').ReactNode; defaultOpen?: boolean }) => {
     const [isOpen, setIsOpen] = useState(defaultOpen);
-    
+
     if (!data) return null;
 
     const { formatted } = formatJsonBestEffort(data);
-    
+
     // 计算预览文本
     const previewText = formatted.length > 80 ? formatted.substring(0, 80) + '...' : formatted;
-    
+
     return (
       <div className="border border-border rounded-lg overflow-hidden">
-        <div 
+        <div
           className="flex items-center gap-2 px-3 py-2 bg-muted/50 cursor-pointer hover:bg-muted transition-colors"
           onClick={() => setIsOpen(!isOpen)}
         >
@@ -519,8 +519,8 @@ export default function Logs() {
           <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-foreground">系统日志</h1>
           <p className="text-muted-foreground mt-1 text-sm sm:text-base">监控 API 请求详情与性能</p>
         </div>
-        <button 
-          onClick={() => fetchLogs(true)} 
+        <button
+          onClick={() => fetchLogs(true)}
           className="p-2 text-muted-foreground hover:text-foreground bg-card border border-border rounded-lg transition-colors"
         >
           <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
@@ -530,7 +530,7 @@ export default function Logs() {
       {/* Toolbar */}
       <div className="bg-card border border-border p-3 sm:p-4 rounded-xl shadow-sm space-y-3 flex-shrink-0">
         {/* Mobile Filter Toggle */}
-        <button 
+        <button
           onClick={() => setShowFilters(!showFilters)}
           className="flex items-center gap-2 text-sm text-muted-foreground md:hidden w-full justify-center py-1"
         >
@@ -541,8 +541,8 @@ export default function Logs() {
 
         {/* Filters - Always show on desktop, toggle on mobile */}
         <div className={`flex flex-col sm:flex-row gap-3 ${showFilters ? 'block' : 'hidden md:flex'}`}>
-          <select 
-            value={filterSuccess} 
+          <select
+            value={filterSuccess}
             onChange={e => setFilterSuccess(e.target.value)}
             className="bg-background border border-border text-sm px-3 py-2 rounded-lg text-foreground flex-1 sm:flex-none"
           >
@@ -551,22 +551,22 @@ export default function Logs() {
             <option value="FAILED">失败</option>
           </select>
 
-          <input 
-            type="text" 
+          <input
+            type="text"
             placeholder="模型过滤"
             value={filterModel}
             onChange={e => setFilterModel(e.target.value)}
             className="bg-background border border-border text-sm px-3 py-2 rounded-lg text-foreground flex-1 sm:w-32 sm:flex-none"
           />
 
-          <input 
-            type="text" 
+          <input
+            type="text"
             placeholder="渠道过滤"
             value={filterProvider}
             onChange={e => setFilterProvider(e.target.value)}
             className="bg-background border border-border text-sm px-3 py-2 rounded-lg text-foreground flex-1 sm:w-32 sm:flex-none"
           />
-          
+
           <div className="text-xs text-muted-foreground self-center">
             共 {totalCount} 条记录
           </div>
@@ -583,15 +583,15 @@ export default function Logs() {
         ) : (
           logs.map((log) => <LogAccordionItem key={log.id} log={log} />)
         )}
-        
+
         {/* Load More */}
         {hasMore && logs.length > 0 && (
-          <button 
-            onClick={loadMore} 
+          <button
+            onClick={loadMore}
             disabled={loading}
             className="w-full text-sm text-muted-foreground hover:text-foreground font-medium flex items-center justify-center gap-1.5 py-4 bg-card border border-border rounded-xl disabled:opacity-50 transition-colors"
           >
-            <ArrowDownToLine className="w-4 h-4" /> 
+            <ArrowDownToLine className="w-4 h-4" />
             {loading ? '加载中...' : `加载更多 (${logs.length}/${totalCount})`}
           </button>
         )}

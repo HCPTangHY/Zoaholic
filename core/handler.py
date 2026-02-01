@@ -501,12 +501,7 @@ async def process_request_passthrough(
     if not adapter:
         raise ValueError(f"Unknown engine: {engine}")
 
-    import inspect
-
-    adapter_result = adapter(request, engine, provider, api_key)
-    if inspect.isawaitable(adapter_result):
-        adapter_result = await adapter_result
-    url, adapter_headers, _ = adapter_result
+    url, adapter_headers, _ = await adapter(request, engine, provider, api_key)
 
     headers: Dict[str, Any] = dict(adapter_headers or {})
     headers.update(_filter_passthrough_headers(passthrough_ctx.original_headers))
@@ -849,10 +844,6 @@ class ModelRequestHandler:
             except (Exception, HTTPException, httpx.ReadError,
                     httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout,
                     httpx.ConnectError) as e:
-                # 对编程错误（如 await tuple）打印堆栈，便于定位
-                if isinstance(e, TypeError) and "await" in str(e) and "tuple" in str(e):
-                    logger.exception("TypeError during provider request (possible await on non-awaitable)")
-
                 # 记录重试路径
                 current_retry_count += 1
                 
@@ -992,10 +983,6 @@ class ModelRequestHandler:
                 # 更新重试路径中的状态码
                 if retry_path:
                     retry_path[-1]["status_code"] = status_code
-
-                # 对“代码错误类”的 500 不进行重试，避免无意义的循环
-                if isinstance(e, TypeError) and "await" in str(e) and "tuple" in str(e):
-                    auto_retry = False
 
                 if auto_retry and (status_code not in [400, 413]
                     or urlparse(provider.get('base_url', '')).netloc == 'models.inference.ai.azure.com'):

@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
-import { 
-  Activity, Cpu, Zap, BarChart3, AlertCircle, CheckCircle2, 
+import {
+  Activity, Cpu, Zap, BarChart3, AlertCircle, CheckCircle2,
   RefreshCw, Server
 } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
-import { 
+import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
   PieChart, Pie, Legend
 } from 'recharts';
@@ -32,9 +32,9 @@ export default function Dashboard() {
   const [totalTokens, setTotalTokens] = useState(0);
   const [loading, setLoading] = useState(true);
   const [timeRange, setTimeRange] = useState(24);
-  const { apiKey } = useAuthStore();
+  const { token } = useAuthStore();
   const { theme } = useThemeStore();
-  
+
   // 用于图表的暗色/亮色配置
   const isDark = theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
   const tooltipStyle = {
@@ -45,10 +45,10 @@ export default function Dashboard() {
   };
 
   const fetchData = async () => {
-    if (!apiKey) return;
+    if (!token) return;
     setLoading(true);
     try {
-      const headers = { Authorization: `Bearer ${apiKey}` };
+      const headers = { Authorization: `Bearer ${token}` };
 
       const statsRes = await fetch(`/v1/stats?hours=${timeRange}`, { headers });
       if (statsRes.ok) {
@@ -71,15 +71,15 @@ export default function Dashboard() {
 
   useEffect(() => {
     fetchData();
-  }, [apiKey, timeRange]);
+  }, [token, timeRange]);
 
   const channelStats = stats?.channel_success_rates || [];
   const modelStats = stats?.model_request_counts || [];
   const endpointStats = stats?.endpoint_request_counts || [];
 
   const totalRequests = channelStats.reduce((sum, item) => sum + item.total_requests, 0) || 0;
-  const avgSuccessRate = totalRequests > 0 
-    ? channelStats.reduce((sum, item) => sum + item.success_rate * item.total_requests, 0) / totalRequests 
+  const avgSuccessRate = totalRequests > 0
+    ? channelStats.reduce((sum, item) => sum + item.success_rate * item.total_requests, 0) / totalRequests
     : 0;
   const activeChannels = channelStats.length || 0;
 
@@ -125,11 +125,10 @@ export default function Dashboard() {
               <button
                 key={range.value}
                 onClick={() => setTimeRange(range.value)}
-                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-all ${
-                  timeRange === range.value 
-                    ? 'bg-primary text-primary-foreground shadow-sm' 
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-all ${timeRange === range.value
+                    ? 'bg-primary text-primary-foreground shadow-sm'
                     : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
-                }`}
+                  }`}
               >
                 {range.label}
               </button>
@@ -157,7 +156,7 @@ export default function Dashboard() {
           </div>
         ))}
       </div>
-      
+
       {/* Chart Section 1 */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="bg-card border border-border rounded-xl p-6 shadow-sm">
@@ -170,9 +169,9 @@ export default function Dashboard() {
               <BarChart data={formattedChannelStats} margin={{ top: 0, right: 0, left: 0, bottom: 0 }}>
                 <XAxis dataKey="name" stroke={isDark ? "#52525b" : "#a1a1aa"} fontSize={12} tickLine={false} axisLine={false} />
                 <YAxis stroke={isDark ? "#52525b" : "#a1a1aa"} fontSize={12} tickLine={false} axisLine={false} domain={[0, 100]} />
-                <Tooltip 
+                <Tooltip
                   cursor={{ fill: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.05)' }}
-             contentStyle={tooltipStyle}
+                  contentStyle={tooltipStyle}
                   itemStyle={{ color: tooltipStyle.color }}
                 />
                 <Bar dataKey="success_rate" name="成功率" radius={[4, 4, 0, 0]}>
@@ -207,9 +206,9 @@ export default function Dashboard() {
                   ))}
                 </Pie>
                 <Tooltip contentStyle={tooltipStyle} itemStyle={{ color: tooltipStyle.color }} />
-                <Legend 
-                  layout="vertical" 
-                  align="right" 
+                <Legend
+                  layout="vertical"
+                  align="right"
                   verticalAlign="middle"
                   wrapperStyle={{ paddingLeft: '10px', fontSize: '12px', maxWidth: '45%' }}
                   formatter={(value: string) => <span className="text-foreground truncate block max-w-[120px]" title={value}>{value}</span>}

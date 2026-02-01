@@ -1,12 +1,12 @@
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../store/authStore';
-import { 
+import {
   Settings2, Save, RefreshCw, AlertCircle, Clock, Zap, Shield,
   Timer, Database, Server, Blocks, Plus, Trash2, Edit2, Link
 } from 'lucide-react';
 
 export default function Settings() {
-  const { apiKey } = useAuthStore();
+  const { token } = useAuthStore();
   const [preferences, setPreferences] = useState<any>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -14,20 +14,20 @@ export default function Settings() {
   // Load configuration
   useEffect(() => {
     const fetchConfig = async () => {
-      if (!apiKey) return;
+      if (!token) return;
       setLoading(true);
       try {
         const res = await fetch('/v1/api_config', {
-          headers: { Authorization: `Bearer ${apiKey}` }
+          headers: { Authorization: `Bearer ${token}` }
         });
         if (res.ok) {
           const data = await res.json();
           const loadedPreferences = data.api_config?.preferences || data.preferences || {};
-          
+
           // Ensure default external clients exist if not defined
           if (!loadedPreferences.external_clients) {
             loadedPreferences.external_clients = [
-              { name: 'IdoFront', icon: '🌚', link: 'https://idofront.pages.dev/?baseurl={address}/v1&key={key}'}
+              { name: 'IdoFront', icon: '🌚', link: 'https://idofront.pages.dev/?baseurl={address}/v1&key={key}' }
             ];
           }
           setPreferences(loadedPreferences);
@@ -39,19 +39,19 @@ export default function Settings() {
       }
     };
     fetchConfig();
-  }, [apiKey]);
+  }, [token]);
 
   const updatePreference = (key: string, value: any) => {
     setPreferences((prev: any) => ({ ...prev, [key]: value }));
   };
 
   const handleSave = async () => {
-    if (!apiKey) return;
+    if (!token) return;
     setSaving(true);
     try {
       const res = await fetch('/v1/api_config/update', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ preferences })
       });
       if (res.ok) {
@@ -83,8 +83,8 @@ export default function Settings() {
           <h1 className="text-3xl font-bold tracking-tight text-foreground">系统设置</h1>
           <p className="text-muted-foreground mt-1">管理全局配置和系统首选项</p>
         </div>
-        <button 
-          onClick={handleSave} 
+        <button
+          onClick={handleSave}
           disabled={saving}
           className="bg-primary hover:bg-primary/90 text-primary-foreground px-4 py-2 rounded-lg flex items-center gap-2 font-medium transition-colors disabled:opacity-50"
         >
@@ -103,7 +103,7 @@ export default function Settings() {
             <div className="grid grid-cols-2 gap-6">
               <div>
                 <label className="text-sm font-medium text-foreground mb-1.5 block">最大重试次数</label>
-                <input 
+                <input
                   type="number" min="1" max="100"
                   value={preferences.max_retry_count ?? 10}
                   onChange={e => updatePreference('max_retry_count', parseInt(e.target.value))}
@@ -113,7 +113,7 @@ export default function Settings() {
               </div>
               <div>
                 <label className="text-sm font-medium text-foreground mb-1.5 block">渠道冷却时间 (秒)</label>
-                <input 
+                <input
                   type="number" min="0"
                   value={preferences.cooldown_period ?? 300}
                   onChange={e => updatePreference('cooldown_period', parseInt(e.target.value))}
@@ -125,7 +125,7 @@ export default function Settings() {
 
             <div>
               <label className="text-sm font-medium text-foreground mb-1.5 block">全局调度算法</label>
-              <select 
+              <select
                 value={preferences.SCHEDULING_ALGORITHM || 'fixed_priority'}
                 onChange={e => updatePreference('SCHEDULING_ALGORITHM', e.target.value)}
                 className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
@@ -148,8 +148,8 @@ export default function Settings() {
           </div>
           <div className="p-6">
             <label className="text-sm font-medium text-foreground mb-1.5 block">全局速率限制</label>
-            <input 
-              type="text" 
+            <input
+              type="text"
               value={preferences.rate_limit || '999999/min'}
               onChange={e => updatePreference('rate_limit', e.target.value)}
               placeholder="100/hour,1000/day"
@@ -168,7 +168,7 @@ export default function Settings() {
             <div className="grid grid-cols-2 gap-6">
               <div>
                 <label className="text-sm font-medium text-foreground mb-1.5 block">默认模型超时时间 (秒)</label>
-                <input 
+                <input
                   type="number" min="30" max="3600"
                   value={preferences.model_timeout?.default ?? 600}
                   onChange={e => updatePreference('model_timeout', { ...preferences.model_timeout, default: parseInt(e.target.value) })}
@@ -177,7 +177,7 @@ export default function Settings() {
               </div>
               <div>
                 <label className="text-sm font-medium text-foreground mb-1.5 block">Keepalive 心跳间隔 (秒)</label>
-                <input 
+                <input
                   type="number" min="0" max="300"
                   value={preferences.keepalive_interval?.default ?? 25}
                   onChange={e => updatePreference('keepalive_interval', { ...preferences.keepalive_interval, default: parseInt(e.target.value) })}
@@ -185,7 +185,7 @@ export default function Settings() {
                 />
               </div>
             </div>
-            
+
             <div className="p-4 bg-blue-500/10 border border-blue-500/20 rounded-lg flex gap-3 text-sm">
               <AlertCircle className="w-5 h-5 text-blue-500 flex-shrink-0" />
               <div>
@@ -207,7 +207,7 @@ export default function Settings() {
           </div>
           <div className="p-6">
             <label className="text-sm font-medium text-foreground mb-1.5 block">日志原始数据保留时间 (小时)</label>
-            <input 
+            <input
               type="number" min="0"
               value={preferences.log_raw_data_retention_hours ?? 24}
               onChange={e => updatePreference('log_raw_data_retention_hours', parseInt(e.target.value))}
@@ -223,7 +223,7 @@ export default function Settings() {
             <div className="flex items-center gap-2 font-medium text-foreground">
               <Blocks className="w-5 h-5 text-pink-500" /> 第三方客户端 (Playground)
             </div>
-            <button 
+            <button
               onClick={() => {
                 const newClients = [...(preferences.external_clients || []), { name: '', icon: '🌟', link: '' }];
                 updatePreference('external_clients', newClients);
@@ -235,12 +235,12 @@ export default function Settings() {
           </div>
           <div className="p-6 space-y-4">
             <p className="text-xs text-muted-foreground mb-4">这些客户端将显示在 Playground 的侧边栏中。链接中可使用 <code className="bg-muted px-1 py-0.5 rounded text-foreground">{"{key}"}</code> 和 <code className="bg-muted px-1 py-0.5 rounded text-foreground">{"{address}"}</code> 作为变量，系统会自动注入当前 API Key 和网关地址。</p>
-            
+
             <div className="space-y-3">
               {(preferences.external_clients || []).map((client: any, idx: number) => (
                 <div key={idx} className="flex gap-3 items-start bg-muted/50 p-4 rounded-lg border border-border">
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     value={client.icon}
                     onChange={e => {
                       const newClients = [...preferences.external_clients];
@@ -251,8 +251,8 @@ export default function Settings() {
                     className="w-12 bg-background border border-border px-2 py-2 rounded-lg text-center text-lg focus:border-primary"
                   />
                   <div className="flex-1 space-y-3">
-                    <input 
-                      type="text" 
+                    <input
+                      type="text"
                       value={client.name}
                       onChange={e => {
                         const newClients = [...preferences.external_clients];
@@ -264,8 +264,8 @@ export default function Settings() {
                     />
                     <div className="relative">
                       <Link className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/60" />
-                      <input 
-                        type="url" 
+                      <input
+                        type="url"
                         value={client.link}
                         onChange={e => {
                           const newClients = [...preferences.external_clients];
@@ -277,7 +277,7 @@ export default function Settings() {
                       />
                     </div>
                   </div>
-                  <button 
+                  <button
                     onClick={() => {
                       const newClients = preferences.external_clients.filter((_: any, i: number) => i !== idx);
                       updatePreference('external_clients', newClients);
