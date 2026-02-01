@@ -857,9 +857,14 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
                     return
                 elif finishReason:
                     # 正常结束（STOP 或 MAX_TOKENS）
+                    # 注意：部分上游/模型可能会直接返回 finishReason=STOP 但不包含任何内容。
+                    # 若在本次流中没有任何有效内容，则不要先发 stop chunk（否则可能被上层判为“空响应”）。
                     stream_finished_normally = True
-                    sse_string = await generate_sse_response(timestamp, model, stop="stop")
-                    yield sse_string
+
+                    if has_content or has_reasoning or has_function_call or has_image:
+                        sse_string = await generate_sse_response(timestamp, model, stop="stop")
+                        yield sse_string
+
                     break
 
                 parts_json = ""
@@ -896,10 +901,12 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
             return
 
         # 如果流没有正常结束（没有收到 finishReason），确保发送 finish_reason
+        # 同样：只有当已经产生过有效内容时才补发 stop，避免被上层当成“空响应”。
         if not stream_finished_normally:
             logger.warning(f"[Gemini] Stream ended without finishReason, sending stop signal")
-            sse_string = await generate_sse_response(timestamp, model, stop="stop")
-            yield sse_string
+            if has_content or has_reasoning or has_function_call or has_image:
+                sse_string = await generate_sse_response(timestamp, model, stop="stop")
+                yield sse_string
         
         # 发送 usage chunk（如果有）
         if totalTokenCount > 0:
