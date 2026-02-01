@@ -98,80 +98,169 @@ async def get_responses_payload(request, engine, provider, api_key=None):
     else:
         url = base_url
 
-    # 构建 input（将 messages 转换为 Responses API input 格式）
+    # 构建 input 和 instructions
     input_items = []
-    for msg in request.messages:
+    instructions_list = []
+    
+    messages = list(request.messages)
+
+    for msg in messages:
         role = msg.role
         tool_calls = msg.tool_calls
         tool_call_id = msg.tool_call_id
+        content = msg.content
 
-        if isinstance(msg.content, list):
-            content = []
-            for item in msg.content:
+        # 处理系统消息
+        if role == "system":
+            # o3-mini 特殊处理：为系统消息添加前缀以绕过限制
+            if "o3-mini" in original_model and isinstance(content, str) and not content.startswith("Formatting re-enabled"):
+                content = "Formatting re-enabled. " + content
+            
+            # o1-mini/o1-preview 可能不支持 instructions 参数，使用 developer 角色在 input 中
+            if "o1-mini" in original_model or "o1-preview" in original_model:
+                role = "developer"
+            else:
+                instructions_list.append(content or "")
+                continue
+
+        if isinstance(content, list):
+            content_items = []
+            for item in content:
                 if item.type == "text":
-                    content.append(format_input_text(item.text))
+                    content_items.append(format_input_text(item.text))
                 elif item.type == "image_url" and provider.get("image", True):
                     image_item = await format_input_image(item.image_url.url)
-                    content.append(image_item)
-            if content:
-                input_items.append({"role": role, "content": content})
+                    content_items.append(image_item)
+            if content_items:
+                input_items.append({"type": "message", "role": role, "content": content_items})
+        elif tool_call_id:
+            # 处理 tool 结果：作为顶层项目
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": tool_call_id,
+                "output": content or ""
+            })
         else:
-            content = msg.content
+            # 处理文本消息
+            if content or role == "assistant":
+                # Responses API 要求 content 必须是数组（当使用 type: message 时）
+                input_items.append({
+                    "type": "message", 
+                    "role": role, 
+                    "content": [{"type": "input_text", "text": content or ""}]
+                })
+            
+            # 处理 tool_calls：作为顶层项目
             if tool_calls:
-                # 处理 tool_calls
-                tool_calls_list = []
                 for tool_call in tool_calls:
-                    tool_calls_list.append({
+                    input_items.append({
                         "type": "function_call",
-                        "id": tool_call.id,
+                        "call_id": tool_call.id,
                         "name": tool_call.function.name,
                         "arguments": tool_call.function.arguments
                     })
-                input_items.append({"role": role, "content": tool_calls_list})
-            elif tool_call_id:
-                # 处理 tool 结果
-                input_items.append({
-                    "type": "function_call_output",
-                    "call_id": tool_call_id,
-                    "output": content
-                })
-            else:
-                input_items.append({"role": role, "content": content})
 
     # 构建 payload
     payload = {
         "model": original_model,
         "input": input_items,
     }
+    
+    if instructions_list:
+        payload["instructions"] = "\n\n".join(instructions_list)
 
     # 添加 stream 参数
     if request.stream:
         payload["stream"] = True
 
-    # 处理 reasoning effort（从模型后缀提取）
-    if request.model.endswith("-high"):
-        payload["reasoning"] = {"effort": "high"}
-    elif request.model.endswith("-low"):
-        payload["reasoning"] = {"effort": "low"}
+    # 处理 reasoning effort 和 summary
+    if any(m in original_model for m in ["o1", "o3", "o4", "gpt-5"]):
+        reasoning_config = {}
+        
+        # o1-preview 和 o1-mini 不支持 reasoning effort
+        if "o1-preview" not in original_model and "o1-mini" not in original_model:
+            effort = "medium"
+            if request.model.endswith("-high"):
+                effort = "high"
+            elif request.model.endswith("-low"):
+                effort = "low"
+            reasoning_config["effort"] = effort
+            
+        # 启用 reasoning summary 以获取推理过程
+        reasoning_config["summary"] = "auto"
+        
+        # 允许覆盖，但合并默认值
+        if "reasoning" not in payload:
+            payload["reasoning"] = reasoning_config
+        elif isinstance(payload["reasoning"], dict):
+            for k, v in reasoning_config.items():
+                if k not in payload["reasoning"]:
+                    payload["reasoning"][k] = v
 
-    # 可选参数
-    miss_fields = ['model', 'messages', 'stream']
+    # 可选参数（严格按 Responses API 支持字段映射，避免上游报：Unsupported parameter）
+    miss_fields = ['model', 'messages', 'stream', 'instructions']
+
+    def _convert_tool_choice(tc):
+        # Chat Completions 的 tool_choice 可能是："auto"/"none"/"required" 或 {type,function:{name}}
+        if tc is None:
+            return None
+        if isinstance(tc, str):
+            return tc
+        if isinstance(tc, dict):
+            # 兼容 {"type":"function","function":{"name":"xxx"}}
+            if tc.get("type") == "function":
+                func = tc.get("function") or {}
+                name = func.get("name")
+                if name:
+                    return {"type": "function", "name": name}
+            return tc
+        # Pydantic ToolChoice
+        try:
+            tc_dict = tc.model_dump(exclude_unset=True)
+            if tc_dict.get("type") == "function":
+                func = tc_dict.get("function") or {}
+                name = func.get("name")
+                if name:
+                    return {"type": "function", "name": name}
+            return tc_dict
+        except Exception:
+            return None
 
     for field, value in request.model_dump(exclude_unset=True).items():
-        if field not in miss_fields and value is not None:
-            if field == "max_tokens":
-                payload["max_output_tokens"] = value
-            elif field == "max_completion_tokens":
-                payload["max_output_tokens"] = value
-            elif field == "tools":
-                # 转换 tools 格式
-                converted_tools = []
-                for tool in value:
-                    if isinstance(tool, dict):
-                        tool_type = tool.get("type", "function")
-                        if tool_type == "function" and "function" in tool:
-                            # 将 Chat Completions 格式转为 Responses API 格式
-                            func = tool["function"]
+        if field in miss_fields or value is None:
+            continue
+
+        # token 限制
+        if field in ("max_tokens", "max_completion_tokens"):
+            payload["max_output_tokens"] = value
+            continue
+
+        # tools
+        if field == "tools":
+            converted_tools = []
+            for tool in value:
+                if isinstance(tool, dict):
+                    tool_type = tool.get("type", "function")
+                    if tool_type == "function" and "function" in tool:
+                        func = tool.get("function") or {}
+                        converted_tools.append({
+                            "type": "function",
+                            "name": func.get("name", ""),
+                            "description": func.get("description", ""),
+                            "parameters": func.get("parameters", {})
+                        })
+                    else:
+                        converted_tools.append(tool)
+                else:
+                    # Pydantic Tool
+                    try:
+                        tool_dict = tool.model_dump(exclude_unset=True)
+                    except Exception:
+                        tool_dict = None
+                    if isinstance(tool_dict, dict):
+                        # 兼容 Chat Completions tool
+                        if tool_dict.get("type") == "function" and "function" in tool_dict:
+                            func = tool_dict.get("function") or {}
                             converted_tools.append({
                                 "type": "function",
                                 "name": func.get("name", ""),
@@ -179,23 +268,58 @@ async def get_responses_payload(request, engine, provider, api_key=None):
                                 "parameters": func.get("parameters", {})
                             })
                         else:
-                            converted_tools.append(tool)
-                    else:
-                        converted_tools.append(tool)
-                if converted_tools:
-                    payload["tools"] = converted_tools
-            elif field == "response_format":
-                # 转换 response_format 为 text.format
-                if isinstance(value, dict):
-                    format_type = value.get("type")
-                    if format_type == "json_object":
-                        payload["text"] = {"format": {"type": "json_object"}}
-                    elif format_type == "json_schema":
-                        payload["text"] = {"format": value}
-            elif field not in ["temperature", "stream_options"]:
-                # Responses API 不支持 temperature（reasoning 模型）
-                # stream_options 也需要移除
-                payload[field] = value
+                            converted_tools.append(tool_dict)
+            if converted_tools:
+                payload["tools"] = converted_tools
+            continue
+
+        # tool_choice
+        if field == "tool_choice":
+            converted = _convert_tool_choice(value)
+            if converted is not None:
+                payload["tool_choice"] = converted
+            continue
+
+        # response_format -> text.format
+        if field == "response_format":
+            try:
+                rf = value if isinstance(value, dict) else value.model_dump(exclude_unset=True)
+            except Exception:
+                rf = None
+            if isinstance(rf, dict):
+                format_type = rf.get("type")
+                if format_type == "json_object":
+                    payload["text"] = {"format": {"type": "json_object"}}
+                elif format_type == "json_schema":
+                    payload["text"] = {"format": rf}
+            continue
+
+        # Responses API/推理模型常见不支持：temperature/top_p/presence_penalty/frequency_penalty/n/logprobs/top_logprobs/stream_options
+        if field in (
+            "temperature", "top_p",
+            "presence_penalty", "frequency_penalty",
+            "n", "logprobs", "top_logprobs",
+            "stream_options",
+        ):
+            continue
+
+        # 其他字段：只允许少数 Responses API 标准字段透传（保守策略）
+        if field in ("parallel_tool_calls", "metadata", "include"):
+            payload[field] = value
+            continue
+
+        # 其余一律忽略，避免上游严格校验报错
+        continue
+
+    # 最终兜底：再次确保不携带 top_p 等字段
+    payload.pop("top_p", None)
+    payload.pop("temperature", None)
+    payload.pop("presence_penalty", None)
+    payload.pop("frequency_penalty", None)
+    payload.pop("n", None)
+    payload.pop("logprobs", None)
+    payload.pop("top_logprobs", None)
+    payload.pop("stream_options", None)
 
     # 覆盖配置
     if safe_get(provider, "preferences", "post_body_parameter_overrides", default=None):
@@ -205,6 +329,10 @@ async def get_responses_payload(request, engine, provider, api_key=None):
                     payload[k] = v
             elif all(_model not in request.model.lower() for _model in model_dict.keys()) and "-" not in key and " " not in key:
                 payload[key] = value
+
+    # 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错
+    # （例如："Store must be set to false"）
+    payload["store"] = False
 
     return url, headers, payload
 
