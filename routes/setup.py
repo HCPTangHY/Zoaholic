@@ -150,13 +150,70 @@ async def setup_init(payload: SetupInitRequest = Body(...)):
 
     app = get_app()
 
-    # 如果已经有配置且不是强制重置，就拒绝重复初始化
-    if getattr(app.state, "api_list", None):
+    # 兼容“配置已存在但管理员账号丢失/未写入”的修复场景：
+    # - 这种情况下 /auth/login 会 404（Admin user not initialized）
+    # - 但 /setup/init 又会因为已有 api_list 而 409
+    # 这里允许在 has_config=True 且 admin_user 为空时补建管理员账号，而不覆盖现有配置。
+    admin_user = await _get_admin_user()
+    has_config = bool(getattr(app.state, "api_list", None))
+
+    # 如果配置和管理员账号都已存在，则拒绝重复初始化
+    if has_config and admin_user is not None:
         raise HTTPException(status_code=409, detail="Already initialized")
 
+    # 1) 写入/更新管理员账号 + 生成并持久化 JWT secret（用户无需手动配置 JWT_SECRET 环境变量）
+    jwt_secret = secrets.token_urlsafe(48)
+    await _upsert_admin_user(payload.username.strip(), payload.password, jwt_secret)
+
+    # 同步到当前进程（避免无需重启即可登录）
+    try:
+        from core.jwt_utils import set_jwt_secret
+
+        set_jwt_secret(jwt_secret)
+    except Exception:
+        pass
+
+    # 2) 配置处理
+    if has_config:
+        # 配置已经存在：不覆盖，仅返回现有 admin_api_key；若配置里没有 admin key，才补一个进去。
+        conf_existing = await load_config_from_db() or getattr(app.state, "config", None) or {}
+        admin_api_key = _select_admin_api_key_from_config(conf_existing)
+
+        if not admin_api_key:
+            # 极端修复：配置里没有任何 key，则补一个
+            admin_api_key = (payload.admin_api_key or "").strip() or _generate_admin_api_key()
+            conf_existing = conf_existing if isinstance(conf_existing, dict) else {}
+            conf_existing.setdefault("providers", [])
+            conf_existing.setdefault("preferences", {})
+            conf_existing.setdefault("api_keys", [])
+            conf_existing["api_keys"].insert(
+                0,
+                {
+                    "api": admin_api_key,
+                    "role": "admin",
+                    "model": ["all"],
+                },
+            )
+
+            # 写回 DB 并刷新内存态
+            app.state.config, app.state.api_keys_db, app.state.api_list = await update_config(
+                conf_existing,
+                use_config_url=False,
+                skip_model_fetch=True,
+                save_to_file=False,
+                save_to_db=True,
+            )
+
+        # 更新内存标记
+        app.state.needs_setup = False
+        app.state.admin_api_key = [admin_api_key]
+
+        logger.info("Setup repaired successfully; admin user created/updated.")
+        return SetupInitResponse(admin_api_key=admin_api_key)
+
+    # 没有配置：走首次初始化（生成最小配置）
     admin_api_key = (payload.admin_api_key or "").strip() or _generate_admin_api_key()
 
-    # 生成最小配置：只有管理员 key
     conf_seed = {
         "providers": [],
         "api_keys": [
@@ -169,31 +226,16 @@ async def setup_init(payload: SetupInitRequest = Body(...)):
         "preferences": {},
     }
 
-    # 1) 写入管理员账号 + 生成并持久化 JWT secret（用户无需手动配置 JWT_SECRET 环境变量）
-    jwt_secret = secrets.token_urlsafe(48)
-    await _upsert_admin_user(payload.username.strip(), payload.password, jwt_secret)
-
-    # 同步到当前进程（避免无需重启即可登录）
-    try:
-        from core.jwt_utils import set_jwt_secret
-
-        set_jwt_secret(jwt_secret)
-    except Exception:
-        pass
-
-    # 2) 写入配置到 DB，并更新内存态
-    save_to_file = False
+    # 写入配置到 DB，并更新内存态
     app.state.config, app.state.api_keys_db, app.state.api_list = await update_config(
         conf_seed,
         use_config_url=False,
         skip_model_fetch=True,
-        save_to_file=save_to_file,
+        save_to_file=False,
         save_to_db=True,
     )
 
     app.state.needs_setup = False
-
-    # 3) 更新 admin_api_key 列表（与 main.py 初始化逻辑保持一致）
     app.state.admin_api_key = [admin_api_key]
 
     logger.info("Setup initialized successfully; admin key created.")

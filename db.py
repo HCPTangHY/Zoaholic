@@ -251,10 +251,13 @@ class AppConfig(Base):
     id = Column(Integer, primary_key=True)
 
     # JSON/JSONB 配置
-    # - PostgreSQL: JSONB
-    # - CockroachDB: 通常只有 JSONB（json 类型可能不存在）
-    # - 其它 DB: 回退到 Text/JSON（但当前主要用于 Postgres/Cockroach/SQLite）
-    config_json = Column(_PG_JSONB if _PG_JSONB is not None else Text, nullable=True)
+    # - PostgreSQL/CockroachDB: JSONB（可索引）
+    # - SQLite 等其它 DB：回退到 Text
+    #
+    # 注意：不要在 SQLite 下使用 postgresql.JSONB，否则会在建表阶段报：
+    # `SQLiteTypeCompiler can't render element of type JSONB`
+    use_jsonb = (DB_TYPE or "sqlite").lower() == "postgres" and _PG_JSONB is not None
+    config_json = Column(_PG_JSONB if use_jsonb else Text, nullable=True)
 
     # 预留：便于人工导出/排查（可选，不参与主流程）
     config_yaml = Column(Text, nullable=True)

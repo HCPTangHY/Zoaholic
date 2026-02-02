@@ -51,6 +51,31 @@ def set_debug_mode(debug: bool):
     is_debug = debug
 
 
+def _fire_and_forget_channel_stats(update_channel_stats_func: Callable, *args, **kwargs) -> None:
+    """异步写入 ChannelStat，不依赖 FastAPI BackgroundTasks。
+
+    背景：
+    - BackgroundTasks 会在响应生命周期结束后执行。
+    - 对于流式接口/客户端提前断开等场景，BackgroundTasks 有可能不被执行，
+      导致 channel_stats 缺失，从而 /v1/stats 的成功率永远是 0 或空。
+
+    这里用 create_task 让统计写入尽量独立于请求/响应生命周期。
+    """
+
+    async def _run():
+        try:
+            await update_channel_stats_func(*args, **kwargs)
+        except Exception as e:
+            # 避免 "Task exception was never retrieved"
+            logger.error(f"Error updating channel stats: {str(e)}")
+
+    try:
+        asyncio.create_task(_run())
+    except RuntimeError:
+        # event loop 未就绪（极少数启动/关闭阶段），忽略即可
+        pass
+
+
 def get_preference_value(provider_timeouts: Dict[str, Any], original_model: str) -> Optional[int]:
     """
     根据模型名获取偏好值（如超时时间）
@@ -255,10 +280,14 @@ async def process_request(
                     )
 
             # 更新成功计数和首次响应时间
-            background_tasks.add_task(
+            _fire_and_forget_channel_stats(
                 update_channel_stats_func,
-                current_info["request_id"], channel_id, request.model,
-                current_info["api_key"], success=True, provider_api_key=api_key
+                current_info["request_id"],
+                channel_id,
+                request.model,
+                current_info["api_key"],
+                success=True,
+                provider_api_key=api_key,
             )
             current_info["first_response_time"] = first_response_time
             current_info["success"] = True
@@ -269,10 +298,14 @@ async def process_request(
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError,
             httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout,
             httpx.ConnectError) as e:
-        background_tasks.add_task(
+        _fire_and_forget_channel_stats(
             update_channel_stats_func,
-            current_info["request_id"], channel_id, request.model,
-            current_info["api_key"], success=False, provider_api_key=api_key
+            current_info["request_id"],
+            channel_id,
+            request.model,
+            current_info["api_key"],
+            success=False,
+            provider_api_key=api_key,
         )
         raise e
 
@@ -602,19 +635,27 @@ async def process_request_passthrough(
     except (Exception, HTTPException, asyncio.CancelledError, httpx.ReadError,
             httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout,
             httpx.ConnectError) as e:
-        background_tasks.add_task(
+        _fire_and_forget_channel_stats(
             update_channel_stats_func,
-            current_info["request_id"], channel_id, request.model,
-            current_info["api_key"], success=False, provider_api_key=api_key
+            current_info["request_id"],
+            channel_id,
+            request.model,
+            current_info["api_key"],
+            success=False,
+            provider_api_key=api_key,
         )
         raise e
 
     response.headers["x-zoaholic-passthrough"] = "request"
 
-    background_tasks.add_task(
+    _fire_and_forget_channel_stats(
         update_channel_stats_func,
-        current_info["request_id"], channel_id, request.model,
-        current_info["api_key"], success=True, provider_api_key=api_key
+        current_info["request_id"],
+        channel_id,
+        request.model,
+        current_info["api_key"],
+        success=True,
+        provider_api_key=api_key,
     )
     current_info["success"] = True
     current_info["status_code"] = 200

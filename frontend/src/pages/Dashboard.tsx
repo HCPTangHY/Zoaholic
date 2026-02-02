@@ -56,7 +56,12 @@ export default function Dashboard() {
         setStats(data.stats || data);
       }
 
-      const tokenRes = await fetch('/v1/token_usage?last_n_days=30', { headers });
+      // Token 使用量：跟随当前 timeRange（单位小时），而不是固定 30 天
+      const end = new Date();
+      const start = new Date(end.getTime() - timeRange * 60 * 60 * 1000);
+      const tokenUrl = `/v1/token_usage?start_datetime=${encodeURIComponent(start.toISOString())}&end_datetime=${encodeURIComponent(end.toISOString())}`;
+
+      const tokenRes = await fetch(tokenUrl, { headers });
       if (tokenRes.ok) {
         const data = await tokenRes.json();
         const total = data.usage?.reduce((sum: number, item: any) => sum + (item.total_tokens || 0), 0) || 0;
@@ -83,9 +88,11 @@ export default function Dashboard() {
     : 0;
   const activeChannels = channelStats.length || 0;
 
+  const timeRangeLabel = TIME_RANGES.find(r => r.value === timeRange)?.label ?? `${timeRange} 小时`;
+
   const topCards = [
     { label: '总请求量', value: totalRequests.toLocaleString(), icon: Zap, color: 'text-amber-500', bg: 'bg-amber-500/10' },
-    { label: 'Token 消耗 (30天)', value: totalTokens.toLocaleString(), icon: BarChart3, color: 'text-blue-500', bg: 'bg-blue-500/10' },
+    { label: `Token 消耗 (${timeRangeLabel})`, value: totalTokens.toLocaleString(), icon: BarChart3, color: 'text-blue-500', bg: 'bg-blue-500/10' },
     { label: '平均成功率', value: `${(avgSuccessRate * 100).toFixed(1)}%`, icon: CheckCircle2, color: 'text-emerald-500', bg: 'bg-emerald-500/10' },
     { label: '活跃渠道', value: activeChannels.toString(), icon: Cpu, color: 'text-purple-500', bg: 'bg-purple-500/10' },
   ];
