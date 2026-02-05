@@ -113,7 +113,7 @@ Render usually injects `PORT` automatically; Zoaholic will read `PORT` as the li
 
 | Variable | Default | Notes |
 |---|---:|---|
-| `CONFIG_STORAGE` | `auto` | Config source strategy: `auto\|db\|file\|url`. For cloud keep `auto` (DB-first). |
+| `CONFIG_STORAGE` | `file` | Config source strategy: `auto\|db\|file\|url`. Default is `file` (`api.yaml` is the source of truth); for cloud you may use `auto` (file-first + sync to DB) or `db` (DB-first). |
 | `SYNC_CONFIG_TO_FILE` | `false` | Whether to write config back to `api.yaml`. Cloud file systems are often ephemeral/readonly, keep `false`. |
 | `JWT_SECRET` | (optional) | JWT signing key for admin console. **You can skip it**: on first `/setup`, Zoaholic auto-generates and persists `admin_user.jwt_secret` in DB and reuses it after restarts. For better security, set it explicitly. |
 | `DISABLE_DATABASE` | `false` | Disable DB entirely. Cloud usually should NOT disable it (otherwise no config persistence / no stats). |
@@ -134,9 +134,19 @@ Render usually injects `PORT` automatically; Zoaholic will read `PORT` as the li
 
 Zoaholic can persist the runtime config (previously `api.yaml`) into the database.
 
-Default behavior (`CONFIG_STORAGE=auto`):
+Default behavior (`CONFIG_STORAGE=file`):
 
-- If DB has config: load from DB (DB is the source of truth)
+- Load from `api.yaml` (`api.yaml` is the source of truth)
+- Saving config in the admin UI will write back to `api.yaml` (requires writable filesystem / volume mount)
+
+Optional cloud mode (`CONFIG_STORAGE=auto`, file-first + sync to DB):
+
+- Load from `api.yaml` / `CONFIG_YAML(_BASE64)` / `CONFIG_URL`
+- Then persist into DB for backup / multi-instance sharing (won't override `api.yaml`)
+
+Optional DB-first mode (`CONFIG_STORAGE=db`):
+
+- If DB has config: load from DB
 - If DB has no config yet: load once from `CONFIG_YAML(_BASE64)` / `CONFIG_URL` / `api.yaml` as a seed, then persist into DB
 
 Once persisted:

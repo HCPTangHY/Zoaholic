@@ -17,7 +17,6 @@ from core.jwt_utils import issue_jwt, decode_jwt
 from core.security import verify_password
 from routes.deps import rate_limit_dependency, get_app
 from db import DISABLE_DATABASE, async_session, AdminUser
-from utils import load_config_from_db
 
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -90,11 +89,12 @@ async def login(payload: LoginRequest = Body(...)):
 
     token = issue_jwt({"sub": admin_user.username, "role": "admin"})
 
-    conf = await load_config_from_db() or {}
+    # admin_api_key 仅用于前端展示/兼容旧鉴权；配置权威来自 api.yaml（app.state.config）
+    app = get_app()
+    conf = getattr(app.state, "config", None) or {}
     admin_api_key = _select_admin_api_key_from_config(conf)
 
     # 同步内存标记：已初始化
-    app = get_app()
     app.state.needs_setup = False
 
     return LoginResponse(access_token=token, admin_api_key=admin_api_key)
@@ -112,7 +112,8 @@ async def me(request: Request):
     role = str(payload.get("role", "user"))
     username = str(payload.get("sub", ""))
 
-    conf = await load_config_from_db() or {}
+    app = get_app()
+    conf = getattr(app.state, "config", None) or {}
     admin_api_key = _select_admin_api_key_from_config(conf)
 
     return MeResponse(username=username, role=role, admin_api_key=admin_api_key)

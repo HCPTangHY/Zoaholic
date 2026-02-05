@@ -6,6 +6,7 @@
 - 该路由使用 /setup 前缀（非 /v1），避免被 StatsMiddleware 对 /v1 的 API Key 鉴权拦截。
 """
 
+import os
 import secrets
 from typing import Optional
 
@@ -20,6 +21,15 @@ from db import DISABLE_DATABASE, async_session
 
 
 router = APIRouter(prefix="/setup", tags=["Setup"])
+
+
+def _get_config_storage() -> str:
+    """配置存储策略。
+
+    默认 file：以 api.yaml 为权威配置源。
+    """
+
+    return (os.getenv("CONFIG_STORAGE") or "file").strip().lower()
 
 
 class SetupStatus(BaseModel):
@@ -176,7 +186,15 @@ async def setup_init(payload: SetupInitRequest = Body(...)):
     # 2) 配置处理
     if has_config:
         # 配置已经存在：不覆盖，仅返回现有 admin_api_key；若配置里没有 admin key，才补一个进去。
-        conf_existing = await load_config_from_db() or getattr(app.state, "config", None) or {}
+        config_storage = _get_config_storage()
+        # 配置权威：file/auto 优先内存态（来自 api.yaml），db 模式才优先 DB
+        if config_storage == "db":
+            conf_existing = await load_config_from_db() or getattr(app.state, "config", None) or {}
+        else:
+            conf_existing = getattr(app.state, "config", None) or {}
+            # auto 模式下 DB 仅作为备份兜底
+            if config_storage == "auto" and (not conf_existing):
+                conf_existing = await load_config_from_db() or {}
         admin_api_key = _select_admin_api_key_from_config(conf_existing)
 
         if not admin_api_key:
@@ -195,13 +213,17 @@ async def setup_init(payload: SetupInitRequest = Body(...)):
                 },
             )
 
-            # 写回 DB 并刷新内存态
+            # 持久化并刷新内存态
+            # - file：写回 api.yaml（保持 yaml 权威）
+            # - auto/db：写回数据库（兼容云平台）
+            save_to_db = config_storage in ("auto", "db")
+            save_to_file = config_storage in ("file", "auto")
             app.state.config, app.state.api_keys_db, app.state.api_list = await update_config(
                 conf_existing,
                 use_config_url=False,
                 skip_model_fetch=True,
-                save_to_file=False,
-                save_to_db=True,
+                save_to_file=save_to_file,
+                save_to_db=save_to_db,
             )
 
         # 更新内存标记
@@ -226,13 +248,16 @@ async def setup_init(payload: SetupInitRequest = Body(...)):
         "preferences": {},
     }
 
-    # 写入配置到 DB，并更新内存态
+    # 写入配置并更新内存态（file 模式写回 api.yaml；auto/db 模式写回 DB）
+    config_storage = _get_config_storage()
+    save_to_db = config_storage in ("auto", "db")
+    save_to_file = config_storage in ("file", "auto")
     app.state.config, app.state.api_keys_db, app.state.api_list = await update_config(
         conf_seed,
         use_config_url=False,
         skip_model_fetch=True,
-        save_to_file=False,
-        save_to_db=True,
+        save_to_file=save_to_file,
+        save_to_db=save_to_db,
     )
 
     app.state.needs_setup = False
@@ -256,8 +281,9 @@ async def setup_login(payload: SetupLoginRequest = Body(...)):
     if not verify_password(payload.password, admin_user.password_hash):
         raise HTTPException(status_code=403, detail="Invalid username or password")
 
-    # 从 DB 配置中取管理员 key
-    conf = await load_config_from_db() or {}
+    # 从当前配置中取管理员 key（配置权威来自 api.yaml/app.state.config）
+    app = get_app()
+    conf = getattr(app.state, "config", None) or {}
     key = _select_admin_api_key_from_config(conf)
     if not key:
         raise HTTPException(

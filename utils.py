@@ -382,15 +382,18 @@ async def load_config(app=None):
     import base64
 
     # 配置来源策略：
-    # - auto（默认）：若数据库可用则优先 DB；否则回退到文件/CONFIG_URL
-    # - db：强制优先 DB（无则回退文件/CONFIG_URL 作为“种子”，并写回 DB）
-    # - file：只读本地 api.yaml（兼容旧行为）
+    # - file（默认）：以本地 api.yaml 为权威配置源（符合“配置即代码”理念）
+    # - auto：兼容云平台场景（DB 优先），若 DB 无配置则回退到文件/CONFIG_URL/ENV 作为“种子”
+    # - db：强制优先 DB（无则回退文件/CONFIG_URL/ENV 作为“种子”，并写回 DB）
     # - url：只读 CONFIG_URL
-    config_storage = (os.getenv("CONFIG_STORAGE") or "auto").strip().lower()
+    #
+    # 背景：PR #2 引入了“配置入库”能力（DB-first），但这会导致 api.yaml 与 DB 形成“双权威”。
+    # 为保持 api.yaml 的绝对权威，这里将默认值改为 file。
+    config_storage = (os.getenv("CONFIG_STORAGE") or "file").strip().lower()
     sync_to_file = env_bool("SYNC_CONFIG_TO_FILE", False)
 
-    # 0) 先尝试 DB（当数据库可用且策略允许）
-    if config_storage in ("auto", "db"):
+    # 0) 仅当显式使用 db 模式时才尝试 DB（避免 DB 与 api.yaml 双权威）
+    if config_storage == "db":
         conf_from_db = await load_config_from_db()
         if conf_from_db:
             config, api_keys_db, api_list = await update_config(
