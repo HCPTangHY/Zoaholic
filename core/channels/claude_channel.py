@@ -101,6 +101,37 @@ async def gpt2claude_tools_json(json_dict):
     return json_dict
 
 
+async def patch_passthrough_claude_payload(
+    payload: dict,
+    modifications: dict,
+    request,
+    engine: str,
+    provider: dict,
+    api_key=None,
+) -> dict:
+    """透传模式下对 Claude native payload 做渠道级修饰（system_prompt 注入）。"""
+    system_prompt = modifications.get("system_prompt")
+    system_prompt_text = str(system_prompt).strip() if system_prompt is not None else ""
+    if not system_prompt_text:
+        return payload
+
+    old_system = payload.get("system")
+    if isinstance(old_system, str):
+        payload["system"] = f"{system_prompt_text}\n\n{old_system}" if old_system else system_prompt_text
+    elif isinstance(old_system, list):
+        # Claude system 也可能是 blocks
+        if old_system and isinstance(old_system[0], dict) and "text" in old_system[0]:
+            old = old_system[0].get("text") or ""
+            old_system[0]["text"] = f"{system_prompt_text}\n\n{old}" if old else system_prompt_text
+        else:
+            old_system.insert(0, {"type": "text", "text": system_prompt_text})
+        payload["system"] = old_system
+    else:
+        payload["system"] = system_prompt_text
+
+    return payload
+
+
 async def get_claude_payload(request, engine, provider, api_key=None):
     """构建 Claude API 的请求 payload"""
     model_dict = get_model_dict(provider)
@@ -490,6 +521,7 @@ def register():
         auth_header="x-api-key: {api_key}",
         description="Anthropic Claude API",
         request_adapter=get_claude_payload,
+        passthrough_payload_adapter=patch_passthrough_claude_payload,
         response_adapter=fetch_claude_response,
         stream_adapter=fetch_claude_response_stream,
         models_adapter=None,

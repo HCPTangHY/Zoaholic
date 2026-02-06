@@ -549,6 +549,17 @@ async def process_request_passthrough(
         original_model=original_model,
     )
 
+    # 渠道级透传 payload 修饰（把“渠道特殊逻辑”收敛在各自 channel 文件内）
+    if channel and getattr(channel, "passthrough_payload_adapter", None):
+        payload = await channel.passthrough_payload_adapter(
+            payload,
+            passthrough_ctx.modifications,
+            request,
+            engine,
+            provider,
+            api_key,
+        )
+
     enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
     url, headers, payload = await apply_request_interceptors(
         request, engine, provider, api_key, url, headers, payload, enabled_plugins

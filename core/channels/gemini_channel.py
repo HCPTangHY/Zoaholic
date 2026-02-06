@@ -79,6 +79,38 @@ def normalize_gemini_payload(payload: dict) -> dict:
     return payload
 
 
+async def patch_passthrough_gemini_payload(
+    payload: dict,
+    modifications: dict,
+    request,
+    engine: str,
+    provider: dict,
+    api_key=None,
+) -> dict:
+    """透传模式下对 Gemini native payload 做渠道级修饰（system_prompt 注入）。"""
+    system_prompt = modifications.get("system_prompt")
+    system_prompt_text = str(system_prompt).strip() if system_prompt is not None else ""
+    if not system_prompt_text:
+        return payload
+
+    # 兼容 systemInstruction / system_instruction
+    key = "systemInstruction" if "systemInstruction" in payload else ("system_instruction" if "system_instruction" in payload else "systemInstruction")
+    sys_inst = payload.get(key)
+
+    if isinstance(sys_inst, dict):
+        parts = sys_inst.get("parts")
+        if isinstance(parts, list) and parts and isinstance(parts[0], dict):
+            old = parts[0].get("text") or ""
+            parts[0]["text"] = f"{system_prompt_text}\n\n{old}" if old else system_prompt_text
+        else:
+            sys_inst["parts"] = [{"text": system_prompt_text}]
+        payload[key] = sys_inst
+    else:
+        payload[key] = {"parts": [{"text": system_prompt_text}]}
+
+    return payload
+
+
 async def get_gemini_payload(request, engine, provider, api_key=None):
     """构建 Gemini API 的请求 payload"""
     headers = {
@@ -997,6 +1029,7 @@ def register():
         auth_header="x-goog-api-key: {api_key}",
         description="Google Gemini API",
         request_adapter=get_gemini_payload,
+        passthrough_payload_adapter=patch_passthrough_gemini_payload,
         response_adapter=fetch_gemini_response,
         stream_adapter=fetch_gemini_response_stream,
         models_adapter=fetch_gemini_models,

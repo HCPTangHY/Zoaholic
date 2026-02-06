@@ -31,6 +31,12 @@ ModelsAdapter = Callable[
     Awaitable[List[str]],
 ]
 
+# PassthroughPayloadAdapter: 透传模式下对 native payload 做渠道级修饰（例如 system_prompt 注入）
+PassthroughPayloadAdapter = Callable[
+    [Dict[str, Any], Dict[str, Any], Any, str, Dict[str, Any], Optional[str]],
+    Awaitable[Dict[str, Any]],
+]
+
 
 @dataclass
 class ChannelDefinition:
@@ -58,6 +64,8 @@ class ChannelDefinition:
     stream_adapter: Optional[StreamAdapter] = None
     response_adapter: Optional[ResponseAdapter] = None
     models_adapter: Optional[ModelsAdapter] = None
+    # 透传模式下对 payload 做二次修饰（保持渠道特殊逻辑在渠道文件内）
+    passthrough_payload_adapter: Optional[PassthroughPayloadAdapter] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典，用于 API 响应"""
@@ -89,6 +97,7 @@ def register_channel(
     overwrite: bool = False,
     *,
     passthrough_adapter: Optional[RequestAdapter] = None,
+    passthrough_payload_adapter: Optional[PassthroughPayloadAdapter] = None,
 ) -> None:
     """
     注册一个渠道, 供 core.request / core.response 统一调度使用。
@@ -116,6 +125,7 @@ def register_channel(
         description=description,
         request_adapter=request_adapter,
         passthrough_adapter=passthrough_adapter,
+        passthrough_payload_adapter=passthrough_payload_adapter,
         stream_adapter=stream_adapter,
         response_adapter=response_adapter,
         models_adapter=models_adapter,

@@ -60,6 +60,94 @@ async def get_openai_passthrough_meta(request, engine, provider, api_key=None):
     return url, headers, {}
 
 
+def _as_text_from_responses_content(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for it in content:
+            if isinstance(it, str):
+                parts.append(it)
+            elif isinstance(it, dict):
+                t = it.get("type")
+                if t in ("input_text", "text", "output_text"):
+                    txt = it.get("text")
+                    if txt:
+                        parts.append(str(txt))
+        return "".join(parts)
+    return str(content)
+
+
+async def patch_passthrough_openai_payload(
+    payload: dict,
+    modifications: dict,
+    request,
+    engine: str,
+    provider: dict,
+    api_key=None,
+) -> dict:
+    """透传模式下对 OpenAI(兼容) payload 做渠道级修饰（主要是 system_prompt 注入）。"""
+    system_prompt = modifications.get("system_prompt")
+    system_prompt_text = str(system_prompt).strip() if system_prompt is not None else ""
+    if not system_prompt_text:
+        return payload
+
+    # Chat Completions: messages
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "system":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    msg["content"] = f"{system_prompt_text}\n\n{content}" if content else system_prompt_text
+                elif isinstance(content, list):
+                    if content and isinstance(content[0], dict) and "text" in content[0]:
+                        old = content[0].get("text") or ""
+                        content[0]["text"] = f"{system_prompt_text}\n\n{old}" if old else system_prompt_text
+                    else:
+                        content.insert(0, {"type": "text", "text": system_prompt_text})
+                else:
+                    msg["content"] = system_prompt_text
+                return payload
+        messages.insert(0, {"role": "system", "content": system_prompt_text})
+        return payload
+
+    # Responses: input + instructions
+    if isinstance(payload.get("input"), list):
+        extracted_parts = []
+        input_items = payload.get("input")
+        new_input = list(input_items)
+        while new_input:
+            first = new_input[0]
+            if not isinstance(first, dict):
+                break
+            role = first.get("role")
+            if role not in ("system", "developer"):
+                break
+            extracted_parts.append(_as_text_from_responses_content(first.get("content")).strip())
+            new_input.pop(0)
+        if len(new_input) != len(input_items):
+            payload["input"] = new_input
+
+        extracted_text = "\n\n".join([p for p in extracted_parts if p]).strip()
+        old_inst = payload.get("instructions")
+        old_inst_text = old_inst.strip() if isinstance(old_inst, str) else ""
+
+        inst_parts = [system_prompt_text]
+        if extracted_text:
+            inst_parts.append(extracted_text)
+        if old_inst_text:
+            inst_parts.append(old_inst_text)
+        payload["instructions"] = "\n\n".join(inst_parts).strip()
+        # 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错
+        payload["store"] = False
+        return payload
+
+    return payload
+
+
 async def get_gpt_payload(request, engine, provider, api_key=None):
     """构建 OpenAI 兼容 API 的请求 payload"""
     headers = {
@@ -138,6 +226,9 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
             "model": original_model,
             "input": messages,
         }
+        # 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错
+        # （例如："Store must be set to false"）
+        payload["store"] = False
     else:
         payload = {
             "model": original_model,
@@ -227,6 +318,11 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
                     payload[k] = v
             elif all(_model not in request.model.lower() for _model in model_dict.keys()) and "-" not in key and " " not in key:
                 payload[key] = value
+
+    # 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错
+    # （例如："Store must be set to false"）
+    if "v1/responses" in url:
+        payload["store"] = False
 
     return url, headers, payload
 
@@ -478,6 +574,7 @@ def register():
         description="OpenAI 兼容 API",
         request_adapter=get_gpt_payload,
         passthrough_adapter=get_openai_passthrough_meta,
+        passthrough_payload_adapter=patch_passthrough_openai_payload,
         response_adapter=fetch_openai_response,
         stream_adapter=fetch_gpt_response_stream,
         models_adapter=fetch_openai_models,
