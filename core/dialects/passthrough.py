@@ -3,7 +3,8 @@
 
 当入口方言与目标上游 engine 匹配时，走透传：
 - 不再进行 Canonical -> Native 的二次转换
-- 仍允许做轻量级字段修改（model 重命名、system_prompt 注入、overrides 深度合并）
+- 仍允许做轻量级字段修改（model 重命名、overrides 深度合并）
+- system_prompt 等“协议/渠道相关”的注入逻辑，交由各自渠道的 passthrough_payload_adapter 处理
 """
 
 from __future__ import annotations
@@ -126,10 +127,6 @@ def apply_passthrough_modifications(
     if modifications.get("model_rename") and dialect_id != "gemini":
         new_payload["model"] = modifications["model_rename"]
 
-    # system_prompt 注入
-    if modifications.get("system_prompt"):
-        _inject_system_prompt(new_payload, modifications["system_prompt"], dialect_id)
-
     # overrides 合并
     if modifications.get("overrides"):
         _apply_overrides(new_payload, modifications["overrides"], request_model, original_model)
@@ -137,44 +134,6 @@ def apply_passthrough_modifications(
     return new_payload
 
 
-def _inject_system_prompt(payload: Dict[str, Any], system_prompt: str, dialect_id: str) -> None:
-    """按不同方言把 system_prompt 注入到 payload 对应位置"""
-    system_prompt_text = str(system_prompt).strip()
-    if not system_prompt_text:
-        return
-
-    if dialect_id == "openai":
-        messages = payload.get("messages")
-        if isinstance(messages, list):
-            for msg in messages:
-                if isinstance(msg, dict) and msg.get("role") == "system":
-                    content = msg.get("content") or ""
-                    msg["content"] = f"{system_prompt_text}\n\n{content}" if content else system_prompt_text
-                    return
-            # 无 system 消息则插入
-            messages.insert(0, {"role": "system", "content": system_prompt_text})
-        return
-
-    if dialect_id == "gemini":
-        sys_inst = payload.get("systemInstruction")
-        if isinstance(sys_inst, dict):
-            parts = sys_inst.get("parts") or []
-            if parts and isinstance(parts, list) and isinstance(parts[0], dict):
-                old = parts[0].get("text") or ""
-                parts[0]["text"] = f"{system_prompt_text}\n\n{old}" if old else system_prompt_text
-            else:
-                sys_inst["parts"] = [{"text": system_prompt_text}]
-        else:
-            payload["systemInstruction"] = {"parts": [{"text": system_prompt_text}]}
-        return
-
-    if dialect_id == "claude":
-        old_system = payload.get("system")
-        if isinstance(old_system, str):
-            payload["system"] = f"{system_prompt_text}\n\n{old_system}" if old_system else system_prompt_text
-        elif old_system is None:
-            payload["system"] = system_prompt_text
-        return
 
 
 def _apply_overrides(

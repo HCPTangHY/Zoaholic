@@ -2,6 +2,7 @@
 Admin 管理路由
 """
 
+import os
 import string
 import secrets
 
@@ -67,14 +68,21 @@ async def api_config_update(
         updated = True
 
     if updated:
-        # 线上默认不写回本地文件（Render 等往往是只读/临时文件系统）
-        save_to_file = env_bool("SYNC_CONFIG_TO_FILE", False)
+        # 配置持久化策略：
+        # - CONFIG_STORAGE=file（默认）：api.yaml 为权威，前端保存必须写回文件，否则重启会被 api.yaml “改回去”
+        # - CONFIG_STORAGE=auto/db：沿用 DB 持久化（云平台默认），可选 SYNC_CONFIG_TO_FILE 回写文件
+        config_storage = (os.getenv("CONFIG_STORAGE") or "file").strip().lower()
+
+        save_to_db = config_storage in ("auto", "db")
+        # auto/file：始终写回 api.yaml，保证 yaml 权威；db：默认不写文件（可用 SYNC_CONFIG_TO_FILE 打开）
+        save_to_file = (config_storage in ("file", "auto")) or env_bool("SYNC_CONFIG_TO_FILE", False)
+
         app.state.config, app.state.api_keys_db, app.state.api_list = await update_config(
             app.state.config,
             use_config_url=False,
             skip_model_fetch=True,
             save_to_file=save_to_file,
-            save_to_db=True,
+            save_to_db=save_to_db,
         )
 
     return JSONResponse(content={"message": "API config updated"})

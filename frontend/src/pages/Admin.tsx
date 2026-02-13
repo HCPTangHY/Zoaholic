@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../store/authStore';
+import { apiFetch } from '../lib/api';
 import {
   Key, Plus, RefreshCw, Copy, Trash2, Edit, Save, X, Search,
   Folder, Clock, CheckCircle2, AlertCircle, AlertTriangle,
@@ -70,8 +71,8 @@ export default function Admin() {
     try {
       const headers = { Authorization: `Bearer ${token}` };
       const [configRes, statesRes] = await Promise.all([
-        fetch('/v1/api_config', { headers }),
-        fetch('/v1/api_keys_states', { headers })
+        apiFetch('/v1/api_config', { headers }),
+        apiFetch('/v1/api_keys_states', { headers })
       ]);
 
       if (configRes.ok) {
@@ -139,7 +140,7 @@ export default function Admin() {
   // ========== Generate Key ==========
   const generateKey = async () => {
     try {
-      const res = await fetch('/v1/generate-api-key', {
+      const res = await apiFetch('/v1/generate-api-key', {
         headers: { Authorization: `Bearer ${token}` }
       });
       const data = await res.json();
@@ -193,7 +194,7 @@ export default function Admin() {
     setModelSearchQuery('');
 
     try {
-      const res = await fetch('/v1/channels/models_by_groups', {
+      const res = await apiFetch('/v1/channels/models_by_groups', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ groups })
@@ -297,7 +298,7 @@ export default function Admin() {
     }
 
     try {
-      const res = await fetch('/v1/api_config/update', {
+      const res = await apiFetch('/v1/api_config/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ api_keys: newKeys })
@@ -322,7 +323,7 @@ export default function Admin() {
 
     const newKeys = keys.filter((_, i) => i !== index);
     try {
-      const res = await fetch('/v1/api_config/update', {
+      const res = await apiFetch('/v1/api_config/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ api_keys: newKeys })
@@ -353,7 +354,7 @@ export default function Admin() {
     }
 
     try {
-      const res = await fetch(`/v1/add_credits?paid_key=${encodeURIComponent(creditsTargetKey)}&amount=${amount}`, {
+      const res = await apiFetch(`/v1/add_credits?paid_key=${encodeURIComponent(creditsTargetKey)}&amount=${amount}`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` }
       });

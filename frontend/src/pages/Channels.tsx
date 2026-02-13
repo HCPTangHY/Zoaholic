@@ -1,5 +1,6 @@
 import { useEffect, useState, KeyboardEvent, ClipboardEvent } from 'react';
 import { useAuthStore } from '../store/authStore';
+import { apiFetch } from '../lib/api';
 import {
   Plus, Edit, Brain, Trash2, ArrowRight, RefreshCw,
   Server, X, CheckCircle2, Settings2, Copy, ToggleRight, ToggleLeft,
@@ -103,9 +104,9 @@ export default function Channels() {
     try {
       const headers = { Authorization: `Bearer ${token}` };
       const [configRes, typesRes, pluginsRes] = await Promise.all([
-        fetch('/v1/api_config', { headers }),
-        fetch('/v1/channels', { headers }),
-        fetch('/v1/plugins/interceptors', { headers })
+        apiFetch('/v1/api_config', { headers }),
+        apiFetch('/v1/channels', { headers }),
+        apiFetch('/v1/plugins/interceptors', { headers })
       ]);
 
       if (configRes.ok) {
@@ -311,7 +312,7 @@ export default function Channels() {
     setModelSearchQuery('');
 
     try {
-      const res = await fetch('/v1/channels/fetch_models', {
+      const res = await apiFetch('/v1/channels/fetch_models', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({
@@ -438,7 +439,7 @@ export default function Channels() {
 
     const newProviders = providers.filter((_, i) => i !== idx);
     try {
-      const res = await fetch('/v1/api_config/update', {
+      const res = await apiFetch('/v1/api_config/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ providers: newProviders }),
@@ -461,7 +462,7 @@ export default function Channels() {
     newProviders[idx] = { ...provider, enabled: newEnabled };
 
     try {
-      const res = await fetch('/v1/api_config/update', {
+      const res = await apiFetch('/v1/api_config/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ providers: newProviders }),
@@ -499,7 +500,7 @@ export default function Channels() {
     newProviders[idx].preferences.weight = newWeight;
 
     try {
-      const res = await fetch('/v1/api_config/update', {
+      const res = await apiFetch('/v1/api_config/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ providers: newProviders }),
@@ -564,7 +565,7 @@ export default function Channels() {
     else newProviders.push(targetProvider);
 
     try {
-      const res = await fetch('/v1/api_config/update', {
+      const res = await apiFetch('/v1/api_config/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ providers: newProviders }),

@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, KeyboardEvent } from 'react';
 import { useAuthStore } from '../store/authStore';
+import { apiFetch } from '../lib/api';
 import {
   Send, Settings2, Trash2, RefreshCw, Copy, ChevronDown, ChevronRight,
   Brain, MessageSquare, Zap, MoreVertical, Edit3, CheckCheck, Loader2,
@@ -75,7 +76,7 @@ export default function Playground() {
   const fetchPreferences = async () => {
     if (!token) return;
     try {
-      const res = await fetch('/v1/api_config', {
+      const res = await apiFetch('/v1/api_config', {
         headers: { Authorization: `Bearer ${token}` }
       });
       if (res.ok) {
@@ -95,7 +96,7 @@ export default function Playground() {
     if (!token) return;
     setLoadingModels(true);
     try {
-      const res = await fetch('/v1/models', {
+      const res = await apiFetch('/v1/models', {
         headers: { Authorization: `Bearer ${token}` }
       });
       if (res.ok) {
@@ -124,7 +125,7 @@ export default function Playground() {
       : msgList;
 
     try {
-      const res = await fetch('/v1/chat/completions', {
+      const res = await apiFetch('/v1/chat/completions', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

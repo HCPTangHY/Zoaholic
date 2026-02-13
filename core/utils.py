@@ -921,12 +921,10 @@ async def generate_no_stream_response(timestamp, model, content=None, tools_id=N
             "data": [{
                 "b64_json": image_base64
             }],
-            # "usage": {
-            #     "total_tokens": 100,
-            #     "input_tokens": 50,
-            #     "output_tokens": 50,
-            # }
         }
+        
+        # Images responses don't have usage, so we just clear it
+        total_tokens = None
 
     if total_tokens:
         sample_data["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}

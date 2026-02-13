@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { X, Play, Square, Search, Loader2, CheckCircle2, XCircle, Clock, Copy, CopyCheck } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
+import { apiFetch } from '../lib/api';
 
 interface ModelInfo {
   display: string;  // 别名
@@ -92,7 +93,7 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
     });
 
     try {
-      const res = await fetch('/v1/channels/test', {
+      const res = await apiFetch('/v1/channels/test', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

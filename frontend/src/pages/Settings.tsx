@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../store/authStore';
+import { apiFetch } from '../lib/api';
 import {
   Settings2, Save, RefreshCw, AlertCircle, Clock, Zap, Shield,
   Timer, Database, Server, Blocks, Plus, Trash2, Edit2, Link
@@ -17,7 +18,7 @@ export default function Settings() {
       if (!token) return;
       setLoading(true);
       try {
-        const res = await fetch('/v1/api_config', {
+        const res = await apiFetch('/v1/api_config', {
           headers: { Authorization: `Bearer ${token}` }
         });
         if (res.ok) {
@@ -49,7 +50,7 @@ export default function Settings() {
     if (!token) return;
     setSaving(true);
     try {
-      const res = await fetch('/v1/api_config/update', {
+      const res = await apiFetch('/v1/api_config/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ preferences })

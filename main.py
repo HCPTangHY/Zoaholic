@@ -1,6 +1,5 @@
 import os
 import json
-import uuid
 import asyncio
 import tomllib
 from collections import defaultdict
@@ -31,7 +30,7 @@ from core.error_response import openai_error_response
 
 from utils import safe_get, load_config
 
-from db import DISABLE_DATABASE, async_session, RequestStat
+from db import DISABLE_DATABASE, RequestStat, AdminUser, DB_TYPE, async_session_scope
 from core.stats import (
     create_tables,
     update_paid_api_keys_states,
@@ -96,12 +95,26 @@ async def cleanup_expired_raw_data():
                 await asyncio.sleep(3600)
             first_run = False
             
-            if DISABLE_DATABASE or async_session is None:
+            if DISABLE_DATABASE:
                 continue
                 
-            async with async_session() as session:
+            async with async_session_scope() as db:
                 now = datetime.now(timezone.utc)
-                
+
+                if (DB_TYPE or "sqlite").lower() == "d1":
+                    result = await db.execute(
+                        "UPDATE request_stats "
+                        "SET request_headers = NULL, request_body = NULL, response_body = NULL "
+                        "WHERE raw_data_expires_at IS NOT NULL "
+                        "AND raw_data_expires_at < ? "
+                        "AND (request_headers IS NOT NULL OR request_body IS NOT NULL OR response_body IS NOT NULL)",
+                        [now],
+                    )
+                    rowcount = int((result.get("meta") or {}).get("changes") or 0)
+                    if rowcount > 0:
+                        logger.info(f"Cleaned up expired raw data from {rowcount} log entries")
+                    continue
+
                 # 清理过期的原始数据字段
                 # 只清理有过期时间且已过期的记录
                 stmt = (
@@ -119,8 +132,8 @@ async def cleanup_expired_raw_data():
                         response_body=None
                     )
                 )
-                result = await session.execute(stmt)
-                await session.commit()
+                result = await db.execute(stmt)
+                await db.commit()
                 
                 if result.rowcount > 0:
                     logger.info(f"Cleaned up expired raw data from {result.rowcount} log entries")
@@ -145,6 +158,26 @@ async def lifespan(app: FastAPI):
     cleanup_task = None
     if not DISABLE_DATABASE:
         await create_tables()
+
+        # 确保 JWT_SECRET 在进程启动后就已确定（避免后端热更新/重启导致前端旧 JWT 立刻 403）
+        # 规则：若未显式设置环境变量 JWT_SECRET，则使用 DB 中持久化的 admin_user.jwt_secret。
+        try:
+            from core.jwt_utils import set_jwt_secret
+
+            if not (os.getenv("JWT_SECRET") or "").strip():
+                async with async_session_scope() as db:
+                    if (DB_TYPE or "sqlite").lower() == "d1":
+                        row = await db.query_one("SELECT jwt_secret FROM admin_user WHERE id = ?", [1])
+                        jwt_secret = row.get("jwt_secret") if row else None
+                    else:
+                        admin_user = await db.get(AdminUser, 1)
+                        jwt_secret = getattr(admin_user, "jwt_secret", None) if admin_user is not None else None
+
+                if jwt_secret:
+                    set_jwt_secret(str(jwt_secret))
+        except Exception as e:
+            logger.debug("JWT secret init skipped/failed: %s", e)
+
         cleanup_task = asyncio.create_task(cleanup_expired_raw_data())
         logger.info("Started raw data cleanup background task")
 

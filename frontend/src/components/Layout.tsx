@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Outlet, Link, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Server, Terminal, Key, Settings as SettingsIcon, LogOut, FileText, Sun, Moon, Laptop, Menu, X } from 'lucide-react';
+import { LayoutDashboard, Server, Terminal, Key, Settings as SettingsIcon, LogOut, FileText, Puzzle, Sun, Moon, Laptop, Menu, X } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import { useThemeStore } from '../store/themeStore';
 
@@ -14,6 +14,7 @@ export default function Layout() {
     { id: '/', label: '仪表盘', icon: <LayoutDashboard className="w-5 h-5" /> },
     { id: '/channels', label: '渠道配置', icon: <Server className="w-5 h-5" /> },
     { id: '/playground', label: '测试工坊', icon: <Terminal className="w-5 h-5" /> },
+    { id: '/plugins', label: '插件管理', icon: <Puzzle className="w-5 h-5" /> },
     { id: '/logs', label: '系统日志', icon: <FileText className="w-5 h-5" /> },
     { id: '/admin', label: '密钥管理', icon: <Key className="w-5 h-5" /> },
     { id: '/settings', label: '系统设置', icon: <SettingsIcon className="w-5 h-5" /> },

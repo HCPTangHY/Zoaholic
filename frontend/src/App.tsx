@@ -5,6 +5,7 @@ import Playground from './pages/Playground';
 import Admin from './pages/Admin';
 import Settings from './pages/Settings';
 import Logs from './pages/Logs';
+import Plugins from './pages/Plugins';
 import Layout from './components/Layout';
 import Login from './pages/Login';
 import Setup from './pages/Setup';
@@ -26,6 +27,7 @@ function App() {
           <Route index element={<Dashboard />} />
           <Route path="channels" element={<Channels />} />
           <Route path="playground" element={<Playground />} />
+          <Route path="plugins" element={<Plugins />} />
           <Route path="admin" element={<Admin />} />
           <Route path="settings" element={<Settings />} />
           <Route path="logs" element={<Logs />} />

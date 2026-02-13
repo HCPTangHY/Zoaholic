@@ -50,9 +50,16 @@ Zoaholic 不再强迫所有请求转换为 OpenAI 格式。网关内置了智能
 
 ## 快速开始（推荐：Docker + 初始化向导）
 
-### 1）准备数据库（线上强烈推荐 PostgreSQL）
+### 1）准备数据库（线上强烈推荐 PostgreSQL / Cloudflare D1）
 
 Render / Aiven / Railway 等平台通常会提供 `DATABASE_URL`。
+
+如果你在 Cloudflare Workers 部署，也可以直接使用 D1：
+
+- `DB_TYPE=d1`
+- `D1_ACCOUNT_ID`（或 `CF_ACCOUNT_ID`）
+- `D1_DATABASE_ID`
+- `D1_API_TOKEN`（或 `CF_API_TOKEN`，需具备 D1 Query 权限）
 
 ### 2）启动服务
 
@@ -90,16 +97,27 @@ docker run --rm -p 8000:8000 \
 
 | 变量 | 示例 | 说明 |
 |---|---|---|
-| `DATABASE_URL` | `postgresql://...` 或 `postgres://...` | 统计/日志 + 配置入库都依赖数据库。支持自动识别并转换为 async 驱动。 |
+| `DATABASE_URL` | `postgresql://...` 或 `postgres://...` | PostgreSQL 连接串（与 D1 二选一）。统计/日志 + 配置入库都依赖数据库。 |
 
 ### 建议配置
 
 | 变量 | 默认 | 说明 |
 |---|---:|---|
-| `CONFIG_STORAGE` | `auto` | 配置来源策略：`auto\|db\|file\|url`。线上一般保持 `auto`（DB 优先）。 |
+| `CONFIG_STORAGE` | `file` | 配置来源策略：`auto\|db\|file\|url`。默认 `file`（`api.yaml` 为权威配置源）；云平台可用 `auto`（文件权威并同步写入 DB）或 `db`（DB 权威）。 |
 | `SYNC_CONFIG_TO_FILE` | `false` | 是否把配置同步写回 `api.yaml`。线上通常文件系统只读/临时，建议保持 `false`。 |
 | `JWT_SECRET` | （可选） | 管理控制台 JWT 签名密钥。**不设置也能用**：首次 `/setup` 会自动生成并持久化到 DB（`admin_user.jwt_secret`），后续重启复用。出于安全考虑仍建议在部署阶段直接设置环境变量。 |
 | `DISABLE_DATABASE` | `false` | 是否关闭数据库。线上一般不要关（否则无法配置入库/无法统计）。 |
+
+### Cloudflare D1（可选）
+
+| 变量 | 默认 | 说明 |
+|---|---:|---|
+| `DB_TYPE` | `sqlite` | 设为 `d1` 启用 Cloudflare D1 HTTP 模式。 |
+| `D1_ACCOUNT_ID` / `CF_ACCOUNT_ID` | - | Cloudflare Account ID。 |
+| `D1_DATABASE_ID` | - | D1 数据库 ID。 |
+| `D1_API_TOKEN` / `CF_API_TOKEN` | - | Cloudflare API Token（需 D1 Query 权限）。 |
+| `D1_API_BASE_URL` | `https://api.cloudflare.com/client/v4` | D1 API 基础地址（一般无需改）。 |
+| `D1_TIMEOUT_SECONDS` | `30` | D1 HTTP 请求超时秒数。 |
 
 ### 可选（高级用法 / 非必须）
 
@@ -117,8 +135,16 @@ docker run --rm -p 8000:8000 \
 
 Zoaholic 支持把配置（原 `api.yaml`）持久化到数据库：
 
-- 默认 `CONFIG_STORAGE=auto`
-  - DB 有配置：启动优先从 DB 读取（DB 作为权威配置）
+- 默认 `CONFIG_STORAGE=file`
+  - 启动时优先从 `api.yaml` 读取（`api.yaml` 作为权威配置）
+  - 前端保存配置会写回 `api.yaml`（需要文件系统可写/挂载卷）
+
+- 可选 `CONFIG_STORAGE=auto`（云平台/多实例场景，仍以文件为权威）
+  - 启动优先从 `api.yaml` / `CONFIG_YAML(_BASE64)` / `CONFIG_URL` 读取
+  - 随后把配置写入 DB（便于备份/多实例共享），但不会反向覆盖 `api.yaml`
+
+- 可选 `CONFIG_STORAGE=db`（云平台/多实例场景，以 DB 为权威）
+  - DB 有配置：启动优先从 DB 读取
   - DB 无配置：会从 `CONFIG_YAML(_BASE64)` / `CONFIG_URL` / `api.yaml` 读取一次作为“种子”，并写入 DB
 
 配置入库后：

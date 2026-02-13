@@ -15,7 +15,18 @@ export default defineConfig({
   },
   server: {
     proxy: {
+      // API（网关端点）
       '/v1': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      // 管理控制台登录（JWT）
+      '/auth': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      // 初始化向导
+      '/setup': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },

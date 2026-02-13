@@ -1,10 +1,12 @@
 import os
 import ssl as ssl_module
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from typing import Optional
 
 from sqlalchemy import event
 
 from core.env import env_bool
+from core.d1_client import D1HTTPClient
 from sqlalchemy.sql import func
 
 # --- CockroachDB compatibility (asyncpg / SQLAlchemy) ---
@@ -48,6 +50,27 @@ DATABASE_URL = (
     or os.getenv("SQLALCHEMY_DATABASE_URL")
 )
 
+# Cloudflare D1 连接参数（HTTP API）
+D1_ACCOUNT_ID = (
+    os.getenv("D1_ACCOUNT_ID")
+    or os.getenv("CF_ACCOUNT_ID")
+    or os.getenv("CLOUDFLARE_ACCOUNT_ID")
+    or ""
+).strip()
+D1_DATABASE_ID = (
+    os.getenv("D1_DATABASE_ID")
+    or os.getenv("CF_D1_DATABASE_ID")
+    or ""
+).strip()
+D1_API_TOKEN = (
+    os.getenv("D1_API_TOKEN")
+    or os.getenv("CF_API_TOKEN")
+    or os.getenv("CLOUDFLARE_API_TOKEN")
+    or ""
+).strip()
+D1_API_BASE_URL = (os.getenv("D1_API_BASE_URL") or "https://api.cloudflare.com/client/v4").strip()
+D1_TIMEOUT_SECONDS = float(os.getenv("D1_TIMEOUT_SECONDS", "30"))
+
 # DB_TYPE：显式优先；否则根据 DATABASE_URL 自动推断；默认 sqlite
 _DB_TYPE_ENV = (os.getenv("DB_TYPE") or "").strip().lower()
 if _DB_TYPE_ENV:
@@ -58,8 +81,12 @@ elif DATABASE_URL:
         DB_TYPE = "postgres"
     elif _url.startswith("sqlite://"):
         DB_TYPE = "sqlite"
+    elif _url.startswith("d1://"):
+        DB_TYPE = "d1"
     else:
         DB_TYPE = "sqlite"
+elif D1_ACCOUNT_ID and D1_DATABASE_ID and D1_API_TOKEN:
+    DB_TYPE = "d1"
 else:
     DB_TYPE = "sqlite"
 
@@ -156,6 +183,10 @@ def _extract_asyncpg_ssl_connect_args(db_url: str) -> tuple[str, dict]:
 
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from contextlib import asynccontextmanager
+
+
+_legacy_async_session = None
 from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text
 
 # PostgreSQL 下使用 JSONB（更高效/可索引）；其它数据库回退到 JSON
@@ -251,10 +282,13 @@ class AppConfig(Base):
     id = Column(Integer, primary_key=True)
 
     # JSON/JSONB 配置
-    # - PostgreSQL: JSONB
-    # - CockroachDB: 通常只有 JSONB（json 类型可能不存在）
-    # - 其它 DB: 回退到 Text/JSON（但当前主要用于 Postgres/Cockroach/SQLite）
-    config_json = Column(_PG_JSONB if _PG_JSONB is not None else Text, nullable=True)
+    # - PostgreSQL/CockroachDB: JSONB（可索引）
+    # - SQLite 等其它 DB：回退到 Text
+    #
+    # 注意：不要在 SQLite 下使用 postgresql.JSONB，否则会在建表阶段报：
+    # `SQLiteTypeCompiler can't render element of type JSONB`
+    use_jsonb = (DB_TYPE or "sqlite").lower() == "postgres" and _PG_JSONB is not None
+    config_json = Column(_PG_JSONB if use_jsonb else Text, nullable=True)
 
     # 预留：便于人工导出/排查（可选，不参与主流程）
     config_yaml = Column(Text, nullable=True)
@@ -266,6 +300,9 @@ class AppConfig(Base):
 DISABLE_DATABASE = env_bool("DISABLE_DATABASE", False)
 db_engine = None
 async_session = None
+
+# D1 运行时对象
+d1_client: Optional[D1HTTPClient] = None
 
 if not DISABLE_DATABASE:
     is_debug = env_bool("DEBUG", False)
@@ -329,6 +366,48 @@ if not DISABLE_DATABASE:
                 if cursor:
                     cursor.close()
     else:
-        raise ValueError(f"Unsupported DB_TYPE: {DB_TYPE}. Please use 'sqlite' or 'postgres'.")
+        if DB_TYPE == "d1":
+            if not (D1_ACCOUNT_ID and D1_DATABASE_ID and D1_API_TOKEN):
+                raise ValueError(
+                    "DB_TYPE=d1 requires D1_ACCOUNT_ID/CF_ACCOUNT_ID, D1_DATABASE_ID and D1_API_TOKEN/CF_API_TOKEN."
+                )
+            d1_client = D1HTTPClient(
+                account_id=D1_ACCOUNT_ID,
+                database_id=D1_DATABASE_ID,
+                api_token=D1_API_TOKEN,
+                api_base_url=D1_API_BASE_URL,
+                timeout_seconds=D1_TIMEOUT_SECONDS,
+            )
+        else:
+            raise ValueError(f"Unsupported DB_TYPE: {DB_TYPE}. Please use 'sqlite', 'postgres' or 'd1'.")
 
-    async_session = sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+    if db_engine is not None:
+        _legacy_async_session = sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+
+
+@asynccontextmanager
+async def async_session_scope():
+    """统一数据库会话入口。
+
+    - sqlite/postgres：返回 SQLAlchemy AsyncSession
+    - d1：返回 D1HTTPClient
+    """
+
+    if DISABLE_DATABASE:
+        raise RuntimeError("Database is disabled")
+
+    if DB_TYPE == "d1":
+        if d1_client is None:
+            raise RuntimeError("D1 client is not initialized")
+        yield d1_client
+        return
+
+    if _legacy_async_session is None:
+        raise RuntimeError("Database session factory is not initialized")
+
+    async with _legacy_async_session() as session:
+        yield session
+
+# 向后兼容：保留 async_session 变量
+if _legacy_async_session is not None:
+    async_session = _legacy_async_session
