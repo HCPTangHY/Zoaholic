@@ -10,13 +10,28 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_serializer
 
 from sqlalchemy import select, case, func, desc
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from db import RequestStat, ChannelStat, async_session, DISABLE_DATABASE
+from db import RequestStat, ChannelStat, async_session_scope, DISABLE_DATABASE, DB_TYPE
+from core.stats import get_usage_data
 from utils import safe_get, query_channel_key_stats
 from routes.deps import rate_limit_dependency, verify_api_key, verify_admin_api_key, get_app
+from core.d1_client import parse_d1_datetime
 
 router = APIRouter()
+
+
+def _bool_from_db(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "no", "n", "off", ""}:
+            return False
+    return bool(value)
 
 
 # ============ Pydantic Models ============
@@ -142,71 +157,6 @@ class LogsPage(BaseModel):
 
 # ============ Helper Functions ============
 
-async def query_token_usage(
-    session: AsyncSession,
-    filter_api_key: Optional[str] = None,
-    filter_model: Optional[str] = None,
-    start_dt: Optional[datetime] = None,
-    end_dt: Optional[datetime] = None
-) -> List[Dict]:
-    """查询 RequestStat 表获取聚合的 token 使用量"""
-    query = select(
-        RequestStat.api_key,
-        RequestStat.model,
-        func.sum(RequestStat.prompt_tokens).label("total_prompt_tokens"),
-        func.sum(RequestStat.completion_tokens).label("total_completion_tokens"),
-        func.sum(RequestStat.total_tokens).label("total_tokens"),
-        func.count(RequestStat.id).label("request_count")
-    ).group_by(RequestStat.api_key, RequestStat.model)
-
-    if filter_api_key:
-        query = query.where(RequestStat.api_key == filter_api_key)
-    if filter_model:
-        query = query.where(RequestStat.model == filter_model)
-    if start_dt:
-        query = query.where(RequestStat.timestamp >= start_dt)
-    if end_dt:
-        query = query.where(RequestStat.timestamp < end_dt + timedelta(days=1))
-
-    if not filter_model:
-        query = query.where(RequestStat.model.isnot(None) & (RequestStat.model != ''))
-
-    result = await session.execute(query)
-    rows = result.mappings().all()
-
-    processed_usage = []
-    for row in rows:
-        usage_dict = dict(row)
-        api_key = usage_dict.get("api_key", "")
-        if api_key and len(api_key) > 7:
-            prefix = api_key[:7]
-            suffix = api_key[-4:]
-            usage_dict["api_key_prefix"] = f"{prefix}...{suffix}"
-        else:
-            usage_dict["api_key_prefix"] = api_key
-        del usage_dict["api_key"]
-        processed_usage.append(usage_dict)
-
-    return processed_usage
-
-
-async def get_usage_data(
-    filter_api_key: Optional[str] = None,
-    filter_model: Optional[str] = None,
-    start_dt_obj: Optional[datetime] = None,
-    end_dt_obj: Optional[datetime] = None
-) -> List[Dict]:
-    """查询数据库并获取令牌使用数据"""
-    async with async_session() as session:
-        usage_data = await query_token_usage(
-            session=session,
-            filter_api_key=filter_api_key,
-            filter_model=filter_model,
-            start_dt=start_dt_obj,
-            end_dt=end_dt_obj
-        )
-    return usage_data
-
 
 def parse_datetime_input(dt_input: str) -> datetime:
     """解析 ISO 8601 字符串或 Unix 时间戳"""
@@ -253,94 +203,175 @@ async def get_stats(
     if DISABLE_DATABASE:
         return JSONResponse(content={"stats": {}})
     
-    async with async_session() as session:
-        start_time = datetime.now(timezone.utc) - timedelta(hours=hours)
+    start_time = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-        # 1. 每个渠道下面每个模型的成功率
-        channel_model_stats = await session.execute(
-            select(
-                ChannelStat.provider,
-                ChannelStat.model,
-                func.count().label('total'),
-                func.sum(case((ChannelStat.success, 1), else_=0)).label('success_count')
+    if (DB_TYPE or "sqlite").lower() == "d1":
+        from db import d1_client
+        if d1_client is None:
+            return JSONResponse(content={"stats": {}})
+
+        channel_model_rows = await d1_client.query_all(
+            "SELECT provider, model, COUNT(*) AS total, "
+            "SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success_count "
+            "FROM channel_stats WHERE timestamp >= ? GROUP BY provider, model",
+            [start_time],
+        )
+        channel_rows = await d1_client.query_all(
+            "SELECT provider, COUNT(*) AS total, "
+            "SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success_count "
+            "FROM channel_stats WHERE timestamp >= ? GROUP BY provider",
+            [start_time],
+        )
+        model_rows = await d1_client.query_all(
+            "SELECT model, COUNT(*) AS count FROM request_stats "
+            "WHERE timestamp >= ? GROUP BY model ORDER BY count DESC",
+            [start_time],
+        )
+        endpoint_rows = await d1_client.query_all(
+            "SELECT endpoint, COUNT(*) AS count FROM request_stats "
+            "WHERE timestamp >= ? GROUP BY endpoint ORDER BY count DESC",
+            [start_time],
+        )
+        ip_rows = await d1_client.query_all(
+            "SELECT client_ip, COUNT(*) AS count FROM request_stats "
+            "WHERE timestamp >= ? GROUP BY client_ip ORDER BY count DESC",
+            [start_time],
+        )
+
+        channel_model_stats = [
+            {
+                "provider": row.get("provider"),
+                "model": row.get("model"),
+                "total": int(row.get("total") or 0),
+                "success_count": int(row.get("success_count") or 0),
+            }
+            for row in channel_model_rows
+        ]
+        channel_stats = [
+            {
+                "provider": row.get("provider"),
+                "total": int(row.get("total") or 0),
+                "success_count": int(row.get("success_count") or 0),
+            }
+            for row in channel_rows
+        ]
+        model_stats = [
+            {"model": row.get("model"), "count": int(row.get("count") or 0)}
+            for row in model_rows
+        ]
+        endpoint_stats = [
+            {"endpoint": row.get("endpoint"), "count": int(row.get("count") or 0)}
+            for row in endpoint_rows
+        ]
+        ip_stats = [
+            {"client_ip": row.get("client_ip"), "count": int(row.get("count") or 0)}
+            for row in ip_rows
+        ]
+    else:
+        async with async_session_scope() as session:
+            # 1. 每个渠道下面每个模型的成功率
+            channel_model_stats_rs = await session.execute(
+                select(
+                    ChannelStat.provider,
+                    ChannelStat.model,
+                    func.count().label('total'),
+                    func.sum(case((ChannelStat.success, 1), else_=0)).label('success_count')
+                )
+                .where(ChannelStat.timestamp >= start_time)
+                .group_by(ChannelStat.provider, ChannelStat.model)
             )
-            .where(ChannelStat.timestamp >= start_time)
-            .group_by(ChannelStat.provider, ChannelStat.model)
-        )
-        channel_model_stats = channel_model_stats.fetchall()
+            channel_model_stats = [
+                {
+                    "provider": stat.provider,
+                    "model": stat.model,
+                    "total": int(stat.total or 0),
+                    "success_count": int(stat.success_count or 0),
+                }
+                for stat in channel_model_stats_rs.fetchall()
+            ]
 
-        # 2. 每个渠道总的成功率
-        channel_stats = await session.execute(
-            select(
-                ChannelStat.provider,
-                func.count().label('total'),
-                func.sum(case((ChannelStat.success, 1), else_=0)).label('success_count')
+            # 2. 每个渠道总的成功率
+            channel_stats_rs = await session.execute(
+                select(
+                    ChannelStat.provider,
+                    func.count().label('total'),
+                    func.sum(case((ChannelStat.success, 1), else_=0)).label('success_count')
+                )
+                .where(ChannelStat.timestamp >= start_time)
+                .group_by(ChannelStat.provider)
             )
-            .where(ChannelStat.timestamp >= start_time)
-            .group_by(ChannelStat.provider)
-        )
-        channel_stats = channel_stats.fetchall()
+            channel_stats = [
+                {
+                    "provider": stat.provider,
+                    "total": int(stat.total or 0),
+                    "success_count": int(stat.success_count or 0),
+                }
+                for stat in channel_stats_rs.fetchall()
+            ]
 
-        # 3. 每个模型在所有渠道总的请求次数
-        model_stats = await session.execute(
-            select(RequestStat.model, func.count().label('count'))
-            .where(RequestStat.timestamp >= start_time)
-            .group_by(RequestStat.model)
-            .order_by(desc('count'))
-        )
-        model_stats = model_stats.fetchall()
+            # 3. 每个模型在所有渠道总的请求次数
+            model_stats_rs = await session.execute(
+                select(RequestStat.model, func.count().label('count'))
+                .where(RequestStat.timestamp >= start_time)
+                .group_by(RequestStat.model)
+                .order_by(desc('count'))
+            )
+            model_stats = [{"model": stat.model, "count": int(stat.count or 0)} for stat in model_stats_rs.fetchall()]
 
-        # 4. 每个端点的请求次数
-        endpoint_stats = await session.execute(
-            select(RequestStat.endpoint, func.count().label('count'))
-            .where(RequestStat.timestamp >= start_time)
-            .group_by(RequestStat.endpoint)
-            .order_by(desc('count'))
-        )
-        endpoint_stats = endpoint_stats.fetchall()
+            # 4. 每个端点的请求次数
+            endpoint_stats_rs = await session.execute(
+                select(RequestStat.endpoint, func.count().label('count'))
+                .where(RequestStat.timestamp >= start_time)
+                .group_by(RequestStat.endpoint)
+                .order_by(desc('count'))
+            )
+            endpoint_stats = [
+                {"endpoint": stat.endpoint, "count": int(stat.count or 0)}
+                for stat in endpoint_stats_rs.fetchall()
+            ]
 
-        # 5. 每个ip请求的次数
-        ip_stats = await session.execute(
-            select(RequestStat.client_ip, func.count().label('count'))
-            .where(RequestStat.timestamp >= start_time)
-            .group_by(RequestStat.client_ip)
-            .order_by(desc('count'))
-        )
-        ip_stats = ip_stats.fetchall()
+            # 5. 每个ip请求的次数
+            ip_stats_rs = await session.execute(
+                select(RequestStat.client_ip, func.count().label('count'))
+                .where(RequestStat.timestamp >= start_time)
+                .group_by(RequestStat.client_ip)
+                .order_by(desc('count'))
+            )
+            ip_stats = [{"client_ip": stat.client_ip, "count": int(stat.count or 0)} for stat in ip_stats_rs.fetchall()]
 
     stats = {
         "time_range": f"Last {hours} hours",
         "channel_model_success_rates": [
             {
-                "provider": stat.provider,
-                "model": stat.model,
-                "success_rate": stat.success_count / stat.total if stat.total > 0 else 0,
-                "total_requests": stat.total
-            } for stat in sorted(channel_model_stats, key=lambda x: x.success_count / x.total if x.total > 0 else 0, reverse=True)
+                "provider": stat.get("provider"),
+                "model": stat.get("model"),
+                "success_rate": (stat.get("success_count", 0) / stat.get("total", 0)) if stat.get("total", 0) > 0 else 0,
+                "total_requests": stat.get("total", 0)
+            } for stat in sorted(channel_model_stats, key=lambda x: (x.get("success_count", 0) / x.get("total", 0)) if x.get("total", 0) > 0 else 0, reverse=True)
         ],
         "channel_success_rates": [
             {
-                "provider": stat.provider,
-                "success_rate": stat.success_count / stat.total if stat.total > 0 else 0,
-                "total_requests": stat.total
-            } for stat in sorted(channel_stats, key=lambda x: x.success_count / x.total if x.total > 0 else 0, reverse=True)
+                "provider": stat.get("provider"),
+                "success_rate": (stat.get("success_count", 0) / stat.get("total", 0)) if stat.get("total", 0) > 0 else 0,
+                "total_requests": stat.get("total", 0)
+            } for stat in sorted(channel_stats, key=lambda x: (x.get("success_count", 0) / x.get("total", 0)) if x.get("total", 0) > 0 else 0, reverse=True)
         ],
         "model_request_counts": [
             {
-                "model": stat.model,
-                "count": stat.count
+                "model": stat.get("model"),
+                "count": stat.get("count", 0)
             } for stat in model_stats
         ],
         "endpoint_request_counts": [
             {
-                "endpoint": stat.endpoint,
-                "count": stat.count
+                "endpoint": stat.get("endpoint"),
+                "count": stat.get("count", 0)
             } for stat in endpoint_stats
         ],
         "ip_request_counts": [
             {
-                "ip": stat.client_ip,
-                "count": stat.count
+                "ip": stat.get("client_ip"),
+                "count": stat.get("count", 0)
             } for stat in ip_stats
         ]
     }
@@ -612,7 +643,123 @@ async def get_logs(
     if DISABLE_DATABASE:
         raise HTTPException(status_code=503, detail="Database is disabled.")
 
-    async with async_session() as session:
+    if (DB_TYPE or "sqlite").lower() == "d1":
+        from db import d1_client
+        if d1_client is None:
+            return LogsPage(items=[], total=0, page=page, page_size=page_size, total_pages=0)
+
+        sql = "SELECT * FROM request_stats WHERE 1=1"
+        count_sql = "SELECT COUNT(*) AS total FROM request_stats WHERE 1=1"
+        params: list[Any] = []
+
+        if start_time:
+            try:
+                start_dt = parse_datetime_input(start_time)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid start_time: {e}")
+            sql += " AND timestamp >= ?"
+            count_sql += " AND timestamp >= ?"
+            params.append(start_dt)
+
+        if end_time:
+            try:
+                end_dt = parse_datetime_input(end_time)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid end_time: {e}")
+            sql += " AND timestamp <= ?"
+            count_sql += " AND timestamp <= ?"
+            params.append(end_dt)
+
+        if provider:
+            like_value = f"%{provider}%"
+            sql += " AND (provider_id LIKE ? OR provider LIKE ?)"
+            count_sql += " AND (provider_id LIKE ? OR provider LIKE ?)"
+            params.extend([like_value, like_value])
+
+        if api_key:
+            like_value = f"%{api_key}%"
+            sql += " AND (api_key_name LIKE ? OR api_key_group LIKE ? OR api_key LIKE ?)"
+            count_sql += " AND (api_key_name LIKE ? OR api_key_group LIKE ? OR api_key LIKE ?)"
+            params.extend([like_value, like_value, like_value])
+
+        if model:
+            like_value = f"%{model}%"
+            sql += " AND model LIKE ?"
+            count_sql += " AND model LIKE ?"
+            params.append(like_value)
+
+        if success is not None:
+            success_value = 1 if success else 0
+            sql += " AND success = ?"
+            count_sql += " AND success = ?"
+            params.append(success_value)
+
+        total = int(await d1_client.query_value(count_sql, params, column="total", default=0) or 0)
+        if total == 0:
+            return LogsPage(items=[], total=0, page=page, page_size=page_size, total_pages=0)
+
+        total_pages = (total + page_size - 1) // page_size
+        if page > total_pages:
+            page = total_pages
+        offset = (page - 1) * page_size
+
+        sql += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+        rows = await d1_client.query_all(sql, [*params, page_size, offset])
+
+        items: List[LogEntry] = []
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            raw_api_key = row.get("api_key") or ""
+            if raw_api_key and len(raw_api_key) > 11:
+                api_key_prefix = f"{raw_api_key[:7]}...{raw_api_key[-4:]}"
+            else:
+                api_key_prefix = raw_api_key
+
+            ts = parse_d1_datetime(row.get("timestamp")) or datetime.now(timezone.utc)
+            raw_expires_at = parse_d1_datetime(row.get("raw_data_expires_at"))
+            raw_data_expired = raw_expires_at is not None and raw_expires_at < now
+
+            items.append(
+                LogEntry(
+                    id=int(row.get("id") or 0),
+                    timestamp=ts,
+                    endpoint=row.get("endpoint"),
+                    client_ip=row.get("client_ip"),
+                    provider=row.get("provider"),
+                    model=row.get("model"),
+                    api_key_prefix=api_key_prefix,
+                    process_time=float(row.get("process_time")) if row.get("process_time") is not None else None,
+                    first_response_time=float(row.get("first_response_time")) if row.get("first_response_time") is not None else None,
+                    prompt_tokens=int(row.get("prompt_tokens") or 0),
+                    completion_tokens=int(row.get("completion_tokens") or 0),
+                    total_tokens=int(row.get("total_tokens") or 0),
+                    success=_bool_from_db(row.get("success")),
+                    status_code=int(row.get("status_code")) if row.get("status_code") is not None else None,
+                    is_flagged=_bool_from_db(row.get("is_flagged")),
+                    provider_id=row.get("provider_id"),
+                    provider_key_index=int(row.get("provider_key_index")) if row.get("provider_key_index") is not None else None,
+                    api_key_name=row.get("api_key_name"),
+                    api_key_group=row.get("api_key_group"),
+                    retry_count=int(row.get("retry_count")) if row.get("retry_count") is not None else None,
+                    retry_path=row.get("retry_path") if not raw_data_expired else None,
+                    request_headers=row.get("request_headers") if not raw_data_expired else None,
+                    request_body=row.get("request_body") if not raw_data_expired else None,
+                    upstream_request_body=row.get("upstream_request_body") if not raw_data_expired else None,
+                    upstream_response_body=row.get("upstream_response_body") if not raw_data_expired else None,
+                    response_body=row.get("response_body") if not raw_data_expired else None,
+                    raw_data_expires_at=raw_expires_at,
+                )
+            )
+
+        return LogsPage(
+            items=items,
+            total=total,
+            page=page,
+            page_size=page_size,
+            total_pages=total_pages,
+        )
+
+    async with async_session_scope() as session:
         # 构建基础查询条件
         conditions = []
         
