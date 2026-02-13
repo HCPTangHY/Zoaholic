@@ -226,7 +226,7 @@ async def lifespan(app: FastAPI):
                 "Accept": "*/*",
                 "Accept-Encoding": "identity",
             },
-            "http2": True,
+            "http2": False,
             "verify": True,
             "follow_redirects": True
         }
