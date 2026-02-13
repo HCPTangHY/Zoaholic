@@ -17,7 +17,7 @@ from core.log_config import logger
 from core.security import hash_password, verify_password
 from routes.deps import get_app
 from utils import update_config, load_config_from_db
-from db import DISABLE_DATABASE, async_session
+from db import DISABLE_DATABASE, async_session_scope
 
 
 router = APIRouter(prefix="/setup", tags=["Setup"])
@@ -69,33 +69,66 @@ async def _get_admin_user():
     # 延迟导入，避免循环引用
     from db import AdminUser
 
-    if DISABLE_DATABASE or async_session is None:
+    if DISABLE_DATABASE:
         return None
-    async with async_session() as session:
-        return await session.get(AdminUser, 1)
+
+    from db import DB_TYPE
+
+    async with async_session_scope() as db:
+        if (DB_TYPE or "sqlite").lower() == "d1":
+            row = await db.query_one(
+                "SELECT id, username, password_hash, jwt_secret FROM admin_user WHERE id = ?",
+                [1],
+            )
+            if not row:
+                return None
+            return AdminUser(
+                id=int(row.get("id") or 1),
+                username=str(row.get("username") or ""),
+                password_hash=str(row.get("password_hash") or ""),
+                jwt_secret=row.get("jwt_secret"),
+            )
+        return await db.get(AdminUser, 1)
 
 
 async def _upsert_admin_user(username: str, password: str, jwt_secret: str) -> None:
     from db import AdminUser
 
-    if DISABLE_DATABASE or async_session is None:
+    if DISABLE_DATABASE:
         raise HTTPException(status_code=500, detail="Database is disabled; cannot persist admin user.")
+
+    from db import DB_TYPE
 
     pwd_hash = hash_password(password)
     jwt_secret = (jwt_secret or "").strip()
 
-    async with async_session() as session:
-        existing = await session.get(AdminUser, 1)
-        if existing is None:
-            existing = AdminUser(id=1, username=username, password_hash=pwd_hash, jwt_secret=jwt_secret)
-            session.add(existing)
+    async with async_session_scope() as db:
+        if (DB_TYPE or "sqlite").lower() == "d1":
+            existing = await db.query_one("SELECT id, jwt_secret FROM admin_user WHERE id = ?", [1])
+            if existing is None:
+                await db.execute(
+                    "INSERT INTO admin_user (id, username, password_hash, jwt_secret) VALUES (?, ?, ?, ?)",
+                    [1, username, pwd_hash, jwt_secret],
+                )
+            else:
+                existing_secret = existing.get("jwt_secret")
+                next_secret = existing_secret if existing_secret else jwt_secret
+                await db.execute(
+                    "UPDATE admin_user SET username = ?, password_hash = ?, jwt_secret = ? WHERE id = ?",
+                    [username, pwd_hash, next_secret, 1],
+                )
         else:
-            existing.username = username
-            existing.password_hash = pwd_hash
-            # 若之前没有 jwt_secret，则补上
-            if not getattr(existing, "jwt_secret", None):
-                existing.jwt_secret = jwt_secret
-        await session.commit()
+            existing = await db.get(AdminUser, 1)
+            if existing is None:
+                existing = AdminUser(id=1, username=username, password_hash=pwd_hash, jwt_secret=jwt_secret)
+                db.add(existing)
+            else:
+                existing.username = username
+                existing.password_hash = pwd_hash
+                # 若之前没有 jwt_secret，则补上
+                if not getattr(existing, "jwt_secret", None):
+                    existing.jwt_secret = jwt_secret
+            await db.commit()
 
 
 def _generate_admin_api_key() -> str:
@@ -149,7 +182,7 @@ async def setup_init(payload: SetupInitRequest = Body(...)):
     - 后续建议通过 /auth/login 使用“账号密码 + JWT”登录管理控制台。
     """
 
-    if DISABLE_DATABASE or async_session is None:
+    if DISABLE_DATABASE:
         raise HTTPException(
             status_code=500,
             detail="Database is disabled; cannot run setup wizard. Please set DISABLE_DATABASE=false and provide DATABASE_URL.",

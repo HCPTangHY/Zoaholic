@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from core.jwt_utils import issue_jwt, decode_jwt
 from core.security import verify_password
 from routes.deps import rate_limit_dependency, get_app
-from db import DISABLE_DATABASE, async_session, AdminUser
+from db import DISABLE_DATABASE, async_session_scope, AdminUser, DB_TYPE
 
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -62,11 +62,25 @@ def _select_admin_api_key_from_config(conf: dict) -> Optional[str]:
 
 @router.post("/login", response_model=LoginResponse, dependencies=[Depends(rate_limit_dependency)])
 async def login(payload: LoginRequest = Body(...)):
-    if DISABLE_DATABASE or async_session is None:
+    if DISABLE_DATABASE:
         raise HTTPException(status_code=500, detail="Database is disabled; cannot login.")
 
-    async with async_session() as session:
-        admin_user = await session.get(AdminUser, 1)
+    async with async_session_scope() as db:
+        if (DB_TYPE or "sqlite").lower() == "d1":
+            row = await db.query_one(
+                "SELECT id, username, password_hash, jwt_secret FROM admin_user WHERE id = ?",
+                [1],
+            )
+            admin_user = (
+                AdminUser(
+                    id=int(row.get("id") or 1),
+                    username=str(row.get("username") or ""),
+                    password_hash=str(row.get("password_hash") or ""),
+                    jwt_secret=row.get("jwt_secret"),
+                ) if row else None
+            )
+        else:
+            admin_user = await db.get(AdminUser, 1)
 
     # 若没有显式配置 JWT_SECRET，则优先使用 DB 中持久化的 jwt_secret
     try:

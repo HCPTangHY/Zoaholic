@@ -9,7 +9,6 @@
 - 成本计算
 """
 
-import os
 import asyncio
 
 from core.env import env_bool
@@ -23,7 +22,8 @@ from sqlalchemy.sql import sqltypes
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.log_config import logger
-from db import Base, RequestStat, ChannelStat, AppConfig, AdminUser, db_engine, async_session, DISABLE_DATABASE, DB_TYPE
+from db import Base, RequestStat, ChannelStat, AppConfig, AdminUser, db_engine, async_session_scope, DISABLE_DATABASE, DB_TYPE
+from core.d1_client import format_d1_datetime
 
 # SQLite 写入重试配置
 SQLITE_MAX_RETRIES = 3
@@ -37,6 +37,10 @@ is_debug = env_bool("DEBUG", False)
 if (DB_TYPE or "sqlite").lower() == 'sqlite':
     db_semaphore = Semaphore(1)
     logger.info("Database semaphore configured for SQLite (1 concurrent writer).")
+elif (DB_TYPE or "sqlite").lower() == 'd1':
+    # D1 走 HTTP API，适当并发即可
+    db_semaphore = Semaphore(20)
+    logger.info("Database semaphore configured for D1 (20 concurrent writers).")
 else:  # For postgres
     # 允许50个并发写入操作，这对于PostgreSQL来说是合理的
     db_semaphore = Semaphore(50)
@@ -136,16 +140,114 @@ def _get_default_sql(default):
     return ""
 
 
+async def _create_tables_d1():
+    """D1 模式下创建表结构（SQLite 兼容 SQL）。"""
+
+    from db import d1_client
+    if d1_client is None:
+        raise RuntimeError("D1 client is not initialized")
+
+    create_sqls = [
+        """
+        CREATE TABLE IF NOT EXISTS request_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT,
+            endpoint TEXT,
+            client_ip TEXT,
+            process_time REAL,
+            first_response_time REAL,
+            content_start_time REAL,
+            provider TEXT,
+            model TEXT,
+            api_key TEXT,
+            success INTEGER DEFAULT 0,
+            status_code INTEGER,
+            is_flagged INTEGER DEFAULT 0,
+            text TEXT,
+            prompt_tokens INTEGER DEFAULT 0,
+            completion_tokens INTEGER DEFAULT 0,
+            total_tokens INTEGER DEFAULT 0,
+            prompt_price REAL DEFAULT 0.0,
+            completion_price REAL DEFAULT 0.0,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            provider_id TEXT,
+            provider_key_index INTEGER,
+            api_key_name TEXT,
+            api_key_group TEXT,
+            retry_count INTEGER DEFAULT 0,
+            retry_path TEXT,
+            request_headers TEXT,
+            request_body TEXT,
+            upstream_request_headers TEXT,
+            upstream_request_body TEXT,
+            upstream_response_body TEXT,
+            response_body TEXT,
+            raw_data_expires_at DATETIME
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS channel_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT,
+            provider TEXT,
+            model TEXT,
+            api_key TEXT,
+            provider_api_key TEXT,
+            success INTEGER DEFAULT 0,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS admin_user (
+            id INTEGER PRIMARY KEY,
+            username TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            jwt_secret TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS app_config (
+            id INTEGER PRIMARY KEY,
+            config_json TEXT,
+            config_yaml TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+    ]
+
+    index_sqls = [
+        "CREATE INDEX IF NOT EXISTS idx_request_stats_provider ON request_stats(provider)",
+        "CREATE INDEX IF NOT EXISTS idx_request_stats_model ON request_stats(model)",
+        "CREATE INDEX IF NOT EXISTS idx_request_stats_api_key ON request_stats(api_key)",
+        "CREATE INDEX IF NOT EXISTS idx_request_stats_success ON request_stats(success)",
+        "CREATE INDEX IF NOT EXISTS idx_request_stats_status_code ON request_stats(status_code)",
+        "CREATE INDEX IF NOT EXISTS idx_request_stats_timestamp ON request_stats(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_channel_stats_provider ON channel_stats(provider)",
+        "CREATE INDEX IF NOT EXISTS idx_channel_stats_model ON channel_stats(model)",
+        "CREATE INDEX IF NOT EXISTS idx_channel_stats_provider_api_key ON channel_stats(provider_api_key)",
+        "CREATE INDEX IF NOT EXISTS idx_channel_stats_timestamp ON channel_stats(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_admin_user_username ON admin_user(username)",
+        "CREATE INDEX IF NOT EXISTS idx_app_config_updated_at ON app_config(updated_at)",
+    ]
+
+    for sql in create_sqls + index_sqls:
+        await d1_client.execute(sql)
+
+
 async def create_tables():
     """创建数据库表并执行简易列迁移"""
     if DISABLE_DATABASE:
         return
+    if (DB_TYPE or "sqlite").lower() == "d1":
+        await _create_tables_d1()
+        return
+
     async with db_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
         # 检查并添加缺失的列 - 扩展此简易迁移以支持 SQLite 和 PostgreSQL
         db_type = (DB_TYPE or "sqlite").lower()
-        if db_type in ["sqlite", "postgres"]:
+        if db_type in ["sqlite", "postgres", "d1"]:
             def check_and_add_columns(connection):
                 inspector = inspect(connection)
                 for table in [RequestStat, ChannelStat, AppConfig, AdminUser]:
@@ -207,7 +309,31 @@ async def compute_total_cost_from_db(filter_api_key: Optional[str] = None, start
     """
     if DISABLE_DATABASE:
         return 0.0
-    async with async_session() as session:
+
+    if (DB_TYPE or "sqlite").lower() == "d1":
+        from db import d1_client
+        if d1_client is None:
+            return 0.0
+
+        sql = (
+            "SELECT COALESCE(SUM((COALESCE(prompt_tokens, 0) * COALESCE(prompt_price, 0.3) "
+            "+ COALESCE(completion_tokens, 0) * COALESCE(completion_price, 1.0)) / 1000000.0), 0.0) AS total_cost "
+            "FROM request_stats WHERE 1=1"
+        )
+        params: list[Any] = []
+        if filter_api_key:
+            sql += " AND api_key = ?"
+            params.append(filter_api_key)
+        if start_dt_obj:
+            sql += " AND timestamp >= ?"
+            params.append(format_d1_datetime(start_dt_obj))
+        total_cost = await d1_client.query_value(sql, params, column="total_cost", default=0.0)
+        try:
+            return float(total_cost or 0.0)
+        except Exception:
+            return 0.0
+
+    async with async_session_scope() as session:
         expr = (func.coalesce(RequestStat.prompt_tokens, 0) * func.coalesce(RequestStat.prompt_price, 0.3) + func.coalesce(RequestStat.completion_tokens, 0) * func.coalesce(RequestStat.completion_price, 1.0)) / 1000000.0
         query = select(func.coalesce(func.sum(expr), 0.0))
         if filter_api_key:
@@ -221,6 +347,62 @@ async def compute_total_cost_from_db(filter_api_key: Optional[str] = None, start
         except Exception:
             total_cost = 0.0
         return total_cost
+
+
+async def _query_token_usage_d1(
+    filter_api_key: Optional[str] = None,
+    filter_model: Optional[str] = None,
+    start_dt: Optional[datetime] = None,
+    end_dt: Optional[datetime] = None,
+) -> List[Dict]:
+    from db import d1_client
+    if d1_client is None:
+        return []
+
+    sql = (
+        "SELECT api_key, model, "
+        "COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens, "
+        "COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens, "
+        "COALESCE(SUM(total_tokens), 0) AS total_tokens, "
+        "COUNT(id) AS request_count "
+        "FROM request_stats WHERE 1=1"
+    )
+    params: list[Any] = []
+    if filter_api_key:
+        sql += " AND api_key = ?"
+        params.append(filter_api_key)
+    if filter_model:
+        sql += " AND model = ?"
+        params.append(filter_model)
+    if start_dt:
+        sql += " AND timestamp >= ?"
+        params.append(format_d1_datetime(start_dt))
+    if end_dt:
+        sql += " AND timestamp < ?"
+        params.append(format_d1_datetime(end_dt + timedelta(days=1)))
+    if not filter_model:
+        sql += " AND model IS NOT NULL AND model != ''"
+    sql += " GROUP BY api_key, model"
+
+    rows = await d1_client.query_all(sql, params)
+    processed_usage = []
+    for row in rows:
+        api_key = row.get("api_key", "")
+        if api_key and len(api_key) > 7:
+            api_key_prefix = f"{api_key[:7]}...{api_key[-4:]}"
+        else:
+            api_key_prefix = api_key
+        processed_usage.append(
+            {
+                "api_key_prefix": api_key_prefix,
+                "model": row.get("model"),
+                "total_prompt_tokens": int(row.get("total_prompt_tokens") or 0),
+                "total_completion_tokens": int(row.get("total_completion_tokens") or 0),
+                "total_tokens": int(row.get("total_tokens") or 0),
+                "request_count": int(row.get("request_count") or 0),
+            }
+        )
+    return processed_usage
 
 
 # ============== 统计写入 ==============
@@ -254,9 +436,39 @@ async def update_stats(current_info: dict, app=None, get_model_prices_func=None)
     # 使用重试机制写入数据库
     for attempt in range(SQLITE_MAX_RETRIES):
         try:
+            if (DB_TYPE or "sqlite").lower() == "d1":
+                from db import d1_client
+                if d1_client is None:
+                    return
+                async with db_semaphore:
+                    columns = [column.key for column in RequestStat.__table__.columns]
+                    filtered_info = {k: v for k, v in current_info.items() if k in columns}
+                    for key, value in list(filtered_info.items()):
+                        if isinstance(value, str):
+                            filtered_info[key] = value.replace('\x00', '')
+                        elif isinstance(value, bool):
+                            filtered_info[key] = 1 if value else 0
+                        elif isinstance(value, datetime):
+                            filtered_info[key] = format_d1_datetime(value)
+
+                    insert_cols = [k for k in filtered_info.keys() if k != "id"]
+                    placeholders = ", ".join(["?" for _ in insert_cols])
+                    sql = (
+                        f"INSERT INTO request_stats ({', '.join(insert_cols)}) "
+                        f"VALUES ({placeholders})"
+                    )
+                    params = [filtered_info[k] for k in insert_cols]
+                    await d1_client.execute(sql, params)
+
+                check_key = current_info.get("api_key")
+                if app and check_key and hasattr(app.state, 'paid_api_keys_states'):
+                    if check_key in app.state.paid_api_keys_states and current_info.get("total_tokens", 0) > 0:
+                        await update_paid_api_keys_states(app, check_key)
+                return
+
             # 等待获取数据库访问权限
             async with db_semaphore:
-                async with async_session() as session:
+                async with async_session_scope() as session:
                     async with session.begin():
                         columns = [column.key for column in RequestStat.__table__.columns]
                         filtered_info = {k: v for k, v in current_info.items() if k in columns}
@@ -303,8 +515,29 @@ async def update_channel_stats(request_id, provider, model, api_key, success, pr
     # 使用重试机制写入数据库
     for attempt in range(SQLITE_MAX_RETRIES):
         try:
+            if (DB_TYPE or "sqlite").lower() == "d1":
+                from db import d1_client
+                if d1_client is None:
+                    return
+                async with db_semaphore:
+                    sql = (
+                        "INSERT INTO channel_stats "
+                        "(request_id, provider, model, api_key, provider_api_key, success, timestamp) "
+                        "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)"
+                    )
+                    params = [
+                        request_id,
+                        provider,
+                        model,
+                        api_key,
+                        provider_api_key,
+                        1 if success else 0,
+                    ]
+                    await d1_client.execute(sql, params)
+                return
+
             async with db_semaphore:
-                async with async_session() as session:
+                async with async_session_scope() as session:
                     async with session.begin():
                         channel_stat = ChannelStat(
                             request_id=request_id,
@@ -404,14 +637,22 @@ async def get_usage_data(filter_api_key: Optional[str] = None, filter_model: Opt
     Returns:
         包含令牌使用统计数据的列表
     """
-    async with async_session() as session:
-        usage_data = await query_token_usage(
-            session=session,
+    if (DB_TYPE or "sqlite").lower() == "d1":
+        usage_data = await _query_token_usage_d1(
             filter_api_key=filter_api_key,
             filter_model=filter_model,
             start_dt=start_dt_obj,
-            end_dt=end_dt_obj
+            end_dt=end_dt_obj,
         )
+    else:
+        async with async_session_scope() as session:
+            usage_data = await query_token_usage(
+                session=session,
+                filter_api_key=filter_api_key,
+                filter_model=filter_model,
+                start_dt=start_dt_obj,
+                end_dt=end_dt_obj
+            )
     return usage_data
 
 
