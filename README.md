@@ -60,6 +60,12 @@ Render / Aiven / Railway 等平台通常会提供 `DATABASE_URL`。
 - `D1_ACCOUNT_ID`（或 `CF_ACCOUNT_ID`）
 - `D1_DATABASE_ID`
 - `D1_API_TOKEN`（或 `CF_API_TOKEN`，需具备 D1 Query 权限）
+- `CONFIG_STORAGE=db`（**建议必须添加**，让 DB 成为配置权威）
+- `SYNC_CONFIG_TO_FILE=false`（建议添加，避免只依赖容器内 `api.yaml`）
+
+> ⚠️ 重要：如果你使用 D1 但没设置 `CONFIG_STORAGE=db`，默认是 `CONFIG_STORAGE=file`，
+> 管理后台保存的配置会写入 `api.yaml`。在容器文件系统临时/不可持久化时，重启后会“像被重置”，
+> 实际是配置没有持久化到数据库。
 
 ### 2）启动服务
 
@@ -69,7 +75,7 @@ Render / Aiven / Railway 等平台通常会提供 `DATABASE_URL`。
 docker run --rm -p 8000:8000 \
   -e PORT=8000 \
   -e DATABASE_URL="postgresql://user:pass@host:5432/db?sslmode=require" \
-  ghcr.io/qianzhuowo/zoaholic:latest
+  ghcr.io/hcptanghy/zoaholic:latest
 ```
 
 ### 3）首次初始化
@@ -118,6 +124,8 @@ docker run --rm -p 8000:8000 \
 | `D1_API_TOKEN` / `CF_API_TOKEN` | - | Cloudflare API Token（需 D1 Query 权限）。 |
 | `D1_API_BASE_URL` | `https://api.cloudflare.com/client/v4` | D1 API 基础地址（一般无需改）。 |
 | `D1_TIMEOUT_SECONDS` | `30` | D1 HTTP 请求超时秒数。 |
+| `CONFIG_STORAGE` | `file` | **D1 场景建议设为 `db`**，否则默认 `file` 会把配置写到 `api.yaml`，容器重启可能丢配置。 |
+| `SYNC_CONFIG_TO_FILE` | `false` | 建议保持 `false`。该变量仅控制是否回写 `api.yaml`，不替代 DB 持久化。 |
 
 ### 可选（高级用法 / 非必须）
 

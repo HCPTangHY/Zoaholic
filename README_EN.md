@@ -71,6 +71,12 @@ If you deploy on Cloudflare Workers, you can also use D1 directly:
 - `D1_ACCOUNT_ID` (or `CF_ACCOUNT_ID`)
 - `D1_DATABASE_ID`
 - `D1_API_TOKEN` (or `CF_API_TOKEN`, with D1 Query permission)
+- `CONFIG_STORAGE=db` (**recommended / required in most container deployments**, so DB is the source of truth)
+- `SYNC_CONFIG_TO_FILE=false` (recommended, to avoid relying on in-container `api.yaml`)
+
+> ⚠️ Important: if you use D1 but do not set `CONFIG_STORAGE=db`, the default is `CONFIG_STORAGE=file`.
+> In that case, config changes from the admin console are written to `api.yaml`. On ephemeral container filesystems,
+> your config may appear "reset" after restart because it was not persisted to the database.
 
 ### 2) Start the service
 
@@ -80,7 +86,7 @@ Example with GHCR image (replace with your own image if you build it yourself):
 docker run --rm -p 8000:8000 \
   -e PORT=8000 \
   -e DATABASE_URL="postgresql://user:pass@host:5432/db?sslmode=require" \
-  ghcr.io/qianzhuowo/zoaholic:latest
+  ghcr.io/hcptanghy/zoaholic:latest
 ```
 
 ### 3) First-time initialization
@@ -99,7 +105,7 @@ Then configure in the console:
 
 Note:
 
-- Gateway APIs under `/v1/*` areOpenAI-compatible APIs and still use **API Key** authentication.
+- Gateway APIs under `/v1/*` are OpenAI-compatible APIs and still use **API Key** authentication.
 - Admin console uses **username/password + JWT**.
 
 ---
@@ -135,6 +141,8 @@ Render usually injects `PORT` automatically; Zoaholic will read `PORT` as the li
 | `D1_API_TOKEN` / `CF_API_TOKEN` | - | Cloudflare API Token with D1 Query permission. |
 | `D1_API_BASE_URL` | `https://api.cloudflare.com/client/v4` | D1 API base URL (usually unchanged). |
 | `D1_TIMEOUT_SECONDS` | `30` | D1 HTTP request timeout in seconds. |
+| `CONFIG_STORAGE` | `file` | **For D1, strongly recommend `db`**. Otherwise default `file` writes config to `api.yaml`, which can be lost on container restart. |
+| `SYNC_CONFIG_TO_FILE` | `false` | Recommended to keep `false`. This only controls writing to `api.yaml`; it does not replace DB persistence. |
 
 ### Optional (advanced)
 
