@@ -240,7 +240,9 @@ async def process_request(
                 wrapped_generator, first_response_time = await error_handling_wrapper(
                     generator, channel_id, engine, request.stream,
                     app.state.error_triggers, keepalive_interval=keepalive_interval,
-                    last_message_role=last_message_role
+                    last_message_role=last_message_role,
+                    request_url=url,
+                    app=app,
                 )
                 response = LoggingStreamingResponse(
                     wrapped_generator,
@@ -254,7 +256,9 @@ async def process_request(
                 wrapped_generator, first_response_time = await error_handling_wrapper(
                     generator, channel_id, engine, request.stream,
                     app.state.error_triggers, keepalive_interval=keepalive_interval,
-                    last_message_role=last_message_role
+                    last_message_role=last_message_role,
+                    request_url=url,
+                    app=app,
                 )
 
                 # 处理音频和其他二进制响应
@@ -778,26 +782,58 @@ class ModelRequestHandler:
         max_retry_limit = safe_get(config, 'preferences', 'max_retry_count', default=10)
         if max_retry_limit < 1:
             max_retry_limit = 1
-        
-        if num_matching_providers == 1:
-            count = provider_api_circular_list[matching_providers[0]['provider']].get_items_count()
-            if count > 1:
-                retry_count = count
-            else:
-                retry_count = 1
-        else:
-            tmp_retry_count = sum(
-                provider_api_circular_list[provider['provider']].get_items_count()
-                for provider in matching_providers
-            ) * 2
-            retry_count = min(tmp_retry_count, max_retry_limit)
+
+        # 计算最大尝试次数（包含首轮 + 自动重试）。
+        # 修复：
+        # - 单 provider 分支此前未受 max_retry_limit 约束，且使用 get_items_count 会把禁用 key 也算进去，
+        #   容易在“只有 1 个可用 key，但配置里堆了大量禁用 key”时触发 1000+ 次重试。
+        # - 统一按“启用的 key 数量”计算，并在所有分支上应用 max_retry_limit。
+        def _provider_key_slots(p: Dict[str, Any]) -> int:
+            """返回该 provider 可用于重试的 key 数量（至少为 1）。
+
+            注意：没有配置 api（例如无需 key 的渠道）也按 1 计。
+            """
+            try:
+                enabled = provider_api_circular_list[p["provider"]].get_enabled_items_count()
+            except Exception:
+                enabled = 0
+            try:
+                enabled_int = int(enabled)
+            except (TypeError, ValueError):
+                enabled_int = 0
+            return max(1, enabled_int)
+
+        def _calc_retry_count(providers: List[Dict[str, Any]]) -> int:
+            """计算“额外重试次数”。
+
+            设计目标：
+            - 保持原有语义：总尝试次数 ≈ num_matching_providers + retry_count
+            - retry_count 受 max_retry_limit 约束
+            - 仅按“启用的 key 数量”估算，避免禁用 key 造成 retry_count 虚高
+            """
+            n = len(providers)
+            if n <= 0:
+                return 0
+
+            if n == 1:
+                slots = _provider_key_slots(providers[0])
+                # 单 provider：至少允许 1 次重试；若有多 key，可覆盖更多 key
+                base = slots if slots > 1 else 1
+                return min(base, max_retry_limit)
+
+            total_slots = sum(_provider_key_slots(p) for p in providers)
+            tmp_retry_count = total_slots * 2
+            return min(tmp_retry_count, max_retry_limit)
+
+        retry_count = _calc_retry_count(matching_providers)
+        max_attempts = num_matching_providers + retry_count
 
         # 初始化重试路径记录
         retry_path: List[Dict[str, Any]] = []
         current_retry_count = 0
 
         while True:
-            if index > num_matching_providers + retry_count:
+            if index >= max_attempts:
                 break
             current_index = (start_index + index) % num_matching_providers
             index += 1
@@ -982,11 +1018,18 @@ class ModelRequestHandler:
                     )
                     last_num_matching_providers = num_matching_providers
                     num_matching_providers = len(matching_providers)
+                    # provider 列表发生变化（或重新排序）时，重算最大尝试次数
+                    retry_count = _calc_retry_count(matching_providers)
+                    max_attempts = num_matching_providers + retry_count
                     if num_matching_providers != last_num_matching_providers:
                         index = 0
 
                 cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
-                api_key_count = provider_api_circular_list[channel_id].get_items_count()
+                # 仅统计“启用”的 key 数量，避免禁用 key 造成误判
+                try:
+                    api_key_count = provider_api_circular_list[channel_id].get_enabled_items_count()
+                except Exception:
+                    api_key_count = provider_api_circular_list[channel_id].get_items_count()
                 current_api = await provider_api_circular_list[channel_id].after_next_current()
 
                 if (cooling_time > 0 and api_key_count > 1
@@ -1036,27 +1079,45 @@ class ModelRequestHandler:
                 if retry_path:
                     retry_path[-1]["status_code"] = status_code
 
-                if auto_retry and (status_code not in [400, 413]
-                    or urlparse(provider.get('base_url', '')).netloc == 'models.inference.ai.azure.com'):
-                    continue
-                else:
-                    # 失败时也记录重试信息和统计
-                    current_info = self.request_info_getter()
-                    if retry_path:
-                        current_info["retry_path"] = json.dumps(retry_path, ensure_ascii=False)
-                    current_info["retry_count"] = current_retry_count
-                    current_info["success"] = False
-                    current_info["status_code"] = status_code
-                    # 记录处理时间
-                    if "start_time" in current_info:
-                        process_time = time() - current_info["start_time"]
-                        current_info["process_time"] = process_time
-                    # 写入失败统计
-                    background_tasks.add_task(update_stats, current_info, app=self.app)
-                    return openai_error_response(
-                        f"Error: Current provider response failed: {error_message}",
-                        status_code,
+                retry_enabled = (
+                    auto_retry
+                    and (
+                        status_code not in [400, 413]
+                        or urlparse(provider.get('base_url', '')).netloc == 'models.inference.ai.azure.com'
                     )
+                )
+
+                # 若还有剩余尝试次数，则进行自动重试（并对 429/5xx 做简单退避，避免瞬时打爆上游/卡死进程）
+                if retry_enabled and index < max_attempts:
+                    if status_code in {429, 500, 502, 503, 504}:
+                        base_delay = 0.5 if status_code == 429 else 0.2
+                        # current_retry_count 从 1 开始；最多指数到 2^5，再封顶 5 秒
+                        delay = min(5.0, base_delay * (2 ** min(max(current_retry_count - 1, 0), 5)))
+                        await asyncio.sleep(delay)
+                    continue
+
+                # retry_enabled 但已无重试额度：跳出循环，走统一的“所有重试失败”出口
+                if retry_enabled and index >= max_attempts:
+                    break
+
+                # 不重试：直接返回本次错误
+                # 失败时也记录重试信息和统计
+                current_info = self.request_info_getter()
+                if retry_path:
+                    current_info["retry_path"] = json.dumps(retry_path, ensure_ascii=False)
+                current_info["retry_count"] = current_retry_count
+                current_info["success"] = False
+                current_info["status_code"] = status_code
+                # 记录处理时间
+                if "start_time" in current_info:
+                    process_time = time() - current_info["start_time"]
+                    current_info["process_time"] = process_time
+                # 写入失败统计
+                background_tasks.add_task(update_stats, current_info, app=self.app)
+                return openai_error_response(
+                    f"Error: Current provider response failed: {error_message}",
+                    status_code,
+                )
 
         # 所有重试都失败
         current_info = self.request_info_getter()
