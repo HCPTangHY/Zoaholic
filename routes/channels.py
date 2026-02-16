@@ -4,11 +4,12 @@ Channels 管理路由
 
 import os
 import json
+import copy
 
 from core.env import env_bool
 import httpx
 from time import time
-from typing import Optional
+from typing import Optional, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Body
 from fastapi.responses import JSONResponse
@@ -150,90 +151,167 @@ async def fetch_channel_models(
 @router.post("/v1/channels/test", dependencies=[Depends(rate_limit_dependency)])
 async def test_channel(
     token: str = Depends(verify_admin_api_key),
-    test_config: dict = Body(..., description="Test configuration including provider config and model to test")
+    test_config: dict = Body(..., description="Test configuration including provider snapshot and model to test")
 ):
     """
-    测试特定渠道的连接。直接向指定渠道发送测试请求，不经过路由逻辑。
+    测试特定渠道的连接。
+
+    目标：尽量复用正式请求链路，避免测试链路与生产链路行为不一致。
+    - 支持传入 provider_snapshot（完整渠道配置）
+    - 保持对旧字段（engine/base_url/api_key/model）的兼容
+    - 支持 preferences.headers / post_body_parameter_overrides / enabled_plugins
     
     请求体示例:
     {
-        "engine": "openai",  // 渠道类型 ID
+        "provider_snapshot": { ...完整渠道配置... },
+        "model": "gpt-4o-mini",  // 建议传模型别名
+        "upstream_model": "gpt-4o-mini",  // 可选，别名缺失时回退
+        "timeout": 30,
+
+        // 兼容旧用法（可选）
+        "engine": "openai",
         "base_url": "https://api.openai.com/v1",
-        "api_key": "sk-xxx",
-        "model": "gpt-4o-mini",  // 要测试的模型
-        "timeout": 30  // 可选，超时时间（秒）
-    }
-    
-    返回:
-    {
-        "success": true,
-        "latency_ms": 1234,
-        "message": "测试成功"
-    }
-    或
-    {
-        "success": false,
-        "latency_ms": null,
-        "message": "错误信息",
-        "error": "详细错误"
+        "api_key": "sk-xxx"
     }
     """
     from core.request import get_payload
     from core.models import RequestModel
-    from core.utils import get_engine as detect_engine
+    from core.utils import get_model_dict
+
+    def _normalize_key_item(item: Any) -> Optional[str]:
+        if isinstance(item, str):
+            key = item.strip()
+            return key or None
+        if isinstance(item, dict):
+            key = item.get("key")
+            if isinstance(key, str) and key.strip():
+                key = key.strip()
+                if item.get("disabled") and not key.startswith("!"):
+                    key = f"!{key}"
+                return key
+        return None
+
+    def _collect_key_candidates(raw_keys: Any) -> list[str]:
+        if raw_keys is None:
+            return []
+        items = raw_keys if isinstance(raw_keys, list) else [raw_keys]
+        results: list[str] = []
+        for item in items:
+            normalized = _normalize_key_item(item)
+            if normalized:
+                results.append(normalized)
+        return results
     
     app = get_app()
-    
-    engine = test_config.get("engine") or test_config.get("type") or "openai"
-    base_url = test_config.get("base_url", "")
-    api_key = test_config.get("api_key") or test_config.get("api") or ""
-    model = test_config.get("model", "")
-    timeout = test_config.get("timeout", 30)
-    
+
+    provider_snapshot = test_config.get("provider_snapshot")
+    provider = copy.deepcopy(provider_snapshot) if isinstance(provider_snapshot, dict) else {}
+    if not isinstance(provider, dict):
+        provider = {}
+
+    engine = (
+        test_config.get("engine")
+        or provider.get("engine")
+        or test_config.get("type")
+        or "openai"
+    )
+    engine = str(engine).strip() if engine is not None else "openai"
+
+    model = (
+        test_config.get("model")
+        or test_config.get("model_alias")
+        or test_config.get("upstream_model")
+        or ""
+    )
+    model = str(model).strip()
+
+    upstream_model_hint = test_config.get("upstream_model")
+    upstream_model_hint = str(upstream_model_hint).strip() if upstream_model_hint else None
+
     if not model:
         raise HTTPException(status_code=400, detail="model 是必填项")
-    
+
+    timeout = test_config.get("timeout", 30)
+    try:
+        timeout = max(1, int(timeout))
+    except Exception:
+        timeout = 30
+
+    channel = get_channel(engine)
+    if not channel:
+        raise HTTPException(status_code=404, detail=f"Channel type '{engine}' not found")
+
+    provider["provider"] = provider.get("provider") or f"test_{engine or 'channel'}"
+    provider["engine"] = engine
+
+    base_url = test_config.get("base_url") or provider.get("base_url", "")
+    base_url = str(base_url).strip() if base_url else ""
+
     # 如果 base_url 为空，使用渠道默认值
     if not base_url:
-        channel = get_channel(engine)
-        if channel and channel.default_base_url:
+        if channel.default_base_url:
             base_url = channel.default_base_url
             logger.info(f"Using default base_url for channel '{engine}': {base_url}")
         else:
             raise HTTPException(status_code=400, detail="base_url 是必填项（该渠道类型没有默认地址）")
-    
+
     # 验证 base_url 格式
     if not base_url.startswith(("http://", "https://")):
         # 自动添加 https:// 前缀
         base_url = f"https://{base_url}"
         logger.info(f"Auto-prefixed base_url: {base_url}")
-    
-    # 构建 provider 配置
-    provider = {
-        "provider": f"test_{engine or 'channel'}",
-        "base_url": base_url.rstrip('/'),
-        "api": api_key,
-        "model": [{model: model}],
-        "tools": True,
-        "_model_dict_cache": {model: model},
-        "engine": engine if engine else None,
-        # Vertex AI 特定配置
-        "project_id": test_config.get("project_id", ""),
-        "client_email": test_config.get("client_email", ""),
-        "private_key": test_config.get("private_key", ""),
-        # AWS 特定配置
-        "aws_access_key": test_config.get("aws_access_key", ""),
-        "aws_secret_key": test_config.get("aws_secret_key", ""),
-        # Cloudflare 特定配置
-        "cf_account_id": test_config.get("cf_account_id", ""),
-    }
-    
-    # 如果没有指定 engine，自动检测
-    if not engine:
-        detected_engine, _ = detect_engine(provider, endpoint=None, original_model=model)
-        engine = detected_engine
-        provider["engine"] = engine
-    
+    provider["base_url"] = base_url.rstrip('/')
+
+    # 解析测试使用 API Key：显式传参 > provider.api / provider.api_keys
+    explicit_api_key = test_config.get("api_key") or test_config.get("api")
+    selected_api_key = None
+    if isinstance(explicit_api_key, str) and explicit_api_key.strip():
+        selected_api_key = explicit_api_key.strip()
+        if selected_api_key.startswith("!"):
+            selected_api_key = selected_api_key[1:]
+    else:
+        candidates = _collect_key_candidates(provider.get("api"))
+        candidates.extend(_collect_key_candidates(provider.get("api_keys")))
+
+        for key in candidates:
+            if not key.startswith("!"):
+                selected_api_key = key
+                break
+
+        if not selected_api_key and candidates:
+            selected_api_key = candidates[0][1:] if candidates[0].startswith("!") else candidates[0]
+
+    if selected_api_key:
+        provider["api"] = selected_api_key
+
+    # 确保模型映射存在，兼容别名测试
+    provider_models = provider.get("model")
+    if not isinstance(provider_models, list):
+        fallback_models = provider.get("models")
+        provider_models = copy.deepcopy(fallback_models) if isinstance(fallback_models, list) else []
+
+    if not provider_models:
+        if upstream_model_hint and upstream_model_hint != model:
+            provider_models = [{upstream_model_hint: model}]
+        else:
+            provider_models = [model]
+
+    provider["model"] = provider_models
+    provider.pop("models", None)
+
+    model_dict = get_model_dict(provider)
+    if model not in model_dict:
+        if upstream_model_hint and upstream_model_hint != model:
+            provider["model"].append({upstream_model_hint: model})
+        else:
+            provider["model"].append(model)
+        model_dict = get_model_dict(provider)
+
+    provider["_model_dict_cache"] = model_dict
+
+    if model not in model_dict:
+        raise HTTPException(status_code=400, detail=f"model '{model}' 不在当前渠道模型配置中")
+
     # 构建测试请求
     test_request = RequestModel(
         model=model,
@@ -241,21 +319,30 @@ async def test_channel(
         max_tokens=1000,
         stream=False,
     )
-    
-    # 获取代理配置
-    proxy = test_config.get("proxy") or safe_get(app.state.config, "preferences", "proxy")
-    
+
+    # 获取代理配置（优先级：test_config > provider > global）
+    proxy = test_config.get("proxy")
+    if not proxy:
+        proxy = safe_get(app.state.config, "preferences", "proxy")
+        proxy = safe_get(provider, "preferences", "proxy", default=proxy)
+
     start_time = time()
     
     try:
-        # 使用 get_payload 构建请求
-        url, headers, payload = await get_payload(test_request, engine, provider, api_key)
+        # 使用正式链路的 payload 构建逻辑（包含参数覆写、请求插件）
+        url, headers, payload = await get_payload(test_request, engine, provider, selected_api_key)
+
+        # 对齐正式链路：追加渠道自定义 headers
+        custom_headers = safe_get(provider, "preferences", "headers", default={})
+        if isinstance(custom_headers, dict):
+            headers.update({str(k): str(v) for k, v in custom_headers.items() if v is not None})
 
         # 打印调试信息
         try:
             pretty_payload = json.dumps(payload, ensure_ascii=False)
         except Exception:
             pretty_payload = str(payload)
+
         print("[CHANNEL_TEST] engine:", engine)
         print("[CHANNEL_TEST] url:", url)
         print("[CHANNEL_TEST] payload:", pretty_payload)
@@ -264,7 +351,7 @@ async def test_channel(
             logger.info(f"Channel test - Engine: {engine}")
             logger.info(f"Channel test - URL: {url}")
             logger.info(f"Channel test - Headers: {headers}")
-            logger.info(f"Channel test - Payload: {pretty_payload}")
+            logger.info(f"Channel test - Payload (truncated): {pretty_payload[:2000]}")
         
         async with app.state.client_manager.get_client(url, proxy) as client:
             response = await client.post(

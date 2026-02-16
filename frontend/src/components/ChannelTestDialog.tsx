@@ -70,17 +70,45 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
     }
   }, [open]);
 
-  const getApiKey = () => {
+  const getFirstActiveApiKey = () => {
     if (provider.api) {
-      const key = Array.isArray(provider.api) ? provider.api[0] : provider.api;
-      // 处理 ! 前缀
-      return typeof key === 'string' && key.startsWith('!') ? key.substring(1) : key;
+      const keys = Array.isArray(provider.api) ? provider.api : [provider.api];
+      const firstActive = keys.find((k: unknown) => {
+        if (typeof k !== 'string') return false;
+        const trimmed = k.trim();
+        return Boolean(trimmed) && !trimmed.startsWith('!');
+      });
+      if (typeof firstActive === 'string') return firstActive;
+
+      const firstAny = keys.find((k: unknown) => typeof k === 'string' && k.trim());
+      if (typeof firstAny === 'string') {
+        return firstAny.startsWith('!') ? firstAny.substring(1) : firstAny;
+      }
     }
+
     if (provider.api_keys && provider.api_keys.length > 0) {
-      const key = provider.api_keys[0];
-      return typeof key === 'string' && key.startsWith('!') ? key.substring(1) : key;
+      const firstActive = provider.api_keys.find((k: unknown) => {
+        if (typeof k !== 'string') return false;
+        const trimmed = k.trim();
+        return Boolean(trimmed) && !trimmed.startsWith('!');
+      });
+      if (typeof firstActive === 'string') return firstActive;
+
+      const firstAny = provider.api_keys.find((k: unknown) => typeof k === 'string' && k.trim());
+      if (typeof firstAny === 'string') {
+        return firstAny.startsWith('!') ? firstAny.substring(1) : firstAny;
+      }
     }
+
     return '';
+  };
+
+  const buildProviderSnapshot = () => {
+    try {
+      return JSON.parse(JSON.stringify(provider));
+    } catch {
+      return provider;
+    }
   };
 
   const testSingleModel = async (modelInfo: ModelInfo) => {
@@ -101,9 +129,14 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
         },
         body: JSON.stringify({
           engine: provider.engine || 'openai',
+          provider_snapshot: buildProviderSnapshot(),
+          // 这里传别名模型，确保与正式路由保持一致（映射、覆写按别名匹配）
+          model: display,
+          upstream_model: upstream,
+
+          // 保留旧字段，兼容后端 fallback 逻辑
           base_url: provider.base_url,
-          api_key: getApiKey(),
-          model: upstream,
+          api_key: getFirstActiveApiKey(),
           timeout: 30,
         }),
         signal: abortControllerRef.current?.signal,
@@ -191,7 +224,7 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
 
   const getStatusIcon = (status: TestResult['status']) => {
     switch (status) {
-      case 'pending': return <Clock className="w-5 h-5 text-zinc-500" />;
+      case 'pending': return <Clock className="w-5 h-5 text-muted-foreground" />;
       case 'testing': return <Loader2 className="w-5 h-5 text-blue-500 animate-spin" />;
       case 'success': return <CheckCircle2 className="w-5 h-5 text-emerald-500" />;
       case 'error': return <XCircle className="w-5 h-5 text-red-500" />;
@@ -200,11 +233,11 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
 
   const getStatusText = (result: TestResult) => {
     switch (result.status) {
-      case 'pending': return <span className="text-zinc-500">等待测试</span>;
-      case 'testing': return <span className="text-blue-400">正在测试...</span>;
+      case 'pending': return <span className="text-muted-foreground">等待测试</span>;
+      case 'testing': return <span className="text-blue-600 dark:text-blue-400">正在测试...</span>;
       case 'success':
         return (
-          <span className="text-emerald-400">
+          <span className="text-emerald-600 dark:text-emerald-400">
             {result.latency !== null && <span className="font-mono">{result.latency}ms</span>}
             <span className="mx-1">·</span>
             测试通过
@@ -213,7 +246,7 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
       case 'error':
         const errorText = result.error || '测试失败';
         const truncated = errorText.length > 40 ? errorText.substring(0, 40) + '...' : errorText;
-        return <span className="text-red-400" title={errorText}>{truncated}</span>;
+        return <span className="text-red-600 dark:text-red-400" title={errorText}>{truncated}</span>;
     }
   };
 
@@ -223,55 +256,55 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40 animate-in fade-in duration-200" />
-        <Dialog.Content className="fixed right-0 top-0 h-full w-[600px] max-w-full bg-zinc-950 border-l border-zinc-800 shadow-2xl z-50 flex flex-col animate-in slide-in-from-right duration-300">
+        <Dialog.Content className="fixed right-0 top-0 h-full w-[600px] max-w-full bg-background border-l border-border shadow-2xl z-50 flex flex-col animate-in slide-in-from-right duration-300">
           {/* Header */}
-          <div className="p-5 border-b border-zinc-800 flex justify-between items-center bg-zinc-900/50 flex-shrink-0">
-            <Dialog.Title className="text-lg font-bold text-zinc-100">
+          <div className="p-5 border-b border-border flex justify-between items-center bg-muted/30 flex-shrink-0">
+            <Dialog.Title className="text-lg font-bold text-foreground">
               测试渠道: {provider.provider}
             </Dialog.Title>
-            <Dialog.Close className="text-zinc-400 hover:text-zinc-100">
+            <Dialog.Close className="text-muted-foreground hover:text-foreground">
               <X className="w-5 h-5" />
             </Dialog.Close>
           </div>
 
           {/* Controls */}
-          <div className="p-4 border-b border-zinc-800 flex flex-wrap items-center gap-3">
+          <div className="p-4 border-b border-border flex flex-wrap items-center gap-3">
             {!isRunning ? (
               <button
                 onClick={startAllTests}
-                className="bg-primary hover:bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 text-sm font-medium transition-colors"
+                className="bg-primary hover:bg-primary/90 text-primary-foreground px-4 py-2 rounded-lg flex items-center gap-2 text-sm font-medium transition-colors"
               >
                 <Play className="w-4 h-4" /> 全部测试
               </button>
             ) : (
               <button
                 onClick={stopTest}
-                className="bg-red-500/20 border border-red-500/50 text-red-400 hover:bg-red-500/30 px-4 py-2 rounded-lg flex items-center gap-2 text-sm font-medium transition-colors"
+                className="bg-red-500/10 border border-red-500/40 text-red-600 dark:text-red-400 hover:bg-red-500/20 px-4 py-2 rounded-lg flex items-center gap-2 text-sm font-medium transition-colors"
               >
                 <Square className="w-4 h-4" /> 停止
               </button>
             )}
 
             <div className="flex items-center gap-2 text-sm">
-              <span className="text-zinc-400">并发:</span>
+              <span className="text-muted-foreground">并发:</span>
               <input
                 type="number"
                 min="1"
                 max="10"
                 value={concurrency}
                 onChange={e => setConcurrency(Math.max(1, Math.min(10, parseInt(e.target.value) || 1)))}
-                className="w-14 bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-center text-sm"
+                className="w-14 bg-background border border-border rounded px-2 py-1 text-center text-sm text-foreground focus:border-primary outline-none"
               />
             </div>
 
             <div className="flex-1 relative min-w-[120px]">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
               <input
                 type="text"
                 placeholder="搜索模型..."
                 value={searchKeyword}
                 onChange={e => setSearchKeyword(e.target.value)}
-                className="w-full bg-zinc-800 border border-zinc-700 rounded-full pl-9 pr-4 py-1.5 text-sm focus:border-primary outline-none"
+                className="w-full bg-muted border border-border rounded-full pl-9 pr-4 py-1.5 text-sm text-foreground focus:border-primary outline-none"
               />
             </div>
           </div>
@@ -279,12 +312,12 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
           {/* Model List */}
           <div className="flex-1 overflow-y-auto">
             {filteredModels.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-16 text-zinc-500">
+              <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
                 <Search className="w-10 h-10 mb-3 opacity-50" />
                 <span>没有匹配的模型</span>
               </div>
             ) : (
-              <ul className="divide-y divide-zinc-800">
+              <ul className="divide-y divide-border">
                 {filteredModels.map(modelInfo => {
                   const result = results.get(modelInfo.display) || { status: 'pending', latency: null, error: null };
                   const displayText = modelInfo.display !== modelInfo.upstream
@@ -294,7 +327,7 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
                   return (
                     <li
                       key={modelInfo.display}
-                      className="flex items-center h-14 px-4 hover:bg-zinc-800/50 transition-colors cursor-pointer group"
+                      className="flex items-center h-14 px-4 hover:bg-muted/50 transition-colors cursor-pointer group"
                       onClick={() => copyModelName(modelInfo.display)}
                       title="点击复制模型名"
                     >
@@ -305,12 +338,12 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
 
                       {/* Content */}
                       <div className="flex-1 min-w-0 ml-2">
-                        <div className="font-mono text-sm text-zinc-100 truncate flex items-center gap-2">
+                        <div className="font-mono text-sm text-foreground truncate flex items-center gap-2">
                           {displayText}
                           {copiedModel === modelInfo.display ? (
                             <CopyCheck className="w-3.5 h-3.5 text-emerald-500" />
                           ) : (
-                            <Copy className="w-3.5 h-3.5 text-zinc-600 opacity-0 group-hover:opacity-100 transition-opacity" />
+                            <Copy className="w-3.5 h-3.5 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
                           )}
                         </div>
                         <div className="text-xs truncate">
@@ -335,8 +368,8 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
           </div>
 
           {/* Footer */}
-          <div className="p-4 border-t border-zinc-800 bg-zinc-900/50 flex-shrink-0">
-            <div className="text-xs text-zinc-500 text-center">
+          <div className="p-4 border-t border-border bg-muted/30 flex-shrink-0">
+            <div className="text-xs text-muted-foreground text-center">
               共 {models.length} 个模型 ·
               {Array.from(results.values()).filter(r => r.status === 'success').length} 成功 ·
               {Array.from(results.values()).filter(r => r.status === 'error').length} 失败
