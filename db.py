@@ -1,6 +1,7 @@
 import os
 import ssl as ssl_module
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+import ipaddress
 from typing import Optional
 
 from sqlalchemy import event, text
@@ -118,18 +119,18 @@ def _normalize_database_url(url: str, db_type: str) -> str:
         return url
 
     if db_type == "mysql":
-        # TiDB / MySQL：强制使用异步驱动（asyncmy/aiomysql），避免落到 MySQLdb(mysqlclient)
+        # TiDB / MySQL：统一使用 asyncmy 异步驱动，避免落到同步驱动（如 MySQLdb/mysqlclient）
         # 常见: mysql://user:pass@host:port/db
         if url.startswith("mysql://"):
             return "mysql+asyncmy://" + url[len("mysql://") :]
         if url.startswith("mariadb://"):
             return "mariadb+asyncmy://" + url[len("mariadb://") :]
 
-        # 若用户提供的是同步驱动（如 mysql+pymysql:// 或 mysql+mysqldb://），这里尽量切换到 asyncmy
-        if url.startswith("mysql+") and "+asyncmy" not in url and "+aiomysql" not in url:
-            # mysql+pymysql://... -> mysql+asyncmy://...
+        # 若用户显式写了其它驱动（如 mysql+pymysql://、mysql+mysqldb://、mysql+aiomysql://），
+        # 统一改写为 asyncmy，保证与本项目依赖一致。
+        if url.startswith("mysql+") and not url.startswith("mysql+asyncmy://"):
             return "mysql+asyncmy://" + url.split("://", 1)[1]
-        if url.startswith("mariadb+") and "+asyncmy" not in url and "+aiomysql" not in url:
+        if url.startswith("mariadb+") and not url.startswith("mariadb+asyncmy://"):
             return "mariadb+asyncmy://" + url.split("://", 1)[1]
         return url
 
@@ -210,17 +211,31 @@ def _extract_mysql_ssl_connect_args(db_url: str) -> tuple[str, dict]:
     # TiDB Cloud Serverless 强制 TLS：若连接串未显式指定任何 SSL 参数，但目标是 tidbcloud.com，
     # 则默认启用证书校验 + 主机名校验（等价于 VERIFY_IDENTITY）。
     # 这样可以避免在 Render 等平台上因为“insecure transport prohibited”导致启动失败。
+    #
+    # 注意：这里不再仅凭端口 4000 自动开启 TLS。很多自托管 TiDB/MySQL 也会使用 4000，
+    # 如果一刀切强制 TLS，反而会导致本地/内网部署无法连接。
     if "ssl" not in connect_args:
         hostname = (parts.hostname or "").lower()
-        port = parts.port
+        is_private_or_local = False
+        if hostname in {"localhost", "127.0.0.1", "::1"}:
+            is_private_or_local = True
+        else:
+            try:
+                ip = ipaddress.ip_address(hostname)
+                is_private_or_local = ip.is_private or ip.is_loopback or ip.is_link_local
+            except Exception:
+                # 非 IP（域名）时忽略
+                pass
 
-        # 经验规则：
-        # - TiDB Cloud 通常域名包含 tidbcloud.com
-        # - TiDB 默认端口常见为 4000
-        # 只要命中其一，就默认开启 TLS（VERIFY_IDENTITY 语义）
+        # 仅在明确是 TiDB Cloud 域名时启用自动 TLS。
+        # 若是自定义域名或自托管环境，请在 URL 中显式设置 ?ssl=true / ?ssl_mode=...
         if (
-            (hostname.endswith("tidbcloud.com") or hostname.endswith("tidbcloud.com.") or "tidbcloud.com" in hostname)
-            or port == 4000
+            not is_private_or_local
+            and (
+                hostname.endswith("tidbcloud.com")
+                or hostname.endswith("tidbcloud.com.")
+                or "tidbcloud.com" in hostname
+            )
         ):
             ctx = ssl_module.create_default_context(cafile=ssl_ca) if ssl_ca else ssl_module.create_default_context()
             ctx.check_hostname = True
