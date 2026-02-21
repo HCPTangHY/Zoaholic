@@ -298,7 +298,7 @@ export default function Plugins() {
                         className={`text-xs px-2 py-0.5 rounded font-medium ${
                           p.enabled
                             ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                            : 'bg-zinc-500/10 text-zinc-600 dark:text-zinc-400'
+                            : 'bg-muted text-muted-foreground'
                         }`}
                       >
                         {p.enabled ? '已启用' : '已禁用'}

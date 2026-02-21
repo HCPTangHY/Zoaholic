@@ -549,7 +549,9 @@ if not DISABLE_DATABASE:
                 timeout_seconds=D1_TIMEOUT_SECONDS,
             )
         else:
+
             raise ValueError(f"Unsupported DB_TYPE: {DB_TYPE}. Please use 'sqlite', 'postgres', 'mysql' or 'd1'.")
+
 
     if db_engine is not None:
         _legacy_async_session = sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)

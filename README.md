@@ -60,6 +60,7 @@ Render / Aiven / Railway 等平台通常会提供 `DATABASE_URL`。
 - `D1_ACCOUNT_ID`（或 `CF_ACCOUNT_ID`）
 - `D1_DATABASE_ID`
 - `D1_API_TOKEN`（或 `CF_API_TOKEN`，需具备 D1 Query 权限）
+
 - `CONFIG_STORAGE=db`（**建议必须添加**，让 DB 成为配置权威）
 - `SYNC_CONFIG_TO_FILE=false`（建议添加，避免只依赖容器内 `api.yaml`）
 
@@ -104,7 +105,6 @@ docker run --rm -p 8000:8000 \
 | 变量 | 示例 | 说明 |
 |---|---|---|
 | `DATABASE_URL` | `postgresql://...` / `postgres://...` / `mysql://...` / `mysql+asyncmy://...` | 数据库连接串（PostgreSQL 或 TiDB/MySQL；与 Cloudflare D1 二选一）。统计/日志 + 配置入库都依赖数据库。 |
-
 > TiDB Cloud（Serverless）通常**强制 TLS**。如果你的连接串未包含任何 SSL 参数，可在 URL 后追加 `?ssl=true` 或 `?ssl_mode=VERIFY_IDENTITY`。
 
 ### 建议配置
@@ -128,6 +128,7 @@ docker run --rm -p 8000:8000 \
 | `D1_TIMEOUT_SECONDS` | `30` | D1 HTTP 请求超时秒数。 |
 | `CONFIG_STORAGE` | `file` | **D1 场景建议设为 `db`**，否则默认 `file` 会把配置写到 `api.yaml`，容器重启可能丢配置。 |
 | `SYNC_CONFIG_TO_FILE` | `false` | 建议保持 `false`。该变量仅控制是否回写 `api.yaml`，不替代 DB 持久化。 |
+
 
 ### 可选（高级用法 / 非必须）
 

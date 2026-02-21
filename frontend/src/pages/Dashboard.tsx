@@ -8,7 +8,6 @@ import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
   PieChart, Pie, Legend
 } from 'recharts';
-import { useThemeStore } from '../store/themeStore';
 
 interface StatData {
   time_range: string;
@@ -25,7 +24,19 @@ const TIME_RANGES = [
   { label: '30 天', value: 720 }
 ];
 
-const CHART_COLORS = ['#3b82f6', '#8b5cf6', '#10b981', '#f59e0b', '#ef4444', '#06b6d4'];
+const CHART_COLORS = [
+  'hsl(var(--primary))',
+  'hsl(var(--ring))',
+  'hsl(160 84% 39%)',
+  'hsl(38 92% 50%)',
+  'hsl(var(--destructive))',
+  'hsl(var(--secondary-foreground))'
+];
+
+const AXIS_COLOR = 'hsl(var(--muted-foreground))';
+const SUCCESS_COLOR = 'hsl(160 84% 39%)';
+const WARNING_COLOR = 'hsl(38 92% 50%)';
+const ERROR_COLOR = 'hsl(var(--destructive))';
 
 export default function Dashboard() {
   const [stats, setStats] = useState<StatData | null>(null);
@@ -33,14 +44,10 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [timeRange, setTimeRange] = useState(24);
   const { token } = useAuthStore();
-  const { theme } = useThemeStore();
-
-  // 用于图表的暗色/亮色配置
-  const isDark = theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
   const tooltipStyle = {
-    backgroundColor: isDark ? '#18181b' : '#ffffff',
-    borderColor: isDark ? '#27272a' : '#e4e4e7',
-    color: isDark ? '#e4e4e7' : '#18181b',
+    backgroundColor: 'hsl(var(--popover))',
+    borderColor: 'hsl(var(--border))',
+    color: 'hsl(var(--popover-foreground))',
     borderRadius: '8px'
   };
 
@@ -174,16 +181,16 @@ export default function Dashboard() {
           <div className="h-64">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={formattedChannelStats} margin={{ top: 0, right: 0, left: 0, bottom: 0 }}>
-                <XAxis dataKey="name" stroke={isDark ? "#52525b" : "#a1a1aa"} fontSize={12} tickLine={false} axisLine={false} />
-                <YAxis stroke={isDark ? "#52525b" : "#a1a1aa"} fontSize={12} tickLine={false} axisLine={false} domain={[0, 100]} />
+                <XAxis dataKey="name" stroke={AXIS_COLOR} fontSize={12} tickLine={false} axisLine={false} />
+                <YAxis stroke={AXIS_COLOR} fontSize={12} tickLine={false} axisLine={false} domain={[0, 100]} />
                 <Tooltip
-                  cursor={{ fill: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.05)' }}
+                  cursor={{ fill: 'hsl(var(--muted) / 0.5)' }}
                   contentStyle={tooltipStyle}
                   itemStyle={{ color: tooltipStyle.color }}
                 />
                 <Bar dataKey="success_rate" name="成功率" radius={[4, 4, 0, 0]}>
                   {formattedChannelStats.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill={entry.success_rate >= 95 ? '#10b981' : entry.success_rate >= 80 ? '#f59e0b' : '#ef4444'} />
+                    <Cell key={`cell-${index}`} fill={entry.success_rate >= 95 ? SUCCESS_COLOR : entry.success_rate >= 80 ? WARNING_COLOR : ERROR_COLOR} />
                   ))}
                 </Bar>
               </BarChart>

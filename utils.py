@@ -1,3 +1,4 @@
+import os
 import json
 import httpx
 import asyncio
@@ -51,7 +52,11 @@ yaml = YAML()
 yaml.preserve_quotes = True
 yaml.indent(mapping=2, sequence=4, offset=2)
 
-API_YAML_PATH = "./api.yaml"
+# 配置文件路径：
+# - 默认使用项目根目录（utils.py 所在目录）下的 api.yaml，避免受启动 cwd 影响
+# - 可通过环境变量 API_YAML_PATH 显式覆盖
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+API_YAML_PATH = os.path.abspath(os.getenv("API_YAML_PATH") or os.path.join(_BASE_DIR, "api.yaml"))
 yaml_error_message = None
 
 
@@ -608,7 +613,22 @@ def identify_audio_format(file_bytes):
 async def wait_for_timeout(wait_for_thing, timeout = 3, wait_task=None):
     # 创建一个任务来获取第一个响应，但不直接中断生成器
     if wait_task is None:
-        first_response_task = asyncio.create_task(wait_for_thing.__anext__())
+        try:
+            first_response_task = asyncio.create_task(wait_for_thing.__anext__())
+        except RuntimeError as e:
+            # 保护：避免并发 anext 直接抛异常打断 keepalive 主循环
+            if "asynchronous generator is already running" in str(e):
+                return None, "reentrant"
+            raise
+        # 防止 "Task exception was never retrieved"：即使后续调用方中途退出，异常也会被消费
+        def _silence_task_exception(task: asyncio.Task):
+            try:
+                _ = task.exception()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        first_response_task.add_done_callback(_silence_task_exception)
     else:
         first_response_task = wait_task
 
@@ -625,7 +645,12 @@ async def wait_for_timeout(wait_for_thing, timeout = 3, wait_task=None):
     if first_response_task in done:
         # 取消超时任务
         timeout_task.cancel()
-        return first_response_task.result(), "success"
+        try:
+            return first_response_task.result(), "success"
+        except RuntimeError as e:
+            if "asynchronous generator is already running" in str(e):
+                return None, "reentrant"
+            raise
 
     # 超时返回
     else:
@@ -640,9 +665,27 @@ async def error_handling_wrapper(
     keepalive_interval=None,
     last_message_role=None,
     done_message: Optional[str] = None,
+    *,
+    request_url: Optional[str] = None,
+    app: Optional[object] = None,
 ):
 
+    def _log_stream_end(reason: str, *, level: str = "info", detail: Optional[str] = None):
+        msg = f"provider: {channel_id:<11} stream_end reason={reason}"
+        if detail:
+            msg += f" detail={detail}"
+        if level == "debug":
+            logger.debug(msg)
+        elif level == "warning":
+            logger.warning(msg)
+        elif level == "error":
+            logger.error(msg)
+        else:
+            logger.info(msg)
+
     async def new_generator(first_item=None, with_keepalive=False, wait_task=None, timeout=3):
+        stream_end_logged = False
+
         if first_item:
             yield await ensure_string(first_item)
 
@@ -653,29 +696,96 @@ async def error_handling_wrapper(
                 try:
                     item, status = await wait_for_timeout(generator, timeout=timeout, wait_task=wait_task)
                     if status == "timeout":
+                        # 关键：复用仍在运行的 __anext__ 任务，避免并发创建导致重入
+                        wait_task = item
+                        yield ": keepalive\n\n"
+                    elif status == "reentrant":
+                        # 理论上不应频繁出现；出现时按正常心跳周期退避，避免刷屏
+                        wait_task = None
+                        await asyncio.sleep(timeout)
                         yield ": keepalive\n\n"
                     else:
                         yield await ensure_string(item)
                         wait_task = None
                 except asyncio.CancelledError:
-                    # 处理客户端断开连接
                     logger.debug(f"provider: {channel_id:<11} Stream cancelled by client in main loop")
+                    if wait_task is not None and not wait_task.done():
+                        wait_task.cancel()
+                    _log_stream_end("client_cancelled", level="debug")
+                    stream_end_logged = True
                     break
-                except Exception:
-                    # 捕获任何其他异常
-                    # import traceback
-                    # error_stack = traceback.format_exc()
-                    # error_message = error_stack.split("\n")[-2]
-                    # logger.info(f"provider: {channel_id:<11} keepalive loop: {error_message}")
+                except StopAsyncIteration:
+                    if wait_task is not None and not wait_task.done():
+                        wait_task.cancel()
+                    _log_stream_end("upstream_eof")
+                    stream_end_logged = True
+                    break
+                except (
+                    httpx.ReadError,
+                    httpx.RemoteProtocolError,
+                    httpx.ReadTimeout,
+                    httpx.WriteError,
+                    httpx.ProtocolError,
+                    h2.exceptions.ProtocolError,
+                ) as e:
+                    logger.error(f"provider: {channel_id:<11} Network error in keepalive loop: {e}")
+
+                    try:
+                        err_str = str(e)
+                        if request_url and app and ("StreamReset" in err_str or "stream_id" in err_str):
+                            from urllib.parse import urlparse
+                            host = urlparse(request_url).netloc
+                            if host and hasattr(app, "state") and hasattr(app.state, "client_manager"):
+                                asyncio.create_task(app.state.client_manager.reset_client(host))
+                    except Exception:
+                        pass
+
+                    done = "data: [DONE]\n\n" if done_message is None else done_message
+                    if done:
+                        yield done
+
+                    if wait_task is not None and not wait_task.done():
+                        wait_task.cancel()
+                    _log_stream_end("upstream_network_error", level="warning", detail=type(e).__name__)
+                    stream_end_logged = True
+                    break
+                except RuntimeError as e:
+                    # 兜底保护：极端时序仍可能抛出重入错误，重置等待任务并退避
+                    if "asynchronous generator is already running" in str(e):
+                        wait_task = None
+                        await asyncio.sleep(0.2)
+                        yield ": keepalive\n\n"
+                        continue
+                    logger.error(f"provider: {channel_id:<11} Error in keepalive loop: {e}")
+                    done = "data: [DONE]\n\n" if done_message is None else done_message
+                    if done:
+                        yield done
+                    if wait_task is not None and not wait_task.done():
+                        wait_task.cancel()
+                    _log_stream_end("wrapper_exception", level="error", detail=type(e).__name__)
+                    stream_end_logged = True
+                    break
+                except Exception as e:
+                    logger.error(f"provider: {channel_id:<11} Error in keepalive loop: {e}")
+                    done = "data: [DONE]\n\n" if done_message is None else done_message
+                    if done:
+                        yield done
+                    if wait_task is not None and not wait_task.done():
+                        wait_task.cancel()
+                    _log_stream_end("wrapper_exception", level="error", detail=type(e).__name__)
+                    stream_end_logged = True
                     break
         else:
-            # 原始的逻辑，当不需要心跳时
+            # 原始逻辑：不需要心跳
             try:
                 async for item in generator:
                     yield await ensure_string(item)
+                _log_stream_end("upstream_eof")
+                stream_end_logged = True
             except asyncio.CancelledError:
-                # 客户端断开连接是正常行为，不需要记录错误日志
                 logger.debug(f"provider: {channel_id:<11} Stream cancelled by client")
+                _log_stream_end("client_cancelled", level="debug")
+                stream_end_logged = True
                 return
             except (
                 httpx.ReadError,
@@ -685,12 +795,27 @@ async def error_handling_wrapper(
                 httpx.ProtocolError,
                 h2.exceptions.ProtocolError,
             ) as e:
-                # 网络错误
                 logger.error(f"provider: {channel_id:<11} Network error in new_generator: {e}")
+
+                try:
+                    err_str = str(e)
+                    if request_url and app and ("StreamReset" in err_str or "stream_id" in err_str):
+                        from urllib.parse import urlparse
+                        host = urlparse(request_url).netloc
+                        if host and hasattr(app, "state") and hasattr(app.state, "client_manager"):
+                            asyncio.create_task(app.state.client_manager.reset_client(host))
+                except Exception:
+                    pass
+
                 done = "data: [DONE]\n\n" if done_message is None else done_message
                 if done:
                     yield done
+                _log_stream_end("upstream_network_error", level="warning", detail=type(e).__name__)
+                stream_end_logged = True
                 return
+            finally:
+                if not stream_end_logged:
+                    _log_stream_end("unknown")
 
     def _extract_first_json_candidate(text: str) -> Optional[str]:
         """
@@ -698,7 +823,7 @@ async def error_handling_wrapper(
 
         兼容：
         - OpenAI/Gemini SSE: "data: {...}"
-        - Claude SSE: "event: ...\\ndata: {...}"
+        - Claude SSE: "event: ...\ndata: {...}"
         - 非 SSE: "{...}" / "[...]"
         """
         if not isinstance(text, str):

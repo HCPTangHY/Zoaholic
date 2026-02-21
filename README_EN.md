@@ -78,6 +78,7 @@ If you deploy on Cloudflare Workers, you can also use D1 directly:
 > In that case, config changes from the admin console are written to `api.yaml`. On ephemeral container filesystems,
 > your config may appear "reset" after restart because it was not persisted to the database.
 
+
 ### 2) Start the service
 
 Example with GHCR image (replace with your own image if you build it yourself):
@@ -118,8 +119,8 @@ Below are the most common and most error-prone environment variables for cloud d
 
 | Variable | Example | Notes |
 |---|---|---|
-| `DATABASE_URL` | `postgresql://...` / `postgres://...` / `mysql://...` / `mysql+asyncmy://...` | Database URL (PostgreSQL or TiDB/MySQL; choose one of `DATABASE_URL` or Cloudflare D1). Stats/logs + config persistence depend on DB. |
 
+| `DATABASE_URL` | `postgresql://...` / `postgres://...` / `mysql://...` / `mysql+asyncmy://...` | Database URL (PostgreSQL or TiDB/MySQL; choose one of `DATABASE_URL` or Cloudflare D1). Stats/logs + config persistence depend on DB. |
 > TiDB Cloud (Serverless) usually **requires TLS**. If your URL doesn't include any SSL params, append `?ssl=true` or `?ssl_mode=VERIFY_IDENTITY`.
 
 Render usually injects `PORT` automatically; Zoaholic will read `PORT` as the listening port.

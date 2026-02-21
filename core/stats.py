@@ -40,6 +40,7 @@ _db_type = (DB_TYPE or "sqlite").lower()
 if _db_type == "sqlite":
     db_semaphore = Semaphore(1)
     logger.info("Database semaphore configured for SQLite (1 concurrent writer).")
+
 elif _db_type == "d1":
     db_semaphore = Semaphore(20)
     logger.info("Database semaphore configured for D1 (20 concurrent writers).")
@@ -252,7 +253,9 @@ async def create_tables():
 
         # 检查并添加缺失的列 - 扩展此简易迁移以支持 SQLite / PostgreSQL / TiDB(MySQL)
         db_type = (DB_TYPE or "sqlite").lower()
+
         if db_type in ["sqlite", "postgres", "mysql", "d1"]:
+
             def check_and_add_columns(connection):
                 inspector = inspect(connection)
                 preparer = connection.dialect.identifier_preparer

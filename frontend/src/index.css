@@ -73,6 +73,6 @@
   }
   
   .dark input:-webkit-autofill {
-    -webkit-text-fill-color: #fff;
+    -webkit-text-fill-color: hsl(var(--foreground));
   }
 }
