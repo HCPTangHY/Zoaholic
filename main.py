@@ -157,7 +157,12 @@ async def lifespan(app: FastAPI):
     # 启动定时清理任务
     cleanup_task = None
     if not DISABLE_DATABASE:
-        await create_tables()
+        try:
+            await create_tables()
+        except Exception as e:
+            # 让 Render 等平台的日志里更直观地看到启动失败原因
+            logger.exception("Database init failed during startup: %s", e)
+            raise
 
         # 确保 JWT_SECRET 在进程启动后就已确定（避免后端热更新/重启导致前端旧 JWT 立刻 403）
         # 规则：若未显式设置环境变量 JWT_SECRET，则使用 DB 中持久化的 admin_user.jwt_secret。

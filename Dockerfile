@@ -18,7 +18,12 @@ WORKDIR /app
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 COPY pyproject.toml uv.lock ./
 # 使用 uv export 导出依赖列表，然后安装到系统 Python
-RUN uv export --frozen --no-dev --no-hashes -o requirements.txt && \
+# 注意：builder 阶段只拷贝了 pyproject.toml/uv.lock，没有拷贝项目源码。
+# uv export 默认会尝试将“当前项目”也写入 requirements（从而触发 setuptools 校验源码/README 是否存在）。
+# 这里用 --no-emit-project 仅导出第三方依赖，避免在 CI/Docker 构建时报：
+#  - File '/app/README.md' cannot be found
+#  - package directory 'core' does not exist
+RUN uv export --frozen --no-dev --no-hashes --no-emit-project -o requirements.txt && \
     uv pip install --system --no-cache -r requirements.txt
 
 # ===============

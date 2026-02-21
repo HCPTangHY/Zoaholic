@@ -32,19 +32,24 @@ SQLITE_RETRY_DELAY = 0.5  # 初始重试延迟（秒）
 is_debug = env_bool("DEBUG", False)
 
 # 根据数据库类型，动态创建信号量
-# SQLite 需要严格的串行写入，而 PostgreSQL 可以处理高并发
+# - SQLite 需要严格的串行写入
+# - Postgres / TiDB(MySQL) 可处理更高并发
+# - D1 走 HTTP API，适当并发即可
 # 这里使用 db.py 的解析结果（支持 DATABASE_URL 自动识别）
-if (DB_TYPE or "sqlite").lower() == 'sqlite':
+_db_type = (DB_TYPE or "sqlite").lower()
+if _db_type == "sqlite":
     db_semaphore = Semaphore(1)
     logger.info("Database semaphore configured for SQLite (1 concurrent writer).")
-elif (DB_TYPE or "sqlite").lower() == 'd1':
-    # D1 走 HTTP API，适当并发即可
+elif _db_type == "d1":
     db_semaphore = Semaphore(20)
     logger.info("Database semaphore configured for D1 (20 concurrent writers).")
-else:  # For postgres
-    # 允许50个并发写入操作，这对于PostgreSQL来说是合理的
+else:
+    # 允许 50 个并发写入操作（适用于 Postgres / TiDB(MySQL) 等）
     db_semaphore = Semaphore(50)
-    logger.info("Database semaphore configured for PostgreSQL (50 concurrent writers).")
+    if _db_type == "mysql":
+        logger.info("Database semaphore configured for TiDB/MySQL (50 concurrent writers).")
+    else:
+        logger.info("Database semaphore configured for PostgreSQL (50 concurrent writers).")
 
 
 # ============== Pydantic Models ==============
@@ -245,11 +250,12 @@ async def create_tables():
     async with db_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-        # 检查并添加缺失的列 - 扩展此简易迁移以支持 SQLite 和 PostgreSQL
+        # 检查并添加缺失的列 - 扩展此简易迁移以支持 SQLite / PostgreSQL / TiDB(MySQL)
         db_type = (DB_TYPE or "sqlite").lower()
-        if db_type in ["sqlite", "postgres", "d1"]:
+        if db_type in ["sqlite", "postgres", "mysql", "d1"]:
             def check_and_add_columns(connection):
                 inspector = inspect(connection)
+                preparer = connection.dialect.identifier_preparer
                 for table in [RequestStat, ChannelStat, AppConfig, AdminUser]:
                     table_name = table.__tablename__
                     existing_columns = {col['name'] for col in inspector.get_columns(table_name)}
@@ -265,9 +271,11 @@ async def create_tables():
                             default = _get_default_sql(column.default) if db_type == "sqlite" else ""
 
                             # 使用标准的 ALTER TABLE 语法
+                            qt = preparer.quote(table_name)
+                            qc = preparer.quote(column_name)
                             connection.execute(
                                 text(
-                                    f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {col_type}{default}'
+                                    f'ALTER TABLE {qt} ADD COLUMN {qc} {col_type}{default}'
                                 )
                             )
                             logger.info(

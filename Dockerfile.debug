@@ -7,7 +7,9 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /home
 COPY pyproject.toml uv.lock ./
-RUN uv pip install -r pyproject.toml --system --no-cache
+# 同生产镜像：仅安装第三方依赖，不在该阶段构建/安装当前项目本身（避免缺少源码文件时报错）
+RUN uv export --frozen --no-dev --no-hashes --no-emit-project -o requirements.txt && \
+    uv pip install --system --no-cache -r requirements.txt
 
 # Stufe 2: Finales Debug-Image
 FROM python:3.11-slim-bullseye
