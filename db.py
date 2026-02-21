@@ -3,7 +3,7 @@ import ssl as ssl_module
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from typing import Optional
 
-from sqlalchemy import event
+from sqlalchemy import event, text
 
 from core.env import env_bool
 from core.d1_client import D1HTTPClient
@@ -79,6 +79,11 @@ elif DATABASE_URL:
     _url = DATABASE_URL.strip().lower()
     if _url.startswith("postgres://") or _url.startswith("postgresql://"):
         DB_TYPE = "postgres"
+    elif _url.startswith("mysql://") or _url.startswith("mariadb://"):
+        DB_TYPE = "mysql"
+    elif _url.startswith("mysql+") or _url.startswith("mariadb+"):
+        # 例如 mysql+asyncmy://... / mysql+pymysql://...
+        DB_TYPE = "mysql"
     elif _url.startswith("sqlite://"):
         DB_TYPE = "sqlite"
     elif _url.startswith("d1://"):
@@ -112,7 +117,120 @@ def _normalize_database_url(url: str, db_type: str) -> str:
             return url.replace("sqlite://", "sqlite+aiosqlite://", 1)
         return url
 
+    if db_type == "mysql":
+        # TiDB / MySQL：强制使用异步驱动（asyncmy/aiomysql），避免落到 MySQLdb(mysqlclient)
+        # 常见: mysql://user:pass@host:port/db
+        if url.startswith("mysql://"):
+            return "mysql+asyncmy://" + url[len("mysql://") :]
+        if url.startswith("mariadb://"):
+            return "mariadb+asyncmy://" + url[len("mariadb://") :]
+
+        # 若用户提供的是同步驱动（如 mysql+pymysql:// 或 mysql+mysqldb://），这里尽量切换到 asyncmy
+        if url.startswith("mysql+") and "+asyncmy" not in url and "+aiomysql" not in url:
+            # mysql+pymysql://... -> mysql+asyncmy://...
+            return "mysql+asyncmy://" + url.split("://", 1)[1]
+        if url.startswith("mariadb+") and "+asyncmy" not in url and "+aiomysql" not in url:
+            return "mariadb+asyncmy://" + url.split("://", 1)[1]
+        return url
+
     return url
+
+
+def _extract_mysql_ssl_connect_args(db_url: str) -> tuple[str, dict]:
+    """从 URL query 中提取 MySQL/TiDB SSL 参数，转换为驱动可识别的 connect_args。
+
+    背景：
+    - TiDB Cloud 通常需要 TLS 连接
+    - 用户可能会在 DATABASE_URL 上附带如 ssl_mode/ssl_ca 等参数
+    - 我们将其转为 `connect_args={"ssl": SSLContext | dict | bool}`
+    """
+
+    parts = urlsplit(db_url)
+    qsl = parse_qsl(parts.query, keep_blank_values=True)
+
+    ssl_mode = None
+    ssl_ca = None
+    ssl_cert = None
+    ssl_key = None
+    kept: list[tuple[str, str]] = []
+
+    for k, v in qsl:
+        lk = k.lower().replace("-", "_")
+        if lk in ("sslmode", "ssl_mode"):
+            ssl_mode = v
+        elif lk in ("ssl", "use_ssl", "usessl", "tls"):
+            # 一些平台/连接串会用 ?ssl=true 这种写法
+            vv = str(v).strip().lower()
+            if vv in ("0", "false", "off", "disable", "disabled"):
+                ssl_mode = "disabled"
+            elif vv in ("1", "true", "on", "require", "required", "yes"):
+                ssl_mode = ssl_mode or "required"
+        elif lk in ("sslrootcert", "ssl_ca", "sslca"):
+            ssl_ca = v
+        elif lk in ("sslcert", "ssl_cert"):
+            ssl_cert = v
+        elif lk in ("sslkey", "ssl_key"):
+            ssl_key = v
+        else:
+            kept.append((k, v))
+
+    connect_args: dict = {}
+
+    if ssl_mode or ssl_ca or ssl_cert or ssl_key:
+        mode = str(ssl_mode or "").strip().lower()
+
+        # MySQL/TiDB 常见语义：DISABLED / REQUIRED / VERIFY_CA / VERIFY_IDENTITY
+        if mode in ("disabled", "disable", "false", "0", "off"):
+            connect_args["ssl"] = False
+        elif mode in ("required", "require"):
+            ctx = ssl_module.create_default_context(cafile=ssl_ca) if ssl_ca else ssl_module.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl_module.CERT_NONE
+            connect_args["ssl"] = ctx
+        elif mode in ("verify_ca", "verify-ca"):
+            ctx = ssl_module.create_default_context(cafile=ssl_ca) if ssl_ca else ssl_module.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl_module.CERT_REQUIRED
+            connect_args["ssl"] = ctx
+        else:
+            # 默认按 VERIFY_IDENTITY/VERIFY_FULL 处理：校验证书链 + 校验主机名
+            ctx = ssl_module.create_default_context(cafile=ssl_ca) if ssl_ca else ssl_module.create_default_context()
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl_module.CERT_REQUIRED
+            connect_args["ssl"] = ctx
+
+        # 若用户提供了客户端证书/私钥，也加载进去（可选）
+        if (ssl_cert or ssl_key) and isinstance(connect_args.get("ssl"), ssl_module.SSLContext):
+            try:
+                connect_args["ssl"].load_cert_chain(certfile=ssl_cert, keyfile=ssl_key)
+            except Exception:
+                # 证书不可用时不阻断启动，交给连接阶段报错更直观
+                pass
+
+    # TiDB Cloud Serverless 强制 TLS：若连接串未显式指定任何 SSL 参数，但目标是 tidbcloud.com，
+    # 则默认启用证书校验 + 主机名校验（等价于 VERIFY_IDENTITY）。
+    # 这样可以避免在 Render 等平台上因为“insecure transport prohibited”导致启动失败。
+    if "ssl" not in connect_args:
+        hostname = (parts.hostname or "").lower()
+        port = parts.port
+
+        # 经验规则：
+        # - TiDB Cloud 通常域名包含 tidbcloud.com
+        # - TiDB 默认端口常见为 4000
+        # 只要命中其一，就默认开启 TLS（VERIFY_IDENTITY 语义）
+        if (
+            (hostname.endswith("tidbcloud.com") or hostname.endswith("tidbcloud.com.") or "tidbcloud.com" in hostname)
+            or port == 4000
+        ):
+            ctx = ssl_module.create_default_context(cafile=ssl_ca) if ssl_ca else ssl_module.create_default_context()
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl_module.CERT_REQUIRED
+            connect_args["ssl"] = ctx
+
+    new_query = urlencode(kept, doseq=True)
+    clean_url = urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+    return clean_url, connect_args
 
 
 def _extract_asyncpg_ssl_connect_args(db_url: str) -> tuple[str, dict]:
@@ -200,18 +318,34 @@ from core.log_config import logger
 # 定义数据库模型
 Base = declarative_base()
 
+
+# ============== Dialect compatibility helpers ==============
+
+# MySQL/TiDB 在列 DEFAULT 上对表达式支持更严格，且 TiDB Cloud Serverless 强制 TLS。
+_IS_MYSQL = (DB_TYPE or "sqlite").lower() == "mysql"
+
+# 用于 DDL 的“当前时间”默认值：
+# - Postgres/SQLite：func.now()
+# - MySQL/TiDB：CURRENT_TIMESTAMP（避免 DEFAULT now() 导致建表失败）
+_SERVER_NOW = text("CURRENT_TIMESTAMP") if _IS_MYSQL else func.now()
+
+# MySQL/TiDB 方言要求 VARCHAR 必须指定长度；同时为避免旧 MySQL/utf8mb4 下索引长度限制，
+# 对带索引的列使用更保守的 191。
+_VARCHAR = String(255) if _IS_MYSQL else String
+_VARCHAR_INDEX = String(191) if _IS_MYSQL else String
+
 class RequestStat(Base):
     __tablename__ = 'request_stats'
     id = Column(Integer, primary_key=True)
-    request_id = Column(String)
-    endpoint = Column(String)
-    client_ip = Column(String)
+    request_id = Column(_VARCHAR)
+    endpoint = Column(_VARCHAR)
+    client_ip = Column(_VARCHAR)
     process_time = Column(Float)
     first_response_time = Column(Float)
     content_start_time = Column(Float, nullable=True)  # 正文开始时间（首个非空content）
-    provider = Column(String, index=True)
-    model = Column(String, index=True)
-    api_key = Column(String, index=True)
+    provider = Column(_VARCHAR_INDEX, index=True)
+    model = Column(_VARCHAR_INDEX, index=True)
+    api_key = Column(_VARCHAR_INDEX, index=True)
     success = Column(Boolean, default=False, index=True)  # 请求是否成功
     status_code = Column(Integer, nullable=True, index=True)  # HTTP 状态码
     is_flagged = Column(Boolean, default=False)
@@ -221,13 +355,13 @@ class RequestStat(Base):
     total_tokens = Column(Integer, default=0)
     prompt_price = Column(Float, default=0.0)
     completion_price = Column(Float, default=0.0)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    timestamp = Column(DateTime(timezone=True), server_default=_SERVER_NOW, index=True)
     
     # 扩展日志字段
-    provider_id = Column(String, nullable=True, index=True)  # 渠道ID
+    provider_id = Column(_VARCHAR_INDEX, nullable=True, index=True)  # 渠道ID
     provider_key_index = Column(Integer, nullable=True)  # 渠道使用的上游key索引
-    api_key_name = Column(String, nullable=True)  # 使用的key
-    api_key_group = Column(String, nullable=True)  # 分组
+    api_key_name = Column(_VARCHAR, nullable=True)  # 使用的key
+    api_key_group = Column(_VARCHAR, nullable=True)  # 分组
     retry_count = Column(Integer, default=0)  # 重试次数
     retry_path = Column(Text, nullable=True)  # 重试路径JSON格式
     request_headers = Column(Text, nullable=True)  # 用户请求头JSON格式
@@ -241,13 +375,13 @@ class RequestStat(Base):
 class ChannelStat(Base):
     __tablename__ = 'channel_stats'
     id = Column(Integer, primary_key=True)
-    request_id = Column(String)
-    provider = Column(String, index=True)
-    model = Column(String, index=True)
-    api_key = Column(String)
-    provider_api_key = Column(String, nullable=True, index=True)
+    request_id = Column(_VARCHAR)
+    provider = Column(_VARCHAR_INDEX, index=True)
+    model = Column(_VARCHAR_INDEX, index=True)
+    api_key = Column(_VARCHAR)
+    provider_api_key = Column(_VARCHAR_INDEX, nullable=True, index=True)
     success = Column(Boolean, default=False)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    timestamp = Column(DateTime(timezone=True), server_default=_SERVER_NOW, index=True)
 
 
 class AdminUser(Base):
@@ -262,9 +396,9 @@ class AdminUser(Base):
     __tablename__ = "admin_user"
 
     id = Column(Integer, primary_key=True)
-    username = Column(String, nullable=False, index=True)
-    password_hash = Column(String, nullable=False)
-    jwt_secret = Column(String, nullable=True)
+    username = Column(_VARCHAR_INDEX, nullable=False, index=True)
+    password_hash = Column(_VARCHAR, nullable=False)
+    jwt_secret = Column(_VARCHAR, nullable=True)
 
 
 class AppConfig(Base):
@@ -294,7 +428,14 @@ class AppConfig(Base):
     config_yaml = Column(Text, nullable=True)
 
     # 最近更新时间（数据库侧 now）
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True)
+    # MySQL/TiDB: 使用 CURRENT_TIMESTAMP，避免 DEFAULT now() 导致建表失败
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=_SERVER_NOW,
+        server_onupdate=_SERVER_NOW if _IS_MYSQL else None,
+        onupdate=(func.now() if not _IS_MYSQL else None),
+        index=True,
+    )
 
 # DISABLE_DATABASE=true 可关闭统计数据库（例如无持久化磁盘的免费部署环境）
 DISABLE_DATABASE = env_bool("DISABLE_DATABASE", False)
@@ -333,6 +474,35 @@ if not DISABLE_DATABASE:
             db_url = f"postgresql+asyncpg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
         db_engine = create_async_engine(db_url, echo=is_debug, connect_args=connect_args)
+
+    elif DB_TYPE == "mysql":
+        # TiDB 兼容（MySQL 协议）
+        try:
+            import asyncmy  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "asyncmy is not installed. Please install it with 'pip install asyncmy' to use TiDB/MySQL."
+            )
+
+        connect_args = {}
+        if DATABASE_URL:
+            db_url = _normalize_database_url(DATABASE_URL, DB_TYPE)
+            db_url, connect_args = _extract_mysql_ssl_connect_args(db_url)
+        else:
+            DB_USER = os.getenv("DB_USER", "root")
+            DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+            DB_HOST = os.getenv("DB_HOST", "localhost")
+            DB_PORT = os.getenv("DB_PORT", "4000")  # TiDB 默认 4000
+            DB_NAME = os.getenv("DB_NAME", "test")
+            db_url = f"mysql+asyncmy://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+        # pool_pre_ping：Render 这类平台上空闲连接容易被断开；开启可减少偶发断连
+        db_engine = create_async_engine(
+            db_url,
+            echo=is_debug,
+            connect_args=connect_args,
+            pool_pre_ping=True,
+        )
 
     elif DB_TYPE == "sqlite":
         if DATABASE_URL:
@@ -379,7 +549,7 @@ if not DISABLE_DATABASE:
                 timeout_seconds=D1_TIMEOUT_SECONDS,
             )
         else:
-            raise ValueError(f"Unsupported DB_TYPE: {DB_TYPE}. Please use 'sqlite', 'postgres' or 'd1'.")
+            raise ValueError(f"Unsupported DB_TYPE: {DB_TYPE}. Please use 'sqlite', 'postgres', 'mysql' or 'd1'.")
 
     if db_engine is not None:
         _legacy_async_session = sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)

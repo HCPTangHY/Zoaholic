@@ -103,7 +103,9 @@ docker run --rm -p 8000:8000 \
 
 | 变量 | 示例 | 说明 |
 |---|---|---|
-| `DATABASE_URL` | `postgresql://...` 或 `postgres://...` | PostgreSQL 连接串（与 D1 二选一）。统计/日志 + 配置入库都依赖数据库。 |
+| `DATABASE_URL` | `postgresql://...` / `postgres://...` / `mysql://...` / `mysql+asyncmy://...` | 数据库连接串（PostgreSQL 或 TiDB/MySQL；与 Cloudflare D1 二选一）。统计/日志 + 配置入库都依赖数据库。 |
+
+> TiDB Cloud（Serverless）通常**强制 TLS**。如果你的连接串未包含任何 SSL 参数，可在 URL 后追加 `?ssl=true` 或 `?ssl_mode=VERIFY_IDENTITY`。
 
 ### 建议配置
 
