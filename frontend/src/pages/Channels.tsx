@@ -400,6 +400,13 @@ export default function Channels() {
     alert('已复制所有有效密钥');
   };
 
+  const clearAllKeys = () => {
+    if (!formData) return;
+    if (formData.api_keys.length === 0) return;
+    if (!confirm('确定要清空该渠道的全部密钥吗？此操作仅影响当前编辑中的渠道配置，保存后才会生效。')) return;
+    updateFormData('api_keys', []);
+  };
+
   const handleGroupInputKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter' && groupInput.trim()) {
       e.preventDefault();
@@ -989,6 +996,14 @@ export default function Channels() {
                     <span className="flex items-center gap-2"><Settings2 className="w-4 h-4 text-emerald-500" /> API Keys</span>
                     <div className="flex items-center gap-2 text-xs">
                       <button onClick={copyAllKeys} className="text-muted-foreground hover:text-foreground flex items-center gap-1"><Copy className="w-3 h-3" /> 复制全部</button>
+                      <button
+                        onClick={clearAllKeys}
+                        disabled={formData.api_keys.length === 0}
+                        className="text-red-600 dark:text-red-500 hover:text-red-700 dark:hover:text-red-400 flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+                        title="一键清空该渠道的全部密钥"
+                      >
+                        <Trash2 className="w-3 h-3" /> 清空
+                      </button>
                       <button onClick={addEmptyKey} className="text-primary hover:text-primary/80 flex items-center gap-1"><Plus className="w-3 h-3" /> 添加密钥</button>
                     </div>
                   </div>
