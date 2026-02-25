@@ -399,15 +399,75 @@ export default function Settings() {
           <div className="p-4 border-b border-border bg-muted/30 flex items-center gap-2 font-medium text-foreground">
             <Database className="w-5 h-5 text-purple-500" /> 数据保留策略
           </div>
-          <div className="p-6">
-            <label className="text-sm font-medium text-foreground mb-1.5 block">日志原始数据保留时间 (小时)</label>
-            <input
-              type="number" min="0"
-              value={preferences.log_raw_data_retention_hours ?? 24}
-              onChange={e => updatePreference('log_raw_data_retention_hours', parseInt(e.target.value))}
-              className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
-            />
-            <p className="text-xs text-muted-foreground mt-2">设为 0 表示不保存请求/响应原始数据，减少存储占用</p>
+          <div className="p-6 space-y-6">
+            <div>
+              <label className="text-sm font-medium text-foreground mb-1.5 block">日志原始数据保留时间 (小时)</label>
+              <input
+                type="number" min="0"
+                value={preferences.log_raw_data_retention_hours ?? 24}
+                onChange={e => updatePreference('log_raw_data_retention_hours', parseInt(e.target.value))}
+                className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
+              />
+              <p className="text-xs text-muted-foreground mt-2">设为 0 表示不保存请求/响应原始数据（大字段），减少存储占用</p>
+            </div>
+
+            <div className="p-4 bg-amber-500/10 border border-amber-500/20 rounded-lg text-sm text-amber-700 dark:text-amber-300">
+              <div className="font-medium mb-1">关于“日志保留天数”</div>
+              <ul className="list-disc pl-4 space-y-1 text-xs">
+                <li>用于控制 request_stats / channel_stats 的保留时间，过期会被自动删除（不可恢复）</li>
+                <li>与“原始数据保留时间”不同：原始数据是清空字段；日志保留天数是删除整行</li>
+                <li>你也可以选择仅手动清理（下方提供工具）</li>
+              </ul>
+            </div>
+
+            <div>
+              <label className="text-sm font-medium text-foreground mb-1.5 block">日志保留策略</label>
+              <select
+                value={preferences.log_retention_mode ?? 'keep'}
+                onChange={e => updatePreference('log_retention_mode', e.target.value)}
+                className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
+              >
+                <option value="keep">不自动清理（永久保留）</option>
+                <option value="manual">仅手动清理</option>
+                <option value="auto_delete">自动清理（删除过期日志）</option>
+              </select>
+            </div>
+
+            {(preferences.log_retention_mode ?? 'keep') === 'auto_delete' && (
+              <div>
+                <label className="text-sm font-medium text-foreground mb-1.5 block">保留天数</label>
+                <div className="flex flex-wrap gap-2 items-center">
+                  <input
+                    type="number" min="1" max="3650"
+                    value={preferences.log_retention_days ?? 30}
+                    onChange={e => updatePreference('log_retention_days', parseInt(e.target.value))}
+                    className="w-40 bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
+                  />
+                  <button type="button" onClick={() => updatePreference('log_retention_days', 7)} className="text-xs bg-muted hover:bg-muted/80 border border-border px-2 py-1 rounded">7 天</button>
+                  <button type="button" onClick={() => updatePreference('log_retention_days', 30)} className="text-xs bg-muted hover:bg-muted/80 border border-border px-2 py-1 rounded">30 天</button>
+                  <button type="button" onClick={() => updatePreference('log_retention_days', 90)} className="text-xs bg-muted hover:bg-muted/80 border border-border px-2 py-1 rounded">90 天</button>
+                </div>
+                <p className="text-xs text-muted-foreground mt-2">后台任务每天在指定时间执行一次：删除早于 N 天的 request_stats / channel_stats</p>
+              </div>
+            )}
+
+            {(preferences.log_retention_mode ?? 'keep') === 'auto_delete' && (
+              <div>
+                <label className="text-sm font-medium text-foreground mb-1.5 block">每天执行时间（按服务器时区）</label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="time"
+                    value={preferences.log_retention_run_at ?? '03:00'}
+                    onChange={e => updatePreference('log_retention_run_at', e.target.value)}
+                    className="w-40 bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
+                  />
+                  <span className="text-xs text-muted-foreground">默认 03:00</span>
+                </div>
+                <p className="text-xs text-muted-foreground mt-2">
+                  如需指定时区（例如 Asia/Shanghai），可在配置中设置 <code className="px-1 rounded bg-muted">log_retention_timezone</code>
+                </p>
+              </div>
+            )}
           </div>
         </section>
 
