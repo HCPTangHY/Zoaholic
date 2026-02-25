@@ -104,10 +104,10 @@ async def cleanup_expired_raw_data():
                 if (DB_TYPE or "sqlite").lower() == "d1":
                     result = await db.execute(
                         "UPDATE request_stats "
-                        "SET request_headers = NULL, request_body = NULL, response_body = NULL "
+                        "SET request_headers = NULL, request_body = NULL, upstream_request_headers = NULL, upstream_request_body = NULL, upstream_response_body = NULL, response_body = NULL, retry_path = NULL "
                         "WHERE raw_data_expires_at IS NOT NULL "
                         "AND raw_data_expires_at < ? "
-                        "AND (request_headers IS NOT NULL OR request_body IS NOT NULL OR response_body IS NOT NULL)",
+                        "AND (request_headers IS NOT NULL OR request_body IS NOT NULL OR upstream_request_headers IS NOT NULL OR upstream_request_body IS NOT NULL OR upstream_response_body IS NOT NULL OR response_body IS NOT NULL OR retry_path IS NOT NULL)",
                         [now],
                     )
                     rowcount = int((result.get("meta") or {}).get("changes") or 0)
@@ -124,17 +124,25 @@ async def cleanup_expired_raw_data():
                     .where(
                         (RequestStat.request_headers.isnot(None)) |
                         (RequestStat.request_body.isnot(None)) |
-                        (RequestStat.response_body.isnot(None))
+                        (RequestStat.upstream_request_headers.isnot(None)) |
+                        (RequestStat.upstream_request_body.isnot(None)) |
+                        (RequestStat.upstream_response_body.isnot(None)) |
+                        (RequestStat.response_body.isnot(None)) |
+                        (RequestStat.retry_path.isnot(None))
                     )
                     .values(
                         request_headers=None,
                         request_body=None,
-                        response_body=None
+                        upstream_request_headers=None,
+                        upstream_request_body=None,
+                        upstream_response_body=None,
+                        response_body=None,
+                        retry_path=None,
                     )
                 )
                 result = await db.execute(stmt)
                 await db.commit()
-                
+
                 if result.rowcount > 0:
                     logger.info(f"Cleaned up expired raw data from {result.rowcount} log entries")
                     

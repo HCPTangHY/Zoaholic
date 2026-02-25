@@ -124,6 +124,30 @@ export default function Playground() {
       ? [{ role: 'system', content: systemPrompt }, ...msgList]
       : msgList;
 
+    const appendSystemError = (text: string) => {
+      const msg = (text || '未知错误').toString();
+      setMessages(prev => [...prev, { role: 'system', content: `请求失败：${msg}` }]);
+    };
+
+    const parseErrorFromResponse = async (res: Response) => {
+      const rawText = await res.text().catch(() => '');
+      if (!rawText) return `HTTP ${res.status}`;
+      try {
+        const data = JSON.parse(rawText);
+        if (data?.error) {
+          if (typeof data.error === 'string') return data.error;
+          if (typeof data.error === 'object') {
+            return data.error.message || data.error.detail || data.error.code || JSON.stringify(data.error);
+          }
+        }
+        if (data?.detail) return typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail);
+        if (data?.message) return typeof data.message === 'string' ? data.message : JSON.stringify(data.message);
+        return rawText;
+      } catch {
+        return rawText;
+      }
+    };
+
     try {
       const res = await apiFetch('/v1/chat/completions', {
         method: 'POST',
@@ -139,7 +163,11 @@ export default function Playground() {
         })
       });
 
-      if (!res.ok) throw new Error('API Request Failed');
+      if (!res.ok) {
+        const errText = await parseErrorFromResponse(res);
+        appendSystemError(errText);
+        return;
+      }
 
       if (stream) {
         const reader = res.body?.getReader();
@@ -168,6 +196,52 @@ export default function Playground() {
 
             try {
               const data = JSON.parse(dataStr);
+
+              // 标准 OpenAI 风格错误：{"error": {"message": "..."}}
+              if (data?.error) {
+                const errMsg = typeof data.error === 'string'
+                  ? data.error
+                  : (data.error.message || data.error.detail || JSON.stringify(data.error));
+
+                try { await reader.cancel(); } catch { }
+                setMessages(prev => {
+                  // 结束 typing，并追加 system 错误
+                  const updated = [...prev];
+                  if (updated[assistantIndex]) {
+                    updated[assistantIndex] = {
+                      role: 'assistant',
+                      content: fullContent,
+                      reasoning_content: fullReasoning,
+                      isTyping: false,
+                    };
+                  }
+                  updated.push({ role: 'system', content: `请求失败：${errMsg}` });
+                  return updated;
+                });
+                return;
+              }
+
+              // 部分网关会把错误塞到 choices[0].error
+              const choiceErr = data?.choices?.[0]?.error;
+              if (choiceErr) {
+                const errMsg = choiceErr.message || JSON.stringify(choiceErr);
+                try { await reader.cancel(); } catch { }
+                setMessages(prev => {
+                  const updated = [...prev];
+                  if (updated[assistantIndex]) {
+                    updated[assistantIndex] = {
+                      role: 'assistant',
+                      content: fullContent,
+                      reasoning_content: fullReasoning,
+                      isTyping: false,
+                    };
+                  }
+                  updated.push({ role: 'system', content: `请求失败：${errMsg}` });
+                  return updated;
+                });
+                return;
+              }
+
               const delta = data.choices[0]?.delta;
 
               if (delta?.reasoning_content) {
@@ -204,6 +278,7 @@ export default function Playground() {
       }
     } catch (err) {
       console.error(err);
+      appendSystemError(err instanceof Error ? err.message : String(err));
     } finally {
       setIsGenerating(false);
     }
@@ -291,7 +366,7 @@ export default function Playground() {
         </div>
         <iframe
           src={getExternalLink(activeClient.link)}
-          className="flex-1 w-full border-0 bg-white"
+          className="flex-1 w-full border-0 bg-background"
           allow="clipboard-read; clipboard-write"
         />
       </div>
@@ -299,12 +374,12 @@ export default function Playground() {
   }
 
   return (
-    <div className="flex h-full animate-in fade-in duration-500 font-sans relative">
+    <div className="flex h-full animate-in fade-in duration-500 font-sans rounded-2xl overflow-hidden border border-border bg-muted/20 shadow-sm">
       {/* Left: Chat Area */}
-      <div className="flex-1 flex flex-col min-w-0 bg-background">
+      <div className="flex-1 flex flex-col min-w-0 bg-background/60 backdrop-blur-sm border-r border-border">
 
         {/* Chat Header */}
-        <div className="h-14 border-b border-border flex items-center px-4 md:px-6 justify-between bg-card/80 backdrop-blur-sm z-10 flex-shrink-0">
+        <div className="h-14 border-b border-border flex items-center px-4 md:px-6 justify-between bg-background/60 backdrop-blur-sm z-10 flex-shrink-0">
           <div className="flex items-center gap-2 text-foreground font-bold">
             <Terminal className="w-5 h-5 text-primary" />
             <span className="hidden sm:inline">Console Playground</span>
@@ -332,7 +407,7 @@ export default function Playground() {
         </div>
 
         {/* Message List */}
-        <div className="flex-1 overflow-y-auto px-4 md:px-12 py-8 space-y-6">
+        <div className="flex-1 overflow-y-auto px-4 md:px-10 py-8 space-y-6">
           {messages.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-muted-foreground">
               <Sparkles className="w-12 h-12 mb-4 opacity-50" />
@@ -341,16 +416,33 @@ export default function Playground() {
             </div>
           ) : (
             messages.map((msg, idx) => (
-              <div key={idx} className="flex flex-col max-w-4xl mx-auto w-full group">
+              <div
+                key={idx}
+                className={`flex flex-col max-w-4xl mx-auto w-full group ${
+                  msg.role === 'user'
+                    ? 'items-end'
+                    : msg.role === 'system'
+                      ? 'items-center'
+                      : 'items-start'
+                }`}
+              >
                 <div className="flex items-center gap-2 mb-2 text-xs font-medium text-muted-foreground">
                   {msg.role === 'user' ? (
                     <span className="flex items-center gap-1 text-emerald-600 dark:text-emerald-500"><MessageSquare className="w-3.5 h-3.5" /> User</span>
+                  ) : msg.role === 'system' ? (
+                    <span className="flex items-center gap-1 text-red-600 dark:text-red-400"><AlertCircle className="w-3.5 h-3.5" /> System</span>
                   ) : (
                     <span className="flex items-center gap-1 text-blue-600 dark:text-blue-400"><Brain className="w-3.5 h-3.5" /> {selectedModel || 'Assistant'}</span>
                   )}
                 </div>
 
-                <div className={`p-4 rounded-xl border transition-colors ${msg.role === 'user' ? 'bg-muted/50 border-border text-foreground' : 'bg-transparent border-transparent text-foreground'}`}>
+                <div className={`w-fit max-w-[92%] p-4 rounded-2xl border shadow-sm transition-colors ${
+                  msg.role === 'user'
+                    ? 'bg-primary text-primary-foreground border-primary/30'
+                    : msg.role === 'system'
+                      ? 'bg-red-500/10 border-red-500/25 text-foreground'
+                      : 'bg-background/50 border-border text-foreground'
+                }`}>
 
                   {msg.reasoning_content && (
                     <div className="mb-4 bg-muted/50 border border-border rounded-lg overflow-hidden">
@@ -425,7 +517,7 @@ export default function Playground() {
         </div>
 
         {/* Input Area */}
-        <div className="p-4 md:px-12 bg-card border-t border-border flex-shrink-0">
+        <div className="p-4 md:px-10 bg-background/60 backdrop-blur-sm border-t border-border flex-shrink-0">
           <div className="max-w-4xl mx-auto relative bg-muted border border-border focus-within:border-primary rounded-xl overflow-hidden transition-colors">
             <textarea
               ref={textareaRef}
@@ -458,8 +550,8 @@ export default function Playground() {
 
 
       {/* Right: Parameters Panel */}
-      <div className="w-80 bg-card border-l border-border flex-shrink-0 flex-col hidden md:flex h-full">
-        <div className="h-14 border-b border-border flex items-center px-4 font-medium text-foreground gap-2 flex-shrink-0">
+      <div className="w-80 bg-background/40 backdrop-blur-sm border-l border-border flex-shrink-0 flex-col hidden md:flex h-full">
+        <div className="h-14 border-b border-border flex items-center px-4 font-medium text-foreground gap-2 flex-shrink-0 bg-background/40 backdrop-blur-sm">
           <Settings2 className="w-4 h-4 text-primary" />
           控制台参数
         </div>

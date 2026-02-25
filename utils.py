@@ -255,24 +255,51 @@ def _quote_colon_strings(obj):
         return obj
 
 def save_api_yaml(config_data):
-    # 深拷贝配置数据并处理包含冒号的字符串
+    """将配置持久化到 api.yaml（原子写入）。
+
+    - 先写入同目录临时文件，再使用 os.replace 原子替换，避免部分写入
+    - 显式 flush + fsync，尽量降低“写入成功但未落盘”的风险
+    - 任何异常都会抛出，调用方应据此返回非 200
+    """
+
     import copy
+    import tempfile
+
     processed_data = copy.deepcopy(config_data)
-    
+
     # 清理运行时字段（以 _ 开头的字段不应该被保存到配置文件）
     for provider in processed_data.get('providers', []):
         keys_to_remove = [k for k in list(provider.keys()) if k.startswith('_')]
         for k in keys_to_remove:
             del provider[k]
-    
+
     for api_key in processed_data.get('api_keys', []):
         keys_to_remove = [k for k in list(api_key.keys()) if k.startswith('_')]
         for k in keys_to_remove:
             del api_key[k]
-    
+
     processed_data = _quote_colon_strings(processed_data)
-    with open(API_YAML_PATH, "w", encoding="utf-8") as f:
-        yaml.dump(processed_data, f)
+
+    target_path = os.path.abspath(API_YAML_PATH)
+    target_dir = os.path.dirname(target_path) or "."
+    os.makedirs(target_dir, exist_ok=True)
+
+    temp_path = None
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix=".api.yaml.", suffix=".tmp", dir=target_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.dump(processed_data, f)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(temp_path, target_path)
+    except Exception as e:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+        raise RuntimeError(f"Failed to save api.yaml to '{target_path}': {e}") from e
 
 async def update_config(config_data, use_config_url=False, skip_model_fetch=False, save_to_file=True, save_to_db: bool = False):
     for index, provider in enumerate(config_data['providers']):

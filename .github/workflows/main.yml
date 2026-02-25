@@ -1,9 +1,11 @@
 name: Docker Build and Publish Docker Image
 
-"on":
+on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -18,14 +20,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Read Version
-        id: version
-        shell: bash
-        run: |
-          VERSION=$(grep "^version = " pyproject.toml | awk -F'"' '{print $2}')
-          echo "Current version: $VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
       - name: Prepare image name (lowercase)
         id: image
         shell: bash
@@ -34,6 +28,19 @@ jobs:
           IMAGE="ghcr.io/${GITHUB_REPOSITORY}"
           IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          # Prefer git tag (vX.Y.Z) when building on tag push.
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION=$(grep "^version = " pyproject.toml | awk -F'"' '{print $2}')
+          fi
+          echo "Resolved version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -48,16 +55,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Extract Docker metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=sha-${{ github.sha }}
+            type=ref,event=tag
+
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ${{ steps.image.outputs.image }}:latest
-            ${{ steps.image.outputs.image }}:${{ steps.version.outputs.version }}
-            ${{ steps.image.outputs.image }}:sha-${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

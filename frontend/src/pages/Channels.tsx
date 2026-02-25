@@ -42,6 +42,7 @@ interface ProviderFormData {
     system_prompt?: string;
     headers?: Record<string, string>;
     post_body_parameter_overrides?: Record<string, any>;
+    post_body_parameter_filter?: any;
     enabled_plugins?: string[];
   };
 }
@@ -91,7 +92,67 @@ export default function Channels() {
   const [testingProvider, setTestingProvider] = useState<any>(null);
   const [headersJson, setHeadersJson] = useState('');
   const [overridesJson, setOverridesJson] = useState('');
+  const [parameterFilterEditMode, setParameterFilterEditMode] = useState<'visual' | 'json'>('visual');
+  const [parameterFilterEnabled, setParameterFilterEnabled] = useState(true);
+  const [parameterFilterUseDefaults, setParameterFilterUseDefaults] = useState(true);
+  const [parameterFilterMode, setParameterFilterMode] = useState<'deny' | 'allow'>('deny');
+  const [parameterFilterCommonChecked, setParameterFilterCommonChecked] = useState<Record<string, boolean>>({});
+  const [parameterFilterCustomText, setParameterFilterCustomText] = useState('');
+  const [parameterFilterJson, setParameterFilterJson] = useState('');
   const [modelDisplayKey, setModelDisplayKey] = useState(0);
+
+  const COMMON_PARAMETER_FILTER_FIELDS: { key: string; label: string; hint?: string }[] = [
+    { key: 'temperature', label: 'temperature', hint: '部分渠道/模型（如部分推理模型）可能不接受 temperature' },
+    { key: 'top_p', label: 'top_p', hint: '部分渠道/模型可能不接受 top_p 或要求与 temperature 二选一' },
+    { key: 'presence_penalty', label: 'presence_penalty', hint: '部分 OpenAI 兼容实现不支持该字段' },
+    { key: 'frequency_penalty', label: 'frequency_penalty', hint: '部分 OpenAI 兼容实现不支持该字段' },
+    { key: 'thinking', label: 'thinking', hint: '部分 OpenAI 兼容网关不支持该字段（常见于 Claude Thinking 相关）' },
+    { key: 'min_p', label: 'min_p', hint: '常见扩展字段，很多兼容渠道会报 unknown field' },
+    { key: 'top_k', label: 'top_k', hint: '常见扩展字段，很多兼容渠道会报 unknown field' },
+    { key: 'include_usage', label: 'include_usage', hint: 'Zoaholic 内部字段，非 OpenAI 标准顶层参数' },
+    { key: 'chat_template_kwargs', label: 'chat_template_kwargs', hint: 'Zoaholic 内部字段，非 OpenAI 标准顶层参数' },
+    { key: 'stream_options', label: 'stream_options', hint: '部分兼容渠道不支持该对象' },
+    { key: 'stream_options.include_usage', label: 'stream_options.include_usage', hint: '以 dot-path 方式删除嵌套字段' },
+    { key: 'response_format', label: 'response_format', hint: '部分兼容渠道不支持 json_schema/json_object' },
+  ];
+
+  const parseFieldListFromText = (text: string): string[] => {
+    const lines = text
+      .split(/\r?\n/)
+      .map(s => s.trim())
+      .filter(Boolean);
+    // 允许逗号分隔
+    const parts = lines.flatMap(line => line.split(',').map(x => x.trim()).filter(Boolean));
+    return Array.from(new Set(parts));
+  };
+
+  const buildVisualParameterFilterConfig = () => {
+    if (!parameterFilterEnabled) return { enabled: false };
+
+    const checkedCommon = Object.entries(parameterFilterCommonChecked)
+      .filter(([, v]) => v)
+      .map(([k]) => k);
+    const custom = parseFieldListFromText(parameterFilterCustomText);
+    const fields = Array.from(new Set([...checkedCommon, ...custom]));
+
+    const base: any = {
+      mode: parameterFilterMode,
+      use_defaults: parameterFilterUseDefaults,
+    };
+
+    if (parameterFilterMode === 'allow') base.allow = fields;
+    else base.deny = fields;
+
+    return base;
+  };
+
+  const safeStringify = (v: any) => {
+    try {
+      return JSON.stringify(v, null, 2);
+    } catch {
+      return '';
+    }
+  };
 
   const [isFetchModelsOpen, setIsFetchModelsOpen] = useState(false);
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
@@ -180,6 +241,64 @@ export default function Channels() {
       setHeadersJson(Object.keys(pHeaders).length > 0 ? JSON.stringify(pHeaders, null, 2) : '');
       setOverridesJson(Object.keys(pOverrides).length > 0 ? JSON.stringify(pOverrides, null, 2) : '');
 
+      // 参数过滤：尽量解析为可视化配置；复杂结构则默认进入 JSON 模式
+      const rawFilter = provider.preferences?.post_body_parameter_filter;
+      setParameterFilterJson(rawFilter ? safeStringify(rawFilter) : '');
+      setParameterFilterEditMode('visual');
+      setParameterFilterEnabled(true);
+      setParameterFilterUseDefaults(true);
+      setParameterFilterMode('deny');
+      setParameterFilterCommonChecked({});
+      setParameterFilterCustomText('');
+
+      try {
+        // list => deny
+        if (Array.isArray(rawFilter)) {
+          const denyList = rawFilter.map((x: any) => String(x).trim()).filter(Boolean);
+          const commonSet = new Set(COMMON_PARAMETER_FILTER_FIELDS.map(x => x.key));
+          const commonChecked: Record<string, boolean> = {};
+          const custom: string[] = [];
+          denyList.forEach(k => {
+            if (commonSet.has(k)) commonChecked[k] = true;
+            else custom.push(k);
+          });
+          setParameterFilterCommonChecked(commonChecked);
+          setParameterFilterCustomText(custom.join('\n'));
+        } else if (rawFilter && typeof rawFilter === 'object') {
+          // 简单结构化配置
+          if (
+            'mode' in rawFilter || 'deny' in rawFilter || 'allow' in rawFilter ||
+            'use_defaults' in rawFilter || 'enabled' in rawFilter
+          ) {
+            if (rawFilter.enabled === false) {
+              setParameterFilterEnabled(false);
+            }
+            if (typeof rawFilter.use_defaults === 'boolean') setParameterFilterUseDefaults(rawFilter.use_defaults);
+            if (rawFilter.mode === 'allow') setParameterFilterMode('allow');
+            else if (rawFilter.mode === 'deny') setParameterFilterMode('deny');
+
+            const list = (rawFilter.mode === 'allow' ? rawFilter.allow : rawFilter.deny) || [];
+            const fields = Array.isArray(list) ? list.map((x: any) => String(x).trim()).filter(Boolean) : [];
+
+            const commonSet = new Set(COMMON_PARAMETER_FILTER_FIELDS.map(x => x.key));
+            const commonChecked: Record<string, boolean> = {};
+            const custom: string[] = [];
+            fields.forEach(k => {
+              if (commonSet.has(k)) commonChecked[k] = true;
+              else custom.push(k);
+            });
+            setParameterFilterCommonChecked(commonChecked);
+            setParameterFilterCustomText(custom.join('\n'));
+          } else {
+            // all/*/model_key 这种复杂结构，交给 JSON
+            if (rawFilter) setParameterFilterEditMode('json');
+          }
+        }
+      } catch {
+        // 解析失败直接交给 JSON
+        if (rawFilter) setParameterFilterEditMode('json');
+      }
+
       setFormData({
         provider: provider.provider || provider.name || '',
         engine: provider.engine || '',
@@ -203,6 +322,13 @@ export default function Channels() {
     } else {
       setHeadersJson('');
       setOverridesJson('');
+      setParameterFilterEditMode('visual');
+      setParameterFilterEnabled(true);
+      setParameterFilterUseDefaults(true);
+      setParameterFilterMode('deny');
+      setParameterFilterCommonChecked({});
+      setParameterFilterCustomText('');
+      setParameterFilterJson('');
       setFormData({
         provider: '',
         engine: channelTypes.length > 0 ? channelTypes[0].id : '',
@@ -544,6 +670,23 @@ export default function Channels() {
       return;
     }
 
+    // 参数过滤配置
+    let parameterFilterObj: any = undefined;
+    if (parameterFilterEditMode === 'json') {
+      if (parameterFilterJson.trim()) {
+        try {
+          parameterFilterObj = JSON.parse(parameterFilterJson);
+        } catch (e: any) {
+          alert(`参数过滤 JSON 格式错误: ${e?.message || 'invalid json'}`);
+          return;
+        }
+      } else {
+        parameterFilterObj = undefined;
+      }
+    } else {
+      parameterFilterObj = buildVisualParameterFilterConfig();
+    }
+
     const targetProvider: any = {
       provider: formData.provider,
       base_url: formData.base_url,
@@ -557,6 +700,7 @@ export default function Channels() {
         ...formData.preferences,
         headers: headersObj,
         post_body_parameter_overrides: overridesObj,
+        post_body_parameter_filter: parameterFilterObj,
       },
     };
 
@@ -1025,6 +1169,141 @@ export default function Channels() {
                       />
                       <p className="text-xs text-muted-foreground mt-1">失焦时自动格式化</p>
                     </div>
+
+                    {/* 请求体参数过滤 */}
+                    <div>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <label className="text-sm font-medium text-foreground">请求体参数过滤</label>
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs text-muted-foreground">启用</span>
+                          <Switch.Root
+                            checked={parameterFilterEnabled}
+                            onCheckedChange={setParameterFilterEnabled}
+                            className="w-11 h-6 bg-muted rounded-full data-[state=checked]:bg-primary"
+                          >
+                            <Switch.Thumb className="block w-5 h-5 bg-white rounded-full transition-transform data-[state=checked]:translate-x-[22px] translate-x-0.5" />
+                          </Switch.Root>
+                        </div>
+                      </div>
+                      <p className="text-xs text-muted-foreground mb-3">
+                        用于移除上游渠道不支持的请求体字段，避免出现 unknown field / validation error。
+                      </p>
+
+                      {/* 编辑模式切换 */}
+                      <div className="flex items-center gap-2 mb-3">
+                        <button
+                          type="button"
+                          onClick={() => setParameterFilterEditMode('visual')}
+                          className={`text-xs px-2 py-1 rounded border ${parameterFilterEditMode === 'visual' ? 'bg-primary text-primary-foreground border-primary' : 'bg-background text-foreground border-border hover:bg-muted'}`}
+                        >
+                          可视化
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            // 进入 JSON 模式时，自动填充当前可视化配置
+                            setParameterFilterJson(safeStringify(buildVisualParameterFilterConfig()));
+                            setParameterFilterEditMode('json');
+                          }}
+                          className={`text-xs px-2 py-1 rounded border ${parameterFilterEditMode === 'json' ? 'bg-primary text-primary-foreground border-primary' : 'bg-background text-foreground border-border hover:bg-muted'}`}
+                        >
+                          JSON
+                        </button>
+                        <span className="text-xs text-muted-foreground">（复杂规则建议用 JSON）</span>
+                      </div>
+
+                      {parameterFilterEditMode === 'json' ? (
+                        <>
+                          <textarea
+                            value={parameterFilterJson}
+                            onChange={e => setParameterFilterJson(e.target.value)}
+                            onBlur={() => formatJsonOnBlur(parameterFilterJson, setParameterFilterJson, '参数过滤')}
+                            rows={6}
+                            placeholder='{"mode":"deny","use_defaults":true,"deny":["thinking","min_p"]}'
+                            className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm font-mono focus:border-primary outline-none text-foreground"
+                          />
+                          <p className="text-xs text-muted-foreground mt-1">失焦时自动格式化</p>
+                        </>
+                      ) : (
+                        <div className="space-y-3">
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div>
+                              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">过滤模式</label>
+                              <select
+                                value={parameterFilterMode}
+                                onChange={e => setParameterFilterMode(e.target.value === 'allow' ? 'allow' : 'deny')}
+                                className="mt-1 w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
+                                disabled={!parameterFilterEnabled}
+                              >
+                                <option value="deny">黑名单 (deny) - 移除不支持字段（推荐）</option>
+                                <option value="allow">白名单 (allow) - 只保留允许字段</option>
+                              </select>
+                            </div>
+
+                            <div className="flex items-center justify-between p-3 bg-muted/50 rounded-lg border border-border mt-5 sm:mt-0">
+                              <div>
+                                <div className="text-sm text-foreground">使用默认过滤规则</div>
+                                <div className="text-xs text-muted-foreground">内置针对常见兼容渠道的保守兜底过滤</div>
+                              </div>
+                              <Switch.Root
+                                checked={parameterFilterUseDefaults}
+                                onCheckedChange={setParameterFilterUseDefaults}
+                                disabled={!parameterFilterEnabled}
+                                className="w-11 h-6 bg-muted rounded-full data-[state=checked]:bg-primary"
+                              >
+                                <Switch.Thumb className="block w-5 h-5 bg-white rounded-full transition-transform data-[state=checked]:translate-x-[22px] translate-x-0.5" />
+                              </Switch.Root>
+                            </div>
+                          </div>
+
+                          <div className="bg-muted/30 border border-border rounded-lg p-3">
+                            <div className="text-xs text-muted-foreground mb-2">常用字段（勾选即可加入规则）</div>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                              {COMMON_PARAMETER_FILTER_FIELDS.map(item => (
+                                <label key={item.key} className="flex items-start gap-2 text-sm text-foreground">
+                                  <input
+                                    type="checkbox"
+                                    className="mt-0.5"
+                                    checked={!!parameterFilterCommonChecked[item.key]}
+                                    disabled={!parameterFilterEnabled}
+                                    onChange={() => {
+                                      setParameterFilterCommonChecked(prev => ({
+                                        ...prev,
+                                        [item.key]: !prev?.[item.key],
+                                      }));
+                                    }}
+                                  />
+                                  <div className="min-w-0">
+                                    <div className="font-mono text-xs">{item.label}</div>
+                                    {item.hint && <div className="text-xs text-muted-foreground">{item.hint}</div>}
+                                  </div>
+                                </label>
+                              ))}
+                            </div>
+                          </div>
+
+                          <div>
+                            <label className="text-sm font-medium text-foreground mb-1.5 block">自定义字段（每行一个；支持 dot-path）</label>
+                            <textarea
+                              value={parameterFilterCustomText}
+                              onChange={e => setParameterFilterCustomText(e.target.value)}
+                              rows={4}
+                              placeholder={"例如：\nreasoning_effort\nservice_tier\nstream_options.include_usage"}
+                              disabled={!parameterFilterEnabled}
+                              className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm font-mono focus:border-primary outline-none text-foreground disabled:opacity-60"
+                            />
+                          </div>
+
+                          <div>
+                            <label className="text-xs text-muted-foreground uppercase tracking-wider">预览（保存后会写入 preferences.post_body_parameter_filter）</label>
+                            <pre className="mt-1 text-xs bg-background border border-border rounded-lg p-3 overflow-auto max-h-[240px]">
+                              {safeStringify(buildVisualParameterFilterConfig()) || ''}
+                            </pre>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
                     <div className="flex items-center justify-between p-3 bg-muted/50 rounded-lg border border-border">
                       <span className="text-sm text-foreground">启用 Tools (函数调用)</span>
                       <Switch.Root checked={formData.preferences.tools} onCheckedChange={val => updatePreference('tools', val)} className="w-11 h-6 bg-muted rounded-full data-[state=checked]:bg-primary">

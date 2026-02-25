@@ -3,13 +3,13 @@ Stats 统计和使用量路由
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, field_serializer
+from pydantic import BaseModel, field_serializer, Field
 
-from sqlalchemy import select, case, func, desc
+from sqlalchemy import select, case, func, desc, update, delete, or_
 
 from db import RequestStat, ChannelStat, async_session_scope, DISABLE_DATABASE, DB_TYPE
 from core.stats import get_usage_data
@@ -155,7 +155,79 @@ class LogsPage(BaseModel):
     total_pages: int
 
 
+# 可手动清理的日志字段（大字段优先）
+LOG_CLEARABLE_FIELDS: Dict[str, str] = {
+    "request_headers": "用户请求头(request_headers)",
+    "request_body": "用户请求体(request_body)",
+    "upstream_request_headers": "上游请求头(upstream_request_headers)",
+    "upstream_request_body": "上游请求体(upstream_request_body)",
+    "upstream_response_body": "上游响应体(upstream_response_body)",
+    "response_body": "返回给用户的响应体(response_body)",
+    "retry_path": "重试路径(retry_path)",
+    "text": "文本摘要(text)",
+}
+
+DEFAULT_LOG_CLEANUP_FIELDS: List[str] = [
+    "request_headers",
+    "request_body",
+    "upstream_request_headers",
+    "upstream_request_body",
+    "upstream_response_body",
+    "response_body",
+    "retry_path",
+]
+
+
+class LogsCleanupRequest(BaseModel):
+    # dry_run=true 时仅预览，不执行写操作
+    dry_run: bool = True
+
+    # clear_fields: 清空指定字段内容但保留日志行
+    # delete_rows:   直接删除匹配日志行
+    action: Literal["clear_fields", "delete_rows"] = "clear_fields"
+
+    # 仅在 action=clear_fields 时使用
+    fields: List[str] = Field(default_factory=lambda: DEFAULT_LOG_CLEANUP_FIELDS.copy())
+
+    # 时间范围过滤：
+    # - older_than_hours 与 start_time/end_time 互斥
+    older_than_hours: Optional[int] = Field(default=None, ge=1, le=24 * 3650)
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+
+    # 其他维度过滤
+    provider: Optional[str] = None
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+    success: Optional[bool] = None
+    status_codes: Optional[List[int]] = None
+    flagged_only: bool = False
+
+
+class LogsCleanupResponse(BaseModel):
+    dry_run: bool
+    action: str
+    matched_rows: int
+    affected_rows: int
+    selected_fields: List[str]
+    non_null_counts: Dict[str, int]
+    filters: Dict[str, Any]
+    message: str
+
+
 # ============ Helper Functions ============
+
+
+def _normalize_cleanup_fields(fields: List[str]) -> List[str]:
+    seen = set()
+    normalized: List[str] = []
+    for item in fields or []:
+        key = str(item or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(key)
+    return normalized
 
 
 def parse_datetime_input(dt_input: str) -> datetime:
@@ -175,6 +247,78 @@ def parse_datetime_input(dt_input: str) -> datetime:
                 f"Invalid datetime format: {dt_input}. "
                 "Use ISO 8601 (YYYY-MM-DDTHH:MM:SSZ) or Unix timestamp."
             )
+
+
+def _build_cleanup_time_filters(payload: LogsCleanupRequest) -> tuple[Optional[datetime], Optional[datetime], Optional[datetime], Dict[str, Any]]:
+    """解析并返回清理任务的时间过滤条件。
+
+    返回值：
+    - cutoff_dt:  older_than_hours 对应的截止时间（timestamp < cutoff_dt）
+    - start_dt:   起始时间（timestamp >= start_dt）
+    - end_dt:     结束时间（timestamp <= end_dt）
+    - filters:    可回传给前端的过滤摘要
+    """
+
+    if payload.older_than_hours is not None and (payload.start_time or payload.end_time):
+        raise HTTPException(
+            status_code=400,
+            detail="older_than_hours cannot be used together with start_time/end_time.",
+        )
+
+    filters: Dict[str, Any] = {}
+
+    cutoff_dt: Optional[datetime] = None
+    if payload.older_than_hours is not None:
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=payload.older_than_hours)
+        filters["older_than_hours"] = payload.older_than_hours
+        filters["older_than_before"] = cutoff_dt.isoformat()
+
+    start_dt: Optional[datetime] = None
+    if payload.start_time:
+        try:
+            start_dt = parse_datetime_input(payload.start_time)
+            filters["start_time"] = start_dt.isoformat()
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid start_time: {e}") from e
+
+    end_dt: Optional[datetime] = None
+    if payload.end_time:
+        try:
+            end_dt = parse_datetime_input(payload.end_time)
+            filters["end_time"] = end_dt.isoformat()
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid end_time: {e}") from e
+
+    if start_dt and end_dt and end_dt < start_dt:
+        raise HTTPException(status_code=400, detail="end_time must be greater than or equal to start_time.")
+
+    return cutoff_dt, start_dt, end_dt, filters
+
+
+def _validate_cleanup_request(payload: LogsCleanupRequest) -> tuple[str, List[str]]:
+    """校验清理请求参数，返回 action 与规范化后的字段列表。"""
+
+    action = (payload.action or "").strip().lower()
+    if action not in {"clear_fields", "delete_rows"}:
+        raise HTTPException(status_code=400, detail="Invalid action. Allowed: clear_fields, delete_rows.")
+
+    selected_fields = _normalize_cleanup_fields(payload.fields)
+    invalid_fields = [field for field in selected_fields if field not in LOG_CLEARABLE_FIELDS]
+    if invalid_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid fields: {invalid_fields}. Allowed fields: {list(LOG_CLEARABLE_FIELDS.keys())}",
+        )
+
+    if action == "clear_fields" and not selected_fields:
+        raise HTTPException(status_code=400, detail="fields is required when action=clear_fields.")
+
+    if payload.status_codes:
+        invalid_codes = [code for code in payload.status_codes if (code < 100 or code > 599)]
+        if invalid_codes:
+            raise HTTPException(status_code=400, detail=f"Invalid status_codes: {invalid_codes}")
+
+    return action, selected_fields
 
 
 # ============ Routes ============
@@ -623,6 +767,223 @@ async def add_credits_to_api_key(
     })
 
 
+@router.post("/v1/logs/cleanup", response_model=LogsCleanupResponse, dependencies=[Depends(rate_limit_dependency)])
+async def cleanup_logs(
+    request: Request,
+    payload: LogsCleanupRequest,
+    token: str = Depends(verify_admin_api_key),
+):
+    """按条件清理日志数据。
+
+    支持两种模式：
+    - clear_fields：清空日志中的大字段，保留日志行（推荐）
+    - delete_rows：删除匹配日志行（危险操作）
+    """
+
+    if DISABLE_DATABASE:
+        raise HTTPException(status_code=503, detail="Database is disabled.")
+
+    action, selected_fields = _validate_cleanup_request(payload)
+    cutoff_dt, start_dt, end_dt, filters = _build_cleanup_time_filters(payload)
+
+    if payload.provider:
+        filters["provider"] = payload.provider
+    if payload.api_key:
+        filters["api_key"] = payload.api_key
+    if payload.model:
+        filters["model"] = payload.model
+    if payload.success is not None:
+        filters["success"] = payload.success
+    if payload.status_codes:
+        filters["status_codes"] = sorted(set(payload.status_codes))
+    if payload.flagged_only:
+        filters["flagged_only"] = True
+
+    db_type = (DB_TYPE or "sqlite").lower()
+
+    # ========== D1 分支 ==========
+    if db_type == "d1":
+        from db import d1_client
+
+        if d1_client is None:
+            raise HTTPException(status_code=503, detail="D1 client is not initialized.")
+
+        where_sql_parts: List[str] = ["1=1"]
+        params: List[Any] = []
+
+        if cutoff_dt is not None:
+            where_sql_parts.append("timestamp < ?")
+            params.append(cutoff_dt)
+        if start_dt is not None:
+            where_sql_parts.append("timestamp >= ?")
+            params.append(start_dt)
+        if end_dt is not None:
+            where_sql_parts.append("timestamp <= ?")
+            params.append(end_dt)
+
+        if payload.provider:
+            like_value = f"%{payload.provider}%"
+            where_sql_parts.append("(provider_id LIKE ? OR provider LIKE ?)")
+            params.extend([like_value, like_value])
+
+        if payload.api_key:
+            like_value = f"%{payload.api_key}%"
+            where_sql_parts.append("(api_key_name LIKE ? OR api_key_group LIKE ? OR api_key LIKE ?)")
+            params.extend([like_value, like_value, like_value])
+
+        if payload.model:
+            where_sql_parts.append("model LIKE ?")
+            params.append(f"%{payload.model}%")
+
+        if payload.success is not None:
+            where_sql_parts.append("success = ?")
+            params.append(1 if payload.success else 0)
+
+        if payload.status_codes:
+            placeholders = ", ".join(["?"] * len(payload.status_codes))
+            where_sql_parts.append(f"status_code IN ({placeholders})")
+            params.extend(payload.status_codes)
+
+        if payload.flagged_only:
+            where_sql_parts.append("is_flagged = 1")
+
+        count_fragments = ["COUNT(*) AS matched_rows"]
+        for field in selected_fields:
+            count_fragments.append(f"SUM(CASE WHEN {field} IS NOT NULL THEN 1 ELSE 0 END) AS {field}")
+
+        count_sql = f"SELECT {', '.join(count_fragments)} FROM request_stats WHERE {' AND '.join(where_sql_parts)}"
+        count_row = await d1_client.query_one(count_sql, params)
+        count_row = count_row or {}
+
+        matched_rows = int(count_row.get("matched_rows") or 0)
+        non_null_counts = {field: int(count_row.get(field) or 0) for field in selected_fields}
+
+        if payload.dry_run:
+            return LogsCleanupResponse(
+                dry_run=True,
+                action=action,
+                matched_rows=matched_rows,
+                affected_rows=0,
+                selected_fields=selected_fields,
+                non_null_counts=non_null_counts,
+                filters=filters,
+                message="Dry run completed. No changes have been applied.",
+            )
+
+        affected_rows = 0
+        if action == "clear_fields":
+            set_clause = ", ".join([f"{field} = NULL" for field in selected_fields])
+            update_where_parts = list(where_sql_parts)
+            if selected_fields:
+                update_where_parts.append("(" + " OR ".join([f"{field} IS NOT NULL" for field in selected_fields]) + ")")
+
+            sql = f"UPDATE request_stats SET {set_clause} WHERE {' AND '.join(update_where_parts)}"
+            result = await d1_client.execute(sql, params)
+            affected_rows = int((result.get("meta") or {}).get("changes") or 0)
+        else:
+            sql = f"DELETE FROM request_stats WHERE {' AND '.join(where_sql_parts)}"
+            result = await d1_client.execute(sql, params)
+            affected_rows = int((result.get("meta") or {}).get("changes") or 0)
+
+        return LogsCleanupResponse(
+            dry_run=False,
+            action=action,
+            matched_rows=matched_rows,
+            affected_rows=affected_rows,
+            selected_fields=selected_fields,
+            non_null_counts=non_null_counts,
+            filters=filters,
+            message="Cleanup applied successfully.",
+        )
+
+    # ========== SQLAlchemy 分支（sqlite/postgres/mysql） ==========
+    conditions = []
+    if cutoff_dt is not None:
+        conditions.append(RequestStat.timestamp < cutoff_dt)
+    if start_dt is not None:
+        conditions.append(RequestStat.timestamp >= start_dt)
+    if end_dt is not None:
+        conditions.append(RequestStat.timestamp <= end_dt)
+
+    if payload.provider:
+        conditions.append(
+            or_(
+                RequestStat.provider_id.ilike(f"%{payload.provider}%"),
+                RequestStat.provider.ilike(f"%{payload.provider}%"),
+            )
+        )
+
+    if payload.api_key:
+        conditions.append(
+            or_(
+                RequestStat.api_key_name.ilike(f"%{payload.api_key}%"),
+                RequestStat.api_key_group.ilike(f"%{payload.api_key}%"),
+                RequestStat.api_key.ilike(f"%{payload.api_key}%"),
+            )
+        )
+
+    if payload.model:
+        conditions.append(RequestStat.model.ilike(f"%{payload.model}%"))
+
+    if payload.success is not None:
+        conditions.append(RequestStat.success == payload.success)
+
+    if payload.status_codes:
+        conditions.append(RequestStat.status_code.in_(payload.status_codes))
+
+    if payload.flagged_only:
+        conditions.append(RequestStat.is_flagged.is_(True))
+
+    async with async_session_scope() as session:
+        aggregate_cols = [func.count(RequestStat.id).label("matched_rows")]
+        for field in selected_fields:
+            column = getattr(RequestStat, field)
+            aggregate_cols.append(func.sum(case((column.isnot(None), 1), else_=0)).label(field))
+
+        count_query = select(*aggregate_cols).where(*conditions)
+        count_result = await session.execute(count_query)
+        count_row = count_result.mappings().one_or_none() or {}
+
+        matched_rows = int(count_row.get("matched_rows") or 0)
+        non_null_counts = {field: int(count_row.get(field) or 0) for field in selected_fields}
+
+        if payload.dry_run:
+            return LogsCleanupResponse(
+                dry_run=True,
+                action=action,
+                matched_rows=matched_rows,
+                affected_rows=0,
+                selected_fields=selected_fields,
+                non_null_counts=non_null_counts,
+                filters=filters,
+                message="Dry run completed. No changes have been applied.",
+            )
+
+        if action == "clear_fields":
+            values_dict = {field: None for field in selected_fields}
+            non_null_clause = or_(*[getattr(RequestStat, field).isnot(None) for field in selected_fields])
+            stmt = update(RequestStat).where(*conditions).where(non_null_clause).values(**values_dict)
+        else:
+            stmt = delete(RequestStat).where(*conditions)
+
+        exec_result = await session.execute(stmt)
+        await session.commit()
+
+        raw_rowcount = exec_result.rowcount
+        affected_rows = int(raw_rowcount if isinstance(raw_rowcount, int) and raw_rowcount >= 0 else matched_rows)
+
+        return LogsCleanupResponse(
+            dry_run=False,
+            action=action,
+            matched_rows=matched_rows,
+            affected_rows=affected_rows,
+            selected_fields=selected_fields,
+            non_null_counts=non_null_counts,
+            filters=filters,
+            message="Cleanup applied successfully.",
+        )
+
+
 @router.get("/v1/logs", response_model=LogsPage, dependencies=[Depends(rate_limit_dependency)])
 async def get_logs(
     request: Request,
@@ -778,7 +1139,6 @@ async def get_logs(
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid end_time: {e}")
         
-        from sqlalchemy import or_
         # 模糊搜索：渠道（兼容 provider_id 与 provider 字段）
         if provider:
             conditions.append(

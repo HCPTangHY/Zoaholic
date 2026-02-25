@@ -6,11 +6,59 @@ import {
   Timer, Database, Server, Blocks, Plus, Trash2, Edit2, Link
 } from 'lucide-react';
 
+type CleanupAction = 'clear_fields' | 'delete_rows';
+type CleanupTimeMode = 'older_than_hours' | 'custom_range' | 'all';
+type CleanupSuccessMode = 'ALL' | 'SUCCESS' | 'FAILED';
+
+interface LogsCleanupResponse {
+  dry_run: boolean;
+  action: CleanupAction;
+  matched_rows: number;
+  affected_rows: number;
+  selected_fields: string[];
+  non_null_counts: Record<string, number>;
+  filters: Record<string, unknown>;
+  message: string;
+}
+
+const LOG_CLEANUP_FIELD_OPTIONS: { key: string; label: string }[] = [
+  { key: 'request_headers', label: '用户请求头' },
+  { key: 'request_body', label: '用户请求体' },
+  { key: 'upstream_request_headers', label: '上游请求头' },
+  { key: 'upstream_request_body', label: '上游请求体' },
+  { key: 'upstream_response_body', label: '上游响应体' },
+  { key: 'response_body', label: '返回给用户的响应体' },
+  { key: 'retry_path', label: '重试路径' },
+  { key: 'text', label: '文本摘要' },
+];
+
+const DEFAULT_CLEANUP_FIELDS = LOG_CLEANUP_FIELD_OPTIONS
+  .filter(item => item.key !== 'text')
+  .map(item => item.key);
+
 export default function Settings() {
   const { token } = useAuthStore();
   const [preferences, setPreferences] = useState<any>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+
+  // 数据库清理状态
+  const [cleanupAction, setCleanupAction] = useState<CleanupAction>('clear_fields');
+  const [cleanupTimeMode, setCleanupTimeMode] = useState<CleanupTimeMode>('older_than_hours');
+  const [cleanupOlderThanHours, setCleanupOlderThanHours] = useState(168);
+  const [cleanupStartTime, setCleanupStartTime] = useState('');
+  const [cleanupEndTime, setCleanupEndTime] = useState('');
+  const [cleanupProvider, setCleanupProvider] = useState('');
+  const [cleanupModel, setCleanupModel] = useState('');
+  const [cleanupApiKey, setCleanupApiKey] = useState('');
+  const [cleanupStatusCodes, setCleanupStatusCodes] = useState('');
+  const [cleanupSuccessMode, setCleanupSuccessMode] = useState<CleanupSuccessMode>('ALL');
+  const [cleanupFlaggedOnly, setCleanupFlaggedOnly] = useState(false);
+  const [cleanupFields, setCleanupFields] = useState<string[]>(DEFAULT_CLEANUP_FIELDS);
+  const [cleanupRunning, setCleanupRunning] = useState(false);
+  const [cleanupResult, setCleanupResult] = useState<LogsCleanupResponse | null>(null);
+  const [cleanupConfirmText, setCleanupConfirmText] = useState('');
+  const [cleanupMessage, setCleanupMessage] = useState('');
 
   // Load configuration
   useEffect(() => {
@@ -46,6 +94,150 @@ export default function Settings() {
     setPreferences((prev: any) => ({ ...prev, [key]: value }));
   };
 
+  const parseErrorMessage = async (res: Response) => {
+    try {
+      const data = await res.json();
+      return data?.detail || data?.message || `HTTP ${res.status}`;
+    } catch {
+      return `HTTP ${res.status}`;
+    }
+  };
+
+  const toIsoStringOrUndefined = (localDateTime: string) => {
+    if (!localDateTime) return undefined;
+    const dt = new Date(localDateTime);
+    if (Number.isNaN(dt.getTime())) return undefined;
+    return dt.toISOString();
+  };
+
+  const toggleCleanupField = (field: string) => {
+    setCleanupFields(prev => (
+      prev.includes(field) ? prev.filter(item => item !== field) : [...prev, field]
+    ));
+  };
+
+  const buildCleanupPayload = (dryRun: boolean) => {
+    const payload: Record<string, unknown> = {
+      dry_run: dryRun,
+      action: cleanupAction,
+      flagged_only: cleanupFlaggedOnly,
+    };
+
+    if (cleanupAction === 'clear_fields') {
+      payload.fields = cleanupFields;
+    }
+
+    if (cleanupTimeMode === 'older_than_hours') {
+      payload.older_than_hours = cleanupOlderThanHours;
+    } else if (cleanupTimeMode === 'custom_range') {
+      const startIso = toIsoStringOrUndefined(cleanupStartTime);
+      const endIso = toIsoStringOrUndefined(cleanupEndTime);
+      if (startIso) payload.start_time = startIso;
+      if (endIso) payload.end_time = endIso;
+    }
+
+    if (cleanupProvider.trim()) payload.provider = cleanupProvider.trim();
+    if (cleanupModel.trim()) payload.model = cleanupModel.trim();
+    if (cleanupApiKey.trim()) payload.api_key = cleanupApiKey.trim();
+    if (cleanupStatusCodes.trim()) {
+      const parsedCodes = cleanupStatusCodes
+        .split(',')
+        .map(item => parseInt(item.trim(), 10))
+        .filter(code => !Number.isNaN(code));
+      if (parsedCodes.length > 0) {
+        payload.status_codes = parsedCodes;
+      }
+    }
+
+    if (cleanupSuccessMode === 'SUCCESS') payload.success = true;
+    if (cleanupSuccessMode === 'FAILED') payload.success = false;
+
+    return payload;
+  };
+
+  const handleCleanupPreview = async () => {
+    if (!token) return;
+
+    if (cleanupAction === 'clear_fields' && cleanupFields.length === 0) {
+      alert('请至少选择一个要清空的字段');
+      return;
+    }
+
+    if (cleanupTimeMode === 'older_than_hours' && cleanupOlderThanHours < 1) {
+      alert('按小时清理时，小时数必须大于等于 1');
+      return;
+    }
+
+    setCleanupRunning(true);
+    setCleanupMessage('');
+    try {
+      const res = await apiFetch('/v1/logs/cleanup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify(buildCleanupPayload(true)),
+      });
+
+      if (!res.ok) {
+        const msg = await parseErrorMessage(res);
+        setCleanupMessage(`预览失败：${msg}`);
+        return;
+      }
+
+      const data = await res.json();
+      setCleanupResult(data);
+      setCleanupMessage('预览成功：仅统计未执行写入。');
+    } catch (err) {
+      setCleanupMessage('预览失败：网络错误');
+    } finally {
+      setCleanupRunning(false);
+    }
+  };
+
+  const requiredConfirmPhrase = cleanupAction === 'delete_rows' ? 'DELETE' : 'CLEAR';
+
+  const handleCleanupExecute = async () => {
+    if (!token) return;
+
+    if (cleanupAction === 'clear_fields' && cleanupFields.length === 0) {
+      alert('请至少选择一个要清空的字段');
+      return;
+    }
+
+    if (cleanupConfirmText.trim().toUpperCase() !== requiredConfirmPhrase) {
+      alert(`请输入确认词 ${requiredConfirmPhrase} 后再执行`);
+      return;
+    }
+
+    if (!window.confirm('该操作会修改数据库，是否确认执行？')) {
+      return;
+    }
+
+    setCleanupRunning(true);
+    setCleanupMessage('');
+    try {
+      const res = await apiFetch('/v1/logs/cleanup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify(buildCleanupPayload(false)),
+      });
+
+      if (!res.ok) {
+        const msg = await parseErrorMessage(res);
+        setCleanupMessage(`执行失败：${msg}`);
+        return;
+      }
+
+      const data: LogsCleanupResponse = await res.json();
+      setCleanupResult(data);
+      setCleanupConfirmText('');
+      setCleanupMessage(`执行完成：影响 ${data.affected_rows} 条记录`);
+    } catch (err) {
+      setCleanupMessage('执行失败：网络错误');
+    } finally {
+      setCleanupRunning(false);
+    }
+  };
+
   const handleSave = async () => {
     if (!token) return;
     setSaving(true);
@@ -58,7 +250,8 @@ export default function Settings() {
       if (res.ok) {
         alert('配置已保存成功');
       } else {
-        alert('保存失败');
+        const msg = await parseErrorMessage(res);
+        alert(`保存失败：${msg}`);
       }
     } catch (err) {
       alert('网络错误');
@@ -215,6 +408,158 @@ export default function Settings() {
               className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
             />
             <p className="text-xs text-muted-foreground mt-2">设为 0 表示不保存请求/响应原始数据，减少存储占用</p>
+          </div>
+        </section>
+
+        {/* 数据库清理工具 */}
+        <section className="bg-card border border-border rounded-xl overflow-hidden">
+          <div className="p-4 border-b border-border bg-muted/30 flex items-center gap-2 font-medium text-foreground">
+            <Database className="w-5 h-5 text-rose-500" /> 数据库清理工具
+          </div>
+          <div className="p-6 space-y-5">
+            <div className="p-4 bg-rose-500/10 border border-rose-500/20 rounded-lg text-sm text-rose-700 dark:text-rose-300">
+              <div className="font-medium mb-1">高风险操作提醒</div>
+              <ul className="list-disc pl-4 space-y-1 text-xs">
+                <li><code className="px-1 rounded bg-rose-500/20">clear_fields</code>：清空大字段，保留日志行（推荐）</li>
+                <li><code className="px-1 rounded bg-rose-500/20">delete_rows</code>：直接删除日志行（不可恢复）</li>
+                <li>建议先点击“预览匹配结果（Dry Run）”，确认范围后再执行</li>
+              </ul>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="text-sm font-medium text-foreground mb-1.5 block">清理动作</label>
+                <select
+                  value={cleanupAction}
+                  onChange={e => setCleanupAction(e.target.value as CleanupAction)}
+                  className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
+                >
+                  <option value="clear_fields">仅清空字段内容（保留日志）</option>
+                  <option value="delete_rows">删除整条日志</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-foreground mb-1.5 block">时间筛选模式</label>
+                <select
+                  value={cleanupTimeMode}
+                  onChange={e => setCleanupTimeMode(e.target.value as CleanupTimeMode)}
+                  className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
+                >
+                  <option value="older_than_hours">清理早于 N 小时的数据</option>
+                  <option value="custom_range">按时间区间清理</option>
+                  <option value="all">不按时间筛选（全量）</option>
+                </select>
+              </div>
+            </div>
+
+            {cleanupTimeMode === 'older_than_hours' && (
+              <div>
+                <label className="text-sm font-medium text-foreground mb-1.5 block">早于多少小时</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={cleanupOlderThanHours}
+                  onChange={e => setCleanupOlderThanHours(parseInt(e.target.value || '0', 10))}
+                  className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
+                />
+              </div>
+            )}
+
+            {cleanupTimeMode === 'custom_range' && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="text-sm font-medium text-foreground mb-1.5 block">开始时间</label>
+                  <input
+                    type="datetime-local"
+                    value={cleanupStartTime}
+                    onChange={e => setCleanupStartTime(e.target.value)}
+                    className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
+                  />
+                </div>
+                <div>
+                  <label className="text-sm font-medium text-foreground mb-1.5 block">结束时间</label>
+                  <input
+                    type="datetime-local"
+                    value={cleanupEndTime}
+                    onChange={e => setCleanupEndTime(e.target.value)}
+                    className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
+                  />
+                </div>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <input type="text" value={cleanupProvider} onChange={e => setCleanupProvider(e.target.value)} placeholder="按渠道过滤（provider/provider_id 模糊匹配）" className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground" />
+              <input type="text" value={cleanupModel} onChange={e => setCleanupModel(e.target.value)} placeholder="按模型过滤（模糊匹配）" className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground" />
+              <input type="text" value={cleanupApiKey} onChange={e => setCleanupApiKey(e.target.value)} placeholder="按 API Key 名称/分组/前缀过滤" className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground" />
+              <input type="text" value={cleanupStatusCodes} onChange={e => setCleanupStatusCodes(e.target.value)} placeholder="按状态码过滤（如 400,401,429）" className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground" />
+              <select value={cleanupSuccessMode} onChange={e => setCleanupSuccessMode(e.target.value as CleanupSuccessMode)} className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground md:col-span-2">
+                <option value="ALL">所有状态</option>
+                <option value="SUCCESS">仅成功请求</option>
+                <option value="FAILED">仅失败请求</option>
+              </select>
+            </div>
+
+            <label className="flex items-center gap-2 text-sm text-foreground">
+              <input
+                type="checkbox"
+                checked={cleanupFlaggedOnly}
+                onChange={e => setCleanupFlaggedOnly(e.target.checked)}
+                className="rounded border-border"
+              />
+              仅清理已标记日志（is_flagged=true）
+            </label>
+
+            {cleanupAction === 'clear_fields' && (
+              <div>
+                <label className="text-sm font-medium text-foreground mb-2 block">选择要清空的字段</label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {LOG_CLEANUP_FIELD_OPTIONS.map(item => (
+                    <label key={item.key} className="flex items-center gap-2 text-sm text-foreground bg-muted/40 border border-border rounded-lg px-3 py-2">
+                      <input
+                        type="checkbox"
+                        checked={cleanupFields.includes(item.key)}
+                        onChange={() => toggleCleanupField(item.key)}
+                        className="rounded border-border"
+                      />
+                      {item.label}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="flex flex-col md:flex-row gap-3 md:items-center">
+              <button onClick={handleCleanupPreview} disabled={cleanupRunning} className="bg-secondary hover:bg-secondary/80 text-secondary-foreground px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50">
+                {cleanupRunning ? '处理中...' : '预览匹配结果（Dry Run）'}
+              </button>
+              <input
+                type="text"
+                value={cleanupConfirmText}
+                onChange={e => setCleanupConfirmText(e.target.value)}
+                placeholder={`执行前请输入确认词：${requiredConfirmPhrase}`}
+                className="flex-1 bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
+              />
+              <button onClick={handleCleanupExecute} disabled={cleanupRunning} className="bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50">
+                执行清理
+              </button>
+            </div>
+
+            {cleanupMessage && <div className="text-sm text-muted-foreground">{cleanupMessage}</div>}
+
+            {cleanupResult && (
+              <div className="border border-border rounded-lg p-4 bg-muted/40 space-y-2 text-sm">
+                <div>匹配记录数：<span className="font-mono">{cleanupResult.matched_rows}</span></div>
+                <div>实际影响数：<span className="font-mono">{cleanupResult.affected_rows}</span></div>
+                {Object.keys(cleanupResult.non_null_counts || {}).length > 0 && (
+                  <div>
+                    <div className="text-muted-foreground mb-1">字段非空统计：</div>
+                    <pre className="bg-background border border-border rounded-lg p-2 text-xs overflow-x-auto">{JSON.stringify(cleanupResult.non_null_counts, null, 2)}</pre>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </section>
 

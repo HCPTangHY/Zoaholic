@@ -12,6 +12,7 @@ from .utils import (
     safe_get,
 )
 from .plugins.interceptors import apply_request_interceptors
+from .payload_filter import filter_payload_parameters
 
 
 def _prepend_system_prompt(request: RequestModel, system_prompt: str) -> RequestModel:
@@ -170,6 +171,15 @@ async def get_payload(request: RequestModel, engine, provider, api_key=None):
         )
 
         logger.debug(f"[get_payload] After apply_request_interceptors, model={payload.get('model')}")
+
+        # 请求体参数过滤：移除渠道不支持的字段，避免上游严格校验报错
+        payload = filter_payload_parameters(
+            payload,
+            engine=engine,
+            provider=provider,
+            model=request.model,
+            original_model=original_model,
+        )
 
         return url, headers, payload
      
