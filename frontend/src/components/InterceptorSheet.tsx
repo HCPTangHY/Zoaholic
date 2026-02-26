@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { 
   Puzzle, 
@@ -18,6 +18,13 @@ interface PluginOption {
   response_interceptors: any[];
   metadata?: {
     params_hint?: string;
+    provider_config?: {
+      key: string;
+      type?: 'json' | 'text';
+      title?: string;
+      description?: string;
+      example?: any;
+    };
   };
 }
 
@@ -26,12 +33,15 @@ interface InterceptorSheetProps {
   onOpenChange: (open: boolean) => void;
   allPlugins: PluginOption[];
   enabledPlugins: string[]; // ["pluginA:config", "pluginB"]
-  onUpdate: (plugins: string[]) => void;
+  providerPreferences: Record<string, any>;
+  onUpdate: (payload: { enabled_plugins: string[]; preferences_patch: Record<string, any>; preferences_delete: string[] }) => void;
 }
 
-export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugins, onUpdate }: InterceptorSheetProps) {
+export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugins, providerPreferences, onUpdate }: InterceptorSheetProps) {
   // Parsing helpers
   const parseEntry = (entry: string) => {
+    // 约定：enabled_plugins 的单条配置使用“第一个冒号”分隔 name 与 options。
+    // 这样 options 中可以包含冒号（例如 URL、JSON 等）。
     const colonIdx = entry.indexOf(':');
     if (colonIdx === -1) return { name: entry.trim(), options: '' };
     return { 
@@ -41,15 +51,40 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
   };
 
   // State
-  const [selected, setSelected] = useState<Map<string, string>>(() => {
+  const [selected, setSelected] = useState<Map<string, string>>(new Map());
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [providerConfigText, setProviderConfigText] = useState<Map<string, string>>(new Map());
+
+  // Re-init when opening (important: same sheet instance is reused across different providers)
+  useEffect(() => {
+    if (!open) return;
+
     const m = new Map<string, string>();
     enabledPlugins.forEach(entry => {
       const { name, options } = parseEntry(entry);
       if (name) m.set(name, options);
     });
-    return m;
-  });
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+    setSelected(m);
+    setExpanded(new Set());
+
+    const cfgMap = new Map<string, string>();
+    allPlugins.forEach(p => {
+      const meta = p.metadata?.provider_config;
+      if (!meta?.key) return;
+
+      const raw = (providerPreferences || {})[meta.key];
+      if (raw === undefined || raw === null) {
+        cfgMap.set(p.plugin_name, '');
+      } else {
+        try {
+          cfgMap.set(p.plugin_name, JSON.stringify(raw, null, 2));
+        } catch {
+          cfgMap.set(p.plugin_name, String(raw));
+        }
+      }
+    });
+    setProviderConfigText(cfgMap);
+  }, [open, enabledPlugins, allPlugins, providerPreferences]);
 
   // Handlers
   const toggleSelect = (pluginName: string) => {
@@ -90,12 +125,56 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
     setSelected(new Map());
   };
 
+  const updateProviderConfigText = (pluginName: string, text: string) => {
+    setProviderConfigText(prev => {
+      const next = new Map(prev);
+      next.set(pluginName, text);
+      return next;
+    });
+  };
+
+  const formatJsonText = (text: string): string => {
+    if (!text.trim()) return '';
+    const obj = JSON.parse(text);
+    return JSON.stringify(obj, null, 2);
+  };
+
   const handleSave = () => {
     const result: string[] = [];
     selected.forEach((options, name) => {
       result.push(options ? `${name}:${options}` : name);
     });
-    onUpdate(result);
+
+    const preferences_patch: Record<string, any> = {};
+    const preferences_delete: string[] = [];
+
+    for (const plugin of allPlugins) {
+      const meta = plugin.metadata?.provider_config;
+      if (!meta?.key) continue;
+
+      const text = providerConfigText.get(plugin.plugin_name) || '';
+      const t = text.trim();
+
+      // empty => delete config key
+      if (!t) {
+        preferences_delete.push(meta.key);
+        continue;
+      }
+
+      const configType = meta.type || 'json';
+      if (configType === 'json') {
+        try {
+          preferences_patch[meta.key] = JSON.parse(t);
+        } catch (e: any) {
+          alert(`插件 ${plugin.plugin_name} 配置 JSON 格式错误：${e?.message || 'invalid json'}`);
+          return;
+        }
+      } else {
+        preferences_patch[meta.key] = t;
+      }
+    }
+
+    onUpdate({ enabled_plugins: result, preferences_patch, preferences_delete });
     onOpenChange(false);
   };
 
@@ -176,6 +255,69 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
                             className="w-full bg-background border border-border text-foreground focus:border-emerald-500 px-3 py-2 rounded-md text-sm font-mono disabled:opacity-50 outline-none"
                           />
                         </div>
+
+                        {plugin.metadata?.provider_config?.key && (
+                          <div className="space-y-2 mt-4">
+                            <label className="text-xs font-medium text-muted-foreground flex items-center gap-1">
+                              <Settings2 className="w-3.5 h-3.5" />
+                              {plugin.metadata?.provider_config?.title || '渠道配置（JSON）'}
+                            </label>
+
+                            {plugin.metadata?.provider_config?.description && (
+                              <p className="text-xs text-muted-foreground">{plugin.metadata.provider_config.description}</p>
+                            )}
+
+                            <textarea
+                              value={providerConfigText.get(plugin.plugin_name) || ''}
+                              onChange={(e) => updateProviderConfigText(plugin.plugin_name, e.target.value)}
+                              disabled={!isSelected}
+                              rows={6}
+                              placeholder={
+                                plugin.metadata?.provider_config?.example
+                                  ? JSON.stringify(plugin.metadata.provider_config.example, null, 2)
+                                  : '请输入 JSON'
+                              }
+                              className="w-full bg-background border border-border text-foreground focus:border-emerald-500 px-3 py-2 rounded-md text-sm font-mono disabled:opacity-50 outline-none"
+                            />
+
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                disabled={!isSelected}
+                                onClick={() => {
+                                  try {
+                                    updateProviderConfigText(plugin.plugin_name, formatJsonText(providerConfigText.get(plugin.plugin_name) || ''));
+                                  } catch (e: any) {
+                                    alert(`格式化失败：${e?.message || 'invalid json'}`);
+                                  }
+                                }}
+                                className="text-xs font-medium text-muted-foreground hover:text-foreground px-2 py-1 bg-muted rounded disabled:opacity-50"
+                              >
+                                格式化
+                              </button>
+
+                              {plugin.metadata?.provider_config?.example && (
+                                <button
+                                  type="button"
+                                  disabled={!isSelected}
+                                  onClick={() => updateProviderConfigText(plugin.plugin_name, JSON.stringify(plugin.metadata?.provider_config?.example, null, 2))}
+                                  className="text-xs font-medium text-emerald-600 dark:text-emerald-500 hover:text-emerald-500 px-2 py-1 bg-emerald-500/10 rounded disabled:opacity-50"
+                                >
+                                  填入示例
+                                </button>
+                              )}
+
+                              <button
+                                type="button"
+                                disabled={!isSelected}
+                                onClick={() => updateProviderConfigText(plugin.plugin_name, '')}
+                                className="text-xs font-medium text-red-600 dark:text-red-400 hover:text-red-500 px-2 py-1 bg-red-500/10 rounded disabled:opacity-50"
+                              >
+                                清空
+                              </button>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>

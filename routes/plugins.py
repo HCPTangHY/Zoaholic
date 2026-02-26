@@ -121,6 +121,7 @@ async def list_interceptor_plugins(_: int = Depends(verify_admin_api_key)):
             "enabled": full_info.enabled if full_info else False,
             "request_interceptors": plugin_info["request_interceptors"],
             "response_interceptors": plugin_info["response_interceptors"],
+            "metadata": full_info.metadata if full_info else {},
         })
     
     return JSONResponse(content={

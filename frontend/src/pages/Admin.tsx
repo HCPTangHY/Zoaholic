@@ -339,6 +339,31 @@ export default function Admin() {
     }
   };
 
+
+  // ========== Clear All Keys ==========
+  const handleClearAllKeys = async () => {
+    if (!token) return;
+    if (keys.length === 0) return;
+    if (!confirm(`确定要清空全部 API Keys 吗？（共 ${keys.length} 个，将无法恢复）`)) return;
+
+    try {
+      const res = await apiFetch('/v1/api_config/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ api_keys: [] })
+      });
+      if (res.ok) {
+        setKeys([]);
+        fetchData();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        alert(`清空失败: ${data.detail || res.status}`);
+      }
+    } catch (err) {
+      alert('网络错误');
+    }
+  };
+
   // ========== Add Credits ==========
   const openCreditsDialog = (key: string) => {
     setCreditsTargetKey(key);
@@ -405,6 +430,14 @@ export default function Admin() {
         <div className="flex gap-2">
           <button onClick={fetchData} className="p-2 text-muted-foreground hover:text-foreground bg-card border border-border rounded-lg">
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+          </button>
+          <button
+            onClick={handleClearAllKeys}
+            disabled={keys.length === 0}
+            className="px-3 py-2 text-sm font-medium bg-red-500/10 border border-red-500/30 text-red-600 dark:text-red-400 hover:bg-red-500/20 rounded-lg flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+            title="一键清空全部 API Keys"
+          >
+            <Trash2 className="w-4 h-4" /> 清空全部
           </button>
           <button onClick={() => openSheet()} className="bg-primary hover:bg-primary/90 text-primary-foreground px-4 py-2 rounded-lg flex items-center gap-2 font-medium">
             <Plus className="w-4 h-4" /> 新增 API Key

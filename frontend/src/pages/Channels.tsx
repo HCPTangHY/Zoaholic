@@ -33,17 +33,9 @@ interface ProviderFormData {
   groups: string[];
   models: string[];
   mappings: ModelMapping[];
-  preferences: {
-    weight?: number;
-    cooldown_period?: number;
-    api_key_schedule_algorithm?: string;
-    proxy?: string;
-    tools?: boolean;
-    system_prompt?: string;
-    headers?: Record<string, string>;
-    post_body_parameter_overrides?: Record<string, any>;
-    enabled_plugins?: string[];
-  };
+  // 注意：preferences 允许包含任意插件的 per-provider 配置。
+  // 因此这里用 Record<string, any>，避免为每个插件都在 Channels 页面硬编码字段。
+  preferences: Record<string, any>;
 }
 
 interface ChannelOption {
@@ -60,9 +52,7 @@ interface PluginOption {
   enabled: boolean;
   request_interceptors: any[];
   response_interceptors: any[];
-  metadata?: {
-    params_hint?: string;
-  };
+  metadata?: any;
 }
 
 const SCHEDULE_ALGORITHMS = [
@@ -180,6 +170,10 @@ export default function Channels() {
       setHeadersJson(Object.keys(pHeaders).length > 0 ? JSON.stringify(pHeaders, null, 2) : '');
       setOverridesJson(Object.keys(pOverrides).length > 0 ? JSON.stringify(pOverrides, null, 2) : '');
 
+      const basePreferences = provider.preferences && typeof provider.preferences === 'object'
+        ? provider.preferences
+        : {};
+
       setFormData({
         provider: provider.provider || provider.name || '',
         engine: provider.engine || '',
@@ -191,14 +185,15 @@ export default function Channels() {
         models,
         mappings,
         preferences: {
-          weight: provider.preferences?.weight ?? provider.weight ?? 10,
-          cooldown_period: provider.preferences?.cooldown_period ?? 300,
-          api_key_schedule_algorithm: provider.preferences?.api_key_schedule_algorithm || 'round_robin',
-          proxy: provider.preferences?.proxy || '',
-          tools: provider.preferences?.tools !== false,
-          system_prompt: provider.preferences?.system_prompt || '',
-          enabled_plugins: provider.preferences?.enabled_plugins || [],
-        }
+          ...basePreferences,
+          weight: basePreferences.weight ?? provider.weight ?? 10,
+          cooldown_period: basePreferences.cooldown_period ?? 300,
+          api_key_schedule_algorithm: basePreferences.api_key_schedule_algorithm || 'round_robin',
+          proxy: basePreferences.proxy || '',
+          tools: basePreferences.tools !== false,
+          system_prompt: basePreferences.system_prompt || '',
+          enabled_plugins: Array.isArray(basePreferences.enabled_plugins) ? basePreferences.enabled_plugins : [],
+        },
       });
     } else {
       setHeadersJson('');
@@ -272,6 +267,13 @@ export default function Channels() {
     if (!activeKeys.length) return;
     navigator.clipboard.writeText(activeKeys.join('\n'));
     alert('已复制所有有效密钥');
+  };
+
+  const clearAllKeys = () => {
+    if (!formData) return;
+    if (formData.api_keys.length === 0) return;
+    if (!confirm('确定要清空该渠道的全部密钥吗？此操作仅影响当前编辑中的渠道配置，保存后才会生效。')) return;
+    updateFormData('api_keys', []);
   };
 
   const handleGroupInputKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
@@ -428,8 +430,19 @@ export default function Channels() {
     setModelDisplayKey(prev => prev + 1);
   };
 
-  const handlePluginSheetUpdate = (newPlugins: string[]) => {
-    updatePreference('enabled_plugins', newPlugins);
+  const handlePluginSheetUpdate = (payload: { enabled_plugins: string[]; preferences_patch: Record<string, any>; preferences_delete: string[] }) => {
+    setFormData(prev => {
+      if (!prev) return prev;
+      const nextPrefs: Record<string, any> = { ...(prev.preferences || {}) };
+      nextPrefs.enabled_plugins = payload.enabled_plugins;
+      for (const [k, v] of Object.entries(payload.preferences_patch || {})) {
+        nextPrefs[k] = v;
+      }
+      for (const k of payload.preferences_delete || []) {
+        delete nextPrefs[k];
+      }
+      return { ...prev, preferences: nextPrefs };
+    });
   };
 
   const handleDeleteProvider = async (idx: number) => {
@@ -845,6 +858,14 @@ export default function Channels() {
                     <span className="flex items-center gap-2"><Settings2 className="w-4 h-4 text-emerald-500" /> API Keys</span>
                     <div className="flex items-center gap-2 text-xs">
                       <button onClick={copyAllKeys} className="text-muted-foreground hover:text-foreground flex items-center gap-1"><Copy className="w-3 h-3" /> 复制全部</button>
+                      <button
+                        onClick={clearAllKeys}
+                        disabled={formData.api_keys.length === 0}
+                        className="text-red-600 dark:text-red-500 hover:text-red-700 dark:hover:text-red-400 flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+                        title="一键清空该渠道的全部密钥"
+                      >
+                        <Trash2 className="w-3 h-3" /> 清空
+                      </button>
                       <button onClick={addEmptyKey} className="text-primary hover:text-primary/80 flex items-center gap-1"><Plus className="w-3 h-3" /> 添加密钥</button>
                     </div>
                   </div>
@@ -976,7 +997,7 @@ export default function Channels() {
                           {(!formData.preferences.enabled_plugins || formData.preferences.enabled_plugins.length === 0) ? (
                             <span className="text-sm text-muted-foreground italic">未启用任何插件</span>
                           ) : (
-                            formData.preferences.enabled_plugins.map((p, idx) => {
+                            (formData.preferences.enabled_plugins as string[]).map((p: string, idx: number) => {
                               const [name, opts] = p.split(':');
                               return (
                                 <span key={idx} className="bg-emerald-500/10 border border-emerald-500/20 text-emerald-600 dark:text-emerald-500 px-2 py-1 rounded text-xs font-mono flex items-center gap-1">
@@ -1025,6 +1046,7 @@ export default function Channels() {
                       />
                       <p className="text-xs text-muted-foreground mt-1">失焦时自动格式化</p>
                     </div>
+
                     <div className="flex items-center justify-between p-3 bg-muted/50 rounded-lg border border-border">
                       <span className="text-sm text-foreground">启用 Tools (函数调用)</span>
                       <Switch.Root checked={formData.preferences.tools} onCheckedChange={val => updatePreference('tools', val)} className="w-11 h-6 bg-muted rounded-full data-[state=checked]:bg-primary">
@@ -1131,6 +1153,7 @@ export default function Channels() {
           onOpenChange={setShowPluginSheet}
           allPlugins={allPlugins}
           enabledPlugins={formData.preferences.enabled_plugins || []}
+          providerPreferences={formData.preferences || {}}
           onUpdate={handlePluginSheetUpdate}
         />
       )}

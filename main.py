@@ -4,7 +4,7 @@ import asyncio
 import tomllib
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from starlette.responses import Response
@@ -96,6 +96,8 @@ async def cleanup_expired_raw_data():
             first_run = False
             
             if DISABLE_DATABASE:
+                # 数据库禁用时避免空转；该任务通常不会在 DISABLE_DATABASE=True 时启动，但这里做防御。
+                await asyncio.sleep(3600)
                 continue
                 
             async with async_session_scope() as db:
@@ -155,6 +157,181 @@ async def cleanup_expired_raw_data():
             await asyncio.sleep(60)
 
 
+async def cleanup_expired_logs(app):
+    """按全局配置清理过期日志行（删除整行，不保留）。
+
+    说明：
+    - 配置项位于 config.preferences：
+      - log_retention_mode: keep | manual | auto_delete
+      - log_retention_days: 正整数，保留天数
+    - 只有 mode == auto_delete 时才执行自动删除（显式开启，避免误删）。
+    - 支持固定在每天某个时间点执行（默认 03:00，按服务器时区/可配置时区）。
+    """
+
+    from sqlalchemy import delete
+    from db import RequestStat, ChannelStat
+
+    def _parse_run_at(value: Optional[str]) -> tuple[int, int]:
+        text = str(value or "").strip()
+        if not text:
+            return 3, 0
+        parts = text.split(":")
+        try:
+            if len(parts) == 1:
+                h = int(parts[0])
+                m = 0
+            else:
+                h = int(parts[0])
+                m = int(parts[1])
+            h = max(0, min(23, h))
+            m = max(0, min(59, m))
+            return h, m
+        except Exception:
+            return 3, 0
+
+    def _get_tz(prefs: dict) -> timezone:
+        tz_name = str(prefs.get("log_retention_timezone") or "").strip()
+        if tz_name:
+            try:
+                from zoneinfo import ZoneInfo
+
+                return ZoneInfo(tz_name)  # type: ignore
+            except Exception:
+                pass
+
+        # 默认使用服务器本地时区（容器里通常是 UTC；若你希望用 Asia/Shanghai，可配置 log_retention_timezone）
+        try:
+            local_tz = datetime.now().astimezone().tzinfo
+            if local_tz is not None:
+                return local_tz  # type: ignore
+        except Exception:
+            pass
+        return timezone.utc
+
+    def _seconds_until_next_run(now: datetime, hour: int, minute: int) -> int:
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target = target + timedelta(days=1)
+        seconds = int((target - now).total_seconds())
+        return max(1, seconds)
+
+    next_sleep_seconds = 0
+    while True:
+        try:
+            if next_sleep_seconds:
+                await asyncio.sleep(next_sleep_seconds)
+                next_sleep_seconds = 0
+
+            if DISABLE_DATABASE:
+                # 防御：数据库禁用时避免空转
+                next_sleep_seconds = 3600
+                continue
+
+            # 等待配置加载完成（避免启动初期 app.state.config 尚未就绪）
+            if not app or not hasattr(app, "state") or not getattr(app.state, "config", None):
+                next_sleep_seconds = 5
+                continue
+
+            prefs = safe_get(app.state.config, "preferences", default={}) or {}
+            mode = str(prefs.get("log_retention_mode") or "").strip().lower()
+            days = prefs.get("log_retention_days")
+
+            tz = _get_tz(prefs)
+            run_hour, run_minute = _parse_run_at(prefs.get("log_retention_run_at"))
+            now_local = datetime.now(tz)
+
+            # 固定在每天指定时间执行。
+            # 启动/重启时如果已过今日执行时间，默认等待到下一次执行（避免在任意时间点“补跑”导致误删）。
+            # 但为了避免恰好在执行窗口附近重启导致错过当天任务，允许一个宽限窗口（默认 10 分钟）内立即执行。
+            target_today = now_local.replace(hour=run_hour, minute=run_minute, second=0, microsecond=0)
+            grace_seconds = 10 * 60
+
+            if mode != "auto_delete":
+                next_sleep_seconds = _seconds_until_next_run(now_local, run_hour, run_minute)
+                continue
+
+            delta_seconds = (now_local - target_today).total_seconds()
+            if delta_seconds < 0:
+                # 还没到今天的执行时间
+                next_sleep_seconds = _seconds_until_next_run(now_local, run_hour, run_minute)
+                continue
+            if delta_seconds > grace_seconds:
+                # 已过执行时间较久：等待下一次执行（通常是明天）
+                next_sleep_seconds = _seconds_until_next_run(now_local, run_hour, run_minute)
+                continue
+
+            try:
+                retention_days = int(days) if days is not None else 30
+            except Exception:
+                retention_days = 30
+
+            if retention_days <= 0:
+                next_sleep_seconds = _seconds_until_next_run(now_local, run_hour, run_minute)
+                continue
+
+            now_utc = datetime.now(timezone.utc)
+            cutoff = now_utc - timedelta(days=retention_days)
+
+            # ========== D1 ==========
+            if (DB_TYPE or "sqlite").lower() == "d1":
+                try:
+                    from db import d1_client
+                except Exception:
+                    # d1_client 不可用：等待一段时间再试
+                    next_sleep_seconds = 60
+                    continue
+                if d1_client is None:
+                    next_sleep_seconds = 60
+                    continue
+
+                # 先删 request_stats，再删 channel_stats
+                res1 = await d1_client.execute(
+                    "DELETE FROM request_stats WHERE timestamp < ?",
+                    [cutoff],
+                )
+                changes1 = int((res1.get("meta") or {}).get("changes") or 0)
+
+                res2 = await d1_client.execute(
+                    "DELETE FROM channel_stats WHERE timestamp < ?",
+                    [cutoff],
+                )
+                changes2 = int((res2.get("meta") or {}).get("changes") or 0)
+
+                if changes1 or changes2:
+                    logger.info(
+                        f"Auto-deleted expired logs (retention_days={retention_days}): "
+                        f"request_stats={changes1}, channel_stats={changes2}"
+                    )
+                next_sleep_seconds = _seconds_until_next_run(now_local, run_hour, run_minute)
+                continue
+
+            # ========== SQLAlchemy (sqlite/postgres/mysql) ==========
+            async with async_session_scope() as session:
+                # delete request_stats
+                r1 = await session.execute(delete(RequestStat).where(RequestStat.timestamp < cutoff))
+                # delete channel_stats
+                r2 = await session.execute(delete(ChannelStat).where(ChannelStat.timestamp < cutoff))
+                await session.commit()
+
+                affected1 = int(r1.rowcount or 0) if hasattr(r1, "rowcount") else 0
+                affected2 = int(r2.rowcount or 0) if hasattr(r2, "rowcount") else 0
+                if affected1 or affected2:
+                    logger.info(
+                        f"Auto-deleted expired logs (retention_days={retention_days}): "
+                        f"request_stats={affected1}, channel_stats={affected2}"
+                    )
+
+            # 安排下一次执行时间
+            next_sleep_seconds = _seconds_until_next_run(datetime.now(tz), run_hour, run_minute)
+
+        except asyncio.CancelledError:
+            logger.info("Logs retention cleanup task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in logs retention cleanup task: {e}")
+            next_sleep_seconds = 60
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 启动时的代码
@@ -164,6 +341,7 @@ async def lifespan(app: FastAPI):
     
     # 启动定时清理任务
     cleanup_task = None
+    logs_cleanup_task = None
     if not DISABLE_DATABASE:
         try:
             await create_tables()
@@ -248,6 +426,13 @@ async def lifespan(app: FastAPI):
             for paid_key in app.state.api_list:
                 await update_paid_api_keys_states(app, paid_key)
 
+        # 启动日志行自动清理任务（依赖 config.preferences）
+        try:
+            logs_cleanup_task = asyncio.create_task(cleanup_expired_logs(app))
+            logger.info("Started logs retention cleanup background task")
+        except Exception as e:
+            logger.error(f"Failed to start logs retention cleanup task: {e}")
+
     if app and not hasattr(app.state, 'client_manager'):
 
         default_config = {
@@ -311,6 +496,13 @@ async def lifespan(app: FastAPI):
         cleanup_task.cancel()
         try:
             await cleanup_task
+        except asyncio.CancelledError:
+            pass
+
+    if logs_cleanup_task:
+        logs_cleanup_task.cancel()
+        try:
+            await logs_cleanup_task
         except asyncio.CancelledError:
             pass
     
