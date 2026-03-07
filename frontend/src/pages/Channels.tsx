@@ -11,6 +11,7 @@ import * as Dialog from '@radix-ui/react-dialog';
 import * as Switch from '@radix-ui/react-switch';
 import { InterceptorSheet } from '../components/InterceptorSheet';
 import { ChannelTestDialog } from '../components/ChannelTestDialog';
+import { ApiKeyTestDialog } from '../components/ApiKeyTestDialog';
 
 // ========== Types ==========
 interface ApiKeyObj {
@@ -79,6 +80,8 @@ export default function Channels() {
   const [showPluginSheet, setShowPluginSheet] = useState(false);
   const [testDialogOpen, setTestDialogOpen] = useState(false);
   const [testingProvider, setTestingProvider] = useState<any>(null);
+  const [keyTestDialogOpen, setKeyTestDialogOpen] = useState(false);
+  const [keyTestInitialIndex, setKeyTestInitialIndex] = useState<number | null>(null);
   const [headersJson, setHeadersJson] = useState('');
   const [overridesJson, setOverridesJson] = useState('');
   const [modelDisplayKey, setModelDisplayKey] = useState(0);
@@ -532,6 +535,78 @@ export default function Channels() {
     setTestDialogOpen(true);
   };
 
+  const openKeyTestDialog = (initialIndex: number | null = null) => {
+    setKeyTestInitialIndex(initialIndex);
+    setKeyTestDialogOpen(true);
+  };
+
+  const buildProviderSnapshotForTest = (): any => {
+    if (!formData) return null;
+
+    const serializedKeys = formData.api_keys
+      .map(k => k.disabled ? `!${k.key.trim()}` : k.key.trim())
+      .filter(Boolean);
+    const finalApi = serializedKeys.length === 0 ? "" : serializedKeys.length === 1 ? serializedKeys[0] : serializedKeys;
+
+    const finalModels: any[] = [...formData.models];
+    formData.mappings.forEach(m => {
+      if (m.from && m.to) finalModels.push({ [m.to]: m.from });
+    });
+
+    let headersObj: any = undefined;
+    let overridesObj: any = undefined;
+    try {
+      if (headersJson.trim()) headersObj = JSON.parse(headersJson);
+    } catch {
+      headersObj = undefined;
+    }
+    try {
+      if (overridesJson.trim()) overridesObj = JSON.parse(overridesJson);
+    } catch {
+      overridesObj = undefined;
+    }
+
+    return {
+      provider: formData.provider,
+      base_url: formData.base_url,
+      model_prefix: formData.model_prefix || undefined,
+      api: finalApi,
+      model: finalModels,
+      engine: formData.engine || undefined,
+      enabled: formData.enabled,
+      groups: formData.groups,
+      preferences: {
+        ...formData.preferences,
+        headers: headersObj,
+        post_body_parameter_overrides: overridesObj,
+      },
+    };
+  };
+
+  const getProviderModelNameListForUi = (): string[] => {
+    if (!formData) return [];
+    // 这里提供“可请求的模型别名列表”，优先展示/返回别名。
+    const aliasMap = getAliasMap(); // upstream -> alias
+    const names: string[] = [];
+    // 1) 正常模型（字符串）
+    formData.models.forEach(upstream => {
+      const alias = aliasMap.get(upstream);
+      names.push(alias || upstream);
+    });
+    // 2) 映射中的 alias
+    formData.mappings.forEach(m => {
+      if (m.from) names.push(m.from);
+    });
+    return Array.from(new Set(names.map(s => String(s || '').trim()).filter(Boolean)));
+  };
+
+  const disableKeysInForm = (indices: number[]) => {
+    if (!formData || !indices.length) return;
+    const set = new Set(indices);
+    const next = formData.api_keys.map((k, idx) => set.has(idx) ? ({ ...k, disabled: true }) : k);
+    updateFormData('api_keys', next);
+  };
+
   const handleSave = async () => {
     if (!formData?.provider) {
       alert("渠道名称为必填项");
@@ -859,6 +934,14 @@ export default function Channels() {
                     <div className="flex items-center gap-2 text-xs">
                       <button onClick={copyAllKeys} className="text-muted-foreground hover:text-foreground flex items-center gap-1"><Copy className="w-3 h-3" /> 复制全部</button>
                       <button
+                        onClick={() => openKeyTestDialog(null)}
+                        disabled={formData.api_keys.length === 0}
+                        className="text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+                        title="测试该渠道中的全部 Key（可选自动禁用失效 Key）"
+                      >
+                        <Play className="w-3 h-3" /> 多key测试
+                      </button>
+                      <button
                         onClick={clearAllKeys}
                         disabled={formData.api_keys.length === 0}
                         className="text-red-600 dark:text-red-500 hover:text-red-700 dark:hover:text-red-400 flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
@@ -883,6 +966,14 @@ export default function Channels() {
                         />
                         <button onClick={() => toggleKeyDisabled(idx)} className={keyObj.disabled ? 'text-muted-foreground' : 'text-emerald-500'} title={keyObj.disabled ? "启用" : "禁用"}>
                           {keyObj.disabled ? <ToggleLeft className="w-5 h-5" /> : <ToggleRight className="w-5 h-5" />}
+                        </button>
+                        <button
+                          onClick={() => openKeyTestDialog(idx)}
+                          disabled={!keyObj.key.trim()}
+                          className="text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                          title="测试此 Key"
+                        >
+                          <Play className="w-4 h-4" />
                         </button>
                         <button onClick={() => deleteKey(idx)} className="text-red-500 hover:text-red-400 ml-1"><Trash2 className="w-4 h-4" /></button>
                       </div>
@@ -1154,7 +1245,23 @@ export default function Channels() {
           allPlugins={allPlugins}
           enabledPlugins={formData.preferences.enabled_plugins || []}
           providerPreferences={formData.preferences || {}}
+          providerModels={getProviderModelNameListForUi()}
           onUpdate={handlePluginSheetUpdate}
+        />
+      )}
+
+      {formData && (
+        <ApiKeyTestDialog
+          open={keyTestDialogOpen}
+          onOpenChange={setKeyTestDialogOpen}
+          title={`测试 API Keys: ${formData.provider || '未命名渠道'}`}
+          engine={formData.engine || 'openai'}
+          base_url={formData.base_url || ''}
+          provider_snapshot={buildProviderSnapshotForTest()}
+          apiKeys={formData.api_keys}
+          availableModels={getProviderModelNameListForUi()}
+          initialKeyIndex={keyTestInitialIndex}
+          onDisableKeys={disableKeysInForm}
         />
       )}
 

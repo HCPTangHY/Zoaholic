@@ -82,7 +82,8 @@ class BaseAPI:
         self.base_url: str = urlunparse(parsed_url[:2] + ("",) + ("",) * 3)
         self.v1_url: str = urlunparse(parsed_url[:2]+ (before_v1,) + ("",) * 3)
         if "v1/messages" in parsed_url.path:
-            self.v1_models: str = urlunparse(parsed_url[:2] + ("v1/models",) + ("",) * 3)
+            # 注意：path 必须以 / 开头，否则 urlunparse 会生成无效 URL（缺少 /）
+            self.v1_models: str = urlunparse(parsed_url[:2] + ("/v1/models",) + ("",) * 3)
         else:
             self.v1_models: str = urlunparse(parsed_url[:2] + (before_v1 + "models",) + ("",) * 3)
 

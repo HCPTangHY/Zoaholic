@@ -8,6 +8,7 @@ import json
 import copy
 import asyncio
 from datetime import datetime
+from urllib.parse import urlparse, urlunparse
 
 from ..utils import (
     safe_get,
@@ -24,6 +25,52 @@ from ..response import check_response
 # ============================================================
 # Claude 格式化函数
 # ============================================================
+
+
+def _anthropic_build_v1_url(base_url: str, suffix: str) -> str:
+    """根据用户配置的 base_url 构造 Anthropic v1 下的具体端点 URL。
+
+    兼容以下几种填写方式：
+    - https://api.anthropic.com/v1
+    - https://api.anthropic.com/v1/
+    - https://api.anthropic.com/v1/messages
+    - https://api.anthropic.com/v1/messages/
+    - https://<proxy>/any/prefix/v1/messages
+
+    Args:
+        base_url: 渠道配置中的 base_url
+        suffix: 端点后缀，如 "messages" / "models"（可带或不带前导 /）
+
+    Returns:
+        str: 拼接后的完整 URL
+    """
+
+    if not base_url:
+        return ""
+
+    suffix = str(suffix or "").strip()
+    suffix = suffix.lstrip("/")
+
+    parsed = urlparse(str(base_url).strip())
+    path = (parsed.path or "").rstrip("/")
+
+    # 1) 如果用户填的是 /v1/messages，把 /messages 去掉
+    if path.endswith("/messages"):
+        path = path[: -len("/messages")]
+
+    # 2) 确保落在 .../v1
+    if not path.endswith("/v1"):
+        # 尝试截断到最后一个 /v1（支持自建反代前缀）
+        idx = path.rfind("/v1")
+        if idx != -1 and (idx + 3 == len(path) or path[idx + 3 : idx + 4] == "/"):
+            path = path[: idx + 3]
+        else:
+            path = (path + "/v1") if path else "/v1"
+
+    # 3) 拼接 suffix
+    final_path = f"{path}/{suffix}" if suffix else path
+
+    return urlunparse((parsed.scheme, parsed.netloc, final_path, "", "", ""))
 
 def format_text_message(text: str) -> dict:
     """格式化文本消息为 Claude 格式"""
@@ -150,7 +197,10 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         "anthropic-version": "2023-06-01",
         "anthropic-beta": anthropic_beta,
     }
-    url = provider['base_url']
+    # 兼容 base_url 填 /v1 或 /v1/messages
+    url = _anthropic_build_v1_url(provider.get('base_url', ''), 'messages')
+    if not url:
+        url = provider.get('base_url', '')
 
     messages = []
     system_prompt = None
@@ -510,6 +560,42 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
     yield "data: [DONE]" + end_of_line
 
 
+async def fetch_claude_models(client, provider):
+    """获取 Anthropic Claude API 的模型列表。
+
+    兼容 base_url 填写：
+    - .../v1
+    - .../v1/messages
+    """
+
+    api_key = provider.get("api")
+    if isinstance(api_key, list):
+        api_key = api_key[0] if api_key else None
+
+    headers = {
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+    }
+    if api_key:
+        headers["x-api-key"] = str(api_key)
+
+    base_url = provider.get("base_url", "")
+    url = _anthropic_build_v1_url(base_url, "models")
+    if not url:
+        # 兜底：尽量按 OpenAI 习惯拼接
+        url = str(base_url).rstrip("/") + "/models"
+
+    response = await client.get(url, headers=headers)
+    response.raise_for_status()
+
+    data = response.json()
+    models = []
+    if isinstance(data, dict) and isinstance(data.get("data"), list):
+        models = [m.get("id") for m in data["data"] if isinstance(m, dict) and m.get("id")]
+
+    return models
+
+
 def register():
     """注册 Claude 渠道到注册中心"""
     from .registry import register_channel
@@ -524,5 +610,5 @@ def register():
         passthrough_payload_adapter=patch_passthrough_claude_payload,
         response_adapter=fetch_claude_response,
         stream_adapter=fetch_claude_response_stream,
-        models_adapter=None,
+        models_adapter=fetch_claude_models,
     )

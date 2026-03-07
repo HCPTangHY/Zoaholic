@@ -9,6 +9,8 @@ import {
   X,
 } from 'lucide-react';
 
+import { ParameterFilterEditorDialog } from './ParameterFilterEditorDialog';
+
 interface PluginOption {
   plugin_name: string;
   version: string;
@@ -34,10 +36,11 @@ interface InterceptorSheetProps {
   allPlugins: PluginOption[];
   enabledPlugins: string[]; // ["pluginA:config", "pluginB"]
   providerPreferences: Record<string, any>;
+  providerModels?: string[]; // 当前渠道已启用模型（用于某些插件的快速配置）
   onUpdate: (payload: { enabled_plugins: string[]; preferences_patch: Record<string, any>; preferences_delete: string[] }) => void;
 }
 
-export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugins, providerPreferences, onUpdate }: InterceptorSheetProps) {
+export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugins, providerPreferences, providerModels, onUpdate }: InterceptorSheetProps) {
   // Parsing helpers
   const parseEntry = (entry: string) => {
     // 约定：enabled_plugins 的单条配置使用“第一个冒号”分隔 name 与 options。
@@ -54,6 +57,8 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
   const [selected, setSelected] = useState<Map<string, string>>(new Map());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [providerConfigText, setProviderConfigText] = useState<Map<string, string>>(new Map());
+
+  const [filterEditorOpen, setFilterEditorOpen] = useState(false);
 
   // Re-init when opening (important: same sheet instance is reused across different providers)
   useEffect(() => {
@@ -86,12 +91,30 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
     setProviderConfigText(cfgMap);
   }, [open, enabledPlugins, allPlugins, providerPreferences]);
 
+  useEffect(() => {
+    if (!open) {
+      setFilterEditorOpen(false);
+    }
+  }, [open]);
+
   // Handlers
   const toggleSelect = (pluginName: string) => {
     setSelected(prev => {
       const next = new Map(prev);
-      if (next.has(pluginName)) next.delete(pluginName);
+      const wasSelected = next.has(pluginName);
+      if (wasSelected) next.delete(pluginName);
       else next.set(pluginName, '');
+
+      // post_body_parameter_filter：启用时自动弹出单独编辑窗口
+      if (!wasSelected && pluginName === 'post_body_parameter_filter') {
+        // 确保展开
+        setExpanded(prevExpanded => {
+          const s = new Set(prevExpanded);
+          s.add(pluginName);
+          return s;
+        });
+        setTimeout(() => setFilterEditorOpen(true), 0);
+      }
       return next;
     });
   };
@@ -178,6 +201,17 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
     onOpenChange(false);
   };
 
+  const getFilterEditorInitialConfig = (): any => {
+    const raw = providerConfigText.get('post_body_parameter_filter') || '';
+    const t = raw.trim();
+    if (!t) return null;
+    try {
+      return JSON.parse(t);
+    } catch {
+      return null;
+    }
+  };
+
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
@@ -216,6 +250,7 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
                 const isSelected = selected.has(plugin.plugin_name);
                 const isExpanded = expanded.has(plugin.plugin_name);
                 const options = selected.get(plugin.plugin_name) || '';
+                const isParameterFilter = plugin.plugin_name === 'post_body_parameter_filter';
 
                 return (
                   <div key={plugin.plugin_name} className={`border rounded-lg transition-colors ${isSelected ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-border bg-card'}`}>
@@ -267,18 +302,49 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
                               <p className="text-xs text-muted-foreground">{plugin.metadata.provider_config.description}</p>
                             )}
 
-                            <textarea
-                              value={providerConfigText.get(plugin.plugin_name) || ''}
-                              onChange={(e) => updateProviderConfigText(plugin.plugin_name, e.target.value)}
-                              disabled={!isSelected}
-                              rows={6}
-                              placeholder={
-                                plugin.metadata?.provider_config?.example
-                                  ? JSON.stringify(plugin.metadata.provider_config.example, null, 2)
-                                  : '请输入 JSON'
-                              }
-                              className="w-full bg-background border border-border text-foreground focus:border-emerald-500 px-3 py-2 rounded-md text-sm font-mono disabled:opacity-50 outline-none"
-                            />
+                            {isParameterFilter ? (
+                              <div className="space-y-2">
+                                <div className="flex items-center justify-between gap-2">
+                                  <p className="text-xs text-muted-foreground">
+                                    参数过滤插件建议使用“高级编辑器”配置（支持按模型快速新增规则）。
+                                  </p>
+                                  <button
+                                    type="button"
+                                    disabled={!isSelected}
+                                    onClick={() => setFilterEditorOpen(true)}
+                                    className="text-xs font-medium text-primary hover:text-primary/80 px-2 py-1 bg-primary/10 rounded disabled:opacity-50"
+                                  >
+                                    打开高级编辑器
+                                  </button>
+                                </div>
+
+                                <textarea
+                                  value={providerConfigText.get(plugin.plugin_name) || ''}
+                                  onChange={(e) => updateProviderConfigText(plugin.plugin_name, e.target.value)}
+                                  disabled={!isSelected}
+                                  rows={6}
+                                  placeholder={
+                                    plugin.metadata?.provider_config?.example
+                                      ? JSON.stringify(plugin.metadata.provider_config.example, null, 2)
+                                      : '请输入 JSON'
+                                  }
+                                  className="w-full bg-background border border-border text-foreground focus:border-emerald-500 px-3 py-2 rounded-md text-sm font-mono disabled:opacity-50 outline-none"
+                                />
+                              </div>
+                            ) : (
+                              <textarea
+                                value={providerConfigText.get(plugin.plugin_name) || ''}
+                                onChange={(e) => updateProviderConfigText(plugin.plugin_name, e.target.value)}
+                                disabled={!isSelected}
+                                rows={6}
+                                placeholder={
+                                  plugin.metadata?.provider_config?.example
+                                    ? JSON.stringify(plugin.metadata.provider_config.example, null, 2)
+                                    : '请输入 JSON'
+                                }
+                                className="w-full bg-background border border-border text-foreground focus:border-emerald-500 px-3 py-2 rounded-md text-sm font-mono disabled:opacity-50 outline-none"
+                              />
+                            )}
 
                             <div className="flex items-center gap-2">
                               <button
@@ -336,6 +402,16 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
 
         </Dialog.Content>
       </Dialog.Portal>
+
+      <ParameterFilterEditorDialog
+        open={filterEditorOpen}
+        onOpenChange={setFilterEditorOpen}
+        availableModels={providerModels || []}
+        initialConfig={getFilterEditorInitialConfig()}
+        onSave={(cfg) => {
+          updateProviderConfigText('post_body_parameter_filter', JSON.stringify(cfg, null, 2));
+        }}
+      />
     </Dialog.Root>
   );
 }
