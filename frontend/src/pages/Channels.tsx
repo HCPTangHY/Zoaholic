@@ -23,6 +23,11 @@ interface ModelMapping {
   to: string;
 }
 
+interface HeaderEntry {
+  key: string;
+  value: string;
+}
+
 interface ProviderFormData {
   provider: string;
   engine: string;
@@ -79,7 +84,7 @@ export default function Channels() {
   const [showPluginSheet, setShowPluginSheet] = useState(false);
   const [testDialogOpen, setTestDialogOpen] = useState(false);
   const [testingProvider, setTestingProvider] = useState<any>(null);
-  const [headersJson, setHeadersJson] = useState('');
+  const [headerEntries, setHeaderEntries] = useState<HeaderEntry[]>([]);
   const [overridesJson, setOverridesJson] = useState('');
   const [modelDisplayKey, setModelDisplayKey] = useState(0);
 
@@ -167,7 +172,15 @@ export default function Channels() {
 
       const pHeaders = provider.preferences?.headers || {};
       const pOverrides = provider.preferences?.post_body_parameter_overrides || {};
-      setHeadersJson(Object.keys(pHeaders).length > 0 ? JSON.stringify(pHeaders, null, 2) : '');
+      const entries: HeaderEntry[] = [];
+      Object.entries(pHeaders).forEach(([k, v]) => {
+        if (Array.isArray(v)) {
+          v.forEach(item => entries.push({ key: k, value: String(item).trim() }));
+        } else {
+          entries.push({ key: k, value: String(v).trim() });
+        }
+      });
+      setHeaderEntries(entries);
       setOverridesJson(Object.keys(pOverrides).length > 0 ? JSON.stringify(pOverrides, null, 2) : '');
 
       const basePreferences = provider.preferences && typeof provider.preferences === 'object'
@@ -196,7 +209,7 @@ export default function Channels() {
         },
       });
     } else {
-      setHeadersJson('');
+      setHeaderEntries([]);
       setOverridesJson('');
       setFormData({
         provider: '',
@@ -548,14 +561,27 @@ export default function Channels() {
       if (m.from && m.to) finalModels.push({ [m.to]: m.from });
     });
 
-    let headersObj, overridesObj;
+    let overridesObj;
     try {
-      if (headersJson.trim()) headersObj = JSON.parse(headersJson);
       if (overridesJson.trim()) overridesObj = JSON.parse(overridesJson);
     } catch (e) {
       alert("高级配置 JSON 格式错误");
       return;
     }
+
+    const headersObj: Record<string, string | string[]> | undefined = headerEntries.some(e => e.key.trim())
+      ? headerEntries.reduce((acc, e) => {
+          const k = e.key.trim(), v = e.value.trim();
+          if (!k) return acc;
+          if (acc[k]) {
+            const prev = acc[k];
+            acc[k] = Array.isArray(prev) ? [...prev, v] : [prev, v];
+          } else {
+            acc[k] = v;
+          }
+          return acc;
+        }, {} as Record<string, string | string[]>)
+      : undefined;
 
     const targetProvider: any = {
       provider: formData.provider,
@@ -1023,16 +1049,40 @@ export default function Channels() {
                       <textarea value={formData.preferences.system_prompt || ''} onChange={e => updatePreference('system_prompt', e.target.value)} rows={3} className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground" />
                     </div>
                     <div>
-                      <label className="text-sm font-medium text-foreground mb-1.5 block">自定义请求头 (JSON)</label>
-                      <textarea
-                        value={headersJson}
-                        onChange={e => setHeadersJson(e.target.value)}
-                        onBlur={() => formatJsonOnBlur(headersJson, setHeadersJson, '请求头')}
-                        rows={3}
-                        placeholder='{"Custom-Header": "Value"}'
-                        className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm font-mono focus:border-primary outline-none text-foreground"
-                      />
-                      <p className="text-xs text-muted-foreground mt-1">失焦时自动格式化</p>
+                      <label className="text-sm font-medium text-foreground mb-1.5 block">自定义请求头</label>
+                      <div className="space-y-2">
+                        {headerEntries.map((entry, idx) => (
+                          <div key={idx} className="flex gap-2 items-center">
+                            <input
+                              value={entry.key}
+                              onChange={e => {
+                                const next = [...headerEntries];
+                                next[idx] = { ...next[idx], key: e.target.value };
+                                setHeaderEntries(next);
+                              }}
+                              placeholder="Header-Name"
+                              className="flex-1 bg-background border border-border px-3 py-1.5 rounded-lg text-sm font-mono text-foreground"
+                            />
+                            <input
+                              value={entry.value}
+                              onChange={e => {
+                                const next = [...headerEntries];
+                                next[idx] = { ...next[idx], value: e.target.value };
+                                setHeaderEntries(next);
+                              }}
+                              placeholder="Value"
+                              className="flex-1 bg-background border border-border px-3 py-1.5 rounded-lg text-sm font-mono text-foreground"
+                            />
+                            <button onClick={() => setHeaderEntries(headerEntries.filter((_, i) => i !== idx))} className="text-muted-foreground hover:text-destructive transition-colors">
+                              <X className="w-4 h-4" />
+                            </button>
+                          </div>
+                        ))}
+                        <button onClick={() => setHeaderEntries([...headerEntries, { key: '', value: '' }])} className="text-xs text-primary hover:text-primary/80 flex items-center gap-1">
+                          <Plus className="w-3 h-3" /> 添加请求头
+                        </button>
+                      </div>
+                      <p className="text-xs text-muted-foreground mt-1">支持同名 Header，每条单独发送</p>
                     </div>
                     <div>
                       <label className="text-sm font-medium text-foreground mb-1.5 block">请求体覆写 (JSON)</label>

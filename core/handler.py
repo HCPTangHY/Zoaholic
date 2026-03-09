@@ -33,7 +33,7 @@ from core.models import (
 from core.utils import get_engine, provider_api_circular_list, truncate_for_logging
 from core.routing import get_right_order_providers
 from core.error_response import openai_error_response
-from utils import safe_get, error_handling_wrapper
+from utils import safe_get, error_handling_wrapper, apply_custom_headers
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -191,7 +191,7 @@ async def process_request(
     last_message_role = safe_get(request, "messages", -1, "role", default=None)
     
     url, headers, payload = await get_payload(request, engine, provider, api_key)
-    headers.update(safe_get(provider, "preferences", "headers", default={}))  # add custom headers
+    apply_custom_headers(headers, safe_get(provider, "preferences", "headers", default={}))  # add custom headers
     
 
     current_info = request_info_getter()
@@ -542,7 +542,7 @@ async def process_request_passthrough(
 
     headers: Dict[str, Any] = dict(adapter_headers or {})
     headers.update(_filter_passthrough_headers(passthrough_ctx.original_headers))
-    headers.update(safe_get(provider, "preferences", "headers", default={}))
+    apply_custom_headers(headers, safe_get(provider, "preferences", "headers", default={}))
     headers.setdefault("Content-Type", "application/json")
 
     payload = apply_passthrough_modifications(

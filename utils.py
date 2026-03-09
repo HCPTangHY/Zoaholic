@@ -619,6 +619,24 @@ async def ensure_string(item):
     else:
         return str(item)
 
+def apply_custom_headers(headers: dict, custom_headers: dict) -> None:
+    """将渠道自定义 headers 合并到请求头中。
+
+    custom_headers 的值支持两种格式：
+    - str: 直接设置
+    - list[str]: 用逗号拼接后设置（符合 RFC 7230 §3.2.2）
+
+    示例::
+        {"anthropic-beta": ["val1", "val2"]}  →  "anthropic-beta": "val1,val2"
+        {"X-Custom": "abc"}                   →  "X-Custom": "abc"
+    """
+    if not isinstance(custom_headers, dict):
+        return
+    for k, v in custom_headers.items():
+        if v is None:
+            continue
+        headers[str(k)] = ",".join(str(i) for i in v) if isinstance(v, list) else str(v)
+
 def identify_audio_format(file_bytes):
     # 读取开头的字节
     if file_bytes.startswith(b'\xFF\xFB') or file_bytes.startswith(b'\xFF\xF3'):

@@ -333,9 +333,8 @@ async def test_channel(
         url, headers, payload = await get_payload(test_request, engine, provider, selected_api_key)
 
         # 对齐正式链路：追加渠道自定义 headers
-        custom_headers = safe_get(provider, "preferences", "headers", default={})
-        if isinstance(custom_headers, dict):
-            headers.update({str(k): str(v) for k, v in custom_headers.items() if v is not None})
+        from utils import apply_custom_headers
+        apply_custom_headers(headers, safe_get(provider, "preferences", "headers", default={}))
 
         # 打印调试信息
         try:
