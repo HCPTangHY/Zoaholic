@@ -87,7 +87,7 @@ async def gpt2claude_tools_json(json_dict):
 
     # 提取 $defs 定义
     defs = {}
-    if "parameters" in json_dict and "defs" in json_dict["parameters"]:
+    if "parameters" in json_dict and isinstance(json_dict["parameters"], dict) and "defs" in json_dict["parameters"]:
         defs = json_dict["parameters"]["defs"]
         # 从参数中删除 $defs，因为 Claude 不需要它
         del json_dict["parameters"]["defs"]
@@ -142,6 +142,27 @@ async def patch_passthrough_claude_payload(
         payload["system"] = system_prompt_text
 
     return payload
+
+
+async def get_claude_passthrough_meta(request, engine, provider, api_key=None):
+    """透传用：仅构建 url/headers，不执行 payload 转换。
+
+    透传模式下 payload 取自入口原始请求体，此函数只负责提供
+    上游 URL 和认证/版本头信息，避免执行完整的 get_claude_payload()
+    中 messages/tools 转换逻辑。
+
+    注意：anthropic-beta 不在此设置。透传模式下客户端原始请求头中
+    的 anthropic-beta 会由 process_request_passthrough 自动合并，
+    无需此处预设默认值。
+    """
+    headers = {
+        "content-type": "application/json",
+        "x-api-key": f"{api_key}",
+        "anthropic-version": "2023-06-01",
+    }
+    url = _normalize_claude_base_url(provider['base_url']) + '/messages'
+
+    return url, headers, {}
 
 
 async def get_claude_payload(request, engine, provider, api_key=None):
@@ -592,6 +613,7 @@ def register():
         description="Anthropic Claude API",
         request_adapter=get_claude_payload,
         passthrough_payload_adapter=patch_passthrough_claude_payload,
+        passthrough_adapter=get_claude_passthrough_meta,
         response_adapter=fetch_claude_response,
         stream_adapter=fetch_claude_response_stream,
         models_adapter=fetch_claude_models,
