@@ -33,6 +33,7 @@ interface HeaderEntry {
 
 interface ProviderFormData {
   provider: string;
+  remark: string;
   engine: string;
   base_url: string;
   api_keys: ApiKeyObj[];
@@ -201,6 +202,7 @@ export default function Channels() {
 
       setFormData({
         provider: provider.provider || provider.name || '',
+        remark: provider.remark || '',
         engine: provider.engine || '',
         base_url: provider.base_url || '',
         api_keys: parsedKeys,
@@ -226,6 +228,7 @@ export default function Channels() {
       setStatusCodeOverridesJson('');
       setFormData({
         provider: '',
+        remark: '',
         engine: channelTypes.length > 0 ? channelTypes[0].id : '',
         base_url: '',
         api_keys: [],
@@ -595,6 +598,7 @@ export default function Channels() {
 
     return {
       provider: formData.provider,
+      remark: formData.remark || undefined,
       base_url: formData.base_url,
       model_prefix: formData.model_prefix || undefined,
       api: finalApi,
@@ -680,6 +684,7 @@ export default function Channels() {
 
     const targetProvider: any = {
       provider: formData.provider,
+      remark: formData.remark || undefined,
       base_url: formData.base_url,
       model_prefix: formData.model_prefix || undefined,
       api: finalApi,
@@ -741,6 +746,11 @@ export default function Channels() {
             <div>
               <div className={`font-medium ${isEnabled ? 'text-foreground' : 'text-muted-foreground'}`}>{p.provider}</div>
               <div className="text-xs text-muted-foreground font-mono">{p.engine || 'openai'}</div>
+              {p.remark && (
+                <div className="mt-1 text-xs text-muted-foreground break-words whitespace-pre-wrap max-w-[220px]">
+                  {p.remark}
+                </div>
+              )}
             </div>
           </div>
           <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium ${isEnabled ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-500' : 'bg-red-500/10 text-red-600 dark:text-red-500'}`}>
@@ -847,7 +857,14 @@ export default function Channels() {
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">
                         <ProviderLogo name={p.provider} />
-                        <span className={`font-medium truncate ${isEnabled ? 'text-foreground' : 'text-muted-foreground'}`}>{p.provider}</span>
+                        <div className="min-w-0">
+                          <div className={`font-medium truncate ${isEnabled ? 'text-foreground' : 'text-muted-foreground'}`}>{p.provider}</div>
+                          {p.remark && (
+                            <div className="text-xs text-muted-foreground truncate max-w-[220px]" title={p.remark}>
+                              {p.remark}
+                            </div>
+                          )}
+                        </div>
                       </div>
                     </td>
                     <td className="px-4 py-3">
@@ -955,6 +972,14 @@ export default function Channels() {
                       <label className="text-sm font-medium text-foreground mb-1.5 block">API 地址 (Base URL)</label>
                       <input type="text" value={formData.base_url} onChange={e => updateFormData('base_url', e.target.value)} placeholder="留空则使用渠道默认地址，末尾加 # 则不拼接路径后缀" className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono outline-none text-foreground" />
                       <span className="text-xs text-muted-foreground mt-1 block">{'末尾加 # 可直接使用完整地址，不拼接路径后缀（如 https://example.com/v1/chat#）'}</span>
+                    </div>
+                    <div>
+                      <label className="text-sm font-medium text-foreground mb-1.5 block">备注</label>
+                      <textarea
+                        value={formData.remark}
+                        onChange={e => updateFormData('remark', e.target.value)}
+                        rows={3} placeholder="填写该渠道的用途、来源、限制说明等" className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm outline-none text-foreground"
+                      />
                     </div>
                     <div>
                       <label className="text-sm font-medium text-foreground mb-1.5 block">模型前缀 (可选)</label>
