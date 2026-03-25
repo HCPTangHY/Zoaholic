@@ -10,6 +10,7 @@ import os
 import json
 
 from core.env import env_bool
+from core.json_utils import json_loads
 import uuid
 import asyncio
 import contextvars
@@ -295,7 +296,7 @@ class StatsMiddleware:
             if body_bytes:
                 try:
                     # 使用 asyncio.to_thread 避免大请求体阻塞事件循环
-                    parsed_body = await asyncio.to_thread(json.loads, body_bytes)
+                    parsed_body = json_loads(body_bytes)
                 except json.JSONDecodeError:
                     parsed_body = None
 
@@ -450,5 +451,5 @@ class StatsMiddleware:
                 moderation_result += chunk
 
         # 解码并解析 JSON
-        moderation_data = await asyncio.to_thread(json.loads, moderation_result.decode("utf-8"))
+        moderation_data = json_loads(moderation_result)
         return moderation_data

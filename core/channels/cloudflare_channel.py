@@ -15,6 +15,9 @@ from ..utils import (
     end_of_line,
 )
 from ..response import check_response
+from ..json_utils import json_loads, json_dumps_text
+from ..response_context import mark_adapter_metrics_managed, mark_content_start
+from ..stream_utils import aiter_decoded_lines
 
 
 # ============================================================
@@ -87,7 +90,7 @@ async def get_cloudflare_payload(request, engine, provider, api_key=None):
 
 async def fetch_cloudflare_response(client, url, headers, payload, model, timeout):
     """处理 Cloudflare Workers AI 非流式响应"""
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
     
     error_message = await check_response(response, "fetch_cloudflare_response")
@@ -96,16 +99,19 @@ async def fetch_cloudflare_response(client, url, headers, payload, model, timeou
         return
 
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await asyncio.to_thread(json_loads, response_bytes)
+    mark_adapter_metrics_managed()
     
     # Cloudflare Workers AI 返回格式通常是 {"result": {"response": "..."}}
     # 我们将其转换为 OpenAI 兼容格式
     from ..utils import generate_no_stream_response
     content = response_json.get("result", {}).get("response", "")
     timestamp = int(datetime.timestamp(datetime.now()))
+    if content:
+        mark_content_start()
     
     yield await generate_no_stream_response(
-        timestamp, model, content=content, role="assistant"
+        timestamp, model, content=content, role="assistant", return_dict=True
     )
 
 
@@ -114,37 +120,35 @@ async def fetch_cloudflare_response_stream(client, url, headers, payload, model,
     from ..log_config import logger
     
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_cloudflare_response_stream")
         if error_message:
             yield error_message
             return
+        mark_adapter_metrics_managed()
         
-        buffer = ""
-        async for chunk in response.aiter_text():
-            buffer += chunk
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                line = line.strip()
-                
-                if not line:
-                    continue
-                
-                if line == "data: [DONE]":
-                    break
-                
-                if line.startswith("data: "):
-                    try:
-                        json_data = json.loads(line[6:])
-                        response_text = json_data.get("response", "")
-                        
-                        if response_text:
-                            sse_string = await generate_sse_response(timestamp, model, content=response_text)
-                            yield sse_string
-                    except json.JSONDecodeError:
-                        logger.error(f"无法解析JSON: {line}")
+        async for line in aiter_decoded_lines(response.aiter_bytes()):
+            line = line.strip()
+
+            if not line:
+                continue
+
+            if line == "data: [DONE]":
+                break
+
+            if line.startswith("data: "):
+                try:
+                    json_data = json_loads(line[6:])
+                    response_text = json_data.get("response", "")
+
+                    if response_text:
+                        mark_content_start()
+                        sse_string = await generate_sse_response(timestamp, model, content=response_text)
+                        yield sse_string
+                except json.JSONDecodeError:
+                    logger.error(f"无法解析JSON: {line}")
     
     yield "data: [DONE]" + end_of_line
 

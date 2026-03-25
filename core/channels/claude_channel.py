@@ -19,6 +19,10 @@ from ..utils import (
     end_of_line,
 )
 from ..response import check_response
+from ..json_utils import json_loads, json_dumps_text
+from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
+from ..stream_utils import aiter_decoded_lines
+from ..file_utils import extract_base64_data
 
 
 # ============================================================
@@ -52,7 +56,7 @@ async def format_image_message(image_url: str) -> dict:
         "source": {
             "type": "base64",
             "media_type": image_type,
-            "data": base64_image.split(",")[1],
+            "data": extract_base64_data(base64_image),
         }
     }
 
@@ -241,7 +245,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                     "type": "tool_use",
                     "id": tool_call.id,
                     "name": tool_call.function.name,
-                    "input": json.loads(tool_call.function.arguments),
+                    "input": json_loads(tool_call.function.arguments),
                 })
             messages.append({"role": msg.role, "content": tool_calls_list})
         elif tool_call_id:
@@ -399,7 +403,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
 async def fetch_claude_response(client, url, headers, payload, model, timeout):
     """处理 Claude 非流式响应"""
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
 
     error_message = await check_response(response, "fetch_claude_response")
@@ -408,7 +412,8 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
         return
 
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await asyncio.to_thread(json_loads, response_bytes)
+    mark_adapter_metrics_managed()
 
     # 遍历 content 数组，提取文本内容和客户端工具调用
     # 跳过服务器端工具（server_tool_use, web_search_tool_result）
@@ -448,42 +453,48 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
     output_tokens = safe_get(response_json, "usage", "output_tokens")
     total_tokens = (prompt_tokens or 0) + (output_tokens or 0)
 
+    merge_usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
+    if content or reasoning_content or function_call_name:
+        mark_content_start()
+
     role = safe_get(response_json, "role")
 
     yield await generate_no_stream_response(
         timestamp, model, content=content, tools_id=tools_id,
         function_call_name=function_call_name, function_call_content=function_call_content,
         role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens,
-        completion_tokens=output_tokens, reasoning_content=reasoning_content
+        completion_tokens=output_tokens, reasoning_content=reasoning_content, return_dict=True
     )
 
 
 async def fetch_claude_response_stream(client, url, headers, payload, model, timeout):
     """处理 Claude 流式响应"""
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_claude_response_stream")
         if error_message:
             yield error_message
             return
-        buffer = ""
+        mark_adapter_metrics_managed()
         input_tokens = 0
         # 跟踪当前 content_block 类型，用于区分服务器端工具和客户端工具
         current_block_type = None
         current_block_id = None
-        async for chunk in response.aiter_text():
-            buffer += chunk
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
+        async for line in aiter_decoded_lines(response.aiter_bytes()):
 
                 if line.startswith("data:") and (line := line.lstrip("data: ")):
-                    resp: dict = await asyncio.to_thread(json.loads, line)
+                    resp: dict = json_loads(line)
 
                     input_tokens = input_tokens or safe_get(resp, "message", "usage", "input_tokens", default=0)
                     output_tokens = safe_get(resp, "usage", "output_tokens", default=0)
                     if output_tokens:
                         total_tokens = input_tokens + output_tokens
+                        merge_usage(prompt_tokens=input_tokens, completion_tokens=output_tokens, total_tokens=total_tokens)
                         sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, total_tokens, input_tokens, output_tokens)
                         yield sse_string
                         break
@@ -508,6 +519,7 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                             function_call_name = content_block.get("name", "")
                             tools_id = content_block.get("id", "")
                             if tools_id and function_call_name:
+                                mark_content_start()
                                 sse_string = await generate_sse_response(timestamp, model, None, tools_id, function_call_name, None)
                                 yield sse_string
                             continue
@@ -525,6 +537,7 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                         if current_block_type == "tool_use" and delta_type == "input_json_delta":
                             partial_json = delta.get("partial_json", "")
                             if partial_json:
+                                mark_content_start()
                                 sse_string = await generate_sse_response(timestamp, model, None, None, None, partial_json)
                                 yield sse_string
                             continue
@@ -542,6 +555,7 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                     # 正常文本输出
                     text = safe_get(resp, "delta", "text", default="")
                     if text:
+                        mark_content_start()
                         sse_string = await generate_sse_response(timestamp, model, text)
                         yield sse_string
                         continue
@@ -552,18 +566,21 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                     block_type = safe_get(resp, "content_block", "type", default="")
                     # 只处理客户端工具（tool_use），跳过服务器端工具（server_tool_use）
                     if tools_id and function_call_name and block_type == "tool_use":
+                        mark_content_start()
                         sse_string = await generate_sse_response(timestamp, model, None, tools_id, function_call_name, None)
                         yield sse_string
 
                     # thinking 内容
                     thinking_content = safe_get(resp, "delta", "thinking", default="")
                     if thinking_content:
+                        mark_content_start()
                         sse_string = await generate_sse_response(timestamp, model, reasoning_content=thinking_content)
                         yield sse_string
 
                     # 客户端工具参数（兼容旧逻辑）
                     function_call_content = safe_get(resp, "delta", "partial_json", default="")
                     if function_call_content and current_block_type != "server_tool_use":
+                        mark_content_start()
                         sse_string = await generate_sse_response(timestamp, model, None, None, None, function_call_content)
                         yield sse_string
 

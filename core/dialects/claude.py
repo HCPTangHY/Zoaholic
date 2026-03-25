@@ -12,6 +12,7 @@ import json
 import asyncio
 from typing import Any, Dict, List, Optional, Union
 
+from core.json_utils import json_loads, json_dumps_text
 from core.models import RequestModel, Message, ContentItem
 
 from .registry import DialectDefinition, EndpointDefinition, register_dialect
@@ -166,7 +167,7 @@ async def parse_claude_request(
                                     "type": "function",
                                     "function": {
                                         "name": name,
-                                        "arguments": json.dumps(args, ensure_ascii=False),
+                                        "arguments": json_dumps_text(args, ensure_ascii=False),
                                     },
                                 }
                             )
@@ -283,7 +284,7 @@ async def render_claude_response(
             for tc in tool_calls:
                 fn = tc.get("function") or {}
                 try:
-                    args = json.loads(fn.get("arguments") or "{}")
+                    args = json_loads(fn.get("arguments") or "{}")
                 except:
                     args = {}
                 content.append({
@@ -357,7 +358,7 @@ class ClaudeStreamRenderer:
                 },
             },
         }
-        return f"event: message_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+        return f"event: message_start\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
 
     def _make_block_start(self, block_type: str, **kwargs) -> str:
         """生成 content_block_start 事件"""
@@ -383,7 +384,7 @@ class ClaudeStreamRenderer:
             "index": self._block_index,
             "content_block": content_block,
         }
-        return f"event: content_block_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+        return f"event: content_block_start\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
 
     def _make_block_stop(self) -> str:
         """生成 content_block_stop 事件"""
@@ -394,7 +395,7 @@ class ClaudeStreamRenderer:
             "index": self._block_index,
         }
         self._current_block_type = None
-        return f"event: content_block_stop\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+        return f"event: content_block_stop\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
 
     def _ensure_message_start(self, canonical: dict) -> str:
         """确保 message_start 已发送"""
@@ -429,7 +430,7 @@ class ClaudeStreamRenderer:
             return result
 
         try:
-            canonical = json.loads(data_str)
+            canonical = json_loads(data_str)
         except json.JSONDecodeError:
             return canonical_sse_chunk
 
@@ -452,7 +453,7 @@ class ClaudeStreamRenderer:
                 "index": self._block_index,
                 "delta": {"type": "thinking_delta", "thinking": reasoning},
             }
-            result += f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            result += f"event: content_block_delta\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
             return result
 
         # 2. 文本
@@ -464,7 +465,7 @@ class ClaudeStreamRenderer:
                 "index": self._block_index,
                 "delta": {"type": "text_delta", "text": content},
             }
-            result += f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            result += f"event: content_block_delta\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
             return result
 
         # 3. 工具调用
@@ -491,7 +492,7 @@ class ClaudeStreamRenderer:
                             "partial_json": tc["function"]["arguments"],
                         },
                     }
-                    result += f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    result += f"event: content_block_delta\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
             elif tc.get("function", {}).get("arguments"):
                 # arguments 续传
                 idx = self._tool_block_indices.get(tc_index, self._block_index)
@@ -503,7 +504,7 @@ class ClaudeStreamRenderer:
                         "partial_json": tc["function"]["arguments"],
                     },
                 }
-                result += f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                result += f"event: content_block_delta\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
             return result
 
         # 4. 完成
@@ -524,7 +525,7 @@ class ClaudeStreamRenderer:
                     "output_tokens": canonical.get("usage", {}).get("completion_tokens", 0),
                 },
             }
-            result += f"event: message_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            result += f"event: message_delta\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
             return result
 
         return result or ""

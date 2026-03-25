@@ -24,6 +24,7 @@ from core.utils import (
     ThreadSafeCircularList,
     provider_api_circular_list,
 )
+from core.json_utils import json_dumps_text, json_loads
 
 class InMemoryRateLimiter:
     def __init__(self):
@@ -644,14 +645,16 @@ async def load_config(app=None):
 
     return config, api_keys_db, api_list
 
-async def ensure_string(item):
+async def ensure_string(item, as_sse: bool = True):
     if isinstance(item, (bytes, bytearray)):
         return item.decode("utf-8")
     elif isinstance(item, str):
         return item
     elif isinstance(item, dict):
-        json_str = await asyncio.to_thread(json.dumps, item)
-        return f"data: {json_str}\n\n"
+        json_str = json_dumps_text(item, ensure_ascii=False)
+        if as_sse:
+            return f"data: {json_str}\n\n"
+        return json_str
     else:
         return str(item)
 
@@ -797,7 +800,7 @@ async def error_handling_wrapper(
         stream_end_logged = False
 
         if first_item:
-            yield await ensure_string(first_item)
+            yield await ensure_string(first_item, as_sse=stream)
 
         # 如果需要心跳机制但不使用嵌套生成器方式
         if with_keepalive:
@@ -815,7 +818,7 @@ async def error_handling_wrapper(
                         await asyncio.sleep(timeout)
                         yield ": keepalive\n\n"
                     else:
-                        yield await ensure_string(item)
+                        yield await ensure_string(item, as_sse=stream)
                         wait_task = None
                 except asyncio.CancelledError:
                     logger.debug(f"provider: {channel_id:<11} Stream cancelled by client in main loop")
@@ -889,7 +892,7 @@ async def error_handling_wrapper(
             # 原始逻辑：不需要心跳
             try:
                 async for item in generator:
-                    yield await ensure_string(item)
+                    yield await ensure_string(item, as_sse=stream)
                 _log_stream_end("upstream_eof")
                 stream_end_logged = True
             except asyncio.CancelledError:
@@ -1012,7 +1015,7 @@ async def error_handling_wrapper(
             # 仅当能提取到 JSON candidate 时才进行 json.loads，避免包含 event: 行的 SSE 首包导致误判
             if json_candidate is not None:
                 try:
-                    first_item_str = await asyncio.to_thread(json.loads, json_candidate)
+                    first_item_str = json_loads(json_candidate)
                 except json.JSONDecodeError:
                     logger.error(
                         f"provider: {channel_id:<11} error_handling_wrapper JSONDecodeError! {repr(json_candidate)}"

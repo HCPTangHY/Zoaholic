@@ -17,6 +17,8 @@ from httpx_socks import AsyncProxyTransport
 from urllib.parse import urlparse, urlunparse
 
 from .log_config import logger
+from .json_utils import json_dumps_text, json_loads
+from .file_utils import split_data_uri_prefix_and_data, extract_base64_data, fetch_url_content
 
 # 本地 API Key 前缀：用于判断 provider 名是否为本地聚合器 Key
 # sk- 是历史前缀，zk- 是新版本前缀，两者都需要兼容
@@ -45,16 +47,13 @@ async def generate_chunked_image_md(
     - 不先构造完整 markdown 大字符串，避免高并发时额外内存分配和事件循环阻塞。
     - image_data 可以是完整 data URI，也可以是纯 base64 字符串。
     """
-    if isinstance(image_data, str) and image_data.startswith("data:"):
-        image_data_uri = image_data
-    else:
-        image_data_uri = f"data:{mime_type};base64,{image_data}"
+    data_uri_prefix, raw_image_data = split_data_uri_prefix_and_data(image_data, mime_type)
 
-    prefix = "\n\n![image]("
+    prefix = "\n\n![image](" + data_uri_prefix
     suffix = ")"
 
     first_chunk_capacity = max(1, chunk_size - len(prefix))
-    first_chunk = prefix + image_data_uri[:first_chunk_capacity]
+    first_chunk = prefix + raw_image_data[:first_chunk_capacity]
     sse_string = await generate_sse_response(
         timestamp,
         model,
@@ -64,11 +63,11 @@ async def generate_chunked_image_md(
     yield sse_string
 
     sent = first_chunk_capacity
-    if sent < len(image_data_uri):
+    if sent < len(raw_image_data):
         await asyncio.sleep(0)
 
-    while sent < len(image_data_uri):
-        chunk_content = image_data_uri[sent:sent + chunk_size]
+    while sent < len(raw_image_data):
+        chunk_content = raw_image_data[sent:sent + chunk_size]
         sse_string = await generate_sse_response(
             timestamp,
             model,
@@ -76,7 +75,7 @@ async def generate_chunked_image_md(
         )
         yield sse_string
         sent += len(chunk_content)
-        if sent < len(image_data_uri):
+        if sent < len(raw_image_data):
             await asyncio.sleep(0)
 
     sse_string = await generate_sse_response(
@@ -946,12 +945,13 @@ async def generate_sse_response(
         }
         sample_data["choices"] = []
 
-    json_data = await asyncio.to_thread(json.dumps, sample_data, ensure_ascii=False)
+    json_data = json_dumps_text(sample_data, ensure_ascii=False)
     sse_response = f"data: {json_data}" + end_of_line
 
     return sse_response
 
-async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, image_base64=None, thought_signature=None):
+async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, image_base64=None, thought_signature=None, return_dict: bool = False):
+
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
     message = {
@@ -986,7 +986,7 @@ async def generate_no_stream_response(timestamp, model, content=None, tools_id=N
         if not tools_id:
             tools_id = f"call_{random_str}"
 
-        arguments_json = await asyncio.to_thread(json.dumps, function_call_content, ensure_ascii=False)
+        arguments_json = json_dumps_text(function_call_content, ensure_ascii=False)
 
         sample_data = {
             "id": f"chatcmpl-{random_str}",
@@ -1035,7 +1035,10 @@ async def generate_no_stream_response(timestamp, model, content=None, tools_id=N
     if total_tokens:
         sample_data["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}
 
-    json_data = await asyncio.to_thread(json.dumps, sample_data, ensure_ascii=False)
+    if return_dict:
+        return sample_data
+
+    json_data = json_dumps_text(sample_data, ensure_ascii=False)
     # print("json_data", json.dumps(sample_data, indent=4, ensure_ascii=False))
 
     return json_data
@@ -1062,26 +1065,14 @@ def encode_image(file_content: bytes):
         raise ValueError(f"不支持的图片格式: {img_format}")
 
 async def get_image_from_url(url):
-    transport = httpx.AsyncHTTPTransport(
-        http2=True,
-        verify=False,
-        retries=1
-    )
-    async with httpx.AsyncClient(transport=transport) as client:
-        try:
-            response = await client.get(
-                url,
-                timeout=30.0
-            )
-            response.raise_for_status()
-            return response.content
-
-        except httpx.RequestError as e:
-            logger.error(f"请求 URL 时出错 {e.request.url!r}: {e}")
-            raise HTTPException(status_code=400, detail=f"无法从 URL 获取内容: {url}")
-        except httpx.HTTPStatusError as e:
-            logger.error(f"获取 URL 时发生 HTTP 错误 {e.request.url!r}: {e.response.status_code}")
-            raise HTTPException(status_code=e.response.status_code, detail=f"获取 URL 时出错: {url}")
+    try:
+        content, _ = await fetch_url_content(url)
+        return content
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取 URL 时发生错误: {url}: {e}")
+        raise HTTPException(status_code=400, detail=f"无法从 URL 获取内容: {url}")
 
 async def get_encode_image(image_url):
     file_content = await get_image_from_url(image_url)
@@ -1090,7 +1081,7 @@ async def get_encode_image(image_url):
 
 
 def _convert_webp_base64_to_png(base64_image: str) -> tuple[str, str]:
-    image_data = base64.b64decode(base64_image.split(",")[1])
+    image_data = base64.b64decode(extract_base64_data(base64_image))
     with Image.open(io.BytesIO(image_data)) as image:
         png_buffer = io.BytesIO()
         image.save(png_buffer, format="PNG")
@@ -1099,11 +1090,7 @@ def _convert_webp_base64_to_png(base64_image: str) -> tuple[str, str]:
 
 
 def _prepare_image_for_upload(base64_image: str, max_size_mb: float) -> dict:
-    if "," in base64_image:
-        base64_data = base64_image.split(",")[1]
-    else:
-        base64_data = base64_image
-
+    base64_data = extract_base64_data(base64_image)
     image_size_bytes = len(base64_data) * 3 // 4
     image_size_mb = image_size_bytes / (1024 * 1024)
     result = {

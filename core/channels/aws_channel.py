@@ -24,6 +24,10 @@ from ..utils import (
     end_of_line,
 )
 from ..response import check_response
+from ..json_utils import json_loads, json_dumps_text
+from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
+from ..stream_utils import aiter_decoded_lines
+from ..file_utils import extract_base64_data
 from .claude_channel import gpt2claude_tools_json
 
 
@@ -44,7 +48,7 @@ async def format_image_message(image_url: str) -> dict:
         "source": {
             "type": "base64",
             "media_type": image_type,
-            "data": base64_image.split(",")[1],
+            "data": extract_base64_data(base64_image),
         }
     }
 
@@ -162,7 +166,7 @@ async def get_aws_payload(request, engine, provider, api_key=None):
                     "type": "tool_use",
                     "id": tool_call.id,
                     "name": tool_call.function.name,
-                    "input": json.loads(tool_call.function.arguments),
+                    "input": json_loads(tool_call.function.arguments),
                 })
             messages.append({"role": msg.role, "content": tool_calls_list})
         elif tool_call_id:
@@ -283,7 +287,7 @@ async def fetch_aws_response(client, url, headers, payload, model, timeout):
     url = url.replace("invoke-with-response-stream", "invoke")
     
     timestamp = int(dt.timestamp(dt.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     
     # AWS Bedrock 非流式签名需要重新生成（此处简化，实际可能需要更完整的实现）
     # 但根据 core/response.py 之前的硬编码，它似乎是复用 Gemini/Vertex 的解析逻辑？
@@ -296,17 +300,25 @@ async def fetch_aws_response(client, url, headers, payload, model, timeout):
         return
 
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await asyncio.to_thread(json_loads, response_bytes)
+    mark_adapter_metrics_managed()
     
     # 解析 AWS Bedrock Claude 格式
     content = safe_get(response_json, "content", 0, "text", default="")
     prompt_tokens = safe_get(response_json, "usage", "input_tokens", default=0)
     output_tokens = safe_get(response_json, "usage", "output_tokens", default=0)
+    merge_usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=prompt_tokens + output_tokens,
+    )
+    if content:
+        mark_content_start()
     
     yield await generate_no_stream_response(
         timestamp, model, content=content, role="assistant",
         total_tokens=prompt_tokens + output_tokens,
-        prompt_tokens=prompt_tokens, completion_tokens=output_tokens
+        prompt_tokens=prompt_tokens, completion_tokens=output_tokens, return_dict=True
     )
 
 
@@ -315,18 +327,15 @@ async def fetch_aws_response_stream(client, url, headers, payload, model, timeou
     from ..log_config import logger
     
     timestamp = int(dt.timestamp(dt.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_aws_response_stream")
         if error_message:
             yield error_message
             return
 
-        buffer = ""
-        async for line in response.aiter_text():
-            buffer += line
-            while "\r" in buffer:
-                line, buffer = buffer.split("\r", 1)
+        mark_adapter_metrics_managed()
+        async for line in aiter_decoded_lines(response.aiter_bytes(), delimiter=b"\r"):
                 if not line or \
                 line.strip() == "" or \
                 line.strip().startswith(':content-type') or \
@@ -337,17 +346,18 @@ async def fetch_aws_response_stream(client, url, headers, payload, model, timeou
                 if not json_match:
                     continue
                 try:
-                    chunk_data = await asyncio.to_thread(json.loads, json_match.group(0).lstrip('event'))
+                    chunk_data = json_loads(json_match.group(0).lstrip('event'))
                 except json.JSONDecodeError:
                     logger.error(f"DEBUG json.JSONDecodeError: {json_match.group(0).lstrip('event')!r}")
                     continue
 
                 if "bytes" in chunk_data:
                     decoded_bytes = base64.b64decode(chunk_data["bytes"])
-                    payload_chunk = await asyncio.to_thread(json.loads, decoded_bytes.decode('utf-8'))
+                    payload_chunk = json_loads(decoded_bytes)
 
                     text = safe_get(payload_chunk, "delta", "text", default="")
                     if text:
+                        mark_content_start()
                         sse_string = await generate_sse_response(timestamp, model, text, None, None)
                         yield sse_string
 
@@ -356,6 +366,7 @@ async def fetch_aws_response_stream(client, url, headers, payload, model, timeou
                         input_tokens = usage.get("inputTokenCount", 0)
                         output_tokens = usage.get("outputTokenCount", 0)
                         total_tokens = input_tokens + output_tokens
+                        merge_usage(prompt_tokens=input_tokens, completion_tokens=output_tokens, total_tokens=total_tokens)
                         sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, total_tokens, input_tokens, output_tokens)
                         yield sse_string
 

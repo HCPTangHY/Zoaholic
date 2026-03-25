@@ -187,6 +187,7 @@ class LoggingStreamingResponse(Response):
         max_response_size = 100 * 1024  # 100KB
         total_response_size = 0
         should_save_response = self.current_info.get("raw_data_expires_at") is not None
+        adapter_metrics_managed = bool(self.current_info.get("adapter_metrics_managed"))
         content_start_recorded = False  # 标记是否已记录正文开始时间
         # 跨 chunk 行缓冲：上游 HTTP chunk 边界与 SSE 行边界不一定对齐，
         # 一个 data: 行可能被拆到相邻两个 chunk 中。
@@ -201,6 +202,12 @@ class LoggingStreamingResponse(Response):
             if should_save_response and total_response_size < max_response_size:
                 response_chunks.append(chunk)
                 total_response_size += len(chunk)
+
+            # 若 usage / content_start_time 已由适配器直接管理，
+            # 这里不再对已经转换过的下游响应做二次 JSON 解析。
+            if adapter_metrics_managed:
+                yield chunk
+                continue
 
             # 音频流不解析 usage，直接透传
             if self.current_info.get("endpoint", "").endswith("/v1/audio/speech"):

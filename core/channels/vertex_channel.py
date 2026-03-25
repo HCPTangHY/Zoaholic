@@ -29,6 +29,10 @@ from ..utils import (
     ThreadSafeCircularList,
 )
 from ..response import check_response
+from ..json_utils import json_loads, json_dumps_text
+from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
+from ..stream_utils import aiter_decoded_lines
+from ..file_utils import extract_base64_data
 from .claude_channel import gpt2claude_tools_json
 
 
@@ -47,7 +51,7 @@ async def format_gemini_image_message(image_url: str) -> dict:
     return {
         "inlineData": {
             "mimeType": image_type,
-            "data": base64_image.split(",")[1],
+            "data": extract_base64_data(base64_image),
         }
     }
 
@@ -69,7 +73,7 @@ async def format_claude_image_message(image_url: str) -> dict:
         "source": {
             "type": "base64",
             "media_type": image_type,
-            "data": base64_image.split(",")[1],
+            "data": extract_base64_data(base64_image),
         }
     }
 
@@ -621,7 +625,7 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
                     "type": "tool_use",
                     "id": tool_call.id,
                     "name": tool_call.function.name,
-                    "input": json.loads(tool_call.function.arguments),
+                    "input": json_loads(tool_call.function.arguments),
                 })
             messages.append({"role": msg.role, "content": tool_calls_list})
         elif tool_call_id:
@@ -737,7 +741,7 @@ async def fetch_vertex_claude_response(client, url, headers, payload, model, tim
     url = url.replace("streamRawPredict", "rawPredict")
     
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
     
     error_message = await check_response(response, "fetch_vertex_claude_response")
@@ -746,7 +750,8 @@ async def fetch_vertex_claude_response(client, url, headers, payload, model, tim
         return
 
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await asyncio.to_thread(json_loads, response_bytes)
+    mark_adapter_metrics_managed()
     
     # Vertex Claude 格式解析与标准 Claude 类似
     content = safe_get(response_json, "content", 0, "text")
@@ -754,11 +759,18 @@ async def fetch_vertex_claude_response(client, url, headers, payload, model, tim
     output_tokens = safe_get(response_json, "usage", "output_tokens")
     total_tokens = (prompt_tokens or 0) + (output_tokens or 0)
     role = safe_get(response_json, "role")
+    merge_usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
+    if content:
+        mark_content_start()
 
     from ..utils import generate_no_stream_response
     yield await generate_no_stream_response(
         timestamp, model, content=content, role=role,
-        total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=output_tokens
+        total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=output_tokens, return_dict=True
     )
 
 
@@ -767,14 +779,14 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
     from ..log_config import logger
     
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_vertex_claude_response_stream")
         if error_message:
             yield error_message
             return
 
-        buffer = ""
+        mark_adapter_metrics_managed()
         revicing_function_call = False
         function_full_response = "{"
         need_function_call = False
@@ -783,10 +795,7 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
         candidatesTokenCount = 0
         totalTokenCount = 0
 
-        async for chunk in response.aiter_text():
-            buffer += chunk
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
+        async for line in aiter_decoded_lines(response.aiter_bytes()):
 
                 if line and '\"finishReason\": \"' in line:
                     is_finish = True
@@ -802,8 +811,9 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
 
                 if line and '\"text\": \"' in line and is_finish == False:
                     try:
-                        json_data = await asyncio.to_thread(json.loads, "{" + line.strip().rstrip(",") + "}")
+                        json_data = json_loads("{" + line.strip().rstrip(",") + "}")
                         content = json_data.get('text', '')
+                        mark_content_start()
                         sse_string = await generate_sse_response(timestamp, model, content=content)
                         yield sse_string
                     except json.JSONDecodeError:
@@ -819,15 +829,21 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
                     function_full_response += line
 
         if need_function_call:
-            function_call = await asyncio.to_thread(json.loads, function_full_response)
+            function_call = json_loads(function_full_response)
             function_call_name = function_call["name"]
             function_call_id = function_call["id"]
+            mark_content_start()
             sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=function_call_id, function_call_name=function_call_name)
             yield sse_string
-            function_full_response = await asyncio.to_thread(json.dumps, function_call["input"])
+            function_full_response = json_dumps_text(function_call["input"], ensure_ascii=False)
             sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=function_call_id, function_call_name=None, function_call_content=function_full_response)
             yield sse_string
 
+        merge_usage(
+            prompt_tokens=promptTokenCount,
+            completion_tokens=candidatesTokenCount,
+            total_tokens=totalTokenCount,
+        )
         sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, totalTokenCount, promptTokenCount, candidatesTokenCount)
         yield sse_string
 

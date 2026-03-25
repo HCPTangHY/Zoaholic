@@ -13,6 +13,7 @@ from typing import Optional, List, Any
 from .log_config import logger
 from .middleware import request_info
 from .utils import safe_get, truncate_for_logging
+from .json_utils import json_loads, json_dumps_text
 
 
 async def check_response(response, error_log):
@@ -42,16 +43,31 @@ async def check_response(response, error_log):
             logger.error(f"Error saving upstream error response: {str(e)}")
         
         try:
-            error_json = await asyncio.to_thread(json.loads, error_str)
+            error_json = json_loads(error_str)
         except json.JSONDecodeError:
             error_json = error_str
         return {"error": f"{error_log} HTTP Error", "status_code": response.status_code, "details": error_json}
     
-    # 成功响应：包装 aiter_text 方法以自动记录上游响应
+    # 成功响应：包装 aiter_text / aiter_bytes 方法以自动记录上游响应
     if response:
-        _wrap_response_aiter_text(response)
+        _wrap_response_iterators(response)
     
     return None
+
+
+def _get_response_capture_state():
+    try:
+        captured_info = request_info.get()
+    except Exception:
+        captured_info = None
+
+    should_save = captured_info and captured_info.get("raw_data_expires_at") is not None
+    return captured_info, should_save
+
+
+def _wrap_response_iterators(response):
+    _wrap_response_aiter_text(response)
+    _wrap_response_aiter_bytes(response)
 
 
 def _wrap_response_aiter_text(response):
@@ -60,13 +76,8 @@ def _wrap_response_aiter_text(response):
     """
     original_aiter_text = response.aiter_text
     
-    try:
-        captured_info = request_info.get()
-    except Exception:
-        captured_info = None
-    
-    should_save = captured_info and captured_info.get("raw_data_expires_at") is not None
-    
+    captured_info, should_save = _get_response_capture_state()
+
     if not should_save:
         return
     
@@ -106,6 +117,54 @@ def _wrap_response_aiter_text(response):
             object.__setattr__(response, 'aiter_text', logging_aiter_text)
         except Exception as e:
             logger.error(f"Failed to wrap response.aiter_text: {str(e)}")
+
+
+def _wrap_response_aiter_bytes(response):
+    """
+    包装 httpx response 的 aiter_bytes 方法，自动记录上游原始响应
+    """
+    if not hasattr(response, "aiter_bytes"):
+        return
+
+    original_aiter_bytes = response.aiter_bytes
+    captured_info, should_save = _get_response_capture_state()
+
+    if not should_save:
+        return
+
+    async def logging_aiter_bytes():
+        upstream_chunks = []
+        max_size = 100 * 1024  # 100KB
+        total_size = 0
+
+        try:
+            async for chunk in original_aiter_bytes():
+                if total_size < max_size:
+                    upstream_chunks.append(chunk)
+                    total_size += len(chunk)
+
+                yield chunk
+        except GeneratorExit:
+            logger.debug("Generator closed by caller (GeneratorExit)")
+            raise
+        except Exception as e:
+            logger.error(f"Error during upstream byte iteration: {str(e)}")
+            raise
+        finally:
+            if upstream_chunks and captured_info:
+                try:
+                    upstream_response = b"".join(upstream_chunks)
+                    captured_info["upstream_response_body"] = truncate_for_logging(upstream_response)
+                except Exception as e:
+                    logger.error(f"Error saving upstream byte response body: {str(e)}")
+
+    try:
+        response.aiter_bytes = logging_aiter_bytes
+    except AttributeError:
+        try:
+            object.__setattr__(response, 'aiter_bytes', logging_aiter_bytes)
+        except Exception as e:
+            logger.error(f"Failed to wrap response.aiter_bytes: {str(e)}")
 
 
 def _save_upstream_response_for_non_stream(response):
@@ -149,7 +208,7 @@ async def fetch_response(client, url, headers, payload, engine, model, timeout=2
         file = payload.pop("file")
         response = await client.post(url, headers=headers, data=payload, files={"file": file}, timeout=timeout)
     else:
-        json_payload = await asyncio.to_thread(json.dumps, payload)
+        json_payload = await asyncio.to_thread(json_dumps_text, payload)
         response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
     
     error_message = await check_response(response, "fetch_response_fallback")
@@ -164,7 +223,7 @@ async def fetch_response(client, url, headers, payload, engine, model, timeout=2
         yield response.read()
     else:
         response_bytes = await response.aread()
-        response_json = await asyncio.to_thread(json.loads, response_bytes)
+        response_json = await asyncio.to_thread(json_loads, response_bytes)
         yield response_json
 
 

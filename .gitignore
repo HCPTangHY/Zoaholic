@@ -84,3 +84,5 @@ plugins/secret_plugins/
 # (If you use alembic locally and don't want it in repo)
 # alembic/
 # alembic.ini
+
+.limcode/

@@ -7,6 +7,7 @@
 import json
 from typing import Any, Dict, TYPE_CHECKING
 
+from core.json_utils import json_loads, json_dumps_text
 from fastapi import APIRouter, Request, BackgroundTasks, Depends
 from fastapi.responses import JSONResponse
 
@@ -186,7 +187,7 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
         body_text = body_bytes.decode("utf-8") if body_bytes else "{}"
         
         try:
-            canonical_json = json.loads(body_text)
+            canonical_json = json_loads(body_text)
         except Exception:
             canonical_json = {}
 
@@ -195,7 +196,7 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
         converted_json = await dialect.render_response(canonical_json, canonical_request.model) if dialect.render_response else canonical_json
 
         async def converted_iter():
-            yield json.dumps(converted_json, ensure_ascii=False)
+            yield json_dumps_text(converted_json, ensure_ascii=False)
 
         return LoggingStreamingResponse(converted_iter(), media_type="application/json",
                                         current_info=current_info, app=getattr(resp, "app", None),

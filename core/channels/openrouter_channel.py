@@ -16,6 +16,9 @@ from ..utils import (
     safe_get,
 )
 from ..response import check_response
+from ..json_utils import json_loads, json_dumps_text
+from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
+from ..stream_utils import aiter_decoded_lines
 
 
 # ============================================================
@@ -94,7 +97,7 @@ async def get_openrouter_payload(request, engine, provider, api_key=None):
 
 async def fetch_openrouter_response(client, url, headers, payload, model, timeout):
     """处理 OpenRouter 非流式响应"""
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
     
     error_message = await check_response(response, "fetch_openrouter_response")
@@ -103,7 +106,16 @@ async def fetch_openrouter_response(client, url, headers, payload, model, timeou
         return
 
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await asyncio.to_thread(json_loads, response_bytes)
+    mark_adapter_metrics_managed()
+    usage = response_json.get("usage", {}) if isinstance(response_json, dict) else {}
+    merge_usage(
+        prompt_tokens=usage.get("prompt_tokens", 0),
+        completion_tokens=usage.get("completion_tokens", 0),
+        total_tokens=usage.get("total_tokens", 0),
+    )
+    if safe_get(response_json, "choices", 0, "message", "content", default=None):
+        mark_content_start()
     yield response_json
 
 
@@ -112,23 +124,16 @@ async def fetch_openrouter_response_stream(client, url, headers, payload, model,
     from ..log_config import logger
     
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_openrouter_response_stream")
         if error_message:
             yield error_message
             return
+        mark_adapter_metrics_managed()
         
-        buffer = ""
-        async for chunk in response.aiter_text():
-            buffer += chunk
-            # 避免 buffer 拼接操作独占 CPU
-            if len(buffer) > 50000:
-                await asyncio.sleep(0)
-
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
+        async for line in aiter_decoded_lines(response.aiter_bytes()):
                 line = line.strip()
                 
                 if not line:
@@ -139,13 +144,14 @@ async def fetch_openrouter_response_stream(client, url, headers, payload, model,
                 
                 if line.startswith("data: "):
                     try:
-                        json_data = await asyncio.to_thread(json.loads, line[6:])
+                        json_data = json_loads(line[6:])
                         choices = json_data.get("choices", [])
                         if choices:
                             delta = choices[0].get("delta", {})
                             content = delta.get("content", "")
                             
                             if content:
+                                mark_content_start()
                                 sse_string = await generate_sse_response(timestamp, model, content=content)
                                 yield sse_string
                             
@@ -155,6 +161,7 @@ async def fetch_openrouter_response_stream(client, url, headers, payload, model,
                                 tool_call = tool_calls[0]
                                 function = tool_call.get("function", {})
                                 if tool_call.get("id"):
+                                    mark_content_start()
                                     sse_string = await generate_sse_response(
                                         timestamp, model, content=None,
                                         tools_id=tool_call["id"],
@@ -162,6 +169,7 @@ async def fetch_openrouter_response_stream(client, url, headers, payload, model,
                                     )
                                     yield sse_string
                                 if function.get("arguments"):
+                                    mark_content_start()
                                     sse_string = await generate_sse_response(
                                         timestamp, model, content=None,
                                         tools_id=tool_call.get("id"),
@@ -173,6 +181,7 @@ async def fetch_openrouter_response_stream(client, url, headers, payload, model,
                             finish_reason = choices[0].get("finish_reason")
                             if finish_reason:
                                 usage = json_data.get("usage", {})
+                                merge_usage(prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0), total_tokens=usage.get("total_tokens", 0))
                                 sse_string = await generate_sse_response(
                                     timestamp, model, None, None, None, None, None,
                                     usage.get("total_tokens", 0),

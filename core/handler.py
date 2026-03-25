@@ -8,6 +8,7 @@
 import json
 import asyncio
 from collections import defaultdict
+from core.json_utils import json_dumps_text, json_loads
 from datetime import datetime, timedelta, timezone
 from time import time
 from urllib.parse import urlparse
@@ -266,14 +267,12 @@ async def process_request(
                     if isinstance(wrapped_generator, bytes):
                         response = Response(content=wrapped_generator, media_type="audio/mpeg")
                 else:
-                    first_element = await anext(wrapped_generator)
-                    first_element = first_element.lstrip("data: ")
-                    decoded_element = await asyncio.to_thread(json.loads, first_element)
-                    encoded_element = await asyncio.to_thread(json.dumps, decoded_element)
-                    
                     # 非流式响应也需要记录统计
                     async def non_stream_iter():
-                        yield encoded_element
+                        first_element = await anext(wrapped_generator)
+                        yield first_element
+                        async for item in wrapped_generator:
+                            yield item
                     
                     response = LoggingStreamingResponse(
                         non_stream_iter(),
@@ -350,7 +349,7 @@ async def _fetch_passthrough_stream(client, url, headers, payload, timeout, engi
         pool=10.0,
     )
     
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=stream_timeout) as response:
         from core.plugins.interceptors import apply_response_interceptors
         error_message = await check_response(response, "passthrough_stream")
@@ -402,7 +401,7 @@ async def _fetch_passthrough_response(client, url, headers, payload, timeout, en
     t0 = _time.time()
     from core.plugins.interceptors import apply_response_interceptors
     
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     t1 = _time.time()
     logger.debug(f"[passthrough] json.dumps took {t1-t0:.3f}s")
     
@@ -414,21 +413,38 @@ async def _fetch_passthrough_response(client, url, headers, payload, timeout, en
         write=300.0,  # 写入超时300秒，支持大型请求体（多图片/PDF）
         pool=10.0,
     )
-    
+
+    # 快路径：未启用响应插件时，直接按文本流转发。
+    # 这样可以避免先 aread() 再 decode() 带来的整包双份内存占用。
+    if not enabled_plugins:
+        async with client.stream('POST', url, headers=headers, content=json_payload, timeout=request_timeout) as response:
+            t2 = _time.time()
+            logger.debug(f"[passthrough] POST request took {t2-t1:.3f}s, status={response.status_code}")
+
+            error_message = await check_response(response, "passthrough_non_stream")
+            if error_message:
+                yield error_message
+                return
+
+            async for text_chunk in response.aiter_text():
+                if text_chunk:
+                    yield text_chunk
+        return
+
     response = await client.post(url, headers=headers, content=json_payload, timeout=request_timeout)
     t2 = _time.time()
     logger.debug(f"[passthrough] POST request took {t2-t1:.3f}s, status={response.status_code}")
-    
+
     error_message = await check_response(response, "passthrough_non_stream")
     if error_message:
         error_message = await apply_response_interceptors(error_message, engine or "passthrough", model or "", is_stream=False, enabled_plugins=enabled_plugins)
-        yield error_message        
+        yield error_message
         return
-    
+
     response_bytes = await response.aread()
     t3 = _time.time()
     logger.debug(f"[passthrough] aread() took {t3-t2:.3f}s, size={len(response_bytes)} bytes")
-    
+
     result = response_bytes.decode("utf-8")
     result = await apply_response_interceptors(result, engine or "passthrough", model or "", is_stream=False, enabled_plugins=enabled_plugins)
     yield result

@@ -25,6 +25,9 @@ from ..utils import (
     end_of_line,
 )
 from ..response import check_response
+from ..json_utils import json_loads, json_dumps_text
+from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
+from ..stream_utils import aiter_decoded_lines
 
 
 # ============================================================
@@ -507,7 +510,7 @@ async def get_responses_payload(request, engine, provider, api_key=None):
 
 async def fetch_responses_response(client, url, headers, payload, model, timeout):
     """处理 Responses API 的非流式响应"""
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
     response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
 
     error_message = await check_response(response, "fetch_responses_response")
@@ -516,10 +519,19 @@ async def fetch_responses_response(client, url, headers, payload, model, timeout
         return
 
     response_bytes = await response.aread()
-    response_json = await asyncio.to_thread(json.loads, response_bytes)
+    response_json = await asyncio.to_thread(json_loads, response_bytes)
 
     # 将 Responses API 响应转换为 Chat Completions 格式
     converted = await convert_responses_to_chat_completions(response_json, model)
+    mark_adapter_metrics_managed()
+    usage = converted.get("usage") or {}
+    merge_usage(
+        prompt_tokens=usage.get("prompt_tokens", 0),
+        completion_tokens=usage.get("completion_tokens", 0),
+        total_tokens=usage.get("total_tokens", 0),
+    )
+    if safe_get(converted, "choices", 0, "message", "content", default=None):
+        mark_content_start()
     yield converted
 
 
@@ -623,7 +635,7 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
 
-    json_payload = await asyncio.to_thread(json.dumps, payload)
+    json_payload = await asyncio.to_thread(json_dumps_text, payload)
 
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_responses_stream")
@@ -631,17 +643,13 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
             yield error_message
             return
 
-        buffer = ""
+        mark_adapter_metrics_managed()
         input_tokens = 0
         output_tokens = 0
         has_sent_role = False
         has_sent_content = False  # 追踪是否已发送任何内容
 
-        async for chunk in response.aiter_text():
-            buffer += chunk
-
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
+        async for line in aiter_decoded_lines(response.aiter_bytes()):
 
                 # 跳过空行和注释
                 if not line or line.startswith(":"):
@@ -659,7 +667,7 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                         break
 
                     try:
-                        data = await asyncio.to_thread(json.loads, data_str)
+                        data = json_loads(data_str)
                     except json.JSONDecodeError:
                         continue
 
@@ -681,6 +689,7 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                     if event_type == "response.reasoning.delta":
                         delta = data.get("delta", "")
                         if delta:
+                            mark_content_start()
                             sse_string = await generate_sse_response(
                                 timestamp, model, reasoning_content=delta
                             )
@@ -691,6 +700,7 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                     elif event_type == "response.reasoning_summary_text.delta":
                         delta = data.get("delta", "")
                         if delta:
+                            mark_content_start()
                             sse_string = await generate_sse_response(
                                 timestamp, model, reasoning_content=delta
                             )
@@ -701,6 +711,7 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                     elif event_type == "response.output_text.delta":
                         delta = data.get("delta", "")
                         if delta:
+                            mark_content_start()
                             sse_string = await generate_sse_response(
                                 timestamp, model, content=delta
                             )
@@ -720,6 +731,7 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                     elif event_type == "response.function_call_arguments.delta":
                         delta = data.get("delta", "")
                         if delta:
+                            mark_content_start()
                             sse_string = await generate_sse_response(
                                 timestamp, model, function_call_content=delta
                             )
@@ -741,6 +753,7 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                         usage = response_data.get("usage", {})
                         input_tokens = usage.get("input_tokens", 0)
                         output_tokens = usage.get("output_tokens", 0)
+                        merge_usage(prompt_tokens=input_tokens, completion_tokens=output_tokens, total_tokens=input_tokens + output_tokens)
                         
                         # 如果还没发送 stop，在这里发送
                         if has_sent_content:

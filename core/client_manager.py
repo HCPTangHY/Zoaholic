@@ -4,6 +4,7 @@ HTTP 客户端管理模块
 负责统一管理 httpx.AsyncClient 连接池，根据 host + proxy 维度复用客户端。
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 from typing import Dict, Optional
@@ -33,12 +34,20 @@ class ClientManager:
         self.max_keepalive_connections = max_keepalive_connections
         self.clients: Dict[str, httpx.AsyncClient] = {}
         self.default_config: dict = {}
+        self._client_locks: Dict[str, asyncio.Lock] = {}
 
     async def init(self, default_config: dict) -> None:
         """
         设置默认 client 配置
         """
         self.default_config = default_config
+
+    def _get_client_lock(self, client_key: str) -> asyncio.Lock:
+        lock = self._client_locks.get(client_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._client_locks[client_key] = lock
+        return lock
 
     @asynccontextmanager
     async def get_client(self, base_url: str, proxy: Optional[str] = None):
@@ -55,26 +64,27 @@ class ClientManager:
             client_key += f"_{proxy_normalized}"
 
         if client_key not in self.clients:
-            timeout = httpx.Timeout(
-                connect=15.0,
-                read=None,  # 保持None，由各渠道自行控制超时
-                write=300.0,  # 写入超时增加到300秒（5分钟），支持大型请求体（多图片/PDF）
-                pool=10.0,  # 获取连接的超时（防止永久阻塞）
-            )
-            limits = httpx.Limits(
-                max_connections=self.pool_size,  # 增加到300
-                max_keepalive_connections=self.max_keepalive_connections
-            )
+            async with self._get_client_lock(client_key):
+                if client_key not in self.clients:
+                    timeout = httpx.Timeout(
+                        connect=15.0,
+                        read=None,  # 保持None，由各渠道自行控制超时
+                        write=300.0,  # 写入超时增加到300秒（5分钟），支持大型请求体（多图片/PDF）
+                        pool=10.0,  # 获取连接的超时（防止永久阻塞）
+                    )
+                    limits = httpx.Limits(
+                        max_connections=self.pool_size,
+                        max_keepalive_connections=self.max_keepalive_connections
+                    )
 
-            client_config = {
-                **self.default_config,
-                "timeout": timeout,
-                "limits": limits,
-            }
+                    client_config = {
+                        **self.default_config,
+                        "timeout": timeout,
+                        "limits": limits,
+                    }
 
-            client_config = get_proxy(proxy, client_config)
-
-            self.clients[client_key] = httpx.AsyncClient(**client_config)
+                    client_config = get_proxy(proxy, client_config)
+                    self.clients[client_key] = httpx.AsyncClient(**client_config)
 
         try:
             yield self.clients[client_key]
@@ -89,6 +99,7 @@ class ClientManager:
         for client in self.clients.values():
             await client.aclose()
         self.clients.clear()
+        self._client_locks.clear()
 
     async def reset_client(self, host: str) -> bool:
         """
@@ -109,6 +120,7 @@ class ClientManager:
         for key in keys_to_remove:
             client = self.clients.pop(key)
             await client.aclose()
+            self._client_locks.pop(key, None)
         return True
 
     async def reset_all_clients(self) -> int:

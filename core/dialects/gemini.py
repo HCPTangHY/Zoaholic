@@ -12,6 +12,7 @@ import json
 import asyncio
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+from core.json_utils import json_loads, json_dumps_text
 from core.models import RequestModel, Message, ContentItem
 
 from .registry import DialectDefinition, EndpointDefinition, register_dialect
@@ -140,7 +141,7 @@ async def parse_gemini_request(
                     "type": "function",
                     "function": {
                         "name": fc.get("name"),
-                        "arguments": json.dumps(fc.get("args") or {}, ensure_ascii=False)
+                        "arguments": json_dumps_text(fc.get("args") or {}, ensure_ascii=False)
                     }
                 }
                 if part_signature:
@@ -154,7 +155,7 @@ async def parse_gemini_request(
                 messages.append(Message(
                     role="tool",
                     name=fr.get("name"),
-                    content=json.dumps(fr.get("response") or {}, ensure_ascii=False),
+                    content=json_dumps_text(fr.get("response") or {}, ensure_ascii=False),
                     tool_call_id=fr.get("name") # Gemini 通常用 name 匹配
                 ))
                 continue
@@ -271,7 +272,7 @@ async def render_gemini_response(
         for i, tc in enumerate(tool_calls):
             fn = tc.get("function") or {}
             try:
-                args = json.loads(fn.get("arguments") or "{}")
+                args = json_loads(fn.get("arguments") or "{}")
             except:
                 args = {}
             
@@ -331,7 +332,7 @@ async def render_gemini_stream(canonical_sse_chunk: str) -> str:
         return ""
 
     try:
-        canonical = await asyncio.to_thread(json.loads, data_str)
+        canonical = json_loads(data_str)
     except json.JSONDecodeError:
         return canonical_sse_chunk
 
@@ -377,7 +378,7 @@ async def render_gemini_stream(canonical_sse_chunk: str) -> str:
             "totalTokenCount": usage.get("total_tokens", 0),
         }
 
-    json_data = await asyncio.to_thread(json.dumps, gemini_chunk, ensure_ascii=False)
+    json_data = json_dumps_text(gemini_chunk, ensure_ascii=False)
     return f"data: {json_data}\n\n"
 
 

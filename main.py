@@ -556,6 +556,13 @@ async def lifespan(app: FastAPI):
     if hasattr(app.state, 'client_manager'):
         await app.state.client_manager.close()
 
+    # 关闭 file_utils 的共享 HTTP 客户端
+    try:
+        from core.file_utils import close_shared_fetch_client
+        await close_shared_fetch_client()
+    except Exception as e:
+        logger.error(f"Failed to close shared fetch client: {e}")
+
 app = FastAPI(lifespan=lifespan, debug=is_debug)
 app.include_router(api_router)
 
