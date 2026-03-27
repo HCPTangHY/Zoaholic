@@ -52,10 +52,12 @@ export default function Admin() {
   const [formModels, setFormModels] = useState<string[]>([]);
   const [formCredits, setFormCredits] = useState('');
   const [formRateLimit, setFormRateLimit] = useState('');
+  const [formBlacklist, setFormBlacklist] = useState<string[]>([]);
 
   // Input states
   const [groupInput, setGroupInput] = useState('');
   const [modelInput, setModelInput] = useState('');
+  const [blacklistInput, setBlacklistInput] = useState('');
 
   // Credits Dialog
   const [isCreditsOpen, setIsCreditsOpen] = useState(false);
@@ -103,6 +105,7 @@ export default function Admin() {
     setEditingIndex(index);
     setGroupInput('');
     setModelInput('');
+    setBlacklistInput('');
 
     let source: ApiKeyData | null = null;
     if (copyFrom) {
@@ -132,6 +135,14 @@ export default function Admin() {
       setFormModels(Array.isArray(source.model) ? [...source.model] : []);
       setFormCredits(source.preferences?.credits !== undefined ? String(source.preferences.credits) : '');
       setFormRateLimit(source.preferences?.rate_limit || '');
+      // Parse blacklist (backward compat: merge old excluded_providers + excluded_models)
+      const bl = source.preferences?.blacklist;
+      const oldEp = source.preferences?.excluded_providers;
+      const oldEm = source.preferences?.excluded_models;
+      const parsedBl = Array.isArray(bl) ? [...bl] : (typeof bl === 'string' && bl.trim() ? bl.split(',').map((s: string) => s.trim()).filter(Boolean) : []);
+      const parsedEp = Array.isArray(oldEp) ? [...oldEp] : (typeof oldEp === 'string' && oldEp.trim() ? oldEp.split(',').map((s: string) => s.trim()).filter(Boolean) : []);
+      const parsedEm = Array.isArray(oldEm) ? [...oldEm] : (typeof oldEm === 'string' && oldEm.trim() ? oldEm.split(',').map((s: string) => s.trim()).filter(Boolean) : []);
+      setFormBlacklist([...new Set([...parsedBl, ...parsedEp, ...parsedEm])]);
     } else {
       setFormApi('');
       setFormName('');
@@ -140,6 +151,7 @@ export default function Admin() {
       setFormModels([]);
       setFormCredits('');
       setFormRateLimit('');
+      setFormBlacklist([]);
     }
 
     setIsSheetOpen(true);
@@ -296,6 +308,9 @@ export default function Admin() {
     }
     if (formRateLimit.trim()) {
       prefs.rate_limit = formRateLimit.trim();
+    }
+    if (formBlacklist.length > 0) {
+      prefs.blacklist = formBlacklist;
     }
     if (Object.keys(prefs).length > 0) target.preferences = prefs;
 
@@ -714,7 +729,77 @@ export default function Admin() {
                   />
                   <p className="text-xs text-muted-foreground mt-1">控制此 Key 的请求速率，支持多段（如 10/min,1000/day）。留空使用全局默认限流。</p>
                 </div>
+
+                {/* Unified Blacklist */}
+                <div className="space-y-3">
+                  <label className="text-sm font-medium text-foreground mb-1.5 block">黑名单</label>
+
+                  {/* Tags display */}
+                  <div className="bg-muted/50 border border-border rounded-lg p-3 min-h-[40px] max-h-[150px] overflow-y-auto">
+                    {formBlacklist.length === 0 ? (
+                      <div className="text-center text-muted-foreground text-xs py-1">无黑名单，此 Key 可访问模型规则内的所有渠道和模型</div>
+                    ) : (<div className="flex flex-wrap gap-2">
+                      {formBlacklist.map((item, idx) => {
+                        const hasSlash = item.includes('/');
+                        const hasStar = item.endsWith('*');
+                        let colorClass = 'bg-red-500/10 border-red-500/30 text-red-600 dark:text-red-400';
+                        let label = '渠道';
+                        if (hasSlash) {
+                          colorClass = 'bg-purple-500/10 border-purple-500/30 text-purple-600 dark:text-purple-400';
+                          label = '渠道/模型';
+                        } else if (hasStar || !item.match(/^[\u4e00-\u9fa5a-zA-Z0-9_-]+$/)) {
+                          colorClass = 'bg-orange-500/10 border-orange-500/30 text-orange-600 dark:text-orange-400';
+                          label = '模型';
+                        }
+                        return (
+                          <span key={idx} className={`${colorClass} border text-xs font-mono px-2 py-1 rounded flex items-center gap-1`}>
+                            <span className="opacity-50">{label}:</span> {item}
+                            <button title="移除" onClick={() => setFormBlacklist(formBlacklist.filter((_, i) => i !== idx))} className="opacity-60 hover:opacity-100 ml-0.5">
+                              <X className="w-3 h-3" />
+                            </button>
+                          </span>
+                        );
+                      })}
+                    </div>)}
+                  </div>
+
+                  {/* Input */}
+                  <div className="flex gap-2">
+                    <input
+                      type="text" value={blacklistInput} onChange={e => setBlacklistInput(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          const parts = blacklistInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
+                          if (parts.length > 0) {
+                            setFormBlacklist([...new Set([...formBlacklist, ...parts])]);
+                            setBlacklistInput('');
+                          }
+                        }
+                      }}
+                      placeholder="渠道名, 模型名, 或 渠道名/模型名，逗号分隔"
+                      className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
+                    />
+                    <button onClick={() => {
+                      const parts = blacklistInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
+                      if (parts.length > 0) {
+                        setFormBlacklist([...new Set([...formBlacklist, ...parts])]);
+                        setBlacklistInput('');
+                      }
+                    }} className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm">添加</button>
+                  </div>
+
+                  <p className="text-xs text-muted-foreground">
+                    支持三种格式：
+                    <code className="bg-muted px-1 rounded">渠道名</code> 排除整个渠道、
+                    <code className="bg-muted px-1 rounded">模型名</code> 排除所有渠道的该模型、
+                    <code className="bg-muted px-1 rounded">渠道名/模型名</code> 只排除该渠道的该模型。
+                    支持通配符 <code className="bg-muted px-1 rounded">*</code>。
+                  </p>
+                </div>
+
               </section>
+
 
               {/* Models Section */}
               <section className="space-y-4">
@@ -764,12 +849,12 @@ export default function Admin() {
                     <input
                       type="text" value={modelInput} onChange={e => setModelInput(e.target.value)}
                       onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addModelsFromInput(); } }}
-                      placeholder="例如 all, gpt-4o 用空格/逗号分隔"
+                      placeholder="例如 all, gpt-4o, 渠道名/模型名（指定渠道）"
                       className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
                     />
                     <button onClick={addModelsFromInput} className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm">添加</button>
                   </div>
-                  <p className="text-xs text-muted-foreground mt-1">多个用逗号或空格分隔，按回车快速添加</p>
+                  <p className="text-xs text-muted-foreground mt-1">多个用逗号或空格分隔，按回车快速添加。支持 <code className="bg-muted px-1 rounded">渠道名/模型名</code> 精确指定渠道，<code className="bg-muted px-1 rounded">渠道名/*</code> 匹配渠道全部模型</p>
                 </div>
               </section>
             </div>
