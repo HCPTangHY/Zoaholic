@@ -337,6 +337,72 @@ async def get_matching_providers(
     
     provider_list = get_provider_list(provider_rules, config, request_model, app)
 
+    # ── 黑名单过滤 ──
+    # excluded_channels: 排除整个渠道
+    # excluded_models: 排除模型，支持三种格式：
+    #   "模型名"         → 排除所有渠道的该模型
+    #   "模型名*"        → 通配符前缀匹配
+    #   "渠道名/模型名"   → 只排除指定渠道的指定模型（支持 渠道名/模型名* 通配）
+    excluded_channels = safe_get(config, 'api_keys', api_index, 'preferences', 'excluded_channels', default=None) or []
+    excluded_models_cfg = safe_get(config, 'api_keys', api_index, 'preferences', 'excluded_models', default=None) or []
+
+    if isinstance(excluded_channels, str):
+        excluded_channels = [s.strip() for s in excluded_channels.split(",") if s.strip()]
+    if isinstance(excluded_models_cfg, str):
+        excluded_models_cfg = [s.strip() for s in excluded_models_cfg.split(",") if s.strip()]
+
+    # 排除整个渠道
+    if excluded_channels:
+        ch_set = set(excluded_channels)
+        provider_list = [p for p in provider_list if p.get('provider') not in ch_set]
+
+    # 排除模型
+    if excluded_models_cfg:
+        global_exact = set()
+        global_prefixes = []
+        pair_exact = set()
+        pair_prefixes = []
+
+        for item in excluded_models_cfg:
+            item = item.strip()
+            if not item:
+                continue
+            if "/" in item:
+                ch, mdl = item.split("/", 1)
+                if mdl.endswith("*"):
+                    pair_prefixes.append((ch, mdl.rstrip("*")))
+                else:
+                    pair_exact.add((ch, mdl))
+            elif item.endswith("*"):
+                global_prefixes.append(item.rstrip("*"))
+            else:
+                global_exact.add(item)
+
+        # 全局模型黑名单命中 → 直接返回空
+        if request_model in global_exact:
+            logger.info("blacklist: request_model %s hit excluded_models exact match", request_model)
+            return []
+        for prefix in global_prefixes:
+            if request_model.startswith(prefix):
+                logger.info("blacklist: request_model %s hit excluded_models prefix '%s*'", request_model, prefix)
+                return []
+
+        # 渠道/模型 对过滤
+        if pair_exact or pair_prefixes:
+            new_list = []
+            for p in provider_list:
+                pname = p.get('provider', '')
+                if (pname, request_model) in pair_exact:
+                    continue
+                skip = False
+                for pair_ch, pair_pfx in pair_prefixes:
+                    if pname == pair_ch and request_model.startswith(pair_pfx):
+                        skip = True
+                        break
+                if not skip:
+                    new_list.append(p)
+            provider_list = new_list
+
     # 分组过滤：仅保留与 API Key 分组有交集的渠道
     api_key_groups = safe_get(config, 'api_keys', api_index, 'groups', default=['default'])
     if isinstance(api_key_groups, str):
