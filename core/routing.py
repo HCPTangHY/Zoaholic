@@ -337,73 +337,66 @@ async def get_matching_providers(
     
     provider_list = get_provider_list(provider_rules, config, request_model, app)
 
-    # ── 统一黑名单过滤 ──
-    # 支持三种格式：
-    #   "渠道名"          → 排除整个渠道
-    #   "模型名"          → 排除所有渠道的该模型（支持 模型名* 通配符）
-    #   "渠道名/模型名"   → 只排除该渠道的该模型（支持 渠道名/模型名* 通配符）
-    # 优先读取 blacklist 字段；向后兼容 excluded_providers / excluded_models
-    blacklist = safe_get(config, 'api_keys', api_index, 'preferences', 'blacklist', default=None)
-    if not blacklist:
-        # 向后兼容：合并旧字段
-        old_ep = safe_get(config, 'api_keys', api_index, 'preferences', 'excluded_providers', default=None) or []
-        old_em = safe_get(config, 'api_keys', api_index, 'preferences', 'excluded_models', default=None) or []
-        if isinstance(old_ep, str):
-            old_ep = [s.strip() for s in old_ep.split(",") if s.strip()]
-        if isinstance(old_em, str):
-            old_em = [s.strip() for s in old_em.split(",") if s.strip()]
-        blacklist = list(old_ep) + list(old_em)
-    if isinstance(blacklist, str):
-        blacklist = [s.strip() for s in blacklist.split(",") if s.strip()]
+    # ── 黑名单过滤 ──
+    # excluded_channels: 排除整个渠道
+    # excluded_models: 排除模型，支持三种格式：
+    #   "模型名"         → 排除所有渠道的该模型
+    #   "模型名*"        → 通配符前缀匹配
+    #   "渠道名/模型名"   → 只排除指定渠道的指定模型（支持 渠道名/模型名* 通配）
+    excluded_channels = safe_get(config, 'api_keys', api_index, 'preferences', 'excluded_channels', default=None) or []
+    excluded_models_cfg = safe_get(config, 'api_keys', api_index, 'preferences', 'excluded_models', default=None) or []
 
-    if blacklist and isinstance(blacklist, list):
-        excluded_provider_set = set()       # 整个渠道被排除
-        excluded_model_set = set()          # 全局模型被排除
-        excluded_model_wildcards = []       # 全局模型通配符
-        excluded_pair_set = set()           # 渠道/模型 精确对被排除
-        excluded_pair_wildcards = []        # 渠道/模型* 通配符对
+    if isinstance(excluded_channels, str):
+        excluded_channels = [s.strip() for s in excluded_channels.split(",") if s.strip()]
+    if isinstance(excluded_models_cfg, str):
+        excluded_models_cfg = [s.strip() for s in excluded_models_cfg.split(",") if s.strip()]
 
-        for item in blacklist:
+    # 排除整个渠道
+    if excluded_channels:
+        ch_set = set(excluded_channels)
+        provider_list = [p for p in provider_list if p.get('provider') not in ch_set]
+
+    # 排除模型
+    if excluded_models_cfg:
+        global_exact = set()
+        global_prefixes = []
+        pair_exact = set()
+        pair_prefixes = []
+
+        for item in excluded_models_cfg:
             item = item.strip()
             if not item:
                 continue
             if "/" in item:
-                prov, model = item.split("/", 1)
-                if model.endswith("*"):
-                    excluded_pair_wildcards.append((prov, model.rstrip("*")))
+                ch, mdl = item.split("/", 1)
+                if mdl.endswith("*"):
+                    pair_prefixes.append((ch, mdl.rstrip("*")))
                 else:
-                    excluded_pair_set.add((prov, model))
+                    pair_exact.add((ch, mdl))
             elif item.endswith("*"):
-                excluded_model_wildcards.append(item.rstrip("*"))
+                global_prefixes.append(item.rstrip("*"))
             else:
-                # 判断是渠道名还是模型名：如果在 provider 列表中出现过则视为渠道名
-                provider_names = {p.get('provider') for p in provider_list}
-                if item in provider_names:
-                    excluded_provider_set.add(item)
-                else:
-                    excluded_model_set.add(item)
+                global_exact.add(item)
 
-        # 1) 全局模型黑名单：直接返回空
-        if request_model in excluded_model_set:
+        # 全局模型黑名单命中 → 直接返回空
+        if request_model in global_exact:
+            logger.info("blacklist: request_model %s hit excluded_models exact match", request_model)
             return []
-        for prefix in excluded_model_wildcards:
+        for prefix in global_prefixes:
             if request_model.startswith(prefix):
+                logger.info("blacklist: request_model %s hit excluded_models prefix '%s*'", request_model, prefix)
                 return []
 
-        # 2) 排除整个渠道
-        if excluded_provider_set:
-            provider_list = [p for p in provider_list if p.get('provider') not in excluded_provider_set]
-
-        # 3) 排除 渠道/模型 精确对和通配符对
-        if excluded_pair_set or excluded_pair_wildcards:
+        # 渠道/模型 对过滤
+        if pair_exact or pair_prefixes:
             new_list = []
             for p in provider_list:
                 pname = p.get('provider', '')
-                if (pname, request_model) in excluded_pair_set:
+                if (pname, request_model) in pair_exact:
                     continue
                 skip = False
-                for pair_prov, pair_prefix in excluded_pair_wildcards:
-                    if pname == pair_prov and request_model.startswith(pair_prefix):
+                for pair_ch, pair_pfx in pair_prefixes:
+                    if pname == pair_ch and request_model.startswith(pair_pfx):
                         skip = True
                         break
                 if not skip:

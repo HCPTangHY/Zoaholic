@@ -358,34 +358,9 @@ async def _fetch_passthrough_stream(client, url, headers, payload, timeout, engi
             yield error_message            
             return
         
-        # 使用 aiter_bytes 替代 aiter_text，然后手动解码
-        # 这样可以更好地处理边界情况和避免编码问题导致流中断
-        buffer = b""
-        async for raw_chunk in response.aiter_bytes():
-            # 合并缓冲区和新数据
-            buffer += raw_chunk
-            
-            # 尝试解码为文本
-            try:
-                # 使用 errors="replace" 避免编码错误导致流终止
-                text = buffer.decode("utf-8", errors="replace")
-                buffer = b""  # 成功解码后清空缓冲区
-                if text:
-                    text = await apply_response_interceptors(text, engine or "passthrough", model or "", is_stream=True, enabled_plugins=enabled_plugins)
-                    yield text
-            except UnicodeDecodeError:
-                # 如果解码失败（可能是不完整的 UTF-8 序列），保留缓冲区等待更多数据
-                # 但如果缓冲区太大，强制输出避免内存问题
-                if len(buffer) > 10 * 1024:  # 10KB
-                    text = buffer.decode("utf-8", errors="replace")
-                    buffer = b""
-                    if text:
-                        text = await apply_response_interceptors(text, engine or "passthrough", model or "", is_stream=True, enabled_plugins=enabled_plugins)
-                        yield text
-        
-        # 处理剩余的缓冲区数据
-        if buffer:
-            text = buffer.decode("utf-8", errors="replace")
+        # aiter_text 由 httpx 内部处理 UTF-8 解码（含多字节字符边界），
+        # SSE 服务端通常在每个事件后 flush，因此每个 chunk 大概率是完整的 SSE 事件。
+        async for text in response.aiter_text():
             if text:
                 text = await apply_response_interceptors(text, engine or "passthrough", model or "", is_stream=True, enabled_plugins=enabled_plugins)
                 yield text

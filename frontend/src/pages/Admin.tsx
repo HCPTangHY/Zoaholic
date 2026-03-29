@@ -4,7 +4,7 @@ import { apiFetch } from '../lib/api';
 import {
   Key, Plus, RefreshCw, Copy, Trash2, Edit, Save, X, Search,
   Folder, CheckCircle2, AlertCircle, AlertTriangle,
-  Wand2, Wallet, Brain, Download, Check
+  Wand2, Wallet, Brain, Download, Check, Ban
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
 
@@ -52,12 +52,14 @@ export default function Admin() {
   const [formModels, setFormModels] = useState<string[]>([]);
   const [formCredits, setFormCredits] = useState('');
   const [formRateLimit, setFormRateLimit] = useState('');
-  const [formBlacklist, setFormBlacklist] = useState<string[]>([]);
+  const [formExcludedChannels, setFormExcludedChannels] = useState<string[]>([]);
+  const [formExcludedModels, setFormExcludedModels] = useState<string[]>([]);
 
   // Input states
   const [groupInput, setGroupInput] = useState('');
   const [modelInput, setModelInput] = useState('');
-  const [blacklistInput, setBlacklistInput] = useState('');
+  const [excludedChannelInput, setExcludedChannelInput] = useState('');
+  const [excludedModelInput, setExcludedModelInput] = useState('');
 
   // Credits Dialog
   const [isCreditsOpen, setIsCreditsOpen] = useState(false);
@@ -105,7 +107,8 @@ export default function Admin() {
     setEditingIndex(index);
     setGroupInput('');
     setModelInput('');
-    setBlacklistInput('');
+    setExcludedChannelInput('');
+    setExcludedModelInput('');
 
     let source: ApiKeyData | null = null;
     if (copyFrom) {
@@ -135,14 +138,11 @@ export default function Admin() {
       setFormModels(Array.isArray(source.model) ? [...source.model] : []);
       setFormCredits(source.preferences?.credits !== undefined ? String(source.preferences.credits) : '');
       setFormRateLimit(source.preferences?.rate_limit || '');
-      // Parse blacklist (backward compat: merge old excluded_providers + excluded_models)
-      const bl = source.preferences?.blacklist;
-      const oldEp = source.preferences?.excluded_providers;
-      const oldEm = source.preferences?.excluded_models;
-      const parsedBl = Array.isArray(bl) ? [...bl] : (typeof bl === 'string' && bl.trim() ? bl.split(',').map((s: string) => s.trim()).filter(Boolean) : []);
-      const parsedEp = Array.isArray(oldEp) ? [...oldEp] : (typeof oldEp === 'string' && oldEp.trim() ? oldEp.split(',').map((s: string) => s.trim()).filter(Boolean) : []);
-      const parsedEm = Array.isArray(oldEm) ? [...oldEm] : (typeof oldEm === 'string' && oldEm.trim() ? oldEm.split(',').map((s: string) => s.trim()).filter(Boolean) : []);
-      setFormBlacklist([...new Set([...parsedBl, ...parsedEp, ...parsedEm])]);
+      // 黑名单
+      const ec = source.preferences?.excluded_channels;
+      setFormExcludedChannels(Array.isArray(ec) ? [...ec] : (typeof ec === 'string' && ec.trim() ? ec.split(',').map((s: string) => s.trim()).filter(Boolean) : []));
+      const em = source.preferences?.excluded_models;
+      setFormExcludedModels(Array.isArray(em) ? [...em] : (typeof em === 'string' && em.trim() ? em.split(',').map((s: string) => s.trim()).filter(Boolean) : []));
     } else {
       setFormApi('');
       setFormName('');
@@ -151,7 +151,8 @@ export default function Admin() {
       setFormModels([]);
       setFormCredits('');
       setFormRateLimit('');
-      setFormBlacklist([]);
+      setFormExcludedChannels([]);
+      setFormExcludedModels([]);
     }
 
     setIsSheetOpen(true);
@@ -309,8 +310,12 @@ export default function Admin() {
     if (formRateLimit.trim()) {
       prefs.rate_limit = formRateLimit.trim();
     }
-    if (formBlacklist.length > 0) {
-      prefs.blacklist = formBlacklist;
+    // 黑名单字段始终写入 prefs（即使为空数组也写入，用于后续清空逻辑）
+    if (formExcludedChannels.length > 0) {
+      prefs.excluded_channels = formExcludedChannels;
+    }
+    if (formExcludedModels.length > 0) {
+      prefs.excluded_models = formExcludedModels;
     }
     if (Object.keys(prefs).length > 0) target.preferences = prefs;
 
@@ -321,6 +326,13 @@ export default function Admin() {
       if (existing.preferences) {
         target.preferences = { ...existing.preferences, ...prefs };
       }
+      // 黑名单字段显式处理：确保用户可以清空
+      if (!target.preferences) target.preferences = {};
+      target.preferences.excluded_channels = formExcludedChannels.length > 0 ? formExcludedChannels : undefined;
+      target.preferences.excluded_models = formExcludedModels.length > 0 ? formExcludedModels : undefined;
+      // 清理 undefined 键
+      if (target.preferences.excluded_channels === undefined) delete target.preferences.excluded_channels;
+      if (target.preferences.excluded_models === undefined) delete target.preferences.excluded_models;
       newKeys[editingIndex] = target;
     } else {
       newKeys.push(target);
@@ -729,75 +741,131 @@ export default function Admin() {
                   />
                   <p className="text-xs text-muted-foreground mt-1">控制此 Key 的请求速率，支持多段（如 10/min,1000/day）。留空使用全局默认限流。</p>
                 </div>
+              </section>
 
-                {/* Unified Blacklist */}
+              {/* Access Control Section */}
+              <section className="space-y-4">
+                <div className="text-sm font-semibold text-foreground border-b border-border pb-2 flex items-center gap-2">
+                  <Ban className="w-4 h-4 text-red-500" /> 访问控制
+                </div>
+
                 <div className="space-y-3">
-                  <label className="text-sm font-medium text-foreground mb-1.5 block">黑名单</label>
-
-                  {/* Tags display */}
-                  <div className="bg-muted/50 border border-border rounded-lg p-3 min-h-[40px] max-h-[150px] overflow-y-auto">
-                    {formBlacklist.length === 0 ? (
-                      <div className="text-center text-muted-foreground text-xs py-1">无黑名单，此 Key 可访问模型规则内的所有渠道和模型</div>
-                    ) : (<div className="flex flex-wrap gap-2">
-                      {formBlacklist.map((item, idx) => {
-                        const hasSlash = item.includes('/');
-                        const hasStar = item.endsWith('*');
-                        let colorClass = 'bg-red-500/10 border-red-500/30 text-red-600 dark:text-red-400';
-                        let label = '渠道';
-                        if (hasSlash) {
-                          colorClass = 'bg-purple-500/10 border-purple-500/30 text-purple-600 dark:text-purple-400';
-                          label = '渠道/模型';
-                        } else if (hasStar || !item.match(/^[\u4e00-\u9fa5a-zA-Z0-9_-]+$/)) {
-                          colorClass = 'bg-orange-500/10 border-orange-500/30 text-orange-600 dark:text-orange-400';
-                          label = '模型';
-                        }
-                        return (
-                          <span key={idx} className={`${colorClass} border text-xs font-mono px-2 py-1 rounded flex items-center gap-1`}>
-                            <span className="opacity-50">{label}:</span> {item}
-                            <button title="移除" onClick={() => setFormBlacklist(formBlacklist.filter((_, i) => i !== idx))} className="opacity-60 hover:opacity-100 ml-0.5">
+                  <label className="text-sm font-medium text-foreground mb-1.5 block">排除渠道</label>
+                  <div className="bg-muted/50 border border-border rounded-lg p-3 min-h-[48px] max-h-[150px] overflow-y-auto">
+                    {formExcludedChannels.length === 0 ? (
+                      <div className="text-center text-muted-foreground text-xs py-1">未设置排除渠道</div>
+                    ) : (
+                      <div className="flex flex-wrap gap-2">
+                        {formExcludedChannels.map((item, idx) => (
+                          <span key={idx} className="bg-red-500/10 border border-red-500/30 text-red-600 dark:text-red-400 text-xs font-mono px-2 py-1 rounded flex items-center gap-1">
+                            {item}
+                            <button
+                              title="移除"
+                              onClick={() => setFormExcludedChannels(formExcludedChannels.filter((_, i) => i !== idx))}
+                              className="opacity-60 hover:opacity-100 ml-0.5"
+                            >
                               <X className="w-3 h-3" />
                             </button>
                           </span>
-                        );
-                      })}
-                    </div>)}
+                        ))}
+                      </div>
+                    )}
                   </div>
-
-                  {/* Input */}
                   <div className="flex gap-2">
                     <input
-                      type="text" value={blacklistInput} onChange={e => setBlacklistInput(e.target.value)}
+                      type="text"
+                      value={excludedChannelInput}
+                      onChange={e => setExcludedChannelInput(e.target.value)}
                       onKeyDown={e => {
                         if (e.key === 'Enter') {
                           e.preventDefault();
-                          const parts = blacklistInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
+                          const parts = excludedChannelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
                           if (parts.length > 0) {
-                            setFormBlacklist([...new Set([...formBlacklist, ...parts])]);
-                            setBlacklistInput('');
+                            setFormExcludedChannels([...new Set([...formExcludedChannels, ...parts])]);
+                            setExcludedChannelInput('');
                           }
                         }
                       }}
-                      placeholder="渠道名, 模型名, 或 渠道名/模型名，逗号分隔"
+                      placeholder="输入渠道名，逗号分隔"
                       className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
                     />
-                    <button onClick={() => {
-                      const parts = blacklistInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
-                      if (parts.length > 0) {
-                        setFormBlacklist([...new Set([...formBlacklist, ...parts])]);
-                        setBlacklistInput('');
-                      }
-                    }} className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm">添加</button>
+                    <button
+                      onClick={() => {
+                        const parts = excludedChannelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
+                        if (parts.length > 0) {
+                          setFormExcludedChannels([...new Set([...formExcludedChannels, ...parts])]);
+                          setExcludedChannelInput('');
+                        }
+                      }}
+                      className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm"
+                    >
+                      添加
+                    </button>
                   </div>
-
-                  <p className="text-xs text-muted-foreground">
-                    支持三种格式：
-                    <code className="bg-muted px-1 rounded">渠道名</code> 排除整个渠道、
-                    <code className="bg-muted px-1 rounded">模型名</code> 排除所有渠道的该模型、
-                    <code className="bg-muted px-1 rounded">渠道名/模型名</code> 只排除该渠道的该模型。
-                    支持通配符 <code className="bg-muted px-1 rounded">*</code>。
-                  </p>
+                  <p className="text-xs text-muted-foreground">命中后将直接排除整个渠道。</p>
                 </div>
 
+                <div className="space-y-3">
+                  <label className="text-sm font-medium text-foreground mb-1.5 block">排除模型</label>
+                  <div className="bg-muted/50 border border-border rounded-lg p-3 min-h-[48px] max-h-[150px] overflow-y-auto">
+                    {formExcludedModels.length === 0 ? (
+                      <div className="text-center text-muted-foreground text-xs py-1">未设置排除模型</div>
+                    ) : (
+                      <div className="flex flex-wrap gap-2">
+                        {formExcludedModels.map((item, idx) => (
+                          <span key={idx} className="bg-orange-500/10 border border-orange-500/30 text-orange-600 dark:text-orange-400 text-xs font-mono px-2 py-1 rounded flex items-center gap-1">
+                            {item}
+                            <button
+                              title="移除"
+                              onClick={() => setFormExcludedModels(formExcludedModels.filter((_, i) => i !== idx))}
+                              className="opacity-60 hover:opacity-100 ml-0.5"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={excludedModelInput}
+                      onChange={e => setExcludedModelInput(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          const parts = excludedModelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
+                          if (parts.length > 0) {
+                            setFormExcludedModels([...new Set([...formExcludedModels, ...parts])]);
+                            setExcludedModelInput('');
+                          }
+                        }
+                      }}
+                      placeholder="输入模型名、模型前缀* 或 渠道名/模型名"
+                      className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
+                    />
+                    <button
+                      onClick={() => {
+                        const parts = excludedModelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
+                        if (parts.length > 0) {
+                          setFormExcludedModels([...new Set([...formExcludedModels, ...parts])]);
+                          setExcludedModelInput('');
+                        }
+                      }}
+                      className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm"
+                    >
+                      添加
+                    </button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    支持三种格式：
+                    <code className="bg-muted px-1 rounded">模型名</code>
+                    、<code className="bg-muted px-1 rounded">模型名前缀*</code>
+                    、<code className="bg-muted px-1 rounded">渠道名/模型名</code>
+                    。渠道名/模型名同样支持 <code className="bg-muted px-1 rounded">*</code> 前缀通配。
+                  </p>
+                </div>
               </section>
 
 
@@ -849,12 +917,12 @@ export default function Admin() {
                     <input
                       type="text" value={modelInput} onChange={e => setModelInput(e.target.value)}
                       onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addModelsFromInput(); } }}
-                      placeholder="例如 all, gpt-4o, 渠道名/模型名（指定渠道）"
+                      placeholder="例如 all, gpt-4o 用空格/逗号分隔"
                       className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
                     />
                     <button onClick={addModelsFromInput} className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm">添加</button>
                   </div>
-                  <p className="text-xs text-muted-foreground mt-1">多个用逗号或空格分隔，按回车快速添加。支持 <code className="bg-muted px-1 rounded">渠道名/模型名</code> 精确指定渠道，<code className="bg-muted px-1 rounded">渠道名/*</code> 匹配渠道全部模型</p>
+                  <p className="text-xs text-muted-foreground mt-1">多个用逗号或空格分隔，按回车快速添加</p>
                 </div>
               </section>
             </div>
