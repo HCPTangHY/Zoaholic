@@ -371,6 +371,14 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
                         items.append(key_str)
                 return items, disabled_keys
             
+            # 保存旧的运行时禁用状态，以便重建后恢复
+            old_circular = provider_api_circular_list.get(provider['provider'])
+            old_rt_disabled = {}  # key -> disabled_until timestamp
+            if old_circular:
+                for k in old_circular.runtime_disabled_keys:
+                    # 只保留运行时自动禁用的
+                    old_rt_disabled[k] = old_circular.disabled_until.get(k, 0)
+
             if isinstance(provider_api, str):
                 items, disabled_keys = parse_api_keys([provider_api])
                 provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(
@@ -389,6 +397,44 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
                     provider_name=provider['provider'],
                     disabled_keys=disabled_keys
                 )
+
+            # 恢复运行时自动禁用状态（仅恢复当前 items 中仍存在的 key）
+            new_circular = provider_api_circular_list.get(provider['provider'])
+            _restored_keys = {}  # key -> remaining_seconds，用于重建定时器
+            if new_circular and old_rt_disabled:  # 热重载：从旧实例恢复
+                from time import time as _time_now
+                now = _time_now()
+                for k, until_ts in old_rt_disabled.items():
+                    if k not in new_circular.disabled_keys and k in new_circular.items:
+                        if until_ts == 0 or until_ts > now:
+                            new_circular.runtime_disabled_keys.add(k)
+                            new_circular.disabled_until[k] = until_ts
+                            if until_ts > 0:
+                                _restored_keys[k] = max(1, int(until_ts - now))
+            elif new_circular and not old_rt_disabled:
+                # 冷启动（无旧实例）：从持久化文件恢复
+                from core.utils import restore_runtime_disabled_for
+                restore_runtime_disabled_for(provider['provider'], new_circular)
+                # 收集需要重建定时器的 key
+                from time import time as _time_now2
+                now2 = _time_now2()
+                for k in new_circular.runtime_disabled_keys:
+                    until_ts = new_circular.disabled_until.get(k, 0)
+                    if until_ts > 0 and until_ts > now2:
+                        _restored_keys[k] = max(1, int(until_ts - now2))
+
+            # 为有倒计时的已恢复 key 重建自动恢复定时器
+            if _restored_keys and new_circular:
+                _ch_id = provider['provider']
+                for _rk, _delay in _restored_keys.items():
+                    async def _re_enable_restored(ch_id, api_key, delay):
+                        try:
+                            await asyncio.sleep(delay)
+                            provider_api_circular_list[ch_id].set_key_disabled(api_key, False)
+                            logger.info(f"[auto_disable_key] Key auto re-enabled for provider {ch_id} after {delay}s (restored)")
+                        except Exception as e:
+                            logger.error(f"[auto_disable_key] Error re-enabling restored key: {e}")
+                    asyncio.create_task(_re_enable_restored(_ch_id, _rk, _delay))
 
         if "models.inference.ai.azure.com" in provider['base_url'] and not provider.get("model"):
             provider['model'] = [

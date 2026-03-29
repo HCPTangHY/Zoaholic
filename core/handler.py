@@ -1133,6 +1133,60 @@ class ModelRequestHandler:
                     and all(error not in error_message for error in exclude_error_rate_limit)):
                     await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=cooling_time)
 
+                # ── Key 自动禁用 ──
+                # 根据渠道配置的 auto_disable_key 设置，当 key 遇到特定错误码且错误信息匹配关键词时自动禁用
+                auto_disable_cfg = safe_get(provider, "preferences", "auto_disable_key", default=None)
+                if auto_disable_cfg and isinstance(auto_disable_cfg, dict) and auto_disable_cfg.get("enabled"):
+                    trigger_codes = auto_disable_cfg.get("status_codes", [429])
+                    if not isinstance(trigger_codes, list):
+                        trigger_codes = [trigger_codes]
+                    trigger_codes_set = set(int(c) for c in trigger_codes if str(c).isdigit())
+
+                    # 关键词匹配（大小写不敏感）
+                    keywords = auto_disable_cfg.get("keywords", None)
+                    if not keywords or not isinstance(keywords, list):
+                        keyword_list = []  # 留空 = 不检测关键词
+                    else:
+                        keyword_list = [k.strip() for k in keywords if isinstance(k, str) and k.strip()]
+
+                    error_lower = (error_message or "").lower()
+                    if keyword_list:
+                        keyword_matched = any(kw.lower() in error_lower for kw in keyword_list)
+                    else:
+                        keyword_matched = False  # 没配关键词，不通过关键词触发
+
+                    # 触发条件：状态码匹配 或 关键词匹配（任一满足即禁用）
+                    code_matched = status_code in trigger_codes_set
+                    should_disable = code_matched or keyword_matched
+
+                    if should_disable and current_api:
+                        re_enable_seconds = int(auto_disable_cfg.get("re_enable_seconds", 0))
+                        from time import time as _time_now
+                        re_enable_at = _time_now() + re_enable_seconds if re_enable_seconds > 0 else 0
+                        provider_api_circular_list[channel_id].set_key_disabled(current_api, True, re_enable_at=re_enable_at, runtime=True)
+                        logger.warning(
+                            f"[auto_disable_key] Key disabled for provider {channel_id} "
+                            f"due to status {status_code}, keyword matched. "
+                            f"Re-enable in {re_enable_seconds}s" if re_enable_seconds > 0 else
+                            f"[auto_disable_key] Key disabled for provider {channel_id} "
+                            f"due to status {status_code}, keyword matched. Manual re-enable required."
+                        )
+
+                        # 自动重新启用定时器
+                        if re_enable_seconds > 0:
+                            async def _re_enable_key(ch_id, api_key, delay):
+                                try:
+                                    await asyncio.sleep(delay)
+                                    provider_api_circular_list[ch_id].set_key_disabled(api_key, False)
+                                    logger.info(
+                                        f"[auto_disable_key] Key auto re-enabled for provider {ch_id} "
+                                        f"after {delay}s"
+                                    )
+                                except Exception as re_e:
+                                    logger.error(f"[auto_disable_key] Error re-enabling key: {re_e}")
+
+                            asyncio.create_task(_re_enable_key(channel_id, current_api, re_enable_seconds))
+
                 # 有些错误并没有请求成功，所以需要删除请求记录
                 if (current_api 
                     and any(error in error_message for error in exclude_error_rate_limit) 

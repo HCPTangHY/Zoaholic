@@ -509,13 +509,77 @@ def parse_rate_limit(limit_string):
 
     return limits
 
+
+# ==================== 运行时禁用 Key 持久化 ====================
+import json as _json
+import os as _os
+import threading as _threading
+
+_RT_DISABLED_FILE = _os.path.join(_os.getenv("DATA_DIR", "/home/data"), "runtime_disabled_keys.json")
+_rt_save_lock = _threading.Lock()
+
+
+def _save_all_runtime_disabled():
+    """将所有渠道的运行时禁用状态持久化到磁盘（去重调用、线程安全）。"""
+    try:
+        from core.utils import provider_api_circular_list
+        snapshot = {}
+        for pname, clist in provider_api_circular_list.items():
+            if clist.runtime_disabled_keys:
+                entries = {}
+                for k in clist.runtime_disabled_keys:
+                    entries[k] = clist.disabled_until.get(k, 0)
+                snapshot[pname] = entries
+        with _rt_save_lock:
+            tmp = _RT_DISABLED_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump(snapshot, f, ensure_ascii=False)
+            # 原子替换
+            if _os.path.exists(_RT_DISABLED_FILE):
+                _os.replace(tmp, _RT_DISABLED_FILE)
+            else:
+                _os.rename(tmp, _RT_DISABLED_FILE)
+    except Exception as e:
+        logger.debug(f"[rt_disabled] Failed to save runtime disabled keys: {e}")
+
+
+def _load_all_runtime_disabled() -> dict:
+    """从磁盘加载运行时禁用状态。返回 { provider_name: { key: re_enable_at } }"""
+    try:
+        if _os.path.exists(_RT_DISABLED_FILE):
+            with open(_RT_DISABLED_FILE, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        logger.debug(f"[rt_disabled] Failed to load runtime disabled keys: {e}")
+    return {}
+
+
+def restore_runtime_disabled_for(provider_name: str, circular_list):
+    """启动时从持久化文件恢复某个渠道的运行时禁用状态。"""
+    saved = _load_all_runtime_disabled()
+    entries = saved.get(provider_name, {})
+    if not entries:
+        return
+    from time import time as _now
+    now = _now()
+    for k, until_ts in entries.items():
+        if k in circular_list.items and k not in circular_list.disabled_keys:
+            # 跳过已过期的倒计时（永久=0 始终恢复）
+            if until_ts == 0 or until_ts > now:
+                circular_list.runtime_disabled_keys.add(k)
+                circular_list.disabled_until[k] = until_ts
+
+
 class ThreadSafeCircularList:
     def __init__(self, items = [], rate_limit={"default": "999999/min"}, schedule_algorithm="round_robin", provider_name=None, disabled_keys=None):
         self.provider_name = provider_name
         self.original_items = list(items)
         self.schedule_algorithm = schedule_algorithm
         # 存储禁用的 key 集合
-        self.disabled_keys = set(disabled_keys) if disabled_keys else set()
+        self.disabled_keys = set(disabled_keys) if disabled_keys else set()  # 配置文件里 ! 前缀的
+        self.runtime_disabled_keys = set()  # 运行时自动禁用的（与配置禁用分开）
 
         if schedule_algorithm == "random":
             self.items = random.sample(items, len(items))
@@ -534,6 +598,7 @@ class ThreadSafeCircularList:
         self.lock = asyncio.Lock()
         self.requests = defaultdict(lambda: defaultdict(list))
         self.cooling_until = defaultdict(float)
+        self.disabled_until = {}  # key -> unix timestamp，记录自动禁用的恢复时间（0=永久）
         self.rate_limits = {}
         self.reordering_task = None
 
@@ -594,28 +659,34 @@ class ThreadSafeCircularList:
             logger.warning(f"API key {item} 已进入冷却状态，冷却时间 {cooling_time} 秒")
 
     def is_key_disabled(self, item: str) -> bool:
-        """检查某个 key 是否被禁用
-        
-        Args:
-            item: API key
-            
-        Returns:
-            bool: 如果 key 被禁用返回 True，否则返回 False
-        """
-        return item in self.disabled_keys
+        """检查某个 key 是否被禁用（配置禁用 或 运行时自动禁用）"""
+        return item in self.disabled_keys or item in self.runtime_disabled_keys
     
-    def set_key_disabled(self, item: str, disabled: bool = True):
-        """设置某个 key 的禁用状态
-        
-        Args:
-            item: API key
-            disabled: True 表示禁用，False 表示启用
+    def is_key_runtime_disabled(self, item: str) -> bool:
+        """检查某个 key 是否被运行时自动禁用（不含配置禁用）"""
+        return item in self.runtime_disabled_keys
+
+    def set_key_disabled(self, item: str, disabled: bool = True, re_enable_at: float = 0, runtime: bool = False):
+        """设置某个 key 的禁用状态。
+        runtime=True 时操作运行时自动禁用集合，False 时操作配置禁用集合。
         """
+        need_persist = False
         if disabled:
-            self.disabled_keys.add(item)
+            if runtime:
+                self.runtime_disabled_keys.add(item)
+                self.disabled_until[item] = re_enable_at
+                need_persist = True
+            else:
+                self.disabled_keys.add(item)
         else:
+            # 恢复时两个集合都清除
+            need_persist = item in self.runtime_disabled_keys
+            self.runtime_disabled_keys.discard(item)
             self.disabled_keys.discard(item)
-    
+            self.disabled_until.pop(item, None)
+        if need_persist:
+            _save_all_runtime_disabled()
+
     def update_disabled_keys(self, disabled_keys: set):
         """更新禁用的 key 集合
         
