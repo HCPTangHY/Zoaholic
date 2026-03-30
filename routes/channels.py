@@ -32,7 +32,7 @@ async def get_channels(token: str = Depends(verify_admin_api_key)):
     """
     channels = list_channels()
     channel_list = [ch.to_dict() for ch in channels]
-
+    return JSONResponse(content={"channels": channel_list})
 
 @router.get("/v1/channels/key_status", dependencies=[Depends(rate_limit_dependency)])
 async def get_key_status(token: str = Depends(verify_admin_api_key), app=Depends(get_app)):
