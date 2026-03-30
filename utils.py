@@ -412,9 +412,9 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
                             if until_ts > 0:
                                 _restored_keys[k] = max(1, int(until_ts - now))
             elif new_circular and not old_rt_disabled:
-                # 冷启动（无旧实例）：从持久化文件恢复
-                from core.utils import restore_runtime_disabled_for
-                restore_runtime_disabled_for(provider['provider'], new_circular)
+                # 冷启动（无旧实例）：从持久化存储恢复（DB 或文件）
+                from core.utils import restore_runtime_disabled_for_async
+                await restore_runtime_disabled_for_async(provider['provider'], new_circular)
                 # 收集需要重建定时器的 key
                 from time import time as _time_now2
                 now2 = _time_now2()

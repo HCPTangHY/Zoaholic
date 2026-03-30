@@ -519,8 +519,88 @@ _RT_DISABLED_FILE = _os.path.join(_os.getenv("DATA_DIR", "/home/data"), "runtime
 _rt_save_lock = _threading.Lock()
 
 
+def _use_db_persistence() -> bool:
+    """判断是否使用数据库持久化（Render 等云平台文件系统是临时的）"""
+    try:
+        from db import db_engine, DISABLE_DATABASE
+        return db_engine is not None and not DISABLE_DATABASE
+    except Exception:
+        return False
+
+
+def _save_to_db(snapshot: dict):
+    """异步保存到数据库 app_config 表 id=2"""
+    import asyncio
+    async def _do_save():
+        try:
+            from db import async_session_scope, AppConfig
+            from sqlalchemy import select
+            async with async_session_scope() as session:
+                result = await session.execute(select(AppConfig).where(AppConfig.id == 2))
+                row = result.scalars().first()
+                json_str = _json.dumps(snapshot, ensure_ascii=False)
+                if row:
+                    row.config_json = json_str
+                else:
+                    session.add(AppConfig(id=2, config_json=json_str))
+                await session.commit()
+        except Exception as e:
+            logger.debug(f"[rt_disabled] Failed to save to DB: {e}")
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_do_save())
+    except RuntimeError:
+        pass
+
+
+def _load_from_db() -> dict:
+    """同步加载 DB 中的运行时禁用数据（启动时用）"""
+    import asyncio
+    async def _do_load():
+        try:
+            from db import async_session_scope, AppConfig
+            from sqlalchemy import select
+            async with async_session_scope() as session:
+                result = await session.execute(select(AppConfig).where(AppConfig.id == 2))
+                row = result.scalars().first()
+                if row and row.config_json:
+                    data = _json.loads(row.config_json) if isinstance(row.config_json, str) else row.config_json
+                    if isinstance(data, dict):
+                        return data
+        except Exception as e:
+            logger.debug(f"[rt_disabled] Failed to load from DB: {e}")
+        return {}
+
+    try:
+        asyncio.get_running_loop()
+        # 已有事件循环（启动阶段是 async 的），不能用 asyncio.run
+        # 返回空，由 restore_runtime_disabled_for_async 处理
+        return {}
+    except RuntimeError:
+        # 没有事件循环，可以直接 run
+        return asyncio.run(_do_load())
+
+
+async def _load_from_db_async() -> dict:
+    """异步加载 DB 中的运行时禁用数据"""
+    try:
+        from db import async_session_scope, AppConfig
+        from sqlalchemy import select
+        async with async_session_scope() as session:
+            result = await session.execute(select(AppConfig).where(AppConfig.id == 2))
+            row = result.scalars().first()
+            if row and row.config_json:
+                data = _json.loads(row.config_json) if isinstance(row.config_json, str) else row.config_json
+                if isinstance(data, dict):
+                    return data
+    except Exception as e:
+        logger.debug(f"[rt_disabled] Failed to async load from DB: {e}")
+    return {}
+
+
 def _save_all_runtime_disabled():
-    """将所有渠道的运行时禁用状态持久化到磁盘（去重调用、线程安全）。"""
+    """将所有渠道的运行时禁用状态持久化（DB 优先，回退文件）。"""
     try:
         from core.utils import provider_api_circular_list
         snapshot = {}
@@ -530,21 +610,29 @@ def _save_all_runtime_disabled():
                 for k in clist.runtime_disabled_keys:
                     entries[k] = clist.disabled_until.get(k, 0)
                 snapshot[pname] = entries
-        with _rt_save_lock:
-            tmp = _RT_DISABLED_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                _json.dump(snapshot, f, ensure_ascii=False)
-            # 原子替换
-            if _os.path.exists(_RT_DISABLED_FILE):
-                _os.replace(tmp, _RT_DISABLED_FILE)
-            else:
-                _os.rename(tmp, _RT_DISABLED_FILE)
+
+        if _use_db_persistence():
+            _save_to_db(snapshot)
+        else:
+            with _rt_save_lock:
+                tmp = _RT_DISABLED_FILE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    _json.dump(snapshot, f, ensure_ascii=False)
+                if _os.path.exists(_RT_DISABLED_FILE):
+                    _os.replace(tmp, _RT_DISABLED_FILE)
+                else:
+                    _os.rename(tmp, _RT_DISABLED_FILE)
     except Exception as e:
         logger.debug(f"[rt_disabled] Failed to save runtime disabled keys: {e}")
 
 
 def _load_all_runtime_disabled() -> dict:
-    """从磁盘加载运行时禁用状态。返回 { provider_name: { key: re_enable_at } }"""
+    """加载运行时禁用状态。DB 优先，回退文件。返回 { provider_name: { key: re_enable_at } }"""
+    if _use_db_persistence():
+        data = _load_from_db()
+        if data:
+            return data
+    # 回退到文件
     try:
         if _os.path.exists(_RT_DISABLED_FILE):
             with open(_RT_DISABLED_FILE, "r", encoding="utf-8") as f:
@@ -552,13 +640,27 @@ def _load_all_runtime_disabled() -> dict:
             if isinstance(data, dict):
                 return data
     except Exception as e:
-        logger.debug(f"[rt_disabled] Failed to load runtime disabled keys: {e}")
+        logger.debug(f"[rt_disabled] Failed to load from file: {e}")
     return {}
 
 
 def restore_runtime_disabled_for(provider_name: str, circular_list):
-    """启动时从持久化文件恢复某个渠道的运行时禁用状态。"""
+    """启动时从持久化存储恢复某个渠道的运行时禁用状态（同步版，用于文件回退）。"""
     saved = _load_all_runtime_disabled()
+    _apply_restored(saved, provider_name, circular_list)
+
+
+async def restore_runtime_disabled_for_async(provider_name: str, circular_list):
+    """启动时从数据库恢复某个渠道的运行时禁用状态（异步版）。"""
+    if _use_db_persistence():
+        saved = await _load_from_db_async()
+    else:
+        saved = _load_all_runtime_disabled()
+    _apply_restored(saved, provider_name, circular_list)
+
+
+def _apply_restored(saved: dict, provider_name: str, circular_list):
+    """将加载的数据应用到 circular_list"""
     entries = saved.get(provider_name, {})
     if not entries:
         return
@@ -566,10 +668,10 @@ def restore_runtime_disabled_for(provider_name: str, circular_list):
     now = _now()
     for k, until_ts in entries.items():
         if k in circular_list.items and k not in circular_list.disabled_keys:
-            # 跳过已过期的倒计时（永久=0 始终恢复）
             if until_ts == 0 or until_ts > now:
                 circular_list.runtime_disabled_keys.add(k)
                 circular_list.disabled_until[k] = until_ts
+
 
 
 class ThreadSafeCircularList:

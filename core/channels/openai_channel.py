@@ -458,7 +458,18 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
                 if result.strip() == "[DONE]":
                     done_received = True
                     break
+
                 line = json_loads(result)
+
+                # 提取 usage（OpenAI chat/completions 流式最后一个 chunk 中包含）
+                chunk_usage = line.get("usage") if isinstance(line, dict) else None
+                if chunk_usage and isinstance(chunk_usage, dict):
+                    _in = chunk_usage.get("prompt_tokens") or chunk_usage.get("input_tokens") or 0
+                    _out = chunk_usage.get("completion_tokens") or chunk_usage.get("output_tokens") or 0
+                    if _in:
+                        input_tokens = _in
+                    if _out:
+                        output_tokens = _out
 
                 # 检查返回的 JSON 是否包含错误信息
                 if 'error' in line:
@@ -597,7 +608,7 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
             if done_received:
                 break
 
-    if input_tokens and output_tokens:
+    if input_tokens or output_tokens:
         merge_usage(prompt_tokens=input_tokens, completion_tokens=output_tokens, total_tokens=input_tokens + output_tokens)
         sse_string = await generate_sse_response(timestamp, payload["model"], None, None, None, None, None, total_tokens=input_tokens + output_tokens, prompt_tokens=input_tokens, completion_tokens=output_tokens)
         yield sse_string
