@@ -10,6 +10,8 @@
 
 import httpx
 from collections import deque
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from threading import RLock
 from time import monotonic
@@ -26,6 +28,9 @@ _outbound_log_buffer_size = DEFAULT_OUTBOUND_LOG_BUFFER_SIZE
 _outbound_log_buffer: deque = deque(maxlen=_outbound_log_buffer_size)
 _outbound_log_lock = RLock()
 _outbound_log_next_id = 1
+
+# 上下文代理：在此 ContextVar 有值时，裸创建的 httpx.AsyncClient() 自动注入代理
+_current_proxy: ContextVar[Optional[str]] = ContextVar("_current_proxy", default=None)
 
 # ==================== event_hooks ====================
 
@@ -110,7 +115,7 @@ def _record_transport_error(request: httpx.Request, exc: Exception):
 
 
 def _patched_async_client_init(self, *args, **kwargs):
-    """在 httpx.AsyncClient 创建时自动注入 tracing event_hooks"""
+    """在 httpx.AsyncClient 创建时自动注入 tracing event_hooks 和上下文代理"""
     existing_hooks = kwargs.get("event_hooks") or {}
 
     merged_request = [_on_request] + list(existing_hooks.get("request") or [])
@@ -120,6 +125,12 @@ def _patched_async_client_init(self, *args, **kwargs):
         "request": merged_request,
         "response": merged_response,
     }
+
+    # 自动注入上下文代理：当调用方未显式指定代理参数时，从 ContextVar 继承
+    _proxy_url = _current_proxy.get(None)
+    if _proxy_url and "proxy" not in kwargs and "proxies" not in kwargs and "transport" not in kwargs:
+        from core.utils import get_proxy
+        kwargs.update(get_proxy(_proxy_url, {}))
 
     _original_async_init(self, *args, **kwargs)
 
@@ -132,6 +143,23 @@ def install():
     httpx.AsyncClient.__init__ = _patched_async_client_init
     httpx.AsyncClient.send = _patched_async_send  # type: ignore[assignment]
     _installed = True
+
+
+@contextmanager
+def proxy_context(proxy_url: Optional[str] = None):
+    """设置当前上下文的代理 URL。
+
+    在此上下文中裸创建的 httpx.AsyncClient() 会自动注入该代理，
+    无需每个调用点手动传递。已显式指定 proxy/proxies/transport 的不受影响。
+    """
+    if proxy_url:
+        token = _current_proxy.set(proxy_url)
+        try:
+            yield
+        finally:
+            _current_proxy.reset(token)
+    else:
+        yield
 
 
 # ==================== 查询接口 ====================

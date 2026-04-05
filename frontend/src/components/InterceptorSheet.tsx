@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { apiFetch } from '../lib/api';
-import { useAuthStore } from '../store/authStore';
 import { 
   Puzzle, 
   Settings2, 
@@ -16,8 +15,8 @@ interface PluginOption {
   version: string;
   description: string;
   enabled: boolean;
-  request_interceptors: any[];
-  response_interceptors: any[];
+  request_interceptors: unknown[];
+  response_interceptors: unknown[];
   metadata?: {
     params_hint?: string;
     provider_config?: {
@@ -25,7 +24,7 @@ interface PluginOption {
       type?: 'json' | 'text';
       title?: string;
       description?: string;
-      example?: any;
+      example?: unknown;
     };
   };
 }
@@ -35,8 +34,8 @@ interface InterceptorSheetProps {
   onOpenChange: (open: boolean) => void;
   allPlugins: PluginOption[];
   enabledPlugins: string[]; // ["pluginA:config", "pluginB"]
-  providerPreferences: Record<string, any>;
-  onUpdate: (payload: { enabled_plugins: string[]; preferences_patch: Record<string, any>; preferences_delete: string[] }) => void;
+  providerPreferences: Record<string, unknown>;
+  onUpdate: (payload: { enabled_plugins: string[]; preferences_patch: Record<string, unknown>; preferences_delete: string[] }) => void;
 }
 
 export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugins, providerPreferences, onUpdate }: InterceptorSheetProps) {
@@ -87,8 +86,9 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
       const { name, options } = parseEntry(entry);
       if (name) m.set(name, options);
     });
-    setSelected(m);
-    setExpanded(new Set());
+    // 打开面板时重置本地状态，这是组件初始化的标准做法
+    // eslint-disable-next-line
+    setSelected(m); setExpanded(new Set());
 
     const cfgMap = new Map<string, string>();
     effectivePlugins.forEach(p => {
@@ -168,7 +168,7 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
       result.push(options ? `${name}:${options}` : name);
     });
 
-    const preferences_patch: Record<string, any> = {};
+    const preferences_patch: Record<string, unknown> = {};
     const preferences_delete: string[] = [];
 
     for (const plugin of effectivePlugins) {
@@ -188,8 +188,8 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
       if (configType === 'json') {
         try {
           preferences_patch[meta.key] = JSON.parse(t);
-        } catch (e: any) {
-          alert(`插件 ${plugin.plugin_name} 配置 JSON 格式错误：${e?.message || 'invalid json'}`);
+        } catch (e) {
+          alert(`插件 ${plugin.plugin_name} 配置 JSON 格式错误：${e instanceof Error ? e.message : 'invalid json'}`);
           return;
         }
       } else {
@@ -310,8 +310,8 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
                                 onClick={() => {
                                   try {
                                     updateProviderConfigText(plugin.plugin_name, formatJsonText(providerConfigText.get(plugin.plugin_name) || ''));
-                                  } catch (e: any) {
-                                    alert(`格式化失败：${e?.message || 'invalid json'}`);
+                                  } catch (e: unknown) {
+                                    alert(`格式化失败：${e instanceof Error ? e.message : 'invalid json'}`);
                                   }
                                 }}
                                 className="text-xs font-medium text-muted-foreground hover:text-foreground px-2 py-1 bg-muted rounded disabled:opacity-50"
@@ -319,7 +319,7 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
                                 格式化
                               </button>
 
-                              {plugin.metadata?.provider_config?.example && (
+                              {plugin.metadata?.provider_config?.example != null && (
                                 <button
                                   type="button"
                                   disabled={!isSelected}

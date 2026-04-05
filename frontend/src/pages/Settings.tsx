@@ -2,12 +2,32 @@ import { useState, useEffect } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
 import {
-  Settings2, Save, RefreshCw, AlertCircle, Clock, Zap, Shield,
-  Timer, Database, Server, Blocks, Plus, Trash2, Edit2, Link
+  Save, RefreshCw, AlertCircle, Zap, Shield,
+  Timer, Database, Blocks, Plus, Trash2, Link
 } from 'lucide-react';
 
 type CleanupAction = 'clear_fields' | 'delete_rows';
 type CleanupTimeMode = 'older_than_hours' | 'custom_range' | 'all';
+
+interface ExternalClient {
+  icon: string;
+  name: string;
+  link: string;
+}
+
+interface Preferences {
+  max_retry_count?: number;
+  cooldown_period?: number;
+  SCHEDULING_ALGORITHM?: string;
+  rate_limit?: string;
+  model_timeout?: { default?: number; [key: string]: number | undefined };
+  keepalive_interval?: { default?: number; [key: string]: number | undefined };
+  log_raw_data_retention_hours?: number;
+  log_retention_mode?: string;
+  log_retention_days?: number;
+  log_retention_run_at?: string;
+  external_clients?: ExternalClient[];
+}
 type CleanupSuccessMode = 'ALL' | 'SUCCESS' | 'FAILED';
 
 interface LogsCleanupResponse {
@@ -38,7 +58,7 @@ const DEFAULT_CLEANUP_FIELDS = LOG_CLEANUP_FIELD_OPTIONS
 
 export default function Settings() {
   const { token } = useAuthStore();
-  const [preferences, setPreferences] = useState<any>({});
+  const [preferences, setPreferences] = useState<Preferences>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
@@ -71,7 +91,7 @@ export default function Settings() {
         });
         if (res.ok) {
           const data = await res.json();
-          const loadedPreferences = data.api_config?.preferences || data.preferences || {};
+          const loadedPreferences: Preferences = (data.api_config?.preferences || data.preferences || {}) as Preferences;
 
           // Ensure default external clients exist if not defined
           if (!loadedPreferences.external_clients) {
@@ -90,8 +110,8 @@ export default function Settings() {
     fetchConfig();
   }, [token]);
 
-  const updatePreference = (key: string, value: any) => {
-    setPreferences((prev: any) => ({ ...prev, [key]: value }));
+  const updatePreference = <K extends keyof Preferences>(key: K, value: Preferences[K]) => {
+    setPreferences(prev => ({ ...prev, [key]: value }));
   };
 
   const parseErrorMessage = async (res: Response) => {
@@ -186,7 +206,7 @@ export default function Settings() {
       const data = await res.json();
       setCleanupResult(data);
       setCleanupMessage('预览成功：仅统计未执行写入。');
-    } catch (err) {
+    } catch {
       setCleanupMessage('预览失败：网络错误');
     } finally {
       setCleanupRunning(false);
@@ -231,7 +251,7 @@ export default function Settings() {
       setCleanupResult(data);
       setCleanupConfirmText('');
       setCleanupMessage(`执行完成：影响 ${data.affected_rows} 条记录`);
-    } catch (err) {
+    } catch {
       setCleanupMessage('执行失败：网络错误');
     } finally {
       setCleanupRunning(false);
@@ -253,7 +273,7 @@ export default function Settings() {
         const msg = await parseErrorMessage(res);
         alert(`保存失败：${msg}`);
       }
-    } catch (err) {
+    } catch {
       alert('网络错误');
     } finally {
       setSaving(false);
@@ -365,7 +385,7 @@ export default function Settings() {
                 <input
                   type="number" min="30" max="3600"
                   value={preferences.model_timeout?.default ?? 600}
-                  onChange={e => updatePreference('model_timeout', { ...preferences.model_timeout, default: parseInt(e.target.value) })}
+                  onChange={e => updatePreference('model_timeout', { ...(preferences.model_timeout || {}), default: parseInt(e.target.value) })}
                   className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
                 />
               </div>
@@ -374,7 +394,7 @@ export default function Settings() {
                 <input
                   type="number" min="0" max="300"
                   value={preferences.keepalive_interval?.default ?? 25}
-                  onChange={e => updatePreference('keepalive_interval', { ...preferences.keepalive_interval, default: parseInt(e.target.value) })}
+                  onChange={e => updatePreference('keepalive_interval', { ...(preferences.keepalive_interval || {}), default: parseInt(e.target.value) })}
                   className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
                 />
               </div>
@@ -401,18 +421,18 @@ export default function Settings() {
           </div>
           <div className="p-6 space-y-6">
             <div>
-              <label className="text-sm font-medium text-foreground mb-1.5 block">日志原始数据保留时间 (小时)</label>
+              <label className="text-sm font-medium text-foreground mb-1.5 block">请求/响应包体保留时间（小时）</label>
               <input
                 type="number" min="0"
                 value={preferences.log_raw_data_retention_hours ?? 24}
                 onChange={e => updatePreference('log_raw_data_retention_hours', parseInt(e.target.value))}
                 className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
               />
-              <p className="text-xs text-muted-foreground mt-2">设为 0 表示不保存请求/响应原始数据，减少存储占用</p>
+              <p className="text-xs text-muted-foreground mt-2">控制日志中请求体、响应体等包体字段的保留时长。超时后包体不再展示，但日志记录本身不受影响。设为 0 表示不保存包体，仅记录基础日志信息</p>
             </div>
 
             <div>
-              <label className="text-sm font-medium text-foreground mb-1.5 block">日志保留策略</label>
+              <label className="text-sm font-medium text-foreground mb-1.5 block">日志记录保留策略</label>
               <select
                 value={preferences.log_retention_mode ?? 'keep'}
                 onChange={e => updatePreference('log_retention_mode', e.target.value)}
@@ -422,6 +442,7 @@ export default function Settings() {
                 <option value="manual">仅手动清理</option>
                 <option value="auto_delete">自动清理（删除过期日志）</option>
               </select>
+              <p className="text-xs text-muted-foreground mt-2">控制整条日志记录的保留，与上方包体保留时间相互独立</p>
             </div>
 
             {(preferences.log_retention_mode ?? 'keep') === 'auto_delete' && (
@@ -638,13 +659,13 @@ export default function Settings() {
             <p className="text-xs text-muted-foreground mb-4">这些客户端将显示在 Playground 的侧边栏中。链接中可使用 <code className="bg-muted px-1 py-0.5 rounded text-foreground">{"{key}"}</code> 和 <code className="bg-muted px-1 py-0.5 rounded text-foreground">{"{address}"}</code> 作为变量，系统会自动注入当前 API Key 和网关地址。</p>
 
             <div className="space-y-3">
-              {(preferences.external_clients || []).map((client: any, idx: number) => (
+              {(preferences.external_clients || []).map((client: ExternalClient, idx: number) => (
                 <div key={idx} className="flex gap-3 items-start bg-muted/50 p-4 rounded-lg border border-border">
                   <input
                     type="text"
                     value={client.icon}
                     onChange={e => {
-                      const newClients = [...preferences.external_clients];
+                      const newClients = [...(preferences.external_clients || [])];
                       newClients[idx].icon = e.target.value;
                       updatePreference('external_clients', newClients);
                     }}
@@ -656,7 +677,7 @@ export default function Settings() {
                       type="text"
                       value={client.name}
                       onChange={e => {
-                        const newClients = [...preferences.external_clients];
+                        const newClients = [...(preferences.external_clients || [])];
                         newClients[idx].name = e.target.value;
                         updatePreference('external_clients', newClients);
                       }}
@@ -669,7 +690,7 @@ export default function Settings() {
                         type="url"
                         value={client.link}
                         onChange={e => {
-                          const newClients = [...preferences.external_clients];
+                          const newClients = [...(preferences.external_clients || [])];
                           newClients[idx].link = e.target.value;
                           updatePreference('external_clients', newClients);
                         }}
@@ -680,7 +701,7 @@ export default function Settings() {
                   </div>
                   <button
                     onClick={() => {
-                      const newClients = preferences.external_clients.filter((_: any, i: number) => i !== idx);
+                      const newClients = (preferences.external_clients || []).filter((_: ExternalClient, i: number) => i !== idx);
                       updatePreference('external_clients', newClients);
                     }}
                     className="p-2 text-muted-foreground/60 hover:text-red-500 hover:bg-red-500/10 rounded-lg transition-colors self-center"

@@ -389,14 +389,6 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         payload.pop("top_p", None)
         payload.pop("top_k", None)
 
-    if safe_get(provider, "preferences", "post_body_parameter_overrides", default=None):
-        for key, value in safe_get(provider, "preferences", "post_body_parameter_overrides", default={}).items():
-            if key == request.model:
-                for k, v in value.items():
-                    payload[k] = v
-            elif all(_model not in request.model.lower() for _model in model_dict.keys()) and "-" not in key and " " not in key:
-                payload[key] = value
-
     return url, headers, payload
 
 

@@ -148,6 +148,23 @@ async def fetch_openrouter_response_stream(client, url, headers, payload, model,
                         choices = json_data.get("choices", [])
                         if choices:
                             delta = choices[0].get("delta", {})
+                            
+                            # 处理 reasoning 思维链（OpenRouter 新格式）
+                            reasoning_text = delta.get("reasoning", "")
+                            if not reasoning_text:
+                                reasoning_details = delta.get("reasoning_details")
+                                if reasoning_details and isinstance(reasoning_details, list):
+                                    parts = []
+                                    for item in reasoning_details:
+                                        if isinstance(item, dict) and item.get("text"):
+                                            parts.append(item["text"])
+                                    reasoning_text = "".join(parts)
+                            
+                            if reasoning_text:
+                                mark_content_start()
+                                sse_string = await generate_sse_response(timestamp, model, reasoning_content=reasoning_text)
+                                yield sse_string
+
                             content = delta.get("content", "")
                             
                             if content:

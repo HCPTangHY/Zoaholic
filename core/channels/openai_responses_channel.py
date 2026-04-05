@@ -488,14 +488,6 @@ async def get_responses_payload(request, engine, provider, api_key=None):
     payload.pop("stream_options", None)
 
     # 覆盖配置
-    if safe_get(provider, "preferences", "post_body_parameter_overrides", default=None):
-        for key, value in safe_get(provider, "preferences", "post_body_parameter_overrides", default={}).items():
-            if key == request.model:
-                for k, v in value.items():
-                    payload[k] = v
-            elif all(_model not in request.model.lower() for _model in model_dict.keys()) and "-" not in key and " " not in key:
-                payload[key] = value
-
     # 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错
     # （例如："Store must be set to false"）
     payload["store"] = False

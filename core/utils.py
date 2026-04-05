@@ -703,6 +703,7 @@ class ThreadSafeCircularList:
         self.disabled_until = {}  # key -> unix timestamp，记录自动禁用的恢复时间（0=永久）
         self.rate_limits = {}
         self.reordering_task = None
+        self.auto_disabled_info = {}  # key -> {"disabled_at": float, "duration": int, "reason": str}
 
         if isinstance(rate_limit, dict):
             for rate_limit_model, rate_limit_value in rate_limit.items():
@@ -760,6 +761,59 @@ class ThreadSafeCircularList:
             # self.requests[item] = []
             logger.warning(f"API key {item} 已进入冷却状态，冷却时间 {cooling_time} 秒")
 
+    async def set_auto_disabled(self, item: str, duration: int = 0, reason: str = ""):
+        """自动禁用某个 Key。
+
+        通过设置 cooling_until 实现，复用现有的 is_rate_limited 判断链路。
+        duration=0 表示永久禁用（直到手动恢复或进程重启）。
+        duration>0 表示禁用指定秒数后自动恢复。
+
+        Args:
+            item: API key
+            duration: 禁用时长（秒），0 表示永久
+            reason: 禁用原因（用于日志和 API 展示）
+        """
+        if item is None:
+            return
+        now = time()
+        async with self.lock:
+            if duration > 0:
+                self.cooling_until[item] = now + duration
+            else:
+                self.cooling_until[item] = float('inf')
+            self.auto_disabled_info[item] = {
+                "disabled_at": now,
+                "duration": duration,
+                "reason": reason,
+            }
+        logger.warning(
+            f"[auto_disable] Key {item} disabled for provider {self.provider_name}, "
+            f"duration={'permanent' if duration == 0 else f'{duration}s'}, reason: {reason}"
+        )
+
+    async def clear_auto_disabled(self, item: str):
+        """手动恢复一个被自动禁用的 Key，清除冷却和元数据。"""
+        async with self.lock:
+            self.cooling_until[item] = 0.0
+            self.auto_disabled_info.pop(item, None)
+
+    async def get_auto_disabled_keys(self) -> list:
+        """返回当前被自动禁用的 Key 列表及其剩余时间。
+
+        同时清理已自然过期的记录。
+        """
+        now = time()
+        async with self.lock:
+            expired = [k for k in self.auto_disabled_info if now >= self.cooling_until.get(k, 0)]
+            for k in expired:
+                self.auto_disabled_info.pop(k, None)
+            result = []
+            for item, info in self.auto_disabled_info.items():
+                until = self.cooling_until.get(item, 0)
+                remaining = -1 if until == float('inf') else max(0, int(until - now))
+                result.append({"key": item, "remaining_seconds": remaining, "duration": info.get("duration", 0), "reason": info.get("reason", "")})
+            return result
+
     def is_key_disabled(self, item: str) -> bool:
         """检查某个 key 是否被禁用（配置禁用 或 运行时自动禁用）"""
         return item in self.disabled_keys or item in self.runtime_disabled_keys
@@ -814,6 +868,7 @@ class ThreadSafeCircularList:
             model_key = "default"
 
         rate_limit = None
+        matched_default = False
         # 先尝试精确匹配
         if model and model in self.rate_limits:
             rate_limit = self.rate_limits[model]
@@ -826,12 +881,20 @@ class ThreadSafeCircularList:
 
         # 如果都没匹配到，使用默认值
         if rate_limit is None:
-            rate_limit = self.rate_limits.get("default", [(999999, 60)])  # 默认限制
+            rate_limit = self.rate_limits.get("default", [(999999, 60)])  #默认限制
+            matched_default = True
 
         # 检查所有速率限制条件
         for limit_count, limit_period in rate_limit:
-            # 使用特定模型的请求记录进行计算
-            recent_requests = sum(1 for req in self.requests[item][model_key] if req > now - limit_period)
+            if matched_default:
+                # default 规则：跨所有模型汇总计数，作为该 key 的总量限制
+                recent_requests = sum(
+                    1 for mk_reqs in self.requests[item].values()
+                    for req in mk_reqs if req > now - limit_period
+                )
+            else:
+                # 模型特定规则：仅计算该模型的请求数
+                recent_requests = sum(1 for req in self.requests[item][model_key] if req > now - limit_period)
             if recent_requests >= limit_count:
                 if not is_check:
                     logger.warning(f"API key {item}: model: {model_key} has been rate limited ({limit_count}/{limit_period} seconds)")
@@ -846,6 +909,7 @@ class ThreadSafeCircularList:
             self.requests[item][model_key].append(now)
 
         return False
+
 
     async def next(self, model: str = None):
         async with self.lock:
@@ -923,12 +987,19 @@ class ThreadSafeCircularList:
             return True
     
     def get_enabled_items_count(self) -> int:
-        """返回启用的项目数量
-        
+        """返回启用的项目数量。
+
+        排除配置禁用和运行时自动禁用（未过期）的 Key。
+        对 auto_disabled_info 中已过期的记录不计入禁用。
+
         Returns:
             int: 启用的 items 数量
         """
-        return len([item for item in self.items if not self.is_key_disabled(item)])
+        now = time()
+        return len([item for item in self.items
+                    if not self.is_key_disabled(item) and not (
+                        item in self.auto_disabled_info and now < self.cooling_until.get(item, 0)
+                    )])
 
     async def after_next_current(self):
         # 返回当前取出的 API，因为已经调用了 next，所以当前API应该是上一个

@@ -94,6 +94,51 @@ async def re_enable_key(token: str = Depends(verify_admin_api_key), app=Depends(
     return JSONResponse(content={"status": "re_enabled", "provider": provider_name})
 
 
+@router.get("/v1/channels/key_status", dependencies=[Depends(rate_limit_dependency)])
+async def get_key_status(token: str = Depends(verify_admin_api_key)):
+    """获取所有渠道的运行时 Key 自动禁用状态。仅反映内存中的实时状态，不修改任何配置。"""
+    from core.utils import provider_api_circular_list
+    from time import time as _time
+
+    now = _time()
+    result = {}
+    for provider_name, circular_list in provider_api_circular_list.items():
+        auto_disabled = await circular_list.get_auto_disabled_keys()
+        cooling = []
+        for item in circular_list.items:
+            # 只返回普通冷却中（非自动禁用）的 Key
+            if item not in circular_list.auto_disabled_info and now < circular_list.cooling_until.get(item, 0):
+                remaining = int(circular_list.cooling_until[item] - now)
+                cooling.append({"key": item, "remaining_seconds": remaining})
+        if auto_disabled or cooling:
+            result[provider_name] = {
+                "auto_disabled": auto_disabled,
+                "cooling": cooling,
+            }
+    return JSONResponse(content=result)
+
+
+@router.post("/v1/channels/key_status/re_enable", dependencies=[Depends(rate_limit_dependency)])
+async def re_enable_key(token: str = Depends(verify_admin_api_key), body: dict = Body(...)):
+    """手动恢复被运行时自动禁用的 Key。
+
+    请求体: { "provider": "渠道名", "key": "api_key_string" }
+    """
+    from core.utils import provider_api_circular_list
+
+    provider_name = body.get("provider")
+    key = body.get("key")
+    if not provider_name or not key:
+        return JSONResponse(status_code=400, content={"error": "Missing provider or key"})
+
+    circular_list = provider_api_circular_list.get(provider_name)
+    if not circular_list:
+        return JSONResponse(status_code=404, content={"error": f"Provider '{provider_name}' not found"})
+
+    await circular_list.clear_auto_disabled(key)
+    return JSONResponse(content={"status": "re_enabled", "provider": provider_name})
+
+
 @router.post("/v1/channels/fetch_models", dependencies=[Depends(rate_limit_dependency)])
 async def fetch_channel_models(
     token: str = Depends(verify_admin_api_key),
@@ -146,7 +191,7 @@ async def fetch_channel_models(
     }
     
     # 获取代理配置
-    proxy = provider_config.get("proxy") or safe_get(app.state.config, "preferences", "proxy")
+    proxy = safe_get(provider_config, "preferences", "proxy") or provider_config.get("proxy") or safe_get(app.state.config, "preferences", "proxy")
     
     # 验证 base_url 格式
     base_url = provider.get("base_url", "")
@@ -156,21 +201,22 @@ async def fetch_channel_models(
         logger.info(f"Auto-prefixed base_url: {provider['base_url']}")
     
     try:
-        async with app.state.client_manager.get_client(provider["base_url"], proxy) as client:
-            # 设置超时，避免请求卡死
-            import asyncio
+        from core.http import proxy_context
+        import asyncio
 
-            # 包装 client，让请求拦截器能作用于 models_adapter 的请求
-            enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
-            if enabled_plugins:
-                from core.plugins.interceptors import InterceptedClient
-                client = InterceptedClient(client, engine, provider, enabled_plugins)
+        with proxy_context(proxy):
+            async with app.state.client_manager.get_client(provider["base_url"], proxy) as client:
+                # 包装 client，让请求拦截器能作用于 models_adapter 的请求
+                enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
+                if enabled_plugins:
+                    from core.plugins.interceptors import InterceptedClient
+                    client = InterceptedClient(client, engine, provider, enabled_plugins)
 
-            models = await asyncio.wait_for(
-                channel.models_adapter(client, provider),
-                timeout=30.0
-            )
-            return JSONResponse(content={"models": models})
+                models = await asyncio.wait_for(
+                    channel.models_adapter(client, provider),
+                    timeout=30.0
+                )
+                return JSONResponse(content={"models": models})
     except Exception as e:
         # 尽量提取并返回上游的错误信息
         upstream_status = None
@@ -417,7 +463,10 @@ async def test_channel(
 
     try:
         # 使用正式链路的 payload 构建逻辑（包含参数覆写、请求插件）
-        url, headers, payload = await get_payload(test_request, engine, provider, selected_api_key)
+        from core.http import proxy_context
+
+        with proxy_context(proxy):
+            url, headers, payload = await get_payload(test_request, engine, provider, selected_api_key)
 
         # 对齐正式链路：追加渠道自定义 headers
         from utils import apply_custom_headers
@@ -717,3 +766,103 @@ async def get_models_by_groups(
     all_models.sort(key=lambda x: x["id"])
     
     return JSONResponse(content={"models": all_models})
+
+
+@router.post("/v1/channels/balance", dependencies=[Depends(rate_limit_dependency)])
+async def query_channel_balance(
+    token: str = Depends(verify_admin_api_key),
+    provider_config: dict = Body(..., description="Provider configuration for balance query")
+):
+    """
+    查询渠道余额。
+
+    根据 provider 配置中的 preferences.balance 规则，
+    向上游余额接口发请求并返回标准化的余额信息。
+
+    请求体示例:
+    {
+        "engine": "openai",
+        "base_url": "https://example.com/v1",
+        "api_key": "sk-xxx",
+        "preferences": {
+            "balance": {
+                "template": "new-api"
+            }
+        }
+    }
+    """
+    from core.balance import query_provider_balance, build_balance_config
+
+    app = get_app()
+
+    engine = provider_config.get("engine") or provider_config.get("type") or "openai"
+
+    # 构建 provider 配置
+    provider = {
+        "base_url": provider_config.get("base_url", ""),
+        "api": provider_config.get("api_key") or provider_config.get("api") or "",
+        "engine": engine,
+        "preferences": provider_config.get("preferences", {}),
+        # Vertex AI
+        "project_id": provider_config.get("project_id", ""),
+        "client_email": provider_config.get("client_email", ""),
+        "private_key": provider_config.get("private_key", ""),
+        # AWS
+        "aws_access_key": provider_config.get("aws_access_key", ""),
+        "aws_secret_key": provider_config.get("aws_secret_key", ""),
+    }
+
+    # 验证是否配置了 balance
+    balance_cfg = build_balance_config(provider)
+    if not balance_cfg:
+        return JSONResponse(content={
+            "supported": False,
+            "error": "该渠道未配置余额查询（preferences.balance）",
+        })
+
+    # 验证 base_url
+    base_url = provider.get("base_url", "")
+    if base_url and not base_url.startswith(("http://", "https://")):
+        provider["base_url"] = f"https://{base_url}"
+
+    # 代理配置
+    proxy = (
+        safe_get(provider_config, "preferences", "proxy")
+        or provider_config.get("proxy")
+        or safe_get(app.state.config, "preferences", "proxy")
+    )
+
+    try:
+        from core.http import proxy_context
+
+        with proxy_context(proxy):
+            target_url = provider.get("base_url") or "https://localhost"
+            async with app.state.client_manager.get_client(target_url, proxy) as client:
+                # 插件拦截器（和 fetch_models 同样的逻辑）
+                enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
+                if enabled_plugins:
+                    from core.plugins.interceptors import InterceptedClient
+                    client = InterceptedClient(client, engine, provider, enabled_plugins)
+
+                result = await query_provider_balance(client, provider)
+                return JSONResponse(content=result)
+
+    except Exception as e:
+        logger.error(f"Balance query error: {e}")
+        return JSONResponse(
+            status_code=200,
+            content={
+                "supported": True,
+                "error": f"查询失败: {str(e)}"[:500],
+                "raw": None,
+            },
+        )
+
+
+@router.get("/v1/channels/balance_templates", dependencies=[Depends(rate_limit_dependency)])
+async def get_balance_templates(token: str = Depends(verify_admin_api_key)):
+    """
+    获取所有预置的余额查询模板列表，供前端展示选择。
+    """
+    from core.balance import list_balance_templates
+    return JSONResponse(content={"templates": list_balance_templates()})

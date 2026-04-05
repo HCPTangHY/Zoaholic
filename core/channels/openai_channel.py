@@ -358,13 +358,6 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
                     }
                 })
 
-    if safe_get(provider, "preferences", "post_body_parameter_overrides", default=None):
-        for key, value in safe_get(provider, "preferences", "post_body_parameter_overrides", default={}).items():
-            if key == request.model:
-                for k, v in value.items():
-                    payload[k] = v
-            elif all(_model not in request.model.lower() for _model in model_dict.keys()) and "-" not in key and " " not in key:
-                payload[key] = value
 
     # 兼容性：部分上游/网关要求 Responses API 显式设置 store=false，否则会报错
     # （例如："Store must be set to false"）
@@ -464,8 +457,8 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
                 # 提取 usage（OpenAI chat/completions 流式最后一个 chunk 中包含）
                 chunk_usage = line.get("usage") if isinstance(line, dict) else None
                 if chunk_usage and isinstance(chunk_usage, dict):
-                    _in = chunk_usage.get("prompt_tokens") or chunk_usage.get("input_tokens") or 0
-                    _out = chunk_usage.get("completion_tokens") or chunk_usage.get("output_tokens") or 0
+                    _in = chunk_usage.get("prompt_tokens") if "prompt_tokens" in chunk_usage else chunk_usage.get("input_tokens", 0)
+                    _out = chunk_usage.get("completion_tokens") if "completion_tokens" in chunk_usage else chunk_usage.get("output_tokens", 0)
                     if _in:
                         input_tokens = _in
                     if _out:
@@ -558,6 +551,16 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
 
                 no_stream_content = safe_get(line, "choices", 0, "message", "content", default=None)
                 openrouter_reasoning = safe_get(line, "choices", 0, "delta", "reasoning", default="")
+                # reasoning_details 数组格式回退：部分模型只返回 reasoning_details 而不带 reasoning
+                if not openrouter_reasoning:
+                    _reasoning_details = safe_get(line, "choices", 0, "delta", "reasoning_details", default=None)
+                    if _reasoning_details and isinstance(_reasoning_details, list):
+                        _parts = []
+                        for _rd_item in _reasoning_details:
+                            if isinstance(_rd_item, dict) and _rd_item.get("text"):
+                                _parts.append(_rd_item["text"])
+                        if _parts:
+                            openrouter_reasoning = "".join(_parts)
                 openrouter_base64_image = safe_get(line, "choices", 0, "delta", "images", 0, "image_url", "url", default="")
                 if openrouter_base64_image:
                     b64_pure = extract_base64_data(openrouter_base64_image if openrouter_base64_image.startswith("data:image/") else f"data:image/png;base64,{openrouter_base64_image}")
