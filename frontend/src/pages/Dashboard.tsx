@@ -269,9 +269,25 @@ export default function Dashboard() {
       if (res.ok) {
         const result = await res.json();
         const data: AnalysisEntry[] = result.data || [];
-        
+
+        // 并发请求后端预设价格匹配
+        let resolvedPrices: Record<string, number[]> = {};
+        try {
+          const models = data.map(d => d.model);
+          if (models.length > 0) {
+            const priceRes = await apiFetch('/v1/stats/resolve_prices', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ models }),
+            });
+            if (priceRes.ok) {
+              const priceData = await priceRes.json();
+              resolvedPrices = priceData.prices || {};
+            }
+          }
+        } catch { /* 降级到默认价格 */ }
+
         setAnalysisData(prevData => {
-          // 修复价格保留逻辑：根据 provider+model 匹配旧价格
           const newPrices: Record<number, RowPrice> = {};
           data.forEach((entry, i) => {
             const key = `${entry.provider}:${entry.model}`;
@@ -279,9 +295,14 @@ export default function Dashboard() {
             if (oldIdx !== -1 && rowPrices[oldIdx]) {
               newPrices[i] = rowPrices[oldIdx];
             } else {
-              // 自动从全局 model_price 前缀匹配填充
-              const auto = matchModelPrice(globalModelPrice, entry.model);
-              newPrices[i] = auto || { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
+              // 优先用后端预设价格，其次全局配置，最后默认值
+              const preset = resolvedPrices[entry.model];
+              if (preset) {
+                newPrices[i] = { prompt: preset[0], completion: preset[1] };
+              } else {
+                const auto = matchModelPrice(globalModelPrice, entry.model);
+                newPrices[i] = auto || { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
+              }
             }
           });
           setRowPrices(newPrices);
@@ -648,11 +669,32 @@ export default function Dashboard() {
                   className="w-full px-3 py-2 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 text-foreground"
                 />
               </div>
-              {/* 时间范围提示 */}
-              <div className="flex items-end">
-                <p className="text-xs text-muted-foreground pb-2.5">
-                  不填写时间则使用上方选择的时间范围（{timeRangeLabel}）
-                </p>
+              {/* 时间范围快捷按钮 */}
+              <div className="flex items-end gap-2 pb-0.5">
+                {[
+                  { label: '1小时', hours: 1 },
+                  { label: '24小时', hours: 24 },
+                  { label: '7天', hours: 168 },
+                  { label: '30天', hours: 720 },
+                ].map(({ label, hours }) => (
+                  <button
+                    key={hours}
+                    type="button"
+                    onClick={() => {
+                      const end = new Date();
+                      const start = new Date(end.getTime() - hours * 60 * 60 * 1000);
+                      const fmt = (d: Date) => {
+                        const pad = (n: number) => String(n).padStart(2, '0');
+                        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+                      };
+                      setAnalysisStart(fmt(start));
+                      setAnalysisEnd(fmt(end));
+                    }}
+                    className="px-2.5 py-1.5 text-xs font-medium bg-muted hover:bg-muted/80 text-foreground border border-border rounded-lg transition-colors"
+                  >
+                    {label}
+                  </button>
+                ))}
               </div>
             </div>
 

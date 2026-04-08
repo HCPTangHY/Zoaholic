@@ -698,6 +698,8 @@ async def get_usage_analysis(
         # 图像模型 token 补估算：1000 tokens × 请求次数
         if pt == 0 and ct == 0 and entry["request_count"] > 0 and "image" in entry["model"].lower():
             ct = IMAGE_TOKENS_PER_REQUEST * entry["request_count"]
+            entry["total_completion_tokens"] = ct
+            entry["total_tokens"] = ct
 
         entry["total_cost"] = (
             pt * prompt_price
