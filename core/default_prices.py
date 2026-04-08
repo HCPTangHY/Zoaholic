@@ -186,66 +186,83 @@ DEFAULT_MODEL_PRICES: dict[str, tuple[float, float]] = {
 }
 
 
-def match_default_price(model_name: str):
+# ═══════════════════════════════════════════════════════════════
+# 图像模型每次请求的预估 token 数
+# 上游 API 不返回 token 计数时注入此估算值用于计费
+# 来源：Google AI / OpenAI 官方定价文档（2026-03）
+# ═══════════════════════════════════════════════════════════════
+IMAGE_MODEL_TOKEN_ESTIMATES: dict[str, tuple[int, int]] = {
+    # key = 模型名前缀（同 DEFAULT_MODEL_PRICES 匹配规则）
+    # value = (estimated_prompt_tokens, estimated_completion_tokens)
+    "gemini-3-pro-image":       (100, 1120),   # $0.134/img @ $120/M output
+    "gemini-2.5-flash-image":   (100, 1290),   # $0.039/img @ $30/M output
+    "gpt-image-1.5":            (100, 1000),
+    "gpt-image-1-mini":         (100, 1000),
+    "gpt-image-1":              (100, 1000),
+}
+
+
+def _match_in_db(model_name: str, db: dict) -> object | None:
     """
-    从内置默认价格库中查找模型价格。
+    通用匹配引擎：在给定 dict 中查找模型价格 / token 估算。
 
-    匹配策略（取所有候选中最长 key 命中）：
-      1. 原始名 + 后缀归一化名 → 精确 / 最长前缀匹配
-      2. 逐段剥离渠道前缀后重试
-
-    先用原始名再用归一化名，确保 image 模型（gemini-3-pro-image）
-    不会被后缀剥离降级到文本模型（gemini-3-pro）。
-
-    Args:
-        model_name: 模型名称（可含插件后缀 / 渠道前缀）
-
-    Returns:
-        (prompt_price, completion_price) 元组，或 None（未找到）
+    策略：原始名 + 归一化名都尝试，取最长 key（word boundary）。
+    未命中时逐段剥离渠道前缀重试。
     """
     if not model_name or not isinstance(model_name, str):
         return None
 
-    # ── 准备候选名 ──
-    # 剥离括号前缀：【猫】claude-xxx → claude-xxx
     clean = _BRACKET_PREFIX_RE.sub("", model_name)
     raw_lower = clean.lower()
     normalized_lower = normalize_model_name(clean).lower()
 
-    # 去重：如果后缀剥离没有变化则只保留一个
     candidates = [raw_lower]
     if normalized_lower != raw_lower:
         candidates.append(normalized_lower)
 
-    # ── 匹配核心 ──
     best_result = None
     best_len = -1
 
     def _update(name: str):
-        """对 name 做精确 + 前缀匹配，更新 best_result / best_len。"""
         nonlocal best_result, best_len
-        # 精确匹配
-        if name in DEFAULT_MODEL_PRICES and len(name) > best_len:
-            best_result = DEFAULT_MODEL_PRICES[name]
+        if name in db and len(name) > best_len:
+            best_result = db[name]
             best_len = len(name)
-        # 最长前缀匹配（要求 word boundary：匹配后剩余部分为空或以 '-' 开头）
-        for k, v in DEFAULT_MODEL_PRICES.items():
+        for k, v in db.items():
             if name.startswith(k) and len(k) > best_len:
                 rest = name[len(k):]
                 if not rest or rest[0] == "-":
                     best_result = v
                     best_len = len(k)
 
-    # Phase 1: 直接匹配
     for c in candidates:
         _update(c)
-    if best_result:
+    if best_result is not None:
         return best_result
 
-    # Phase 2: 逐段剥离渠道前缀（CC-、打野-、opal官- 等）
     for c in candidates:
         stripped = c
         while "-" in stripped:
             stripped = stripped[stripped.index("-") + 1:]
             _update(stripped)
     return best_result
+
+
+def match_default_price(model_name: str):
+    """
+    从内置默认价格库中查找模型价格。
+
+    Returns:
+        (prompt_price, completion_price) 元组，或 None
+    """
+    return _match_in_db(model_name, DEFAULT_MODEL_PRICES)
+
+
+def match_image_token_estimate(model_name: str):
+    """
+    查找图像模型的预估 token 数（用于上游不返回 token 时注入）。
+
+    Returns:
+        (estimated_prompt_tokens, estimated_completion_tokens) 元组，或 None
+    """
+    return _match_in_db(model_name, IMAGE_MODEL_TOKEN_ESTIMATES)

@@ -4,7 +4,7 @@
 
 import pytest
 from core.model_name_utils import normalize_model_name
-from core.default_prices import match_default_price, DEFAULT_MODEL_PRICES
+from core.default_prices import match_default_price, match_image_token_estimate, DEFAULT_MODEL_PRICES
 
 
 # ═══════════════════════════════════════
@@ -327,3 +327,45 @@ class TestPriceDbIntegrity:
         assert "deepseek" in keys_str, "Missing DeepSeek"
         assert "grok" in keys_str, "Missing xAI Grok"
         assert "gpt-image" in keys_str, "Missing OpenAI Image Generation"
+
+
+# ═══════════════════════════════════════
+# 图像模型 token 估算测试
+# ═══════════════════════════════════════
+
+class TestImageTokenEstimate:
+    """match_image_token_estimate 图像模型 token 注入。"""
+
+    # ── 正向匹配 ──
+
+    def test_gemini_3_pro_image(self):
+        assert match_image_token_estimate("gemini-3-pro-image-preview") == (100, 1120)
+
+    def test_gemini_3_pro_image_with_prefix(self):
+        assert match_image_token_estimate("opal官-gemini-3-pro-image-preview") == (100, 1120)
+
+    def test_gemini_25_flash_image(self):
+        assert match_image_token_estimate("gemini-2.5-flash-image-generation") == (100, 1290)
+
+    def test_gpt_image_1(self):
+        assert match_image_token_estimate("gpt-image-1") == (100, 1000)
+
+    def test_gpt_image_1_with_bracket_prefix(self):
+        assert match_image_token_estimate("【渠道】gpt-image-1") == (100, 1000)
+
+    # ── 非图像模型不匹配 ──
+
+    def test_text_model_no_match(self):
+        assert match_image_token_estimate("gpt-4o") is None
+
+    def test_claude_no_match(self):
+        assert match_image_token_estimate("claude-opus-4-6") is None
+
+    def test_gemini_text_no_match(self):
+        assert match_image_token_estimate("gemini-2.5-pro") is None
+
+    def test_empty_string(self):
+        assert match_image_token_estimate("") is None
+
+    def test_none(self):
+        assert match_image_token_estimate(None) is None

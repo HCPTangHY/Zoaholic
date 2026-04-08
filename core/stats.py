@@ -496,6 +496,16 @@ async def update_stats(current_info: dict, app=None, get_model_prices_func=None)
                 prompt_price, completion_price = 0.0, 0.0
             current_info["prompt_price"] = prompt_price
             current_info["completion_price"] = completion_price
+
+            # 图像模型 token 估算：上游不返回 token 时注入已知值
+            if (current_info.get("prompt_tokens", 0) == 0
+                    and current_info.get("completion_tokens", 0) == 0):
+                from core.default_prices import match_image_token_estimate
+                estimate = match_image_token_estimate(current_info["model"])
+                if estimate:
+                    current_info["prompt_tokens"] = estimate[0]
+                    current_info["completion_tokens"] = estimate[1]
+                    current_info["total_tokens"] = estimate[0] + estimate[1]
     except Exception:
         pass
 

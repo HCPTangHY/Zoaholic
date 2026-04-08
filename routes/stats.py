@@ -686,14 +686,25 @@ async def get_usage_analysis(
 
     # 用当前配置价格实时计算每行费用（渠道级 > 全局级 > 0）
     from core.stats import get_current_model_prices
+    from core.default_prices import match_image_token_estimate
     app = get_app()
     for entry in data:
         prompt_price, completion_price = get_current_model_prices(
             app, entry["model"], provider_name=entry["provider"]
         )
+        pt = entry["total_prompt_tokens"]
+        ct = entry["total_completion_tokens"]
+
+        # 图像模型 token 补估算：上游未返回 token 时按请求次数注入
+        if pt == 0 and ct == 0 and entry["request_count"] > 0:
+            est = match_image_token_estimate(entry["model"])
+            if est:
+                pt = est[0] * entry["request_count"]
+                ct = est[1] * entry["request_count"]
+
         entry["total_cost"] = (
-            entry["total_prompt_tokens"] * prompt_price
-            + entry["total_completion_tokens"] * completion_price
+            pt * prompt_price
+            + ct * completion_price
         ) / 1_000_000
 
     return JSONResponse(content={
