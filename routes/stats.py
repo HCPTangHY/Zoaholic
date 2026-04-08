@@ -686,7 +686,7 @@ async def get_usage_analysis(
 
     # 用当前配置价格实时计算每行费用（渠道级 > 全局级 > 0）
     from core.stats import get_current_model_prices
-    from core.default_prices import match_image_token_estimate
+    from core.default_prices import IMAGE_TOKENS_PER_REQUEST
     app = get_app()
     for entry in data:
         prompt_price, completion_price = get_current_model_prices(
@@ -695,12 +695,9 @@ async def get_usage_analysis(
         pt = entry["total_prompt_tokens"]
         ct = entry["total_completion_tokens"]
 
-        # 图像模型 token 补估算：上游未返回 token 时按请求次数注入
-        if pt == 0 and ct == 0 and entry["request_count"] > 0:
-            est = match_image_token_estimate(entry["model"])
-            if est:
-                pt = est[0] * entry["request_count"]
-                ct = est[1] * entry["request_count"]
+        # 图像模型 token 补估算：1000 tokens × 请求次数
+        if pt == 0 and ct == 0 and entry["request_count"] > 0 and "image" in entry["model"].lower():
+            ct = IMAGE_TOKENS_PER_REQUEST * entry["request_count"]
 
         entry["total_cost"] = (
             pt * prompt_price

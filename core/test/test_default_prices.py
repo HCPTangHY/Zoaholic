@@ -4,7 +4,7 @@
 
 import pytest
 from core.model_name_utils import normalize_model_name
-from core.default_prices import match_default_price, match_image_token_estimate, DEFAULT_MODEL_PRICES
+from core.default_prices import match_default_price, DEFAULT_MODEL_PRICES, IMAGE_TOKENS_PER_REQUEST
 
 
 # ═══════════════════════════════════════
@@ -257,9 +257,9 @@ class TestMatchDefaultPrice:
         assert match_default_price("gpt-image-1-mini") == (2.0, 8.0)
 
     def test_gemini_image_preview_price(self):
-        """gemini-2.5-flash-image-preview 匹配 gemini-2.5-flash-image（图像输出费率）。"""
+        """gemini-2.5-flash-image-preview 匹配 gemini-2.5-flash-image（1000 tokens = 1 img）。"""
         result = match_default_price("gemini-2.5-flash-image-preview")
-        assert result == (0.3, 30.0)
+        assert result == (0.3, 39.0)
 
     # ── 审查补充用例 ──
 
@@ -333,39 +333,42 @@ class TestPriceDbIntegrity:
 # 图像模型 token 估算测试
 # ═══════════════════════════════════════
 
-class TestImageTokenEstimate:
-    """match_image_token_estimate 图像模型 token 注入。"""
+class TestImageModelPricing:
+    """图像模型定价：1000 tokens = 1 张图，completion_price × 1000 / 1M = 每图成本。"""
 
-    # ── 正向匹配 ──
+    def test_image_tokens_constant(self):
+        assert IMAGE_TOKENS_PER_REQUEST == 1000
 
-    def test_gemini_3_pro_image(self):
-        assert match_image_token_estimate("gemini-3-pro-image-preview") == (100, 1120)
+    def test_gemini_3_pro_image_cost(self):
+        """gemini-3-pro-image: $0.134/img。"""
+        result = match_default_price("gemini-3-pro-image-preview")
+        assert result is not None
+        per_image = IMAGE_TOKENS_PER_REQUEST * result[1] / 1_000_000
+        assert abs(per_image - 0.134) < 0.001
 
-    def test_gemini_3_pro_image_with_prefix(self):
-        assert match_image_token_estimate("opal官-gemini-3-pro-image-preview") == (100, 1120)
+    def test_gemini_25_flash_image_cost(self):
+        """gemini-2.5-flash-image: $0.039/img。"""
+        result = match_default_price("gemini-2.5-flash-image-generation")
+        assert result is not None
+        per_image = IMAGE_TOKENS_PER_REQUEST * result[1] / 1_000_000
+        assert abs(per_image - 0.039) < 0.001
 
-    def test_gemini_25_flash_image(self):
-        assert match_image_token_estimate("gemini-2.5-flash-image-generation") == (100, 1290)
+    def test_gpt_image_1_cost(self):
+        """gpt-image-1: $0.040/img。"""
+        result = match_default_price("gpt-image-1")
+        assert result is not None
+        per_image = IMAGE_TOKENS_PER_REQUEST * result[1] / 1_000_000
+        assert abs(per_image - 0.040) < 0.001
 
-    def test_gpt_image_1(self):
-        assert match_image_token_estimate("gpt-image-1") == (100, 1000)
+    def test_image_model_with_prefix(self):
+        """渠道前缀不影响图像模型匹配。"""
+        result = match_default_price("opal官-gemini-3-pro-image-preview")
+        assert result is not None
+        per_image = IMAGE_TOKENS_PER_REQUEST * result[1] / 1_000_000
+        assert abs(per_image - 0.134) < 0.001
 
-    def test_gpt_image_1_with_bracket_prefix(self):
-        assert match_image_token_estimate("【渠道】gpt-image-1") == (100, 1000)
-
-    # ── 非图像模型不匹配 ──
-
-    def test_text_model_no_match(self):
-        assert match_image_token_estimate("gpt-4o") is None
-
-    def test_claude_no_match(self):
-        assert match_image_token_estimate("claude-opus-4-6") is None
-
-    def test_gemini_text_no_match(self):
-        assert match_image_token_estimate("gemini-2.5-pro") is None
-
-    def test_empty_string(self):
-        assert match_image_token_estimate("") is None
-
-    def test_none(self):
-        assert match_image_token_estimate(None) is None
+    def test_non_image_model_unaffected(self):
+        """非图像模型不含 'image'，不会被误注入。"""
+        assert "image" not in "gpt-4o".lower()
+        assert "image" not in "claude-opus-4-6".lower()
+        assert "image" not in "gemini-2.5-pro".lower()

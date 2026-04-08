@@ -388,7 +388,7 @@ class TestPriceMatchStress:
         ("gemini-2.5-flash-think-32768", (0.3, 2.5)),
         ("gemini-2.5-flash-think--1", (0.3, 2.5)),
         ("gemini-2.5-flash-think-8192-search", (0.3, 2.5)),
-        ("gemini-2.5-flash-image", (0.3, 30.0)),
+        ("gemini-2.5-flash-image", (0.3, 39.0)),
         ("gemini-2.5-flash-lite", (0.1, 0.4)),
         ("gemini-2.0-flash", (0.1, 0.4)),
         ("gemini-2.0-flash-exp-image-generation", (0.1, 0.4)),

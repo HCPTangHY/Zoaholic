@@ -53,13 +53,13 @@ DEFAULT_MODEL_PRICES: dict[str, tuple[float, float]] = {
     "chatgpt-4o-latest":    (5.0, 15.0),   # deprecated by OpenAI
 
     # ═══════════════════════════════════════
-    # OpenAI — 图像生成（token-based 费率）
-    # prompt_price = text input $/M tokens
-    # completion_price = image output $/M tokens
+    # OpenAI — 图像生成
+    # 统一按 1000 completion tokens = 1 张图换算：
+    # completion_price = 实际每图成本 × 1000
     # ═══════════════════════════════════════
-    "gpt-image-1.5":        (5.0, 32.0),
-    "gpt-image-1-mini":     (2.0, 8.0),
-    "gpt-image-1":          (10.0, 40.0),
+    "gpt-image-1.5":        (5.0, 32.0),    # $0.032/img
+    "gpt-image-1-mini":     (2.0, 8.0),     # $0.008/img
+    "gpt-image-1":          (10.0, 40.0),   # $0.040/img
 
     # ═══════════════════════════════════════
     # OpenAI — O 系列（推理）
@@ -118,11 +118,12 @@ DEFAULT_MODEL_PRICES: dict[str, tuple[float, float]] = {
     "gemini-3-flash":           (0.5, 3.0),
 
     # ═══════════════════════════════════════
-    # Google — Gemini 图像生成（image output token rate）
-    # completion_price = image output $/M tokens（远高于 text）
+    # Google — Gemini 图像生成
+    # 统一按 1000 completion tokens = 1 张图换算：
+    # completion_price = 实际每图成本 × 1000
     # ═══════════════════════════════════════
-    "gemini-3-pro-image":       (2.0, 120.0),
-    "gemini-2.5-flash-image":   (0.3, 30.0),
+    "gemini-3-pro-image":       (2.0, 134.0),   # $0.134/img
+    "gemini-2.5-flash-image":   (0.3, 39.0),    # $0.039/img
 
     # ═══════════════════════════════════════
     # Google — Gemini 2.5
@@ -186,20 +187,8 @@ DEFAULT_MODEL_PRICES: dict[str, tuple[float, float]] = {
 }
 
 
-# ═══════════════════════════════════════════════════════════════
-# 图像模型每次请求的预估 token 数
-# 上游 API 不返回 token 计数时注入此估算值用于计费
-# 来源：Google AI / OpenAI 官方定价文档（2026-03）
-# ═══════════════════════════════════════════════════════════════
-IMAGE_MODEL_TOKEN_ESTIMATES: dict[str, tuple[int, int]] = {
-    # key = 模型名前缀（同 DEFAULT_MODEL_PRICES 匹配规则）
-    # value = (estimated_prompt_tokens, estimated_completion_tokens)
-    "gemini-3-pro-image":       (100, 1120),   # $0.134/img @ $120/M output
-    "gemini-2.5-flash-image":   (100, 1290),   # $0.039/img @ $30/M output
-    "gpt-image-1.5":            (100, 1000),
-    "gpt-image-1-mini":         (100, 1000),
-    "gpt-image-1":              (100, 1000),
-}
+# 图像模型统一注入的 completion tokens（1000 tokens = 1 张图）
+IMAGE_TOKENS_PER_REQUEST = 1000
 
 
 def _match_in_db(model_name: str, db: dict) -> object | None:
@@ -256,13 +245,3 @@ def match_default_price(model_name: str):
         (prompt_price, completion_price) 元组，或 None
     """
     return _match_in_db(model_name, DEFAULT_MODEL_PRICES)
-
-
-def match_image_token_estimate(model_name: str):
-    """
-    查找图像模型的预估 token 数（用于上游不返回 token 时注入）。
-
-    Returns:
-        (estimated_prompt_tokens, estimated_completion_tokens) 元组，或 None
-    """
-    return _match_in_db(model_name, IMAGE_MODEL_TOKEN_ESTIMATES)
