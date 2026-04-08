@@ -505,7 +505,8 @@ async def update_stats(current_info: dict, app=None, get_model_prices_func=None)
                 current_info["completion_tokens"] = IMAGE_TOKENS_PER_REQUEST
                 current_info["total_tokens"] = IMAGE_TOKENS_PER_REQUEST
     except Exception:
-        pass
+        logger.warning("Failed to snapshot price/token for model=%s",
+                       current_info.get("model", "?"), exc_info=True)
 
     # 使用重试机制写入数据库
     for attempt in range(SQLITE_MAX_RETRIES):

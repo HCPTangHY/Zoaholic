@@ -13,6 +13,7 @@
 """
 
 import re
+from functools import lru_cache
 
 from core.model_name_utils import normalize_model_name
 
@@ -237,9 +238,12 @@ def _match_in_db(model_name: str, db: dict) -> object | None:
     return best_result
 
 
+@lru_cache(maxsize=256)
 def match_default_price(model_name: str):
     """
     从内置默认价格库中查找模型价格。
+
+    Results are cached — same model name only computes once.
 
     Returns:
         (prompt_price, completion_price) 元组，或 None
