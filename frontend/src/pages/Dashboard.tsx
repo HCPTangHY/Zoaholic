@@ -194,6 +194,7 @@ export default function Dashboard() {
   const [defaultPromptPrice, setDefaultPromptPrice] = useState(0.3);
   const [defaultCompletionPrice, setDefaultCompletionPrice] = useState(1.0);
   const [rowPrices, setRowPrices] = useState<Record<number, RowPrice>>({});
+  const [presetPriceLoading, setPresetPriceLoading] = useState(false);
   const [analysisQueried, setAnalysisQueried] = useState(false);
   const [trendData, setTrendData] = useState<Record<string, string | number>[]>([]);
   const [trendModels, setTrendModels] = useState<string[]>([]);
@@ -324,6 +325,37 @@ export default function Dashboard() {
       prices[i] = auto || { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
     });
     setRowPrices(prices);
+  };
+
+  const applyPresetPricesToAll = async () => {
+    if (presetPriceLoading) return;
+    setPresetPriceLoading(true);
+    const models = analysisData.map(d => d.model);
+    try {
+      const res = await apiFetch('/v1/stats/resolve_prices', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ models }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const resolved: Record<string, number[]> = data.prices || {};
+      const prices: Record<number, RowPrice> = {};
+      analysisData.forEach((row, i) => {
+        const match = resolved[row.model];
+        if (match) {
+          prices[i] = { prompt: match[0], completion: match[1] };
+        } else {
+          prices[i] = rowPrices[i] || { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
+        }
+      });
+      setRowPrices(prices);
+    } catch (err) {
+      console.error('Failed to resolve preset prices:', err);
+      alert('获取预设价格失败，请检查网络连接');
+    } finally {
+      setPresetPriceLoading(false);
+    }
   };
 
   const updateRowPrice = (index: number, field: 'prompt' | 'completion', value: number) => {
@@ -772,14 +804,21 @@ export default function Dashboard() {
                   </div>
                 )}
 
-                {/* 应用默认价格按钮 */}
+                {/* 应用价格按钮 */}
                 {analysisData.length > 0 && (
-                  <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-3 flex-wrap">
                     <button
                       onClick={applyDefaultPricesToAll}
                       className="px-3 py-1.5 text-xs font-medium bg-muted hover:bg-muted/80 text-foreground border border-border rounded-lg transition-colors"
                     >
-                      将默认价格应用到所有行
+                      应用默认价格到所有
+                    </button>
+                    <button
+                      onClick={applyPresetPricesToAll}
+                      disabled={presetPriceLoading}
+                      className="px-3 py-1.5 text-xs font-medium bg-amber-500/10 hover:bg-amber-500/20 text-amber-700 dark:text-amber-400 border border-amber-500/30 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {presetPriceLoading ? '匹配中...' : '应用预设价格到所有'}
                     </button>
                     <span className="text-xs text-muted-foreground">可在表格中逐行调整每个模型的价格</span>
                   </div>

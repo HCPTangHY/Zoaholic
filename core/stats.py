@@ -325,7 +325,8 @@ def get_current_model_prices(app, model_name: str, provider_name: str = None):
     查找优先级：
     1. 渠道级 provider.preferences.model_price（前缀匹配）
     2. 全局 preferences.model_price（前缀匹配）
-    3. 都未配置 → 返回 (0, 0)，即不计费
+    3. 内置默认价格库（后缀归一化 + 前缀匹配）
+    4. 都未配置 → 返回 (0, 0)，即不计费
 
     Args:
         app: FastAPI 应用实例
@@ -354,7 +355,13 @@ def get_current_model_prices(app, model_name: str, provider_name: str = None):
         if result is not None:
             return result
 
-        # 3. 都未配置，不计费
+        # 3. 内置默认价格库（后缀归一化 + 前缀匹配）
+        from core.default_prices import match_default_price
+        result = match_default_price(model_name)
+        if result is not None:
+            return result
+
+        # 4. 都未配置，不计费
         return 0.0, 0.0
     except Exception:
         return 0.0, 0.0

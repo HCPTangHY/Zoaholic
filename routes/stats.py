@@ -5,7 +5,7 @@ Stats 统计和使用量路由
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, Body
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_serializer, Field
 
@@ -1649,3 +1649,33 @@ async def get_outbound_logs(
         search=search,
     )
     return JSONResponse(content=result)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 内置默认价格批量匹配
+# ═══════════════════════════════════════════════════════════════
+
+class ResolvePricesRequest(BaseModel):
+    models: List[str] = Field(..., max_length=500, description="模型名列表")
+
+
+@router.post("/v1/stats/resolve_prices", dependencies=[Depends(rate_limit_dependency)])
+async def resolve_default_prices(
+    token: str = Depends(verify_admin_api_key),
+    body: ResolvePricesRequest = Body(...),
+):
+    """
+    批量匹配模型名到内置默认价格库。
+
+    Response: { "prices": { "gpt-4o": [2.5, 10.0], ... }, "last_updated": "2026-04-08" }
+    """
+    from core.default_prices import match_default_price, PRICES_LAST_UPDATED
+
+    prices = {}
+    for name in body.models:
+        if name:
+            result = match_default_price(name)
+            if result is not None:
+                prices[name] = [result[0], result[1]]
+
+    return JSONResponse(content={"prices": prices, "last_updated": PRICES_LAST_UPDATED})
