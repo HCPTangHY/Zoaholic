@@ -181,7 +181,7 @@ class TestNormalizeStress:
 
         # 不应被修改
         ("gemini-2.5-flash-think", "gemini-2.5-flash-think"),  # 裸 think 无数字
-        ("gemini-2.5-flash-image-preview", "gemini-2.5-flash-image-preview"),  # 不以 -image 结尾
+        ("gemini-2.5-flash-image-preview", "gemini-2.5-flash"),  # -preview 再 -image 连续剥离
     ])
     def test_gemini_variants(self, input_name, expected):
         assert normalize_model_name(input_name) == expected
@@ -388,7 +388,7 @@ class TestPriceMatchStress:
         ("gemini-2.5-flash-think-32768", (0.3, 2.5)),
         ("gemini-2.5-flash-think--1", (0.3, 2.5)),
         ("gemini-2.5-flash-think-8192-search", (0.3, 2.5)),
-        ("gemini-2.5-flash-image", (0.3, 2.5)),
+        ("gemini-2.5-flash-image", (0.3, 30.0)),
         ("gemini-2.5-flash-lite", (0.1, 0.4)),
         ("gemini-2.0-flash", (0.1, 0.4)),
         ("gemini-2.0-flash-exp-image-generation", (0.1, 0.4)),

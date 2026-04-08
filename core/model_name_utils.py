@@ -17,6 +17,7 @@ _SIMPLE_SUFFIXES = (
     "-image-generation",
     "-artifacts",
     "-computer",
+    "-preview",
     "-search",
     "-image",
     "-code",

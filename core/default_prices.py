@@ -12,10 +12,17 @@
   - 同一模型的不同版本号（如 -20250514）通过前缀匹配自动覆盖
 """
 
+import re
+
 from core.model_name_utils import normalize_model_name
 
 # 元数据
 PRICES_LAST_UPDATED = "2026-04-08"
+
+# 渠道前缀中可能出现的括号包裹模式：【xx】、[xx]、(xx)、（xx）
+_BRACKET_PREFIX_RE = re.compile(
+    r"^(?:[\[【（(][^\]】）)]*[\]】）)])+[-_]?"
+)
 
 # key = 模型名前缀（规范名，不含插件后缀）
 # value = (prompt_price_per_M_tokens, completion_price_per_M_tokens)
@@ -68,9 +75,14 @@ DEFAULT_MODEL_PRICES: dict[str, tuple[float, float]] = {
     # ═══════════════════════════════════════
     # Anthropic — Claude 4.x
     # ═══════════════════════════════════════
+    # 4.6 Fast Mode（6× 标准价，2.5x 推理速度）
+    "claude-opus-4.6-fast":     (30.0, 150.0),
+    "claude-opus-4-6-fast":     (30.0, 150.0),
     # 4.6 系列（最新，大幅降价）
     "claude-opus-4-6":      (5.0, 25.0),
+    "claude-opus-4.6":      (5.0, 25.0),
     "claude-sonnet-4-6":    (3.0, 15.0),
+    "claude-sonnet-4.6":    (3.0, 15.0),
     # 4.0 系列
     "claude-opus-4-0":      (15.0, 75.0),
     "claude-sonnet-4-0":    (3.0, 15.0),
@@ -100,9 +112,17 @@ DEFAULT_MODEL_PRICES: dict[str, tuple[float, float]] = {
     # ═══════════════════════════════════════
     # Google — Gemini 3.x（预览）
     # ═══════════════════════════════════════
-    "gemini-3.1-pro":       (2.0, 12.0),
-    "gemini-3-pro":         (2.0, 12.0),
-    "gemini-3-flash":       (0.5, 3.0),
+    "gemini-3.1-pro":           (2.0, 12.0),
+    "gemini-3.1-flash-lite":    (0.25, 1.5),
+    "gemini-3-pro":             (2.0, 12.0),
+    "gemini-3-flash":           (0.5, 3.0),
+
+    # ═══════════════════════════════════════
+    # Google — Gemini 图像生成（image output token rate）
+    # completion_price = image output $/M tokens（远高于 text）
+    # ═══════════════════════════════════════
+    "gemini-3-pro-image":       (2.0, 120.0),
+    "gemini-2.5-flash-image":   (0.3, 30.0),
 
     # ═══════════════════════════════════════
     # Google — Gemini 2.5
@@ -170,11 +190,15 @@ def match_default_price(model_name: str):
     """
     从内置默认价格库中查找模型价格。
 
-    查找前会先做后缀归一化（剥离 -thinking, -high 等插件后缀），
-    然后依次尝试：精确匹配 → 最长前缀匹配。
+    匹配策略（取所有候选中最长 key 命中）：
+      1. 原始名 + 后缀归一化名 → 精确 / 最长前缀匹配
+      2. 逐段剥离渠道前缀后重试
+
+    先用原始名再用归一化名，确保 image 模型（gemini-3-pro-image）
+    不会被后缀剥离降级到文本模型（gemini-3-pro）。
 
     Args:
-        model_name: 模型名称（可含插件后缀）
+        model_name: 模型名称（可含插件后缀 / 渠道前缀）
 
     Returns:
         (prompt_price, completion_price) 元组，或 None（未找到）
@@ -182,23 +206,46 @@ def match_default_price(model_name: str):
     if not model_name or not isinstance(model_name, str):
         return None
 
-    # 归一化：剥离插件后缀
-    base_name = normalize_model_name(model_name)
+    # ── 准备候选名 ──
+    # 剥离括号前缀：【猫】claude-xxx → claude-xxx
+    clean = _BRACKET_PREFIX_RE.sub("", model_name)
+    raw_lower = clean.lower()
+    normalized_lower = normalize_model_name(clean).lower()
 
-    # 统一小写（价格库 key 全部小写）
-    base_lower = base_name.lower()
+    # 去重：如果后缀剥离没有变化则只保留一个
+    candidates = [raw_lower]
+    if normalized_lower != raw_lower:
+        candidates.append(normalized_lower)
 
-    # 快路径：精确匹配
-    if base_lower in DEFAULT_MODEL_PRICES:
-        return DEFAULT_MODEL_PRICES[base_lower]
+    # ── 匹配核心 ──
+    best_result = None
+    best_len = -1
 
-    # 最长前缀匹配（与 _match_model_price 相同算法）
-    matched = [
-        (k, v) for k, v in DEFAULT_MODEL_PRICES.items()
-        if base_lower.startswith(k)
-    ]
-    if matched:
-        best = max(matched, key=lambda x: len(x[0]))
-        return best[1]
+    def _update(name: str):
+        """对 name 做精确 + 前缀匹配，更新 best_result / best_len。"""
+        nonlocal best_result, best_len
+        # 精确匹配
+        if name in DEFAULT_MODEL_PRICES and len(name) > best_len:
+            best_result = DEFAULT_MODEL_PRICES[name]
+            best_len = len(name)
+        # 最长前缀匹配（要求 word boundary：匹配后剩余部分为空或以 '-' 开头）
+        for k, v in DEFAULT_MODEL_PRICES.items():
+            if name.startswith(k) and len(k) > best_len:
+                rest = name[len(k):]
+                if not rest or rest[0] == "-":
+                    best_result = v
+                    best_len = len(k)
 
-    return None
+    # Phase 1: 直接匹配
+    for c in candidates:
+        _update(c)
+    if best_result:
+        return best_result
+
+    # Phase 2: 逐段剥离渠道前缀（CC-、打野-、opal官- 等）
+    for c in candidates:
+        stripped = c
+        while "-" in stripped:
+            stripped = stripped[stripped.index("-") + 1:]
+            _update(stripped)
+    return best_result

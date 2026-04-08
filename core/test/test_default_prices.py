@@ -99,9 +99,9 @@ class TestNormalizeModelName:
         # 所以不会被误匹配
         assert normalize_model_name("deepseek-acode") == "deepseek-acode"
 
-    def test_gemini_image_preview_not_stripped(self):
-        """gemini-2.5-flash-image-preview 不以 -image 结尾，不应被剥离。"""
-        assert normalize_model_name("gemini-2.5-flash-image-preview") == "gemini-2.5-flash-image-preview"
+    def test_gemini_image_preview_stripped(self):
+        """gemini-2.5-flash-image-preview: -preview 剥离后 -image 也会被剥离。"""
+        assert normalize_model_name("gemini-2.5-flash-image-preview") == "gemini-2.5-flash"
 
     # ── 边界情况 ──
 
@@ -257,9 +257,9 @@ class TestMatchDefaultPrice:
         assert match_default_price("gpt-image-1-mini") == (2.0, 8.0)
 
     def test_gemini_image_preview_price(self):
-        """gemini-2.5-flash-image-preview 通过前缀匹配 gemini-2.5-flash。"""
+        """gemini-2.5-flash-image-preview 匹配 gemini-2.5-flash-image（图像输出费率）。"""
         result = match_default_price("gemini-2.5-flash-image-preview")
-        assert result == (0.3, 2.5)
+        assert result == (0.3, 30.0)
 
     # ── 审查补充用例 ──
 
