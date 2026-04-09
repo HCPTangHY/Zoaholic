@@ -88,3 +88,4 @@ plugins/secret_plugins/
 .limcode/
 test/
 /反代暂存区
+plugins/descript_channel.py
