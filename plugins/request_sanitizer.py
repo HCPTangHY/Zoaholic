@@ -11,6 +11,8 @@
 4. 修正空 system 消息：移除内容为空白的 system 消息
    （"system: text content blocks must contain non-whitespace text"）
 5. 修正空顶层 system 字段：移除 Claude API 格式中空白的顶层 "system" 字段
+6. 解决 temperature/top_p 冲突：部分模型不允许同时传 temperature 和 top_p，
+   当两者同时存在时移除 top_p（保留 temperature）
 
 配置位置：
 - provider.preferences.enabled_plugins 中添加 "request_sanitizer"
@@ -60,6 +62,22 @@ def _clamp_temperature(payload: Dict[str, Any]) -> bool:
     clamped = max(0.0, min(1.0, float(temp)))
     if clamped != original:
         payload["temperature"] = clamped
+        return True
+    return False
+
+
+def _fix_temperature_top_p_conflict(payload: Dict[str, Any]) -> bool:
+    """当 temperature 和 top_p 同时存在时移除 top_p，返回是否做了修改
+
+    部分模型（如 OpenAI o1/o3 系列）不允许同时指定 temperature 和 top_p，
+    报错："temperature and top_p cannot both be specified for this model"
+    策略：保留 temperature，移除 top_p。
+    """
+    has_temp = "temperature" in payload and payload["temperature"] is not None
+    has_top_p = "top_p" in payload and payload["top_p"] is not None
+
+    if has_temp and has_top_p:
+        del payload["top_p"]
         return True
     return False
 
@@ -167,6 +185,9 @@ async def request_sanitizer_request_interceptor(
 
     if _clamp_temperature(payload):
         fixes.append(f"temperature={payload['temperature']}")
+
+    if _fix_temperature_top_p_conflict(payload):
+        fixes.append("removed top_p (conflicts with temperature)")
 
     if _remove_safety_settings(payload):
         fixes.append("removed safety_settings")
