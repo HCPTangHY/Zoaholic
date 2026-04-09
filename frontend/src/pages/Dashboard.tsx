@@ -82,6 +82,20 @@ const formatCost = (n: number) => {
   return `$${n.toFixed(6)}`;
 };
 
+/** 根据 model_price 配置，按最长前缀匹配返回 {prompt, completion}，未命中返回 null */
+function matchModelPrice(modelPrice: Record<string, string>, modelName: string): { prompt: number; completion: number } | null {
+  if (!modelName || !modelPrice || Object.keys(modelPrice).length === 0) return null;
+  const matched = Object.keys(modelPrice)
+    .filter(k => k !== 'default' && modelName.startsWith(k))
+    .sort((a, b) => b.length - a.length);
+  const key = matched.length > 0 ? matched[0] : (modelPrice['default'] !== undefined ? 'default' : null);
+  if (!key) return null;
+  const parts = String(modelPrice[key] || '').split(',').map(s => s.trim());
+  const prompt = parseFloat(parts[0]) || 0;
+  const completion = parseFloat(parts[1]) || 0;
+  return { prompt, completion };
+}
+
 /** 多选下拉组件 */
 function MultiSelect({
   label,
@@ -157,6 +171,8 @@ function MultiSelect({
 export default function Dashboard() {
   const [stats, setStats] = useState<StatData | null>(null);
   const [totalTokens, setTotalTokens] = useState(0);
+  const [totalCost, setTotalCost] = useState(0);
+  const [globalModelPrice, setGlobalModelPrice] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [timeRange, setTimeRange] = useState(24);
   const { token } = useAuthStore();
@@ -192,6 +208,7 @@ export default function Dashboard() {
       if (statsRes.ok) {
         const data = await statsRes.json();
         setStats(data.stats || data);
+        setTotalCost((data.stats || data).total_cost || 0);
       }
 
       const end = new Date();
@@ -204,6 +221,16 @@ export default function Dashboard() {
         const total = data.usage?.reduce((sum: number, item: { total_tokens?: number }) => sum + (item.total_tokens || 0), 0) || 0;
         setTotalTokens(total);
       }
+
+      // 获取全局 model_price 配置
+      try {
+        const configRes = await apiFetch('/v1/api_config');
+        if (configRes.ok) {
+          const cfgData = await configRes.json();
+          const prefs = cfgData.preferences || cfgData.api_config?.preferences || {};
+          setGlobalModelPrice(prefs.model_price || {});
+        }
+      } catch { /* ignore */ }
     } catch (err) {
       console.error('Failed to fetch stats:', err);
     } finally {
@@ -251,7 +278,9 @@ export default function Dashboard() {
             if (oldIdx !== -1 && rowPrices[oldIdx]) {
               newPrices[i] = rowPrices[oldIdx];
             } else {
-              newPrices[i] = { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
+              // 自动从全局 model_price 前缀匹配填充
+              const auto = matchModelPrice(globalModelPrice, entry.model);
+              newPrices[i] = auto || { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
             }
           });
           setRowPrices(newPrices);
@@ -291,7 +320,8 @@ export default function Dashboard() {
   const applyDefaultPricesToAll = () => {
     const prices: Record<number, RowPrice> = {};
     analysisData.forEach((_, i) => {
-      prices[i] = { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
+      const auto = matchModelPrice(globalModelPrice, analysisData[i].model);
+      prices[i] = auto || { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
     });
     setRowPrices(prices);
   };
@@ -338,6 +368,7 @@ export default function Dashboard() {
     { label: `Token 消耗 (${timeRangeLabel})`, value: totalTokens.toLocaleString(), icon: BarChart3, color: 'text-blue-500', bg: 'bg-blue-500/10' },
     { label: '平均成功率', value: `${(avgSuccessRate * 100).toFixed(1)}%`, icon: CheckCircle2, color: 'text-emerald-500', bg: 'bg-emerald-500/10' },
     { label: '活跃渠道', value: activeChannels.toString(), icon: Cpu, color: 'text-purple-500', bg: 'bg-purple-500/10' },
+    { label: `费用 (${timeRangeLabel})`, value: formatCost(totalCost), icon: DollarSign, color: 'text-amber-500', bg: 'bg-amber-500/10' },
   ];
 
   const formattedEndpointStats = endpointStats.slice(0, 5).map(item => ({
@@ -391,7 +422,7 @@ export default function Dashboard() {
       </div>
 
       {/* Top Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6">
         {topCards.map((stat, i) => (
           <div key={i} className="bg-card border border-border p-6 rounded-xl shadow-sm">
             <div className="flex justify-between items-start">
@@ -585,11 +616,32 @@ export default function Dashboard() {
                   className="w-full px-3 py-2 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 text-foreground"
                 />
               </div>
-              {/* 时间范围提示 */}
-              <div className="flex items-end">
-                <p className="text-xs text-muted-foreground pb-2.5">
-                  不填写时间则使用上方选择的时间范围（{timeRangeLabel}）
-                </p>
+              {/* 时间范围快捷按钮 */}
+              <div className="flex items-end gap-2 pb-0.5">
+                {[
+                  { label: '1小时', hours: 1 },
+                  { label: '24小时', hours: 24 },
+                  { label: '7天', hours: 168 },
+                  { label: '30天', hours: 720 },
+                ].map(({ label, hours }) => (
+                  <button
+                    key={hours}
+                    type="button"
+                    onClick={() => {
+                      const end = new Date();
+                      const start = new Date(end.getTime() - hours * 60 * 60 * 1000);
+                      const fmt = (d: Date) => {
+                        const pad = (n: number) => String(n).padStart(2, '0');
+                        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+                      };
+                      setAnalysisStart(fmt(start));
+                      setAnalysisEnd(fmt(end));
+                    }}
+                    className="px-2.5 py-1.5 text-xs font-medium bg-muted hover:bg-muted/80 text-foreground border border-border rounded-lg transition-colors"
+                  >
+                    {label}
+                  </button>
+                ))}
               </div>
             </div>
 

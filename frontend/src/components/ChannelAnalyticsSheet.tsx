@@ -25,6 +25,7 @@ interface UsageEntry {
   total_prompt_tokens: number;
   total_completion_tokens: number;
   total_tokens: number;
+  total_cost: number;
 }
 
 interface KeyRanking {
@@ -163,10 +164,8 @@ export function ChannelAnalyticsSheet({ open, onOpenChange, providerName }: Chan
 
   // Computed
   const totalRequests = usageData.reduce((s, r) => s + r.request_count, 0);
-  const totalPromptTokens = usageData.reduce((s, r) => s + r.total_prompt_tokens, 0);
-  const totalCompletionTokens = usageData.reduce((s, r) => s + r.total_completion_tokens, 0);
   const totalTokens = usageData.reduce((s, r) => s + r.total_tokens, 0);
-  const totalCost = (totalPromptTokens * 0.3 + totalCompletionTokens * 1.0) / 1_000_000;
+  const totalCost = usageData.reduce((s, r) => s + (r.total_cost || 0), 0);
 
   const activeTrendData = trendMetric === 'tokens' ? trendTokensData : trendData;
 
@@ -242,7 +241,7 @@ export function ChannelAnalyticsSheet({ open, onOpenChange, providerName }: Chan
                 <p className="text-xl font-bold text-foreground mt-1">{formatTokens(totalTokens)}</p>
               </div>
               <div className="bg-card border border-border rounded-xl p-4 border-amber-500/20">
-                <p className="text-xs text-amber-600 dark:text-amber-400">模拟费用</p>
+                <p className="text-xs text-amber-600 dark:text-amber-400">费用</p>
                 <p className="text-xl font-bold text-amber-600 dark:text-amber-400 mt-1">{formatCost(totalCost)}</p>
               </div>
             </div>
@@ -346,6 +345,7 @@ export function ChannelAnalyticsSheet({ open, onOpenChange, providerName }: Chan
                         <th className="px-4 py-2.5 text-right">输入 Token</th>
                         <th className="px-4 py-2.5 text-right">输出 Token</th>
                         <th className="px-4 py-2.5 text-right">总 Token</th>
+                        <th className="px-4 py-2.5 text-right">费用</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-border">
@@ -356,6 +356,7 @@ export function ChannelAnalyticsSheet({ open, onOpenChange, providerName }: Chan
                           <td className="px-4 py-2.5 text-right text-muted-foreground">{entry.total_prompt_tokens.toLocaleString()}</td>
                           <td className="px-4 py-2.5 text-right text-muted-foreground">{entry.total_completion_tokens.toLocaleString()}</td>
                           <td className="px-4 py-2.5 text-right font-medium text-foreground">{entry.total_tokens.toLocaleString()}</td>
+                          <td className="px-4 py-2.5 text-right font-mono text-amber-600 dark:text-amber-400">{entry.total_cost > 0 ? formatCost(entry.total_cost) : '—'}</td>
                         </tr>
                       ))}
                     </tbody>

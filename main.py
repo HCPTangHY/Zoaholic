@@ -354,7 +354,7 @@ async def lifespan(app: FastAPI):
         try:
             await create_tables()
         except Exception as e:
-            # 让 Render 等平台的日志里更直观地看到启动失败原因
+            # 让云平台的日志里更直观地看到启动失败原因
             logger.exception("Database init failed during startup: %s", e)
             raise
 
@@ -726,6 +726,8 @@ if __name__ == '__main__':
     uvicorn_config = {
         "host": "0.0.0.0",
         "port": PORT,
+        "proxy_headers": True,
+        "forwarded_allow_ips": "*",
         "ws": "none",
         # "log_level": "warning"
     }

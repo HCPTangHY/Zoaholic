@@ -305,7 +305,14 @@ export default function Admin() {
     const prefs: any = {};
     if (formCredits.trim()) {
       const num = Number(formCredits);
-      if (!isNaN(num)) prefs.credits = num;
+      if (!isNaN(num)) {
+        prefs.credits = num;
+        // 首次设置 credits 时自动写入计费起始时间
+        const existing = editingIndex !== null ? keys[editingIndex] : null;
+        if (!existing?.preferences?.created_at) {
+          prefs.created_at = new Date().toISOString();
+        }
+      }
     }
     if (formRateLimit.trim()) {
       prefs.rate_limit = formRateLimit.trim();

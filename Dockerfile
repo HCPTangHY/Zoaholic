@@ -40,5 +40,5 @@ COPY . .
 # 将前端产物放入后端 static/ 目录（FastAPI 直接挂载）
 COPY --from=frontend_builder /app/static ./static
 
-# Render 会注入 $PORT；用 shell 形式让变量生效
-CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# 部分云平台会注入 $PORT；用 shell 形式让变量生效
+CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips '*'"]

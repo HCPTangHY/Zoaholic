@@ -287,27 +287,77 @@ async def create_tables():
 
 # ============== 成本计算 ==============
 
-def get_current_model_prices(app, model_name: str):
+def _match_model_price(model_price_dict: dict, model_name: str):
     """
-    根据当前配置偏好，返回指定模型的 prompt_price 和 completion_price（单位：$/M tokens）
-    
+    在一个 model_price 字典中，按前缀匹配模型名，返回 (prompt_price, completion_price) 或 None。
+
+    匹配规则：遍历字典 key，如果 model_name 以该 key 开头则命中；
+    多个前缀同时匹配时，取最长的那个（最精确匹配）。
+    未命中任何 key 时，尝试 "default" 兜底。都没有则返回 None。
+    """
+    if not model_price_dict or not model_name:
+        return None
+    # 前缀匹配：收集所有命中的 key，取最长的（最精确）
+    matched = [(k, model_price_dict[k]) for k in model_price_dict if k and k != "default" and model_name.startswith(k)]
+    if matched:
+        matched.sort(key=lambda x: len(x[0]), reverse=True)
+        price_str = matched[0][1]
+    else:
+        price_str = None
+    # 兜底 default
+    if price_str is None:
+        price_str = model_price_dict.get("default")
+    if price_str is None:
+        return None
+    parts = [p.strip() for p in str(price_str).split(",")]
+    try:
+        prompt_price = float(parts[0]) if len(parts) > 0 and parts[0] != "" else 0.0
+        completion_price = float(parts[1]) if len(parts) > 1 and parts[1] != "" else 0.0
+    except (ValueError, TypeError):
+        return None
+    return prompt_price, completion_price
+
+
+def get_current_model_prices(app, model_name: str, provider_name: str = None):
+    """
+    根据配置返回指定模型的 prompt_price 和 completion_price（单位：$/M tokens）。
+
+    查找优先级：
+    1. 渠道级 provider.preferences.model_price（前缀匹配）
+    2. 全局 preferences.model_price（前缀匹配）
+    3. 都未配置 → 返回 (0, 0)，即不计费
+
     Args:
         app: FastAPI 应用实例
         model_name: 模型名称
-    
+        provider_name: 渠道名称（可选）
+
     Returns:
         (prompt_price, completion_price) 元组
     """
     from utils import safe_get
     try:
-        model_price = safe_get(app.state.config, 'preferences', "model_price", default={})
-        price_str = next((model_price[k] for k in model_price.keys() if model_name and model_name.startswith(k)), model_price.get("default", "0.3,1"))
-        parts = [p.strip() for p in str(price_str).split(",")]
-        prompt_price = float(parts[0]) if len(parts) > 0 and parts[0] != "" else 0.3
-        completion_price = float(parts[1]) if len(parts) > 1 and parts[1] != "" else 1.0
-        return prompt_price, completion_price
+        # 1. 渠道级查找
+        if provider_name:
+            providers = safe_get(app.state.config, 'providers', default=[])
+            for p in providers:
+                if p.get('provider') == provider_name:
+                    provider_prices = safe_get(p, 'preferences', 'model_price', default={})
+                    result = _match_model_price(provider_prices, model_name)
+                    if result is not None:
+                        return result
+                    break
+
+        # 2. 全局查找
+        global_prices = safe_get(app.state.config, 'preferences', 'model_price', default={})
+        result = _match_model_price(global_prices, model_name)
+        if result is not None:
+            return result
+
+        # 3. 都未配置，不计费
+        return 0.0, 0.0
     except Exception:
-        return 0.3, 1.0
+        return 0.0, 0.0
 
 
 async def compute_total_cost_from_db(filter_api_key: Optional[str] = None, start_dt_obj: Optional[datetime] = None) -> float:
@@ -324,8 +374,8 @@ async def compute_total_cost_from_db(filter_api_key: Optional[str] = None, start
             return 0.0
 
         sql = (
-            "SELECT COALESCE(SUM((COALESCE(prompt_tokens, 0) * COALESCE(prompt_price, 0.3) "
-            "+ COALESCE(completion_tokens, 0) * COALESCE(completion_price, 1.0)) / 1000000.0), 0.0) AS total_cost "
+            "SELECT COALESCE(SUM((COALESCE(prompt_tokens, 0) * COALESCE(prompt_price, 0.0) "
+            "+ COALESCE(completion_tokens, 0) * COALESCE(completion_price, 0.0)) / 1000000.0), 0.0) AS total_cost "
             "FROM request_stats WHERE 1=1"
         )
         params: list[Any] = []
@@ -342,7 +392,7 @@ async def compute_total_cost_from_db(filter_api_key: Optional[str] = None, start
             return 0.0
 
     async with async_session_scope() as session:
-        expr = (func.coalesce(RequestStat.prompt_tokens, 0) * func.coalesce(RequestStat.prompt_price, 0.3) + func.coalesce(RequestStat.completion_tokens, 0) * func.coalesce(RequestStat.completion_price, 1.0)) / 1000000.0
+        expr = (func.coalesce(RequestStat.prompt_tokens, 0) * func.coalesce(RequestStat.prompt_price, 0.0) + func.coalesce(RequestStat.completion_tokens, 0) * func.coalesce(RequestStat.completion_price, 0.0)) / 1000000.0
         query = select(func.coalesce(func.sum(expr), 0.0))
         if filter_api_key:
             query = query.where(RequestStat.api_key == filter_api_key)
@@ -433,9 +483,10 @@ async def update_stats(current_info: dict, app=None, get_model_prices_func=None)
             if get_model_prices_func:
                 prompt_price, completion_price = get_model_prices_func(current_info["model"])
             elif app:
-                prompt_price, completion_price = get_current_model_prices(app, current_info["model"])
+                prompt_price, completion_price = get_current_model_prices(
+                    app, current_info["model"], provider_name=current_info.get("provider"))
             else:
-                prompt_price, completion_price = 0.3, 1.0
+                prompt_price, completion_price = 0.0, 0.0
             current_info["prompt_price"] = prompt_price
             current_info["completion_price"] = completion_price
     except Exception:

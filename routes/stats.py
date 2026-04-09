@@ -12,7 +12,7 @@ from pydantic import BaseModel, field_serializer, Field
 from sqlalchemy import select, case, func, desc, update, delete, or_
 
 from db import RequestStat, ChannelStat, async_session_scope, DISABLE_DATABASE, DB_TYPE
-from core.stats import get_usage_data
+from core.stats import get_usage_data, compute_total_cost_from_db
 from utils import safe_get, query_channel_key_stats
 from routes.deps import rate_limit_dependency, verify_api_key, verify_admin_api_key, get_app
 from core.d1_client import parse_d1_datetime, format_d1_datetime
@@ -117,6 +117,8 @@ class LogEntry(BaseModel):
     total_tokens: Optional[int] = None
     success: bool = False
     status_code: Optional[int] = None
+    prompt_price: Optional[float] = None
+    completion_price: Optional[float] = None
     is_flagged: bool = False
     
     # 扩展日志字段
@@ -352,6 +354,7 @@ async def get_stats(
     
     start_time = datetime.now(timezone.utc) - timedelta(hours=hours)
 
+    total_cost = 0.0
     if (DB_TYPE or "sqlite").lower() == "d1":
         from db import d1_client
         if d1_client is None:
@@ -485,6 +488,12 @@ async def get_stats(
                 .order_by(desc('count'))
             )
             ip_stats = [{"client_ip": stat.client_ip, "count": int(stat.count or 0)} for stat in ip_stats_rs.fetchall()]
+    # 计算选定时间范围内的总费用
+    try:
+        total_cost = await compute_total_cost_from_db(start_dt_obj=start_time)
+    except Exception:
+        total_cost = 0.0
+
 
     stats = {
         "time_range": f"Last {hours} hours",
@@ -520,7 +529,8 @@ async def get_stats(
                 "ip": stat.get("client_ip"),
                 "count": stat.get("count", 0)
             } for stat in ip_stats
-        ]
+        ],
+        "total_cost": round(total_cost, 6),
     }
 
     return JSONResponse(content=stats)
@@ -548,7 +558,7 @@ async def get_usage_analysis(
     model: Optional[str] = Query(default=None, description="Model filter, comma-separated for multiple"),
 ):
     """
-    按渠道和模型分组的用量分析，返回请求次数和 Token 消耗量，用于费用模拟。
+    按渠道和模型分组的用量分析，返回请求次数、Token 消耗量和基于当前配置价格的实时费用。
     """
     if DISABLE_DATABASE:
         return JSONResponse(content={"data": []})
@@ -674,6 +684,18 @@ async def get_usage_analysis(
                 for row in result.fetchall()
             ]
 
+    # 用当前配置价格实时计算每行费用（渠道级 > 全局级 > 0）
+    from core.stats import get_current_model_prices
+    app = get_app()
+    for entry in data:
+        prompt_price, completion_price = get_current_model_prices(
+            app, entry["model"], provider_name=entry["provider"]
+        )
+        entry["total_cost"] = (
+            entry["total_prompt_tokens"] * prompt_price
+            + entry["total_completion_tokens"] * completion_price
+        ) / 1_000_000
+
     return JSONResponse(content={
         "data": data,
         "start_datetime": start_detail,
@@ -681,6 +703,7 @@ async def get_usage_analysis(
         "provider_filter": provider or "all",
         "model_filter": model or "all",
     })
+
 
 
 @router.get("/v1/stats/model_trend", dependencies=[Depends(rate_limit_dependency)])
@@ -724,7 +747,8 @@ async def get_model_trend(
         if model_list:
             sql += f" AND model IN ({','.join(['?']*len(model_list))})"
             params.extend(model_list)
-        sql += f" GROUP BY hour, model ORDER BY hour ASC"
+        sql += " AND model IS NOT NULL AND model != ''"
+        sql += " GROUP BY hour, model ORDER BY hour ASC"
         
         rows = await d1_client.query_all(sql, params)
         data = rows
@@ -1006,6 +1030,9 @@ async def add_credits_to_api_key(
     为指定的 API key 添加额度
     """
     from core.log_config import logger
+    from utils import update_config, save_config_to_db, save_api_yaml
+    from core.env import env_bool
+    import os
     
     app = get_app()
     
@@ -1016,6 +1043,29 @@ async def add_credits_to_api_key(
         )
 
     app.state.paid_api_keys_states[paid_key]["credits"] += float(amount)
+
+    # 持久化：同步回写 app.state.config 中的 credits
+    try:
+        api_list = getattr(app.state, 'api_list', []) or []
+        if paid_key in api_list:
+            key_index = api_list.index(paid_key)
+            api_keys = app.state.config.get('api_keys', [])
+            if key_index < len(api_keys) and isinstance(api_keys[key_index], dict):
+                if 'preferences' not in api_keys[key_index]:
+                    api_keys[key_index]['preferences'] = {}
+                api_keys[key_index]['preferences']['credits'] = app.state.paid_api_keys_states[paid_key]["credits"]
+                # 首次设置 credits 时自动写入计费起始时间
+                if not api_keys[key_index]['preferences'].get('created_at'):
+                    from datetime import datetime, timezone
+                    api_keys[key_index]['preferences']['created_at'] = datetime.now(timezone.utc)
+
+                config_storage = (os.getenv("CONFIG_STORAGE") or "file").strip().lower()
+                if config_storage in ("file", "auto") or env_bool("SYNC_CONFIG_TO_FILE", False):
+                    save_api_yaml(app.state.config)
+                if config_storage in ("auto", "db"):
+                    await save_config_to_db(app.state.config)
+    except Exception as e:
+        logger.warning(f"Failed to persist credits change: {e}")
 
     current_credits = app.state.paid_api_keys_states[paid_key]["credits"]
     total_cost = app.state.paid_api_keys_states[paid_key]["total_cost"]
@@ -1364,6 +1414,8 @@ async def get_logs(
                     total_tokens=int(row.get("total_tokens") or 0),
                     success=_bool_from_db(row.get("success")),
                     status_code=int(row.get("status_code")) if row.get("status_code") is not None else None,
+                    prompt_price=float(row.get("prompt_price")) if row.get("prompt_price") is not None else None,
+                    completion_price=float(row.get("completion_price")) if row.get("completion_price") is not None else None,
                     is_flagged=_bool_from_db(row.get("is_flagged")),
                     provider_id=row.get("provider_id"),
                     provider_key_index=int(row.get("provider_key_index")) if row.get("provider_key_index") is not None else None,
@@ -1501,6 +1553,8 @@ async def get_logs(
                 total_tokens=row.total_tokens,
                 success=row.success if hasattr(row, 'success') else False,
                 status_code=row.status_code if hasattr(row, 'status_code') else None,
+                prompt_price=getattr(row, 'prompt_price', None),
+                completion_price=getattr(row, 'completion_price', None),
                 is_flagged=row.is_flagged,
                 # 扩展日志字段
                 provider_id=row.provider_id,

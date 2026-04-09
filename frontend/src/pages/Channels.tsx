@@ -1,12 +1,12 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { useEffect, useState, KeyboardEvent, ClipboardEvent } from 'react';
+import { useEffect, useMemo, useState, KeyboardEvent, ClipboardEvent } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
 import {
   Plus, Edit, Brain, Trash2, ArrowRight, RefreshCw,
   Server, X, CheckCircle2, Settings2, Copy, ToggleRight, ToggleLeft,
   Folder, Puzzle, Network, CopyCheck, Power, Files, Play,
-  Search, Check, BarChart3, Wallet
+  Search, Check, BarChart3, Wallet, XCircle
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as Switch from '@radix-ui/react-switch';
@@ -195,6 +195,9 @@ export default function Channels() {
   const [balanceLoading, setBalanceLoading] = useState(false);
   const [focusedKeyIdx, setFocusedKeyIdx] = useState<number | null>(null);
 
+  // ── 全局配置（用于价格提示等）──
+  const [globalModelPrice, setGlobalModelPrice] = useState<Record<string, string>>({});
+
   const [isFetchModelsOpen, setIsFetchModelsOpen] = useState(false);
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [selectedModels, setSelectedModels] = useState<Set<string>>(() => new Set());
@@ -203,6 +206,12 @@ export default function Channels() {
   // ── Key 运行时状态 ──
   const [runtimeKeyStatus, setRuntimeKeyStatus] = useState<Record<string, { auto_disabled: { key: string; remaining_seconds: number; duration: number; reason: string }[]; cooling: any[] }>>({});
   const [localCountdowns, setLocalCountdowns] = useState<Record<string, Record<string, { remaining: number; duration: number }>>>({}); // provider -> key -> {remaining, duration}
+
+  // ── 列表筛选 ──
+  const [filterKeyword, setFilterKeyword] = useState('');
+  const [filterEngine, setFilterEngine] = useState<string>(''); // '' = 全部
+  const [filterGroup, setFilterGroup] = useState<string>('');   // '' = 全部
+  const [filterStatus, setFilterStatus] = useState<'' | 'enabled' | 'disabled'>('');
 
   const { token } = useAuthStore();
 
@@ -243,6 +252,8 @@ export default function Channels() {
           return weightB - weightA;
         });
         setProviders(sortedProviders);
+        const globalPrefs = data.preferences || data.api_config?.preferences || {};
+        setGlobalModelPrice(globalPrefs.model_price || {});
       }
       if (typesRes.ok) {
         const data = await typesRes.json();
@@ -849,10 +860,13 @@ export default function Channels() {
   };
 
   const disableKeysInForm = (indices: number[]) => {
-    if (!formData || !indices.length) return;
+    if (!indices.length) return;
     const set = new Set(indices);
-    const next = formData.api_keys.map((k, idx) => set.has(idx) ? ({ ...k, disabled: true }) : k);
-    updateFormData('api_keys', next);
+    setFormData(prev => {
+      if (!prev) return prev;
+      const next = prev.api_keys.map((k, idx) => set.has(idx) ? ({ ...k, disabled: true }) : k);
+      return { ...prev, api_keys: next };
+    });
   };
 
   const handleSave = async () => {
@@ -901,6 +915,25 @@ export default function Channels() {
         }, {} as Record<string, string | string[]>)
       : undefined;
 
+    // 校验并清理渠道级 model_price：去掉空前缀条目，检查价格值合法性
+    let cleanedModelPrice = formData.preferences.model_price;
+    if (cleanedModelPrice && typeof cleanedModelPrice === 'object') {
+      const validEntries: [string, string][] = [];
+      for (const [prefix, priceStr] of Object.entries(cleanedModelPrice)) {
+        const trimmed = prefix.trim();
+        if (!trimmed) continue;
+        const parts = String(priceStr || '').split(',').map(s => s.trim());
+        const inp = parts[0] || '0';
+        const out = parts[1] || '0';
+        if (isNaN(Number(inp)) || isNaN(Number(out))) {
+          alert(`模型价格「${trimmed}」的价格值无效，请填写数字`);
+          return;
+        }
+        validEntries.push([trimmed, `${inp},${out}`]);
+      }
+      cleanedModelPrice = validEntries.length > 0 ? Object.fromEntries(validEntries) : undefined;
+    }
+
     const targetProvider: any = {
       provider: formData.provider,
       remark: formData.remark || undefined,
@@ -913,6 +946,7 @@ export default function Channels() {
       groups: formData.groups,
       preferences: {
         ...formData.preferences,
+        model_price: cleanedModelPrice,
         headers: headersObj,
         post_body_parameter_overrides: overridesObj,
         status_code_overrides: statusCodeOverridesObj,
@@ -1014,6 +1048,83 @@ export default function Channels() {
     );
   };
 
+  // ── 从 provider 对象中提取所有模型名（别名 + 上游） ──
+  const getProviderModelNames = (p: any): string[] => {
+    const rawModels = Array.isArray(p.model) ? p.model : Array.isArray(p.models) ? p.models : [];
+    const prefix = (p.model_prefix || '').trim();
+    const names: string[] = [];
+    rawModels.forEach((m: any) => {
+      if (typeof m === 'string') {
+        names.push(m);
+        if (prefix) names.push(`${prefix}${m}`);
+      }
+      else if (typeof m === 'object' && m !== null) {
+        Object.entries(m).forEach(([upstream, alias]) => {
+          names.push(String(alias));
+          names.push(upstream);
+          if (prefix) {
+            names.push(`${prefix}${String(alias)}`);
+            names.push(`${prefix}${upstream}`);
+          }
+        });
+      }
+    });
+    return names;
+  };
+
+  // ── 可用引擎列表和分组列表（从当前渠道数据中提取） ──
+  const availableEngines = useMemo(() => {
+    const set = new Set<string>();
+    providers.forEach(p => set.add(p.engine || 'openai'));
+    return Array.from(set).sort();
+  }, [providers]);
+
+  const availableGroups = useMemo(() => {
+    const set = new Set<string>();
+    providers.forEach(p => {
+      const groups = Array.isArray(p.groups) ? p.groups : p.group ? [p.group] : ['default'];
+      groups.forEach((g: string) => set.add(g));
+    });
+    return Array.from(set).sort();
+  }, [providers]);
+
+  // ── 筛选后的渠道列表（保留原始 index 用于操作） ──
+  const filteredProviders = useMemo(() => {
+    const kw = filterKeyword.trim().toLowerCase();
+    return providers
+      .map((p, idx) => ({ p, idx }))
+      .filter(({ p }) => {
+        // 状态筛选
+        if (filterStatus === 'enabled' && p.enabled === false) return false;
+        if (filterStatus === 'disabled' && p.enabled !== false) return false;
+        // 引擎筛选
+        if (filterEngine && (p.engine || 'openai') !== filterEngine) return false;
+        // 分组筛选
+        if (filterGroup) {
+          const groups = Array.isArray(p.groups) ? p.groups : p.group ? [p.group] : ['default'];
+          if (!groups.includes(filterGroup)) return false;
+        }
+        // 关键词搜索：匹配渠道名、备注、模型名
+        if (kw) {
+          const nameMatch = (p.provider || '').toLowerCase().includes(kw);
+          const remarkMatch = (p.remark || '').toLowerCase().includes(kw);
+          const modelNames = getProviderModelNames(p);
+          const modelMatch = modelNames.some(n => n.toLowerCase().includes(kw));
+          if (!nameMatch && !remarkMatch && !modelMatch) return false;
+        }
+        return true;
+      });
+  }, [providers, filterKeyword, filterEngine, filterGroup, filterStatus]);
+
+  // 关键词是否命中了某个 provider 的模型（用于高亮提示）
+  const getMatchedModels = (p: any): string[] => {
+    const kw = filterKeyword.trim().toLowerCase();
+    if (!kw) return [];
+    return getProviderModelNames(p).filter(n => n.toLowerCase().includes(kw));
+  };
+
+  const hasActiveFilters = filterKeyword || filterEngine || filterGroup || filterStatus;
+
   return (
     <div className="space-y-6 animate-in fade-in duration-500 font-sans">
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
@@ -1027,14 +1138,94 @@ export default function Channels() {
         </button>
       </div>
 
+      {/* ── Filter Bar ── */}
+      {!loading && providers.length > 0 && (
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+          {/* 搜索框 */}
+          <div className="relative flex-1 min-w-0">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+            <input
+              type="text"
+              value={filterKeyword}
+              onChange={e => setFilterKeyword(e.target.value)}
+              placeholder="搜索渠道名、备注、模型名…"
+              className="w-full bg-background border border-border rounded-lg pl-9 pr-8 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:border-primary outline-none"
+            />
+            {filterKeyword && (
+              <button
+                onClick={() => setFilterKeyword('')}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              >
+                <XCircle className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+
+          {/* 引擎筛选 */}
+          <select
+            value={filterEngine}
+            onChange={e => setFilterEngine(e.target.value)}
+            className="bg-background border border-border rounded-lg px-3 py-2 text-sm text-foreground min-w-[120px]"
+          >
+            <option value="">全部引擎</option>
+            {availableEngines.map(eng => (
+              <option key={eng} value={eng}>{eng}</option>
+            ))}
+          </select>
+
+          {/* 分组筛选 */}
+          <select
+            value={filterGroup}
+            onChange={e => setFilterGroup(e.target.value)}
+            className="bg-background border border-border rounded-lg px-3 py-2 text-sm text-foreground min-w-[120px]"
+          >
+            <option value="">全部分组</option>
+            {availableGroups.map(g => (
+              <option key={g} value={g}>{g}</option>
+            ))}
+          </select>
+
+          {/* 状态筛选 */}
+          <select
+            value={filterStatus}
+            onChange={e => setFilterStatus(e.target.value as '' | 'enabled' | 'disabled')}
+            className="bg-background border border-border rounded-lg px-3 py-2 text-sm text-foreground min-w-[100px]"
+          >
+            <option value="">全部状态</option>
+            <option value="enabled">已启用</option>
+            <option value="disabled">已禁用</option>
+          </select>
+
+          {/* 清除筛选 */}
+          {hasActiveFilters && (
+            <button
+              onClick={() => { setFilterKeyword(''); setFilterEngine(''); setFilterGroup(''); setFilterStatus(''); }}
+              className="flex items-center gap-1 px-3 py-2 text-xs text-muted-foreground hover:text-foreground bg-muted hover:bg-muted/80 rounded-lg transition-colors flex-shrink-0"
+            >
+              <X className="w-3 h-3" /> 清除
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* 筛选结果统计 */}
+      {!loading && hasActiveFilters && (
+        <div className="text-xs text-muted-foreground">
+          筛选结果：{filteredProviders.length}/{providers.length} 个渠道
+          {filterKeyword && filteredProviders.length > 0 && (
+            <span className="ml-2 text-primary">含模型名匹配</span>
+          )}
+        </div>
+      )}
+
       {/* Mobile Card List */}
       <div className="md:hidden space-y-4">
         {loading ? (
           <div className="p-8 text-center text-muted-foreground">加载中...</div>
-        ) : providers.length === 0 ? (
-          <div className="p-12 text-center text-muted-foreground">暂无渠道配置，点击上方按钮添加。</div>
+        ) : filteredProviders.length === 0 ? (
+          <div className="p-12 text-center text-muted-foreground">{providers.length === 0 ? '暂无渠道配置，点击上方按钮添加。' : '没有符合筛选条件的渠道。'}</div>
         ) : (
-          providers.map((p, idx) => <ProviderCard key={idx} p={p} idx={idx} />)
+          filteredProviders.map(({ p, idx }) => <ProviderCard key={idx} p={p} idx={idx} />)
         )}
       </div>
 
@@ -1042,8 +1233,8 @@ export default function Channels() {
       <div className="hidden md:block bg-card border border-border rounded-xl overflow-hidden">
         {loading ? (
           <div className="p-8 text-center text-muted-foreground">加载中...</div>
-        ) : providers.length === 0 ? (
-          <div className="p-12 text-center text-muted-foreground">暂无渠道配置，点击右上角添加。</div>
+        ) : filteredProviders.length === 0 ? (
+          <div className="p-12 text-center text-muted-foreground">{providers.length === 0 ? '暂无渠道配置，点击右上角添加。' : '没有符合筛选条件的渠道。'}</div>
         ) : (
           <table className="w-full text-left border-collapse table-fixed">
             <thead className="bg-muted border-b border-border text-muted-foreground text-sm font-medium">
@@ -1058,7 +1249,7 @@ export default function Channels() {
               </tr>
             </thead>
             <tbody className="divide-y divide-border text-sm">
-              {providers.map((p, idx) => {
+              {filteredProviders.map(({ p, idx }) => {
                 const isEnabled = p.enabled !== false;
                 const groups = Array.isArray(p.groups) ? p.groups : p.group ? [p.group] : ['default'];
                 const plugins = p.preferences?.enabled_plugins || [];
@@ -1074,6 +1265,9 @@ export default function Channels() {
                 const effectiveEnabled = Math.max(0, enabledKeys - rtDisabledCount);
                 const hasKeyIssue = configDisabledKeys > 0 || rtDisabledCount > 0;
 
+                // 模型名匹配高亮
+                const matchedModels = getMatchedModels(p);
+
                 return (
                   <tr key={idx} className={`transition-colors ${isEnabled ? 'hover:bg-muted/50' : 'bg-muted/30 opacity-60'}`}>
                     <td className="px-4 py-3">
@@ -1084,6 +1278,14 @@ export default function Channels() {
                           {p.remark && (
                             <div className="text-xs text-muted-foreground truncate max-w-xs" title={p.remark}>
                               {p.remark}
+                            </div>
+                          )}
+                          {matchedModels.length > 0 && (
+                            <div className="flex flex-wrap gap-0.5 mt-0.5">
+                              {matchedModels.slice(0, 2).map((m, i) => (
+                                <span key={i} className="text-[10px] font-mono px-1 py-px rounded bg-primary/10 text-primary truncate max-w-[120px]" title={m}>{m}</span>
+                              ))}
+                              {matchedModels.length > 2 && <span className="text-[10px] text-muted-foreground">+{matchedModels.length - 2}</span>}
                             </div>
                           )}
                         </div>
@@ -1630,6 +1832,101 @@ export default function Channels() {
                       <Switch.Root checked={formData.preferences.tools} onCheckedChange={val => updatePreference('tools', val)} className="w-11 h-6 bg-muted rounded-full data-[state=checked]:bg-primary">
                         <Switch.Thumb className="block w-5 h-5 bg-white rounded-full transition-transform data-[state=checked]:translate-x-[22px]" />
                       </Switch.Root>
+                    </div>
+
+                    {/* 模型价格（渠道级） */}
+                    <div className="border-t border-border pt-4">
+                      <div className="flex items-center justify-between mb-3">
+                        <label className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                          <Wallet className="w-3.5 h-3.5 text-amber-500" /> 模型价格
+                        </label>
+                        <button
+                          onClick={() => {
+                            const mp = { ...(formData.preferences.model_price || {}) };
+                            const entries = Object.entries(mp);
+                            entries.push(['', '']);
+                            updatePreference('model_price', Object.fromEntries(entries));
+                          }}
+                          className="text-xs text-primary hover:text-primary/80 flex items-center gap-1"
+                        >
+                          <Plus className="w-3 h-3" /> 添加
+                        </button>
+                      </div>
+                      <p className="text-xs text-muted-foreground mb-3">渠道级价格优先于全局配置。未配置的模型回退到全局价格；全局也未配置则不计费。</p>
+                      {Object.keys(formData.preferences.model_price || {}).length > 0 && (
+                        <div className="space-y-2">
+                          <div className="grid grid-cols-[1fr_4.5rem_4.5rem_1.5rem] gap-1.5 text-[10px] text-muted-foreground font-medium px-0.5">
+                            <span>模型名 / 前缀</span>
+                            <span className="text-center">输入$/M</span>
+                            <span className="text-center">输出$/M</span>
+                            <span></span>
+                          </div>
+                          {Object.entries(formData.preferences.model_price || {}).map(([prefix, priceStr], idx) => {
+                            const parts = String(priceStr || '').split(',').map(s => s.trim());
+                            const inputPrice = parts[0] || '';
+                            const outputPrice = parts[1] || '';
+                            // 检查全局是否有同名价格
+                            const globalEntry = globalModelPrice[prefix];
+                            return (
+                              <div key={idx}>
+                                <div className="grid grid-cols-[1fr_4.5rem_4.5rem_1.5rem] gap-1.5 items-center">
+                                  <input
+                                    type="text"
+                                    value={prefix}
+                                    onChange={e => {
+                                      const entries = Object.entries(formData.preferences.model_price || {});
+                                      entries[idx] = [e.target.value, entries[idx][1]];
+                                      updatePreference('model_price', Object.fromEntries(entries));
+                                    }}
+                                    placeholder="gpt-4o / default"
+                                    className="bg-background border border-border px-2 py-1 rounded text-xs font-mono text-foreground focus:border-primary outline-none"
+                                  />
+                                  <input
+                                    type="text"
+                                    value={inputPrice}
+                                    onChange={e => {
+                                      const entries = Object.entries(formData.preferences.model_price || {});
+                                      entries[idx] = [prefix, `${e.target.value},${outputPrice}`];
+                                      updatePreference('model_price', Object.fromEntries(entries));
+                                    }}
+                                    placeholder="0.3"
+                                    className="bg-background border border-border px-1.5 py-1 rounded text-xs font-mono text-center text-foreground focus:border-primary outline-none"
+                                  />
+                                  <input
+                                    type="text"
+                                    value={outputPrice}
+                                    onChange={e => {
+                                      const entries = Object.entries(formData.preferences.model_price || {});
+                                      entries[idx] = [prefix, `${inputPrice},${e.target.value}`];
+                                      updatePreference('model_price', Object.fromEntries(entries));
+                                    }}
+                                    placeholder="1.0"
+                                    className="bg-background border border-border px-1.5 py-1 rounded text-xs font-mono text-center text-foreground focus:border-primary outline-none"
+                                  />
+                                  <button
+                                    onClick={() => {
+                                      const entries = Object.entries(formData.preferences.model_price || {});
+                                      entries.splice(idx, 1);
+                                      updatePreference('model_price', entries.length > 0 ? Object.fromEntries(entries) : undefined);
+                                    }}
+                                    className="p-0.5 text-muted-foreground hover:text-destructive transition-colors"
+                                  >
+                                    <X className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                                {globalEntry && prefix && (
+                                  <p className="text-[10px] text-amber-500/70 mt-0.5 ml-0.5">覆盖全局: {globalEntry}</p>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                      {Object.keys(globalModelPrice).length > 0 && Object.keys(formData.preferences.model_price || {}).length === 0 && (
+                        <div className="text-xs text-muted-foreground bg-muted/50 rounded-lg p-2 mt-2">
+                          当前使用全局价格配置（{Object.keys(globalModelPrice).length} 条规则）。点击「添加」可为该渠道单独设定价格。
+                        </div>
+                      )}
                     </div>
 
                     {/* 余额查询配置 */}

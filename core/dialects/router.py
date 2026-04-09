@@ -216,6 +216,7 @@ def _create_custom_handler_wrapper(dialect_id: str, endpoint: EndpointDefinition
         api_index: int = Depends(verify_api_key),
     ):
         dialect = get_dialect(dialect_id)
+
         return await endpoint.handler(request=request, background_tasks=background_tasks,
                                        api_index=api_index, dialect=dialect)
 

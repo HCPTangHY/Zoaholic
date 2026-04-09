@@ -44,7 +44,7 @@ except Exception:
     # 兼容：未安装 sqlalchemy/asyncpg 时不处理
     pass
 
-# Render / Railway 等平台通常提供 DATABASE_URL（多为 postgres://...），这里统一解析。
+# 云平台通常提供 DATABASE_URL（多为 postgres://...），这里统一解析。
 DATABASE_URL = (
     os.getenv("DATABASE_URL")
     or os.getenv("DB_URL")
@@ -210,7 +210,7 @@ def _extract_mysql_ssl_connect_args(db_url: str) -> tuple[str, dict]:
 
     # TiDB Cloud Serverless 强制 TLS：若连接串未显式指定任何 SSL 参数，但目标是 tidbcloud.com，
     # 则默认启用证书校验 + 主机名校验（等价于 VERIFY_IDENTITY）。
-    # 这样可以避免在 Render 等平台上因为“insecure transport prohibited”导致启动失败。
+    # 这样可以避免在云平台上因为“insecure transport prohibited”导致启动失败。
     #
     # 注意：这里不再仅凭端口 4000 自动开启 TLS。很多自托管 TiDB/MySQL 也会使用 4000，
     # 如果一刀切强制 TLS，反而会导致本地/内网部署无法连接。
@@ -511,7 +511,7 @@ if not DISABLE_DATABASE:
             DB_NAME = os.getenv("DB_NAME", "test")
             db_url = f"mysql+asyncmy://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-        # pool_pre_ping：Render 这类平台上空闲连接容易被断开；开启可减少偶发断连
+        # pool_pre_ping：云平台上空闲连接容易被断开；开启可减少偶发断连
         db_engine = create_async_engine(
             db_url,
             echo=is_debug,

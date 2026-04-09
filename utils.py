@@ -338,8 +338,51 @@ def save_api_yaml(config_data):
         raise RuntimeError(f"Failed to save api.yaml to '{target_path}': {e}") from e
 
 
+# 需要去除首尾空格的 provider 字符串字段
+_PROVIDER_STRIP_FIELDS = (
+    "provider", "base_url", "engine", "model_prefix",
+    "project_id", "client_email", "private_key",
+    "cf_account_id", "aws_access_key", "aws_secret_key",
+)
+
+
+def _strip_provider_fields(provider: dict) -> None:
+    """去除 provider 配置中字符串字段的首尾空格，防止多余空白导致请求异常。"""
+    for field in _PROVIDER_STRIP_FIELDS:
+        val = provider.get(field)
+        if isinstance(val, str):
+            provider[field] = val.strip()
+
+    # 去除模型名称的首尾空格
+    models = provider.get("model")
+    if isinstance(models, list):
+        stripped = []
+        for m in models:
+            if isinstance(m, str):
+                stripped.append(m.strip())
+            elif isinstance(m, dict):
+                stripped.append(
+                    {str(k).strip(): str(v).strip() for k, v in m.items()}
+                )
+            else:
+                stripped.append(m)
+        provider["model"] = stripped
+
+    # 去除 API key 的首尾空格
+    api_val = provider.get("api")
+    if isinstance(api_val, str):
+        provider["api"] = api_val.strip()
+    elif isinstance(api_val, list):
+        provider["api"] = [
+            str(k).strip() if isinstance(k, (str, int)) else k
+            for k in api_val
+        ]
+
+
 async def update_config(config_data, use_config_url=False, skip_model_fetch=False, save_to_file=True, save_to_db: bool = False):
     for index, provider in enumerate(config_data['providers']):
+        _strip_provider_fields(provider)
+
         if provider.get('project_id'):
             if "google-vertex-ai" not in provider.get("base_url", ""):
                 provider['base_url'] = 'https://aiplatform.googleapis.com/'
@@ -447,7 +490,7 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
 
     for index, api_key in enumerate(config_data['api_keys']):
         if "api" in api_key:
-            config_data['api_keys'][index]["api"] = str(api_key["api"])
+            config_data['api_keys'][index]["api"] = str(api_key["api"]).strip()
 
         # 兼容 JSON/JSONB：把 created_at 从字符串恢复为 datetime（用于余额/账期逻辑）
         try:
@@ -487,16 +530,16 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
 
         # 确保api字段为字符串类型
         if "api" in api_key:
-            config_data['api_keys'][index]["api"] = str(api_key["api"])
+            config_data['api_keys'][index]["api"] = str(api_key["api"]).strip()
 
         if api_key.get('model'):
             for model in api_key.get('model'):
                 if isinstance(model, dict):
                     # 只提取模型名，忽略权重值（权重现在在渠道级别配置）
                     key = list(model.keys())[0]
-                    models.append(key)
+                    models.append(str(key).strip())
                 if isinstance(model, str):
-                    models.append(model)
+                    models.append(model.strip())
             config_data['api_keys'][index]['model'] = models
             api_keys_db[index]['model'] = models
         else:

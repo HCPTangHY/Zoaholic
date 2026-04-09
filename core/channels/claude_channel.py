@@ -269,7 +269,15 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         elif msg.role != "system":
             messages.append({"role": msg.role, "content": content})
         elif msg.role == "system":
-            system_prompt = content
+            if system_prompt is None:
+                system_prompt = content
+            elif isinstance(system_prompt, str) and isinstance(content, str):
+                system_prompt = system_prompt + "\n\n" + content
+            elif isinstance(system_prompt, list) and isinstance(content, list):
+                system_prompt = system_prompt + content
+            else:
+                # 类型不一致时（str vs list），以最新的为准并拼接旧内容为文本
+                system_prompt = (str(system_prompt) + "\n\n" + str(content)) if content else system_prompt
 
     conversation_len = len(messages) - 1
     message_index = 0
@@ -283,7 +291,11 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                     content_list.extend(messages[message_index + 1]["content"])
                     messages[message_index]["content"] = content_list
                 else:
-                    messages[message_index]["content"] += messages[message_index + 1]["content"]
+                    next_content = messages[message_index + 1]["content"]
+                    if isinstance(messages[message_index]["content"], str) and isinstance(next_content, str):
+                        messages[message_index]["content"] += "\n" + next_content
+                    else:
+                        messages[message_index]["content"] += next_content
             messages.pop(message_index + 1)
             conversation_len = conversation_len - 1
         else:
@@ -305,6 +317,8 @@ async def get_claude_payload(request, engine, provider, api_key=None):
     miss_fields = [
         'model',
        'messages',
+        'tools',
+        'tool_choice',
         'presence_penalty',
         'frequency_penalty',
         'n',
@@ -341,22 +355,27 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                 json_tool = await gpt2claude_tools_json(tool_dict)
                 tools.append(json_tool)
         payload["tools"] = tools
-        if "tool_choice" in payload:
-            if isinstance(payload["tool_choice"], dict):
-                if payload["tool_choice"]["type"] == "function":
+
+        # tool_choice 转换：从 request 对象读取，而非从 payload 读取
+        # （tool_choice 在 miss_fields 中被排除，不会自动进入 payload）
+        raw_tool_choice = request.tool_choice
+        if raw_tool_choice is not None:
+            if isinstance(raw_tool_choice, dict) or (hasattr(raw_tool_choice, 'type') and hasattr(raw_tool_choice, 'function')):
+                tc_dict = raw_tool_choice if isinstance(raw_tool_choice, dict) else raw_tool_choice.model_dump(exclude_none=True)
+                if tc_dict.get("type") == "function" and tc_dict.get("function", {}).get("name"):
                     payload["tool_choice"] = {
                         "type": "tool",
-                        "name": payload["tool_choice"]["function"]["name"]
+                        "name": tc_dict["function"]["name"]
                     }
-            if isinstance(payload["tool_choice"], str):
-                if payload["tool_choice"] == "auto":
-                    payload["tool_choice"] = {
-                        "type": "auto"
-                    }
-                if payload["tool_choice"] == "none":
-                    payload["tool_choice"] = {
-                        "type": "any"
-                    }
+                else:
+                    payload["tool_choice"] = tc_dict
+            elif isinstance(raw_tool_choice, str):
+                if raw_tool_choice == "auto":
+                    payload["tool_choice"] = {"type": "auto"}
+                elif raw_tool_choice == "none":
+                    payload["tool_choice"] = {"type": "any"}
+                elif raw_tool_choice == "required":
+                    payload["tool_choice"] = {"type": "any"}
 
     if tools_mode == "none":
         payload.pop("tools", None)
@@ -441,7 +460,11 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
     content = "".join(text_parts) if text_parts else None
     reasoning_content = "".join(thinking_parts) if thinking_parts else None
 
-    prompt_tokens = safe_get(response_json, "usage", "input_tokens")
+    prompt_tokens = (
+        (safe_get(response_json, "usage", "input_tokens") or 0)
+        + (safe_get(response_json, "usage", "cache_creation_input_tokens") or 0)
+        + (safe_get(response_json, "usage", "cache_read_input_tokens") or 0)
+    ) or None
     output_tokens = safe_get(response_json, "usage", "output_tokens")
     total_tokens = (prompt_tokens or 0) + (output_tokens or 0)
 
@@ -482,7 +505,14 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                 if line.startswith("data:") and (line := line.lstrip("data: ")):
                     resp: dict = json_loads(line)
 
-                    input_tokens = input_tokens or safe_get(resp, "message", "usage", "input_tokens", default=0)
+                    if not input_tokens:
+                        msg_usage = safe_get(resp, "message", "usage", default={})
+                        if msg_usage:
+                            input_tokens = (
+                                (msg_usage.get("input_tokens") or 0)
+                                + (msg_usage.get("cache_creation_input_tokens") or 0)
+                                + (msg_usage.get("cache_read_input_tokens") or 0)
+                            )
                     output_tokens = safe_get(resp, "usage", "output_tokens", default=0)
                     if output_tokens:
                         total_tokens = input_tokens + output_tokens

@@ -86,3 +86,4 @@ plugins/secret_plugins/
 # alembic.ini
 
 .limcode/
+test/

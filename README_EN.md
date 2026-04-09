@@ -63,7 +63,7 @@ Inherited from uni-api routing core (`core/routing.py`):
 
 ### 1) Prepare a database (PostgreSQL / Cloudflare D1 recommended for cloud)
 
-Platforms like Render/Aiven/Railway usually provide a `DATABASE_URL`.
+Cloud platforms like Aiven/Railway usually provide a `DATABASE_URL`.
 
 If you deploy on Cloudflare Workers, you can also use D1 directly:
 
@@ -105,7 +105,7 @@ Note:
 
 ---
 
-## Cloud Deploy (Render etc.): Which env vars should I set?
+## Cloud Deploy: Which env vars should I set?
 
 Below are the most common and most error-prone environment variables for cloud deployments.
 

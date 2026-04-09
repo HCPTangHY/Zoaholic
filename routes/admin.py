@@ -99,6 +99,9 @@ async def api_config_update(
         if "preferences" not in app.state.config:
             app.state.config["preferences"] = {}
         app.state.config["preferences"].update(config["preferences"])
+        # 前端发送 null 表示显式删除该字段，清理掉 None 值
+        for k in [k for k, v in app.state.config["preferences"].items() if v is None]:
+            del app.state.config["preferences"][k]
         updated = True
 
     if not updated:

@@ -820,6 +820,15 @@ class ModelRequestHandler:
         config = self.app.state.config
         request_model_name = request_data.model
         
+        # 用户 API Key 限速（统一入口，标准路由和方言路由都经过此处）
+        try:
+            final_api_key = self.app.state.api_list[api_index]
+            await self.app.state.user_api_keys_rate_limit[final_api_key].next(request_model_name)
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=429, detail="Too many requests")
+
         if not safe_get(config, 'api_keys', api_index, 'model'):
             raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
 

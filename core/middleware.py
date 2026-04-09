@@ -134,6 +134,28 @@ class StatsMiddleware:
                 return True
         return False
 
+    @staticmethod
+    def _get_client_ip(scope: Scope, headers: list) -> str:
+        """
+        获取客户端真实 IP。
+        优先级：X-Forwarded-For > X-Real-IP > scope["client"]
+        """
+        headers_dict = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in headers}
+
+        # X-Forwarded-For: client, proxy1, proxy2 —— 取第一个
+        forwarded_for = headers_dict.get("x-forwarded-for")
+        if forwarded_for:
+            real_ip = forwarded_for.split(",")[0].strip()
+            if real_ip:
+                return real_ip
+
+        real_ip_header = headers_dict.get("x-real-ip")
+        if real_ip_header:
+            return real_ip_header.strip()
+
+        client = scope.get("client")
+        return client[0] if client else "unknown"
+
     def _normalize_endpoint(self, method: str, path: str) -> str:
         """归一化端点路径，将带模型名的路径转换为模板格式"""
         # 处理 Gemini 风格路径: /v1beta/models/{model}:generateContent
@@ -236,8 +258,7 @@ class StatsMiddleware:
                 return
 
         # 获取 client IP
-        client = scope.get("client")
-        client_ip = client[0] if client else "unknown"
+        client_ip = self._get_client_ip(scope, headers)
 
         # 获取用户key相关信息
         api_key_name = safe_get(config, "api_keys", api_index, "name", default=None)
@@ -300,9 +321,9 @@ class StatsMiddleware:
                 except json.JSONDecodeError:
                     parsed_body = None
 
-        # 获取原始数据保留时间配置（小时），默认为0表示不保存
+        # 获取原始数据保留时间配置（小时），默认为24小时
         raw_data_retention_hours = safe_get(
-            config, "preferences", "log_raw_data_retention_hours", default=0
+            config, "preferences", "log_raw_data_retention_hours", default=24
         )
         
         # 如果配置了保留时间，保存请求头和请求体
@@ -346,14 +367,6 @@ class StatsMiddleware:
                     model = request_model.model
                     current_info["model"] = model
 
-                    final_api_key = app.state.api_list[api_index]
-                    try:
-                        # ApiKeyRateLimitRegistry 会自动按需创建限流器
-                        await app.state.user_api_keys_rate_limit[final_api_key].next(model)
-                    except Exception:
-                        response = openai_error_response("Too many requests", 429)
-                        await response(scope, receive_wrapper, send)
-                        return
 
                     moderated_content = None
                     if request_model.request_type == "chat":

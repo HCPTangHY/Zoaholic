@@ -68,6 +68,7 @@ def _get_response_capture_state():
 def _wrap_response_iterators(response):
     _wrap_response_aiter_text(response)
     _wrap_response_aiter_bytes(response)
+    _wrap_response_aread(response)
 
 
 def _wrap_response_aiter_text(response):
@@ -165,6 +166,42 @@ def _wrap_response_aiter_bytes(response):
             object.__setattr__(response, 'aiter_bytes', logging_aiter_bytes)
         except Exception as e:
             logger.error(f"Failed to wrap response.aiter_bytes: {str(e)}")
+
+
+def _wrap_response_aread(response):
+    """
+    包装 httpx response 的 aread 方法，自动记录上游原始响应。
+
+    所有渠道适配器的非流式处理函数（如 fetch_claude_response、fetch_openai_response 等）
+    都使用 response.aread() 读取完整响应体，而不经过 aiter_bytes/aiter_text。
+    此包装器确保 aread() 读取的数据也被采集到 upstream_response_body 中。
+    """
+    if not hasattr(response, "aread"):
+        return
+
+    original_aread = response.aread
+    captured_info, should_save = _get_response_capture_state()
+
+    if not should_save:
+        return
+
+    async def logging_aread():
+        """包装后的 aread，自动记录数据"""
+        result = await original_aread()
+        if captured_info:
+            try:
+                captured_info["upstream_response_body"] = truncate_for_logging(result)
+            except Exception as e:
+                logger.error(f"Error saving upstream response body (aread): {str(e)}")
+        return result
+
+    try:
+        response.aread = logging_aread
+    except AttributeError:
+        try:
+            object.__setattr__(response, 'aread', logging_aread)
+        except Exception as e:
+            logger.error(f"Failed to wrap response.aread: {str(e)}")
 
 
 def _save_upstream_response_for_non_stream(response):

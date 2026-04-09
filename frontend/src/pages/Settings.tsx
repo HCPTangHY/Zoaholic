@@ -3,7 +3,7 @@ import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
 import {
   Save, RefreshCw, AlertCircle, Zap, Shield,
-  Timer, Database, Blocks, Plus, Trash2, Link
+  Timer, Database, Blocks, Plus, Trash2, Link, DollarSign
 } from 'lucide-react';
 
 type CleanupAction = 'clear_fields' | 'delete_rows';
@@ -27,6 +27,7 @@ interface Preferences {
   log_retention_days?: number;
   log_retention_run_at?: string;
   external_clients?: ExternalClient[];
+  model_price?: Record<string, string> | null;
 }
 type CleanupSuccessMode = 'ALL' | 'SUCCESS' | 'FAILED';
 
@@ -260,12 +261,32 @@ export default function Settings() {
 
   const handleSave = async () => {
     if (!token) return;
+
+    // 校验并清理 model_price：去掉空前缀条目，检查价格值合法性
+    const cleanedPreferences = { ...preferences };
+    if (cleanedPreferences.model_price) {
+      const validEntries: [string, string][] = [];
+      for (const [prefix, priceStr] of Object.entries(cleanedPreferences.model_price)) {
+        const trimmed = prefix.trim();
+        if (!trimmed) continue;
+        const parts = String(priceStr || '').split(',').map(s => s.trim());
+        const inp = parts[0] || '0';
+        const out = parts[1] || '0';
+        if (isNaN(Number(inp)) || isNaN(Number(out))) {
+          alert(`模型价格「${trimmed}」的价格值无效，请填写数字`);
+          return;
+        }
+        validEntries.push([trimmed, `${inp},${out}`]);
+      }
+      cleanedPreferences.model_price = validEntries.length > 0 ? Object.fromEntries(validEntries) : null;
+    }
+
     setSaving(true);
     try {
       const res = await apiFetch('/v1/api_config/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ preferences })
+        body: JSON.stringify({ preferences: cleanedPreferences })
       });
       if (res.ok) {
         alert('配置已保存成功');
@@ -370,6 +391,101 @@ export default function Settings() {
               className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm font-mono text-foreground"
             />
             <p className="text-xs text-muted-foreground mt-2">支持组合：例如 "15/min,100/hour,1000/day"</p>
+          </div>
+        </section>
+
+        {/* 费用计算 */}
+        <section className="bg-card border border-border rounded-xl overflow-hidden">
+          <div className="p-4 border-b border-border bg-muted/30 flex items-center justify-between">
+            <div className="flex items-center gap-2 font-medium text-foreground">
+              <DollarSign className="w-5 h-5 text-emerald-500" /> 模型价格（全局）
+            </div>
+            <button
+              onClick={() => {
+                const entries = Object.entries(preferences.model_price || {});
+                entries.push(['', '']);
+                updatePreference('model_price', Object.fromEntries(entries));
+              }}
+              className="text-xs flex items-center gap-1 bg-primary hover:bg-primary/90 text-primary-foreground px-2.5 py-1.5 rounded-md transition-colors"
+            >
+              <Plus className="w-3.5 h-3.5" /> 添加
+            </button>
+          </div>
+          <div className="p-6 space-y-4">
+            <p className="text-xs text-muted-foreground">
+              配置模型的输入/输出价格（$/百万 tokens）。按模型名前缀匹配，渠道可单独覆盖。未配置的模型不计算费用。
+            </p>
+            {Object.keys(preferences.model_price || {}).length === 0 ? (
+              <div className="text-sm text-muted-foreground italic py-4 text-center">
+                未配置任何模型价格
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <div className="grid grid-cols-[1fr_5.5rem_5.5rem_2rem] gap-2 text-[11px] text-muted-foreground font-medium px-1">
+                  <span>模型名 / 前缀</span>
+                  <span className="text-center">输入 $/M</span>
+                  <span className="text-center">输出 $/M</span>
+                  <span></span>
+                </div>
+                {Object.entries(preferences.model_price || {}).map(([prefix, priceStr], idx) => {
+                  const parts = String(priceStr || '').split(',').map(s => s.trim());
+                  const inputPrice = parts[0] || '';
+                  const outputPrice = parts[1] || '';
+                  return (
+                    <div key={idx} className="grid grid-cols-[1fr_5.5rem_5.5rem_2rem] gap-2 items-center">
+                      <input
+                        type="text"
+                        value={prefix}
+                        onChange={e => {
+                          const entries = Object.entries(preferences.model_price || {});
+                          entries[idx] = [e.target.value, entries[idx][1]];
+                          updatePreference('model_price', Object.fromEntries(entries));
+                        }}
+                        placeholder="gpt-4o / default"
+                        className="bg-background border border-border px-3 py-1.5 rounded-lg text-sm font-mono text-foreground focus:border-primary outline-none"
+                      />
+                      <input
+                        type="text"
+                        value={inputPrice}
+                        onChange={e => {
+                          const mp = { ...(preferences.model_price || {}) };
+                          const entries = Object.entries(mp);
+                          entries[idx] = [prefix, `${e.target.value},${outputPrice}`];
+                          updatePreference('model_price', Object.fromEntries(entries));
+                        }}
+                        placeholder="0.3"
+                        className="bg-background border border-border px-2 py-1.5 rounded-lg text-sm font-mono text-center text-foreground focus:border-primary outline-none"
+                      />
+                      <input
+                        type="text"
+                        value={outputPrice}
+                        onChange={e => {
+                          const mp = { ...(preferences.model_price || {}) };
+                          const entries = Object.entries(mp);
+                          entries[idx] = [prefix, `${inputPrice},${e.target.value}`];
+                          updatePreference('model_price', Object.fromEntries(entries));
+                        }}
+                        placeholder="1.0"
+                        className="bg-background border border-border px-2 py-1.5 rounded-lg text-sm font-mono text-center text-foreground focus:border-primary outline-none"
+                      />
+                      <button
+                        onClick={() => {
+                          const entries = Object.entries(preferences.model_price || {});
+                          entries.splice(idx, 1);
+                          updatePreference('model_price', Object.fromEntries(entries));
+                        }}
+                        className="p-1 text-muted-foreground hover:text-destructive transition-colors"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <p className="text-xs text-muted-foreground pt-2 border-t border-border">
+              填写 <code className="bg-muted px-1 py-0.5 rounded text-foreground">default</code> 作为前缀可匹配所有未单独配价的模型。价格快照在请求时写入日志，后续改价不影响历史记录。
+            </p>
           </div>
         </section>
 
