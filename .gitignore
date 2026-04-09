@@ -89,3 +89,4 @@ plugins/secret_plugins/
 test/
 /反代暂存区
 plugins/descript_channel.py
+plugins/opal_channel-6c5f46abfea1898a.py
