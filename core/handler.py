@@ -180,6 +180,10 @@ async def process_request(
     else:
         api_key = None
 
+    # 将实际使用的 api_key 存入 request_info，供重试循环的 except 块精确定位出错的 key
+    current_info_early = request_info_getter()
+    current_info_early["_used_api_key"] = api_key
+
     engine, stream_mode = get_engine(provider, endpoint, original_model)
 
     if stream_mode is not None:
@@ -534,6 +538,10 @@ async def process_request_passthrough(
         api_key = await provider_api_circular_list[provider["provider"]].next(original_model)
     else:
         api_key = None
+
+    # 将实际使用的 api_key 存入 request_info，供重试循环的 except 块精确定位出错的 key
+    current_info_early = request_info_getter()
+    current_info_early["_used_api_key"] = api_key
 
     engine, stream_mode = get_engine(provider, endpoint, original_model)
     if stream_mode is not None:
@@ -1148,7 +1156,13 @@ class ModelRequestHandler:
                     api_key_count = provider_api_circular_list[channel_id].get_enabled_items_count()
                 except Exception:
                     api_key_count = provider_api_circular_list[channel_id].get_items_count()
-                current_api = await provider_api_circular_list[channel_id].after_next_current()
+
+                # ★ 修复：优先从 request_info 获取本次实际使用的 api_key，
+                # 避免并发场景下 after_next_current() 返回其他请求的 key，
+                # 导致冷却/禁用操作作用在错误的 key 上。
+                _current_info_for_key = self.request_info_getter()
+                current_api = _current_info_for_key.get("_used_api_key") or \
+                    await provider_api_circular_list[channel_id].after_next_current()
 
                 if (cooling_time > 0 and api_key_count > 1
                     and all(error not in error_message for error in exclude_error_rate_limit)):

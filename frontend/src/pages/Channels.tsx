@@ -319,6 +319,15 @@ export default function Channels() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // ── 定期轮询 Key 禁用状态（每 15 秒），确保页面打开期间能及时反映后端变化 ──
+  useEffect(() => {
+    const pollTimer = setInterval(() => {
+      refreshKeyStatus();
+    }, 15000);
+    return () => clearInterval(pollTimer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // ── 打开编辑面板时自动查询余额 ──
   useEffect(() => {
     if (isModalOpen && formData?.preferences?.balance && formData.base_url && formData.api_keys.some(k => k.key.trim() && !k.disabled)) {
@@ -1549,7 +1558,7 @@ export default function Channels() {
                           {!isFocused && balLabel && balColor && (
                             <span className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] ${TAG_CLASSES[balColor]}`}>{balLabel}</span>
                           )}
-                          {!isFocused && isPermanent && <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-700/50 text-zinc-400 flex-shrink-0 relative z-[2]">永久禁用</span>}
+                          {!isFocused && isPermanent && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/15 text-red-500 dark:text-red-400 font-medium flex-shrink-0 relative z-[2]">永久禁用</span>}
                           {!isFocused && isPermanent && (
                             <button onClick={async () => { await apiFetch('/v1/channels/key_status/re_enable', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ provider: providerName, key: keyObj.key }) }); refreshKeyStatus(); }} className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 cursor-pointer flex-shrink-0 relative z-[2]">恢复</button>
                           )}

@@ -34,65 +34,6 @@ async def get_channels(token: str = Depends(verify_admin_api_key)):
     channel_list = [ch.to_dict() for ch in channels]
     return JSONResponse(content={"channels": channel_list})
 
-@router.get("/v1/channels/key_status", dependencies=[Depends(rate_limit_dependency)])
-async def get_key_status(token: str = Depends(verify_admin_api_key), app=Depends(get_app)):
-    """
-    获取所有渠道的运行时 Key 状态（自动禁用 + 恢复倒计时）。
-    仅反映内存中的实时状态，不修改任何配置。
-    """
-    from core.utils import provider_api_circular_list
-    from time import time as _time
-
-    now = _time()
-    result = {}
-    for provider_name, circular_list in provider_api_circular_list.items():
-        runtime_disabled = []
-        cooling = []
-        for item in circular_list.items:
-            if circular_list.is_key_runtime_disabled(item):
-                re_enable_at = circular_list.disabled_until.get(item, 0)
-                remaining = max(0, int(re_enable_at - now)) if re_enable_at > 0 else -1  # -1 = 永久
-                runtime_disabled.append({
-                    "key": item,
-                    "remaining_seconds": remaining,  # -1=永久, 0=即将恢复, >0=剩余秒数
-                })
-            if now < circular_list.cooling_until.get(item, 0):
-                remaining = int(circular_list.cooling_until[item] - now)
-                cooling.append({"key": item, "remaining_seconds": remaining})
-        if runtime_disabled or cooling:
-            result[provider_name] = {
-                "runtime_disabled": runtime_disabled,
-                "cooling": cooling,
-            }
-    return JSONResponse(content=result)
-
-
-@router.post("/v1/channels/key_status/re_enable", dependencies=[Depends(rate_limit_dependency)])
-async def re_enable_key(token: str = Depends(verify_admin_api_key), app=Depends(get_app), body: dict = None):
-    """
-    手动恢复被运行时自动禁用的 Key。
-    body: { "provider": "渠道名", "key": "api_key_string" }
-    """
-    from core.utils import provider_api_circular_list
-
-    if not body:
-        return JSONResponse(status_code=400, content={"error": "Missing request body"})
-
-    provider_name = body.get("provider")
-    key = body.get("key")
-    if not provider_name or not key:
-        return JSONResponse(status_code=400, content={"error": "Missing provider or key"})
-
-    circular_list = provider_api_circular_list.get(provider_name)
-    if not circular_list:
-        return JSONResponse(status_code=404, content={"error": f"Provider '{provider_name}' not found"})
-
-    if not circular_list.is_key_disabled(key):
-        return JSONResponse(content={"status": "already_enabled"})
-
-    circular_list.set_key_disabled(key, False)
-    return JSONResponse(content={"status": "re_enabled", "provider": provider_name})
-
 
 @router.get("/v1/channels/key_status", dependencies=[Depends(rate_limit_dependency)])
 async def get_key_status(token: str = Depends(verify_admin_api_key)):
@@ -108,7 +49,8 @@ async def get_key_status(token: str = Depends(verify_admin_api_key)):
         for item in circular_list.items:
             # 只返回普通冷却中（非自动禁用）的 Key
             if item not in circular_list.auto_disabled_info and now < circular_list.cooling_until.get(item, 0):
-                remaining = int(circular_list.cooling_until[item] - now)
+                until = circular_list.cooling_until[item]
+                remaining = -1 if until == float('inf') else int(until - now)
                 cooling.append({"key": item, "remaining_seconds": remaining})
         if auto_disabled or cooling:
             result[provider_name] = {
