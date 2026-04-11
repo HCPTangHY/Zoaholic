@@ -478,6 +478,13 @@ async def lifespan(app: FastAPI):
 
     # 初始化插件系统（扫描 plugins/ 目录并加载所有插件）
     try:
+        # 先从环境变量恢复自定义插件（适用于无持久化文件系统的平台如 Render）
+        try:
+            from restore_plugins import restore_plugins
+            restore_plugins()
+        except Exception as e:
+            logger.warning(f"Plugin restore skipped or failed: {e}")
+
         plugin_manager = get_plugin_manager()
         load_result = plugin_manager.load_all()
         total = sum(len(v) for v in load_result.values())
@@ -516,14 +523,6 @@ async def lifespan(app: FastAPI):
             update_channel_stats_func=update_channel_stats,
             default_timeout=DEFAULT_TIMEOUT,
         )
-
-    # 恢复运行时自动禁用的 Key（从持久化快照）
-    try:
-        from core.utils import restore_auto_disabled
-        restore_auto_disabled()
-        logger.info("Restored auto-disabled keys from snapshot")
-    except Exception as e:
-        logger.debug(f"Failed to restore auto-disabled keys: {e}")
 
     app.state.startup_completed = True
     yield
