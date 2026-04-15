@@ -349,6 +349,14 @@ _SERVER_NOW = text("CURRENT_TIMESTAMP") if _IS_MYSQL else func.now()
 _VARCHAR = String(255) if _IS_MYSQL else String
 _VARCHAR_INDEX = String(191) if _IS_MYSQL else String
 
+# MySQL TEXT 最大 64KB，不足以存储截断至 100KB 的请求/响应体；
+# 使用 MEDIUMTEXT（16MB）避免溢出。其它数据库的 TEXT 无大小限制。
+try:
+    from sqlalchemy.dialects.mysql import MEDIUMTEXT as _MYSQL_MEDIUMTEXT
+    _BODY_TEXT = _MYSQL_MEDIUMTEXT if _IS_MYSQL else Text
+except ImportError:
+    _BODY_TEXT = Text
+
 class RequestStat(Base):
     __tablename__ = 'request_stats'
     id = Column(Integer, primary_key=True)
@@ -380,11 +388,11 @@ class RequestStat(Base):
     retry_count = Column(Integer, default=0)  # 重试次数
     retry_path = Column(Text, nullable=True)  # 重试路径JSON格式
     request_headers = Column(Text, nullable=True)  # 用户请求头JSON格式
-    request_body = Column(Text, nullable=True)  # 用户请求体
+    request_body = Column(_BODY_TEXT, nullable=True)  # 用户请求体
     upstream_request_headers = Column(Text, nullable=True)  # 发送到上游的请求头JSON格式
-    upstream_request_body = Column(Text, nullable=True)  # 发送到上游的请求体
-    upstream_response_body = Column(Text, nullable=True)  # 上游返回的原始响应体
-    response_body = Column(Text, nullable=True)  # 返回给用户的响应体
+    upstream_request_body = Column(_BODY_TEXT, nullable=True)  # 发送到上游的请求体
+    upstream_response_body = Column(_BODY_TEXT, nullable=True)  # 上游返回的原始响应体
+    response_body = Column(_BODY_TEXT, nullable=True)  # 返回给用户的响应体
     raw_data_expires_at = Column(DateTime(timezone=True), nullable=True)  # 原始数据过期时间
 
 class ChannelStat(Base):

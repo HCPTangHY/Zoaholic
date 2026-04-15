@@ -284,6 +284,35 @@ async def create_tables():
 
             await conn.run_sync(check_and_add_columns)
 
+            # MySQL 专属：将 body 列从 TEXT (64KB) 升级到 MEDIUMTEXT (16MB)
+            # v1.4.1 起默认保存请求/响应体，截断上限 100KB 超出 TEXT 容量
+            if db_type == "mysql":
+                _body_columns = [
+                    ("request_stats", "request_body"),
+                    ("request_stats", "upstream_request_body"),
+                    ("request_stats", "upstream_response_body"),
+                    ("request_stats", "response_body"),
+                ]
+
+                def _upgrade_text_to_mediumtext(connection):
+                    insp = inspect(connection)
+                    for tbl, col in _body_columns:
+                        for col_info in insp.get_columns(tbl):
+                            if col_info["name"] == col:
+                                col_type_str = str(col_info["type"]).upper()
+                                if col_type_str == "TEXT":
+                                    connection.execute(
+                                        text(
+                                            f"ALTER TABLE `{tbl}` MODIFY COLUMN `{col}` MEDIUMTEXT"
+                                        )
+                                    )
+                                    logger.info(
+                                        f"Upgraded column '{col}' in '{tbl}' from TEXT to MEDIUMTEXT."
+                                    )
+                                break
+
+                await conn.run_sync(_upgrade_text_to_mediumtext)
+
 
 # ============== 成本计算 ==============
 

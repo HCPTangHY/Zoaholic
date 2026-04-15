@@ -95,7 +95,7 @@ def register() -> None:
             render_response=render_openai_response,
             render_stream=render_openai_stream,
             parse_usage=parse_openai_usage,
-            target_engine="openai",
+            target_engine=["openai", "openrouter"],
             endpoints=[
                 # POST /v1/chat/completions - Chat Completions
                 EndpointDefinition(

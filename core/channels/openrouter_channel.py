@@ -95,6 +95,61 @@ async def get_openrouter_payload(request, engine, provider, api_key=None):
     return url, headers, payload
 
 
+async def get_openrouter_passthrough_meta(request, engine, provider, api_key=None):
+    """透传用：仅构建 url/headers，payload 由入口原生请求提供"""
+    headers = {
+        'Content-Type': 'application/json',
+    }
+    if api_key:
+        headers['Authorization'] = f'Bearer {api_key}'
+
+    from ..utils import resolve_base_url
+    url = resolve_base_url(provider.get("base_url", "https://openrouter.ai/api/v1"), "/chat/completions")
+
+    # OpenRouter 特定头
+    headers['HTTP-Referer'] = "https://github.com/HCPTangHY/Zoaholic"
+    headers['X-Title'] = "Zoaholic"
+
+    return url, headers, {}
+
+
+async def patch_passthrough_openrouter_payload(
+    payload: dict,
+    modifications: dict,
+    request,
+    engine: str,
+    provider: dict,
+    api_key=None,
+) -> dict:
+    """透传模式下对 OpenRouter payload 做渠道级修饰（system_prompt 注入）。"""
+    system_prompt = modifications.get("system_prompt")
+    system_prompt_text = str(system_prompt).strip() if system_prompt is not None else ""
+    if not system_prompt_text:
+        return payload
+
+    # OpenRouter 使用 OAI 兼容格式，system_prompt 注入到 messages 数组
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "system":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    msg["content"] = f"{system_prompt_text}\n\n{content}" if content else system_prompt_text
+                elif isinstance(content, list):
+                    if content and isinstance(content[0], dict) and "text" in content[0]:
+                        old = content[0].get("text") or ""
+                        content[0]["text"] = f"{system_prompt_text}\n\n{old}" if old else system_prompt_text
+                    else:
+                        content.insert(0, {"type": "text", "text": system_prompt_text})
+                else:
+                    msg["content"] = system_prompt_text
+                return payload
+        messages.insert(0, {"role": "system", "content": system_prompt_text})
+        return payload
+
+    return payload
+
+
 async def fetch_openrouter_response(client, url, headers, payload, model, timeout):
     """处理 OpenRouter 非流式响应"""
     json_payload = await asyncio.to_thread(json_dumps_text, payload)
@@ -246,6 +301,8 @@ def register():
         auth_header="Authorization: Bearer {api_key}",
         description="OpenRouter (Multi-provider gateway)",
         request_adapter=get_openrouter_payload,
+        passthrough_adapter=get_openrouter_passthrough_meta,
+        passthrough_payload_adapter=patch_passthrough_openrouter_payload,
         response_adapter=fetch_openrouter_response,
         stream_adapter=fetch_openrouter_response_stream,
         models_adapter=fetch_openrouter_models,

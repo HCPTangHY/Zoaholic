@@ -1,5 +1,7 @@
 import logging
+import logging.handlers
 import os
+import queue
 import re
 import sys
 from collections import deque
@@ -24,6 +26,7 @@ _backend_log_lock = RLock()
 _backend_log_next_id = 1
 _ORIGINAL_STDOUT = sys.stdout
 _ORIGINAL_STDERR = sys.stderr
+_log_listener = None
 _LOGGER_LINE_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}.*? - (?P<logger>.*?) - (?P<level>DEBUG|INFO|WARNING|ERROR|CRITICAL) - (?P<message>.*)$"
 )
@@ -219,6 +222,7 @@ def _install_backend_log_capture():
 
 
 def _configure_root_logging():
+    global _log_listener
     if getattr(logging, "_zoaholic_root_logging_configured", False):
         return
 
@@ -230,11 +234,24 @@ def _configure_root_logging():
     stderr_handler.setLevel(logging.WARNING)
     stderr_handler.setFormatter(logging.Formatter(LOG_FORMAT))
 
+    # Use QueueHandler + QueueListener so that logger.xxx() calls never
+    # block the event loop on stream.write() — the actual I/O happens in
+    # a dedicated background thread managed by QueueListener.
+    log_queue = queue.Queue(-1)  # unbounded
+    queue_handler = logging.handlers.QueueHandler(log_queue)
+
     logging.basicConfig(
         level=logging.INFO,
-        handlers=[stdout_handler, stderr_handler],
+        handlers=[queue_handler],
         force=True,
     )
+
+    _log_listener = logging.handlers.QueueListener(
+        log_queue, stdout_handler, stderr_handler,
+        respect_handler_level=True,
+    )
+    _log_listener.start()
+
     logging._zoaholic_root_logging_configured = True
 
 

@@ -716,7 +716,9 @@ async def ensure_string(item, as_sse: bool = True):
     elif isinstance(item, str):
         return item
     elif isinstance(item, dict):
-        json_str = json_dumps_text(item, ensure_ascii=False)
+        # 大 dict（如含 base64 图片的响应）同步序列化会阻塞事件循环，
+        # 放到线程池执行，避免高并发生图时 event loop block
+        json_str = await asyncio.to_thread(json_dumps_text, item)
         if as_sse:
             return f"data: {json_str}\n\n"
         return json_str
