@@ -285,7 +285,13 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         if messages[message_index]["role"] == messages[message_index + 1]["role"]:
             if messages[message_index].get("content"):
                 if isinstance(messages[message_index]["content"], list):
-                    messages[message_index]["content"].extend(messages[message_index + 1]["content"])
+                    next_content = messages[message_index + 1]["content"]
+                    if isinstance(next_content, list):
+                        messages[message_index]["content"].extend(next_content)
+                    elif isinstance(next_content, str):
+                        messages[message_index]["content"].append({"type": "text", "text": next_content})
+                    else:
+                        messages[message_index]["content"].append({"type": "text", "text": str(next_content)})
                 elif isinstance(messages[message_index]["content"], str) and isinstance(messages[message_index + 1]["content"], list):
                     content_list = [{"type": "text", "text": messages[message_index]["content"]}]
                     content_list.extend(messages[message_index + 1]["content"])

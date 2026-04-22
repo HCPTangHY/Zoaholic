@@ -269,13 +269,39 @@ async def render_gemini_response(
             parts.append({"thought": True, "text": reasoning})
 
         # 2. 文本内容 (Content)
-        content_text = msg.get("content") or ""
-        if isinstance(content_text, list):
-            content_text = "".join(
-                str(i.get("text", "")) for i in content_text if isinstance(i, dict)
-            )
-        if content_text:
-            parts.append({"text": content_text})
+        content = msg.get("content") or ""
+        if isinstance(content, list):
+            # 结构化 content list → Gemini parts
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "")
+                if item_type == "text":
+                    text = item.get("text", "")
+                    if text:
+                        parts.append({"text": text})
+                elif item_type == "image_url":
+                    image_url = item.get("image_url")
+                    url = ""
+                    if isinstance(image_url, dict):
+                        url = image_url.get("url", "")
+                    elif isinstance(image_url, str):
+                        url = image_url
+                    # 解析 data URI → inlineData
+                    if url.startswith("data:"):
+                        try:
+                            # data:image/png;base64,AAAA...
+                            header, b64data = url.split(",", 1)
+                            mime = header.split(":", 1)[1].split(";", 1)[0]
+                            parts.append({"inlineData": {"mimeType": mime, "data": b64data}})
+                        except (ValueError, IndexError):
+                            # 解析失败，降级为 markdown 文本
+                            parts.append({"text": f"![image]({url})"})
+                    else:
+                        # 普通 URL，Gemini 用 fileData
+                        parts.append({"fileData": {"fileUri": url}})
+        elif content:
+            parts.append({"text": content})
 
         # 3. 工具调用 (Tool Calls)
         # 如果存在 tool_calls，Gemini 期望渲染为 functionCall parts

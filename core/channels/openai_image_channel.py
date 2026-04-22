@@ -184,9 +184,9 @@ async def fetch_image_response(client, url, headers, payload, model, timeout):
     response_bytes = await response.aread()
     response_json = await asyncio.to_thread(json_loads, response_bytes)
 
-    # 提取 b64_json 图片
+    # 提取 b64_json 图片 → 结构化 content list
     data_list = response_json.get("data", [])
-    content_parts = []
+    content_items = []
 
     for i, item in enumerate(data_list):
         b64 = item.get("b64_json", "")
@@ -199,14 +199,20 @@ async def fetch_image_response(client, url, headers, payload, model, timeout):
             elif output_format == "webp":
                 mime = "image/webp"
 
-            content_parts.append(f"![image](data:{mime};base64,{b64})")
+            content_items.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"}
+            })
 
         # 如果有 revised_prompt，也加上
         revised = item.get("revised_prompt")
         if revised:
-            content_parts.append(f"*Revised prompt: {revised}*")
+            content_items.append({
+                "type": "text",
+                "text": f"*Revised prompt: {revised}*"
+            })
 
-    content = "\n\n".join(content_parts) if content_parts else None
+    content = content_items if content_items else None
 
     # 构建 Chat Completions 格式响应
     timestamp = int(datetime.timestamp(datetime.now()))

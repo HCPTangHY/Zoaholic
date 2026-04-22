@@ -542,7 +542,8 @@ async def convert_responses_to_chat_completions(response: dict, model: str) -> d
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
 
-    content = ""
+    content_text = ""
+    content_images = []  # 收集图片 items
     reasoning_content = ""
     tool_calls = []
 
@@ -564,7 +565,7 @@ async def convert_responses_to_chat_completions(response: dict, model: str) -> d
             for c in item_content:
                 c_type = c.get("type", "")
                 if c_type == "output_text":
-                    content += c.get("text", "")
+                    content_text += c.get("text", "")
                 elif c_type == "tool_use":
                     tool_calls.append({
                         "id": c.get("id", f"call_{random_str[:24]}"),
@@ -576,10 +577,23 @@ async def convert_responses_to_chat_completions(response: dict, model: str) -> d
                     })
 
         elif item_type == "image_generation_call":
-            # gpt-image-2 等模型的生图结果：将 base64 图片转为 inline markdown
+            # gpt-image-2 等模型的生图结果：结构化 image_url item
             result = item.get("result", "")
             if result and result.strip():
-                content += f"\n\n![image](data:image/png;base64,{result})"
+                content_images.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{result}"}
+                })
+
+    # 构建 content：有图片时用结构化 list，纯文本时保持 string
+    if content_images:
+        content_items = []
+        if content_text:
+            content_items.append({"type": "text", "text": content_text})
+        content_items.extend(content_images)
+        content = content_items
+    else:
+        content = content_text
 
     # 构建 Chat Completions 响应
     message = {

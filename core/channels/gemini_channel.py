@@ -786,16 +786,22 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
             role = "assistant"
 
         # 检查是否需要处理图像
-        # 无论是否是专门的绘图模型，只要 Gemini 返回了图片（比如普通大模型使用 Python 代码执行工具画了图表），
-        # 我们都统一将其转换为 Markdown 图片追加到文本内容中，确保在标准聊天客户端中可见，
-        # 并防止被 utils.py 错误地转换为只包含 b64_json 的图片生成 API 格式。
+        # 无论是否是专门的绘图模型，只要 Gemini 返回了图片，
+        # 都将其转换为结构化 content list，让方言出口层决定最终格式。
         if image_base64:
             try:
                 from ..log_config import logger
                 logger.info(f"[Gemini] Processing image for non-stream response, model={model}")
                 
-                # 非流式路径也不再走图床，统一直接返回 inline base64
-                content = (content or "") + f"\n\n![image](data:image/png;base64,{image_base64})"
+                # 构建结构化 content list
+                content_items = []
+                if content:
+                    content_items.append({"type": "text", "text": content})
+                content_items.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_base64}"}
+                })
+                content = content_items
                 image_base64 = None  # 清除，防止 generate_no_stream_response 返回图像 API 格式
 
             except Exception as e:

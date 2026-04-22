@@ -3,7 +3,8 @@ OpenAI 方言
 
 OpenAI 兼容格式本身就是系统 Canonical 形式，因此：
 - parse_request: 直接校验并返回 RequestModel
-- render_response / render_stream: 直接透传
+- render_response: 将结构化 content list 拍扁为 markdown 字符串
+- render_stream: 直接透传（流式 delta 已是字符串）
 - endpoints: Chat Completions 端点
 """
 
@@ -28,16 +29,60 @@ async def parse_openai_request(
     return RequestModel(**native_body)
 
 
+def _flatten_content_list(content) -> str:
+    """将结构化 content list 拍扁为 markdown 字符串。
+
+    Chat Completions API 的响应 content 必须是 string，
+    但内核可能返回结构化 list（含 text/image_url 等 items）。
+    """
+    if not isinstance(content, list):
+        return content
+
+    parts = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type", "")
+        if item_type == "text":
+            text = item.get("text", "")
+            if text:
+                parts.append(text)
+        elif item_type == "image_url":
+            image_url = item.get("image_url")
+            url = ""
+            if isinstance(image_url, dict):
+                url = image_url.get("url", "")
+            elif isinstance(image_url, str):
+                url = image_url
+            if url:
+                parts.append(f"![image]({url})")
+
+    return "\n\n".join(parts) if parts else ""
+
+
 async def render_openai_response(
     canonical_response: Dict[str, Any],
     model: str,
 ) -> Dict[str, Any]:
-    """Canonical(OpenAI 风格) -> OpenAI 原生响应"""
+    """Canonical -> OpenAI 原生响应
+
+    将结构化 content list 拍扁为 markdown 字符串，
+    因为 Chat Completions API 的 content 字段必须是 string。
+    """
+    choices = canonical_response.get("choices") or []
+    for choice in choices:
+        msg = choice.get("message")
+        if not msg:
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            msg["content"] = _flatten_content_list(content)
+
     return canonical_response
 
 
 async def render_openai_stream(canonical_sse_chunk: str) -> str:
-    """Canonical SSE -> OpenAI SSE"""
+    """Canonical SSE -> OpenAI SSE（直接透传）"""
     return canonical_sse_chunk
 
 
@@ -48,7 +93,7 @@ def parse_openai_usage(data: Any) -> Optional[Dict[str, int]]:
     usage = data.get("usage")
     if not usage:
         usage = data.get("message", {}).get("usage")
-    
+
     if usage:
         prompt = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
         completion = usage.get("completion_tokens") or usage.get("output_tokens") or 0
@@ -56,29 +101,6 @@ def parse_openai_usage(data: Any) -> Optional[Dict[str, int]]:
         if prompt or completion:
             return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
     return None
-
-
-# ============== 自定义端点处理函数 ==============
-
-
-async def chat_completions_handler(
-    request: "Request",
-    background_tasks: "BackgroundTasks",
-    api_index: int,
-    **kwargs,
-):
-    """
-    OpenAI Chat Completions 端点 - POST /v1/chat/completions
-    
-    OpenAI 是 Canonical 格式，直接解析为 RequestModel 并调用 handler
-    """
-    from routes.deps import get_model_handler
-
-    native_body: Dict[str, Any] = await request.json()
-    request_model = await parse_openai_request(native_body, {}, {})
-
-    model_handler = get_model_handler()
-    return await model_handler.request_model(request_model, api_index, background_tasks)
 
 
 # ============== 注册 ==============
@@ -101,7 +123,6 @@ def register() -> None:
                 EndpointDefinition(
                     path="/v1/chat/completions",
                     methods=["POST"],
-                    handler=chat_completions_handler,
                     tags=["Chat"],
                     summary="Create Chat Completion",
                     description="创建聊天完成请求，兼容 OpenAI Chat Completions API 格式",

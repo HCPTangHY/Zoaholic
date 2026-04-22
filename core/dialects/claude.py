@@ -272,10 +272,46 @@ async def render_claude_response(
         if reasoning:
             content.append({"type": "thinking", "thinking": reasoning})
 
-        # 2. 文本内容
-        text = msg.get("content")
-        if text:
-            content.append({"type": "text", "text": text})
+        # 2. 文本内容（支持结构化 content list）
+        msg_content = msg.get("content")
+        if isinstance(msg_content, list):
+            # 结构化 content list → Claude content blocks
+            for item in msg_content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "")
+                if item_type == "text":
+                    text_val = item.get("text", "")
+                    if text_val:
+                        content.append({"type": "text", "text": text_val})
+                elif item_type == "image_url":
+                    image_url = item.get("image_url")
+                    url = ""
+                    if isinstance(image_url, dict):
+                        url = image_url.get("url", "")
+                    elif isinstance(image_url, str):
+                        url = image_url
+                    if url.startswith("data:"):
+                        try:
+                            header, b64data = url.split(",", 1)
+                            media_type = header.split(":", 1)[1].split(";", 1)[0]
+                            content.append({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": media_type,
+                                    "data": b64data,
+                                }
+                            })
+                        except (ValueError, IndexError):
+                            content.append({"type": "text", "text": f"![image]({url})"})
+                    elif url:
+                        content.append({
+                            "type": "image",
+                            "source": {"type": "url", "url": url}
+                        })
+        elif msg_content:
+            content.append({"type": "text", "text": msg_content})
             
         # 2. 工具调用
         tool_calls = msg.get("tool_calls") or []

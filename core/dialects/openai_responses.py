@@ -323,11 +323,41 @@ async def render_responses_response(
         }
 
         if content:
-            message_item["content"].append({
-                "type": "output_text",
-                "text": content,
-                "annotations": []
-            })
+            if isinstance(content, list):
+                # 结构化 content list → Responses output items
+                for ci in content:
+                    if not isinstance(ci, dict):
+                        continue
+                    ci_type = ci.get("type", "")
+                    if ci_type == "text":
+                        text_val = ci.get("text", "")
+                        if text_val:
+                            message_item["content"].append({
+                                "type": "output_text",
+                                "text": text_val,
+                                "annotations": []
+                            })
+                    elif ci_type == "image_url":
+                        image_url = ci.get("image_url")
+                        url = ""
+                        if isinstance(image_url, dict):
+                            url = image_url.get("url", "")
+                        elif isinstance(image_url, str):
+                            url = image_url
+                        if url:
+                            # Responses API 没有标准的 image output，
+                            # 降级为 markdown 文本
+                            message_item["content"].append({
+                                "type": "output_text",
+                                "text": f"![image]({url})",
+                                "annotations": []
+                            })
+            else:
+                message_item["content"].append({
+                    "type": "output_text",
+                    "text": content,
+                    "annotations": []
+                })
 
         # 处理 tool_calls
         if tool_calls:
