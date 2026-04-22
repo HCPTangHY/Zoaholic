@@ -60,8 +60,22 @@ def _extract_prompt_and_images(request) -> tuple:
                 if item_type == "text" and getattr(item, "text", None):
                     text_parts.append(item.text)
                 elif item_type == "image_url" and getattr(item, "image_url", None):
+                    # OAI 标准格式: {type: "image_url", image_url: {url: "data:..."}}
                     url = item.image_url.url if hasattr(item.image_url, "url") else str(item.image_url)
                     images.append(url)
+                elif item_type == "file":
+                    # Gemini 方言转换格式: {type: "file", file: {mime_type: "image/png", data: "base64..."}}
+                    file_obj = getattr(item, "file", None)
+                    if file_obj:
+                        file_dict = file_obj if isinstance(file_obj, dict) else (file_obj.model_dump() if hasattr(file_obj, "model_dump") else {})
+                        mime = file_dict.get("mime_type", "")
+                        if mime.startswith("image/"):
+                            data = file_dict.get("data", "")
+                            if data:
+                                # 有裸 base64 data → 拼成 data URI
+                                images.append(f"data:{mime};base64,{data}")
+                            elif file_dict.get("url"):
+                                images.append(file_dict["url"])
             prompt = "\n".join(text_parts)
         break
 
