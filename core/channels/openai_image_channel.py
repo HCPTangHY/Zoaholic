@@ -121,16 +121,22 @@ async def get_image_payload(request, engine, provider, api_key=None):
 
     base_url = provider.get('base_url', 'https://api.openai.com/v1')
     # 归一化：去除可能的 /chat/completions 等后缀，只保留到 /v1
-    for suffix in ('/chat/completions', '/images/generations', '/responses'):
+    for suffix in ('/chat/completions', '/images/generations', '/images/edits', '/responses'):
         if base_url.rstrip('/').endswith(suffix.rstrip('/')):
             base_url = base_url.rstrip('/')[:-len(suffix.rstrip('/'))]
             break
-    url = resolve_base_url(base_url, '/images/generations')
 
     # 从 messages 提取 prompt
     prompt, images = _extract_prompt_and_images(request)
     if not prompt:
         prompt = "Generate an image"  # fallback
+
+    # 有图片附件 → 编辑模式（/images/edits），否则 → 生成模式（/images/generations）
+    is_edit = bool(images)
+    if is_edit:
+        url = resolve_base_url(base_url, '/images/edits')
+    else:
+        url = resolve_base_url(base_url, '/images/generations')
 
     # 构建 payload
     # gpt-image-2 默认且只返回 b64_json，不认 response_format 参数
@@ -143,12 +149,12 @@ async def get_image_payload(request, engine, provider, api_key=None):
     image_params = _extract_image_params(request, provider)
     payload.update(image_params)
 
-    # 如果有图片附件（编辑模式），加入 image 参数
-    if images:
-        payload["image"] = images[0]  # 取第一张
+    # 编辑模式：将图片转为 edits API 的 images 数组格式
+    # GPT Image 模型支持 JSON body，images 是 [{image_url: "data:..."}, ...] 数组
+    if is_edit:
+        payload["images"] = [{"image_url": img_url} for img_url in images]
 
     # 清理 Chat Completions 的字段，Image API 不认这些
-    # 注意：response_format 不清理，上面已设为 "b64_json"（Image API 需要的格式）
     for k in (
         "messages", "stream", "tools", "tool_choice",
         "temperature", "top_p", "max_tokens", "max_completion_tokens",
