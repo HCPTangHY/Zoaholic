@@ -22,6 +22,7 @@ from ..utils import (
     get_model_dict,
     get_base64_image,
     generate_sse_response,
+    generate_chunked_image_md,
     end_of_line,
 )
 from ..response import check_response
@@ -566,6 +567,12 @@ async def convert_responses_to_chat_completions(response: dict, model: str) -> d
                         }
                     })
 
+        elif item_type == "image_generation_call":
+            # gpt-image-2 等模型的生图结果：将 base64 图片转为 inline markdown
+            result = item.get("result", "")
+            if result and result.strip():
+                content += f"\n\n![image](data:image/png;base64,{result})"
+
     # 构建 Chat Completions 响应
     message = {
         "role": "assistant",
@@ -710,14 +717,11 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                             yield sse_string
                             has_sent_content = True
 
-                    # output text done -> finish_reason
-                    # 只有当已发送内容时才发送 stop，避免空响应
+                    # output text done
+                    # 注意：不在此处发送 stop，统一由 response.completed 发送
+                    # 避免 text + image 混合响应时提前终止流（image 在 output_item.done 中处理）
                     elif event_type == "response.output_text.done":
-                        if has_sent_content:
-                            sse_string = await generate_sse_response(
-                                timestamp, model, stop="stop"
-                            )
-                            yield sse_string
+                        pass
 
                     # function call arguments delta
                     elif event_type == "response.function_call_arguments.delta":
@@ -738,6 +742,28 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                             timestamp, model, tools_id=call_id, function_call_name=name
                         )
                         yield sse_string
+
+                    # image generation call completed -> inline markdown image
+                    elif event_type == "response.output_item.done":
+                        item = data.get("item", {})
+                        if item.get("type") == "image_generation_call":
+                            result = item.get("result", "")
+                            if result and result.strip():
+                                if not has_sent_role:
+                                    sse_string = await generate_sse_response(timestamp, model, role="assistant")
+                                    yield sse_string
+                                    has_sent_role = True
+
+                                mark_content_start()
+                                # SSE 注释作为 keepalive，防止客户端超时
+                                yield ": streaming inline image\n\n"
+
+                                # 使用 chunked helper 分块发送大图 base64
+                                async for sse_string in generate_chunked_image_md(
+                                    result, timestamp, model
+                                ):
+                                    yield sse_string
+                                has_sent_content = True
 
                     # response completed -> 提取 usage，同时确保发送 stop
                     elif event_type == "response.completed":
