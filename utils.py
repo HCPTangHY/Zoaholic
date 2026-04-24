@@ -73,6 +73,12 @@ def _sanitize_config_for_persistence(config_data: dict) -> dict:
 
     processed_data = copy.deepcopy(config_data or {})
 
+    # 过滤掉子渠道展开生成的 provider（运行时产物，不持久化）
+    processed_data['providers'] = [
+        p for p in (processed_data.get('providers') or [])
+        if not p.get('_is_sub_channel')
+    ]
+
     for provider in processed_data.get("providers", []) or []:
         keys_to_remove = [k for k in list(provider.keys()) if str(k).startswith("_")]
         for k in keys_to_remove:
@@ -272,6 +278,12 @@ def save_api_yaml(config_data):
 
     processed_data = copy.deepcopy(config_data)
 
+    # 过滤掉子渠道展开生成的 provider（它们是运行时产物，不持久化）
+    processed_data['providers'] = [
+        p for p in processed_data.get('providers', [])
+        if not p.get('_is_sub_channel')
+    ]
+
     # 清理运行时字段（以 _ 开头的字段不写入配置文件）
     for provider in processed_data.get('providers', []):
         keys_to_remove = [k for k in list(provider.keys()) if k.startswith('_')]
@@ -379,7 +391,82 @@ def _strip_provider_fields(provider: dict) -> None:
         ]
 
 
+def _expand_sub_channels(providers: list) -> list:
+    """展开子渠道：将 sub_channels 配置展开为独立的内部 provider。
+
+    子渠道继承主渠道的 api/base_url/preferences 等配置，
+    自己的配置项覆盖继承的值。展开后的 provider 在路由层表现为独立渠道。
+
+    子渠道 provider 名格式：{主渠道名}:{子渠道engine}
+    """
+    expanded = []
+    for provider in providers:
+        # 主渠道本身始终保留（即使有 sub_channels）
+        expanded.append(provider)
+
+        sub_channels = provider.get("sub_channels")
+        if not isinstance(sub_channels, list) or not sub_channels:
+            continue
+
+        # 主渠道可继承的字段（子渠道没配的就继承）
+        parent_api = provider.get("api")
+        parent_base_url = provider.get("base_url", "")
+        parent_preferences = provider.get("preferences") or {}
+        parent_groups = provider.get("groups") or ["default"]
+        parent_enabled = provider.get("enabled", True)
+        parent_name = provider.get("provider", "")
+
+        seen_names = set()
+        for sub_idx, sub in enumerate(sub_channels):
+            if not isinstance(sub, dict):
+                continue
+            sub_engine = sub.get("engine")
+            if not sub_engine:
+                continue
+
+            # 子渠道 provider 名：主渠道名:子引擎名（重复时加序号）
+            base_name = sub.get("provider") or f"{parent_name}:{sub_engine}"
+            sub_name = base_name
+            if sub_name in seen_names:
+                sub_name = f"{base_name}:{sub_idx}"
+            seen_names.add(sub_name)
+
+            # 深合并 preferences：主渠道为底，子渠道覆盖
+            merged_prefs = {**parent_preferences}
+            sub_prefs = sub.get("preferences")
+            if isinstance(sub_prefs, dict):
+                merged_prefs.update(sub_prefs)
+
+            sub_provider = {
+                "provider": sub_name,
+                "engine": sub_engine,
+                "api": sub.get("api") or parent_api,
+                "base_url": sub.get("base_url") or parent_base_url,
+                "model": sub.get("model") or [],
+                "preferences": merged_prefs,
+                "groups": sub.get("groups") or parent_groups,
+                "enabled": sub.get("enabled") if sub.get("enabled") is not None else parent_enabled,
+                "remark": sub.get("remark") or f"[子渠道] {parent_name} → {sub_engine}",
+                # 标记为子渠道（前端/API 可用来识别）
+                "_parent_provider": parent_name,
+                "_is_sub_channel": True,
+            }
+
+            # 继承其他可选字段
+            if sub.get("model_prefix"):
+                sub_provider["model_prefix"] = sub["model_prefix"]
+            elif provider.get("model_prefix"):
+                sub_provider["model_prefix"] = provider["model_prefix"]
+
+            expanded.append(sub_provider)
+
+    return expanded
+
+
 async def update_config(config_data, use_config_url=False, skip_model_fetch=False, save_to_file=True, save_to_db: bool = False):
+    # 展开子渠道为独立 provider（路由层无感知）
+    config_data['providers'] = _expand_sub_channels(config_data['providers'])
+
     for index, provider in enumerate(config_data['providers']):
         _strip_provider_fields(provider)
 
@@ -396,7 +483,15 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
         if provider_api:
             if isinstance(provider_api, int):
                 provider_api = str(provider_api)
-            
+
+            # 子渠道共享主渠道的 key circular list（保证 round_robin 和禁用状态一致）
+            parent_name = provider.get('_parent_provider')
+            if parent_name and parent_name in provider_api_circular_list:
+                provider_api_circular_list[provider['provider']] = provider_api_circular_list[parent_name]
+                # 跳过后面的 circular list 创建
+                provider_api = None
+
+        if provider_api:
             # 解析 API key 列表，支持 ! 前缀标记禁用的 key
             # 格式：正常 key 直接使用，以 ! 开头的 key 表示禁用
             def parse_api_keys(api_list):
@@ -1502,14 +1597,35 @@ async def query_channel_key_stats(
     start_dt: Optional[datetime] = None,
     end_dt: Optional[datetime] = None,
 ) -> List[Dict]:
-    """Queries the ChannelStat table for API key success rates."""
+    """Queries the ChannelStat table for API key success rates.
+    
+    provider_name 支持逗号分隔的多个 provider（用于聚合主渠道+子渠道的统计）。
+    """
     if DISABLE_DATABASE:
         return []
 
+    # 解析逗号分隔的多 provider
+    provider_names = [p.strip() for p in provider_name.split(',') if p.strip()]
+
     if (DB_TYPE or "sqlite").lower() == "d1":
-        key_stats = await _query_channel_key_stats_d1(provider_name, start_dt=start_dt, end_dt=end_dt)
+        # D1: 逐个查再合并
+        all_stats: Dict[str, Dict] = {}
+        for pn in provider_names:
+            for item in await _query_channel_key_stats_d1(pn, start_dt=start_dt, end_dt=end_dt):
+                key = item["api_key"]
+                if key in all_stats:
+                    existing = all_stats[key]
+                    existing["total_requests"] += item["total_requests"]
+                    existing["success_count"] += item["success_count"]
+                    existing["total_prompt_tokens"] += item.get("total_prompt_tokens", 0)
+                    existing["total_completion_tokens"] += item.get("total_completion_tokens", 0)
+                    existing["total_tokens"] += item.get("total_tokens", 0)
+                else:
+                    all_stats[key] = {**item}
+        for v in all_stats.values():
+            v["success_rate"] = v["success_count"] / v["total_requests"] if v["total_requests"] > 0 else 0
         sorted_stats = sorted(
-            key_stats,
+            all_stats.values(),
             key=lambda item: (item["success_rate"], item["total_requests"]),
             reverse=True,
         )
@@ -1518,13 +1634,20 @@ async def query_channel_key_stats(
     async with async_session_scope() as session:
         if not start_dt:
             start_dt = datetime.now(timezone.utc) - timedelta(hours=24)
+        
+        # 支持多 provider IN 查询
+        if len(provider_names) == 1:
+            provider_filter = ChannelStat.provider == provider_names[0]
+        else:
+            provider_filter = ChannelStat.provider.in_(provider_names)
+        
         query = (
             select(
                 ChannelStat.provider_api_key,
                 func.count().label("total_requests"),
                 func.sum(case((ChannelStat.success, 1), else_=0)).label("success_count"),
             )
-            .where(ChannelStat.provider == provider_name)
+            .where(provider_filter)
             .where(ChannelStat.timestamp >= start_dt)
             .where(ChannelStat.provider_api_key.isnot(None))
         )
@@ -1543,7 +1666,7 @@ async def query_channel_key_stats(
                 func.coalesce(func.sum(RequestStat.total_tokens), 0).label("total_tokens"),
             )
             .join(RequestStat, ChannelStat.request_id == RequestStat.request_id)
-            .where(ChannelStat.provider == provider_name)
+            .where(provider_filter)
             .where(ChannelStat.timestamp >= start_dt)
             .where(ChannelStat.provider_api_key.isnot(None))
             .where(ChannelStat.success == True)

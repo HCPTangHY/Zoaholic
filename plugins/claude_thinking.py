@@ -36,12 +36,13 @@ from core.plugins import (
 PLUGIN_INFO = {
     "name": "claude_thinking",
     "version": "1.1.0",
-    "description": "Claude Thinking 模式插件 - 支持 -thinking 后缀模型的思考链处理",
+    "description": "Claude Thinking 旧版兼容插件 — 通过预填充 <thinking> 标签实现思考链，并将响应中的 <thinking>...</thinking> 映射到 reasoning_content。适用于不支持原生 extended thinking 的旧版上游。新版上游推荐用 claude_tools 的 -thinking 后缀。",
     "author": "Zoaholic Team",
     "dependencies": [],
     "metadata": {
         "category": "interceptors",
         "tags": ["claude", "thinking", "reasoning"],
+        "params_hint": "无需参数。自动检测 -thinking 后缀模型名并处理。",
     },
 }
 

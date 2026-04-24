@@ -777,14 +777,15 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                                     has_sent_role = True
 
                                 mark_content_start()
-                                # SSE 注释作为 keepalive，防止客户端超时
-                                yield ": streaming inline image\n\n"
-
-                                # 使用 chunked helper 分块发送大图 base64
-                                async for sse_string in generate_chunked_image_md(
-                                    result, timestamp, model
-                                ):
-                                    yield sse_string
+                                # 发结构化 image content item，方言出口各自转换
+                                image_content_item = [{
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{result}"}
+                                }]
+                                sse_string = await generate_sse_response(
+                                    timestamp, model, content=image_content_item
+                                )
+                                yield sse_string
                                 has_sent_content = True
 
                     # response completed -> 提取 usage，同时确保发送 stop

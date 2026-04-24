@@ -62,12 +62,13 @@ from core.channels import get_channel, register_channel
 PLUGIN_INFO = {
     "name": "gemini_empty_retry",
     "version": "1.1.0",
-    "description": "Gemini 空内容自动重试插件 - 检测空响应并触发重试",
+    "description": "Gemini 空响应自动重试 — 检测到空内容、图片生成失败或响应被截断时自动重试，走完整的 key 轮换流程。适用于图像生成模型（有思维链但没图片）和普通模型的空响应场景。注意：流式请求会增加 TTFB。",
     "author": "Zoaholic Team",
     "dependencies": [],
     "metadata": {
         "category": "interceptors",
         "tags": ["gemini", "retry", "empty-content"],
+        "params_hint": "填写最大重试次数（数字），如 3 或 5。默认 3 次。",
     },
 }
 

@@ -357,6 +357,8 @@ async def render_gemini_stream(canonical_sse_chunk: str) -> str:
 
     输入: "data: {...}\n\n"
     输出: "data: {...}\n\n" (Gemini candidates 格式)
+
+    支持 delta.content 为结构化 list（图片等）或普通 string。
     """
     if not isinstance(canonical_sse_chunk, str):
         return canonical_sse_chunk
@@ -378,7 +380,7 @@ async def render_gemini_stream(canonical_sse_chunk: str) -> str:
         return ""
 
     delta = choices[0].get("delta") or {}
-    content = delta.get("content") or ""
+    content = delta.get("content")
     reasoning = delta.get("reasoning_content") or ""
     thought_signature = delta.get("thoughtSignature")
 
@@ -393,15 +395,43 @@ async def render_gemini_stream(canonical_sse_chunk: str) -> str:
         ]
     }
 
-    if reasoning:
-        gemini_chunk["candidates"][0]["content"]["parts"].append(
-            {"thought": True, "text": reasoning}
-        )
-    if content:
-        gemini_chunk["candidates"][0]["content"]["parts"].append({"text": content})
+    parts = gemini_chunk["candidates"][0]["content"]["parts"]
 
-    if thought_signature and gemini_chunk["candidates"][0]["content"]["parts"]:
-        gemini_chunk["candidates"][0]["content"]["parts"][-1]["thoughtSignature"] = thought_signature
+    if reasoning:
+        parts.append({"thought": True, "text": reasoning})
+
+    if isinstance(content, list):
+        # 结构化 content items（图片等）→ Gemini parts
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type", "")
+            if item_type == "text":
+                text = item.get("text", "")
+                if text:
+                    parts.append({"text": text})
+            elif item_type == "image_url":
+                image_url = item.get("image_url")
+                url = ""
+                if isinstance(image_url, dict):
+                    url = image_url.get("url", "")
+                elif isinstance(image_url, str):
+                    url = image_url
+                if url.startswith("data:"):
+                    try:
+                        header, b64data = url.split(",", 1)
+                        mime = header.split(":", 1)[1].split(";", 1)[0]
+                        parts.append({"inlineData": {"mimeType": mime, "data": b64data}})
+                    except (ValueError, IndexError):
+                        parts.append({"text": f"![image]({url})"})
+                else:
+                    parts.append({"fileData": {"fileUri": url}})
+    elif content:
+        # 普通 string content
+        parts.append({"text": content})
+
+    if thought_signature and parts:
+        parts[-1]["thoughtSignature"] = thought_signature
 
     finish_reason = choices[0].get("finish_reason")
     if finish_reason:
@@ -517,6 +547,7 @@ def register() -> None:
             render_stream=render_gemini_stream,
             parse_usage=parse_gemini_usage,
             target_engine="gemini",
+            structured_stream=True,  # Gemini 原生支持 inlineData，保留结构化 content
             extract_token=extract_gemini_token,
             endpoints=[
                 # GET /v1beta/models - 列出模型

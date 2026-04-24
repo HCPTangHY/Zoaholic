@@ -128,8 +128,15 @@ export function ChannelAnalyticsSheet({ open, onOpenChange, providerName }: Chan
       if (statsRes.ok) {
         const raw = await statsRes.json();
         const stats = raw.stats || raw;
-        const ch = stats.channel_success_rates?.find((c: any) => c.provider === providerName);
-        setSuccessRate(ch?.success_rate ?? null);
+        const providerSet = new Set(providerName.split(',').map((s: string) => s.trim()).filter(Boolean));
+        const matched = (stats.channel_success_rates || []).filter((c: any) => providerSet.has(c.provider));
+        if (matched.length > 0) {
+          const totalReqs = matched.reduce((s: number, c: any) => s + (c.total || 0), 0);
+          const totalSucc = matched.reduce((s: number, c: any) => s + (c.success_count || Math.round((c.success_rate || 0) * (c.total || 0))), 0);
+          setSuccessRate(totalReqs > 0 ? totalSucc / totalReqs : null);
+        } else {
+          setSuccessRate(null);
+        }
       }
       if (usageRes.ok) {
         const result = await usageRes.json();
@@ -185,7 +192,7 @@ export function ChannelAnalyticsSheet({ open, onOpenChange, providerName }: Chan
           <div className="p-4 sm:p-5 border-b border-border flex justify-between items-center bg-muted/30 flex-shrink-0">
             <Dialog.Title className="text-lg sm:text-xl font-bold text-foreground flex items-center gap-2">
               <BarChart3 className="w-5 h-5 text-primary" />
-              渠道分析: {providerName}
+              渠道分析: {providerName.split(',')[0]}
             </Dialog.Title>
             <Dialog.Close className="text-muted-foreground hover:text-foreground">
               <X className="w-5 h-5" />

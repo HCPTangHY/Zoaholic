@@ -1066,8 +1066,8 @@ async def generate_sse_response(
         delta_content = {"role": "assistant", "content": "", "reasoning_content": reasoning_content}
         if thought_signature:
             delta_content["thought_signature"] = thought_signature
-    # 优先级 7：普通文本内容
-    elif content:
+    # 优先级 7：普通文本内容（支持 string 或结构化 list）
+    elif content is not None and content != "":
         delta_content = {"role": "assistant", "content": content}
         if thought_signature:
             delta_content["thought_signature"] = thought_signature

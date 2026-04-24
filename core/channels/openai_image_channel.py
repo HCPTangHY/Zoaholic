@@ -315,20 +315,19 @@ async def fetch_image_stream(client, url, headers, payload, model, timeout):
             sse_rev = await generate_sse_response(timestamp, model, content=f"*Revised prompt: {revised}*\n\n")
             yield sse_rev
 
-        # SSE keepalive comment
-        yield ": streaming inline image\n\n"
-
-        # 分块发送大图 base64
+        # 发结构化 image content item
         mime = "image/png"
         if output_format == "jpeg":
             mime = "image/jpeg"
         elif output_format == "webp":
             mime = "image/webp"
 
-        async for sse_string in generate_chunked_image_md(
-            b64, timestamp, model, mime_type=mime
-        ):
-            yield sse_string
+        image_content_item = [{
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{b64}"}
+        }]
+        sse_string = await generate_sse_response(timestamp, model, content=image_content_item)
+        yield sse_string
 
     # stop
     sse_string = await generate_sse_response(timestamp, model, stop="stop")

@@ -35,12 +35,13 @@ from core.plugins import (
 PLUGIN_INFO = {
     "name": "oai_tools",
     "version": "2.0.0",
-    "description": "OpenAI 工具插件 - 统一处理 -high/-medium/-low/-image 等后缀",
+    "description": "OpenAI 后缀工具插件 — 在模型名后追加 -high/-medium/-low/-image 等后缀，自动设置 reasoning_effort 或注入 image_generation tool。后缀可组合，如 gpt-4o-image-high。注意: -image 仅对 openai-responses 引擎生效。",
     "author": "Zoaholic Team",
     "dependencies": [],
     "metadata": {
         "category": "interceptors",
         "tags": ["openai", "reasoning", "image", "tools", "gpt-5"],
+        "params_hint": "无需参数。后缀直接写在模型名后: -high / -medium / -low / -minimal / -none / -xhigh / -image",
     },
 }
 

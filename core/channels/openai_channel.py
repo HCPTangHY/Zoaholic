@@ -174,6 +174,10 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
 
     messages = []
     for msg in request.messages:
+        # 透传 Message model 上的额外字段（reasoning_content 等）
+        # Message 使用 extra='allow'，客户端传入的非标准字段保存在 model_extra 中
+        extra_fields = {k: v for k, v in (msg.model_extra or {}).items() if v is not None}
+
         tool_calls = None
         tool_call_id = None
         if isinstance(msg.content, list):
@@ -256,13 +260,13 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
                             "arguments": tool_call.function.arguments
                         }
                     })
-                messages.append({"role": msg.role, "tool_calls": tool_calls_list})
+                messages.append({"role": msg.role, "tool_calls": tool_calls_list, **extra_fields})
         elif tool_call_id:
             tools_mode = get_tools_mode(provider)
             if tools_mode != "none":
-                messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content})
+                messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content, **extra_fields})
         else:
-            messages.append({"role": msg.role, "content": content})
+            messages.append({"role": msg.role, "content": content, **extra_fields})
 
     if ("o1-mini" in original_model or "o1-preview" in original_model) and len(messages) > 1 and messages[0]["role"] == "system":
         system_msg = messages.pop(0)
@@ -564,10 +568,14 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
                 openrouter_base64_image = safe_get(line, "choices", 0, "delta", "images", 0, "image_url", "url", default="")
                 if openrouter_base64_image:
                     b64_pure = extract_base64_data(openrouter_base64_image if openrouter_base64_image.startswith("data:image/") else f"data:image/png;base64,{openrouter_base64_image}")
-                    # 使用统一 helper
+                    # 发结构化 image content item，方言出口各自转换
                     mark_content_start()
-                    async for sse_string in generate_chunked_image_md(b64_pure, timestamp, payload["model"]):
-                        yield sse_string
+                    image_content_item = [{
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64_pure}"}
+                    }]
+                    sse_string = await generate_sse_response(timestamp, payload["model"], content=image_content_item)
+                    yield sse_string
                     continue
 
                 azure_databricks_claude_summary_content = safe_get(line, "choices", 0, "delta", "content", 0, "summary", 0, "text", default="")

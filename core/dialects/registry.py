@@ -122,6 +122,11 @@ class DialectDefinition:
     extract_token: Optional[ExtractToken] = None
     parse_usage: Optional[ParseUsage] = None
 
+    # 流式结构化 content 处理：
+    # False（默认）= 自动将 delta.content list 拍扁为 markdown string（OAI/Claude 等不支持结构化图片的方言）
+    # True = 保留结构化 content，由方言自己的 render_stream 处理（如 Gemini 转 inlineData）
+    structured_stream: bool = False
+
     # 端点定义：用于自动路由注册
     endpoints: List[EndpointDefinition] = field(default_factory=list)
 

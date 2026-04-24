@@ -70,7 +70,10 @@ async def api_config(api_index: int = Depends(verify_admin_api_key)):
     获取当前 API 配置
     """
     app = get_app()
-    encoded_config = jsonable_encoder(app.state.config)
+    # 过滤运行时字段和展开的子渠道，返回可持久化的配置
+    from utils import _sanitize_config_for_persistence
+    clean_config = _sanitize_config_for_persistence(app.state.config)
+    encoded_config = jsonable_encoder(clean_config)
     return JSONResponse(content={"api_config": encoded_config})
 
 

@@ -17,6 +17,61 @@ from .registry import get_dialect, list_dialects, EndpointDefinition
 if TYPE_CHECKING:
     from starlette.responses import Response
 
+
+def _flatten_stream_content(sse_chunk: str) -> str:
+    """将 SSE chunk 中结构化的 delta.content list 拍扁为 markdown 字符串。
+
+    作为方言基类的默认行为：不支持结构化图片的方言（OAI/Claude/Responses）
+    在 render_stream 之前自动调用。
+    """
+    if not isinstance(sse_chunk, str) or not sse_chunk.startswith("data: "):
+        return sse_chunk
+
+    data_str = sse_chunk[6:].strip()
+    if data_str == "[DONE]":
+        return sse_chunk
+
+    try:
+        chunk = json_loads(data_str)
+    except Exception:
+        return sse_chunk
+
+    choices = chunk.get("choices") or []
+    modified = False
+    for choice in choices:
+        delta = choice.get("delta")
+        if not delta:
+            continue
+        content = delta.get("content")
+        if isinstance(content, list):
+            # 拍扁结构化 content items 为 markdown string
+            parts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "")
+                if item_type == "text":
+                    text = item.get("text", "")
+                    if text:
+                        parts.append(text)
+                elif item_type == "image_url":
+                    image_url = item.get("image_url")
+                    url = ""
+                    if isinstance(image_url, dict):
+                        url = image_url.get("url", "")
+                    elif isinstance(image_url, str):
+                        url = image_url
+                    if url:
+                        parts.append(f"![image]({url})")
+            delta["content"] = "\n\n".join(parts) if parts else ""
+            modified = True
+
+    if not modified:
+        return sse_chunk
+
+    return f"data: {json_dumps_text(chunk, ensure_ascii=False)}\n\n"
+
+
 # 全局方言路由器
 dialect_router = APIRouter()
 
@@ -173,8 +228,12 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
                 # 每次流请求创建独立实例以维护 message_start 等生命周期状态
                 stream_renderer = dialect.render_stream_factory() if dialect.render_stream_factory else None
                 render_fn = stream_renderer or dialect.render_stream
+                # 默认拍扁：方言未声明 structured_stream 时，自动将结构化 content list 拍扁为 markdown string
+                should_flatten = not dialect.structured_stream
                 async for chunk in resp.body_iterator:
                     chunk_text = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                    if should_flatten:
+                        chunk_text = _flatten_stream_content(chunk_text)
                     converted = await render_fn(chunk_text) if render_fn else chunk_text
                     if converted:
                         yield converted

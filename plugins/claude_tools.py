@@ -35,12 +35,13 @@ from core.plugins import (
 PLUGIN_INFO = {
     "name": "claude_tools",
     "version": "1.0.0",
-    "description": "Claude 工具插件 - 支持 -thinking/-search/-code 等后缀的原生 Claude 渠道参数设置",
+    "description": "Claude 后缀工具插件 — 在模型名后追加 -thinking/-search/-code/-computer/-artifacts 等后缀，自动注入对应的原生 Claude API 参数。后缀可自由组合，如 claude-sonnet-4-thinking-search。",
     "author": "Zoaholic Team",
     "dependencies": [],
     "metadata": {
         "category": "interceptors",
         "tags": ["claude", "anthropic", "thinking", "tools"],
+        "params_hint": "无需参数。后缀直接写在模型名后: -thinking[-N] / -search / -code / -computer / -artifacts",
     },
 }
 

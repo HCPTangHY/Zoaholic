@@ -82,7 +82,10 @@ async def render_openai_response(
 
 
 async def render_openai_stream(canonical_sse_chunk: str) -> str:
-    """Canonical SSE -> OpenAI SSE（直接透传）"""
+    """Canonical SSE -> OpenAI SSE
+
+    直接透传。结构化 content list 的拍扁已在 router 层默认完成。
+    """
     return canonical_sse_chunk
 
 
