@@ -267,6 +267,7 @@ export default function Channels() {
   const [headerEntries, setHeaderEntries] = useState<HeaderEntry[]>([]);
   const [keyTestDialogOpen, setKeyTestDialogOpen] = useState(false);
   const [keyTestInitialIndex, setKeyTestInitialIndex] = useState<number | null>(null);
+  const [keyTestOverride, setKeyTestOverride] = useState<{ engine: string; base_url: string; models: string[]; title: string } | null>(null);
   const [overridesJson, setOverridesJson] = useState('');
   const [statusCodeOverridesJson, setStatusCodeOverridesJson] = useState('');
   const [modelDisplayKey, setModelDisplayKey] = useState(0);
@@ -991,8 +992,9 @@ export default function Channels() {
     setTestDialogOpen(true);
   };
 
-  const openKeyTestDialog = (initialIndex: number | null = null) => {
+  const openKeyTestDialog = (initialIndex: number | null = null, subOverride?: { engine: string; base_url: string; models: string[]; title: string }) => {
     setKeyTestInitialIndex(initialIndex);
+    setKeyTestOverride(subOverride ?? null);
     setKeyTestDialogOpen(true);
   };
 
@@ -1813,6 +1815,33 @@ export default function Channels() {
                   </div>
                 </section>
 
+                {/* 2a. 子渠道模式：简化的 Key 测试入口 */}
+                {editingSubChannel && (
+                  <section>
+                    <div className="flex items-center justify-between text-sm font-semibold text-foreground mb-2 border-b border-border pb-2">
+                      <span className="flex items-center gap-2">
+                        <Settings2 className="w-4 h-4 text-emerald-500" /> API Keys
+                        <span className="text-xs font-normal text-muted-foreground">（继承主渠道）</span>
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                      <span>共 <span className="font-mono text-foreground">{formData.api_keys.filter(k => !k.disabled).length}</span>/{formData.api_keys.length} 个可用 Key</span>
+                      <button
+                        onClick={() => openKeyTestDialog(null, {
+                          engine: formData.engine || 'openai',
+                          base_url: formData.base_url || '',
+                          models: formData.models || [],
+                          title: `测试 API Keys: ${formData.provider}`,
+                        })}
+                        disabled={formData.api_keys.length === 0}
+                        className="text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <Play className="w-3 h-3" /> 多key测试
+                      </button>
+                    </div>
+                  </section>
+                )}
+
                 {/* 2. API Keys (子渠道模式隐藏) */}
                 {!editingSubChannel && <section>
                   <div className="flex items-center justify-between text-sm font-semibold text-foreground mb-2 border-b border-border pb-2">
@@ -2043,6 +2072,22 @@ export default function Channels() {
                               {sub.enabled === false && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/10 text-red-500">已禁用</span>}
                             </div>
                             <div className="flex items-center gap-1">
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  openKeyTestDialog(null, {
+                                    engine: sub.engine || formData.engine || 'openai',
+                                    base_url: sub.base_url || formData.base_url || '',
+                                    models: sub.models || [],
+                                    title: `测试 API Keys: ${formData.provider}:${sub.engine || 'sub'}`,
+                                  });
+                                }}
+                                disabled={formData.api_keys.length === 0 || !sub.engine}
+                                className="text-blue-600 dark:text-blue-400 hover:bg-blue-500/10 p-1 rounded-md transition-colors disabled:opacity-30"
+                                title="用子渠道引擎测试全部 Key"
+                              >
+                                <Play className="w-4 h-4" />
+                              </button>
                               {originalIndex !== null && (
                                 <button
                                   onClick={(e) => {
@@ -2933,13 +2978,13 @@ export default function Channels() {
       {formData && (
         <ApiKeyTestDialog
           open={keyTestDialogOpen}
-          onOpenChange={setKeyTestDialogOpen}
-          title={`测试 API Keys: ${formData.provider || '未命名渠道'}`}
-          engine={formData.engine || 'openai'}
-          base_url={formData.base_url || ''}
+          onOpenChange={(v) => { setKeyTestDialogOpen(v); if (!v) setKeyTestOverride(null); }}
+          title={keyTestOverride?.title || `测试 API Keys: ${formData.provider || '未命名渠道'}`}
+          engine={keyTestOverride?.engine || formData.engine || 'openai'}
+          base_url={keyTestOverride?.base_url || formData.base_url || ''}
           provider_snapshot={buildProviderSnapshotForTest()}
           apiKeys={formData.api_keys}
-          availableModels={getProviderModelNameListForUi()}
+          availableModels={keyTestOverride?.models || getProviderModelNameListForUi()}
           initialKeyIndex={keyTestInitialIndex}
           onDisableKeys={disableKeysInForm}
         />

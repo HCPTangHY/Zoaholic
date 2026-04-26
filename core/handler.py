@@ -146,7 +146,8 @@ async def process_request(
     endpoint: Optional[str] = None,
     role: Optional[str] = None,
     timeout_value: int = DEFAULT_TIMEOUT,
-    keepalive_interval: Optional[int] = None
+    keepalive_interval: Optional[int] = None,
+    force_api_key: Optional[str] = None
 ) -> Response:
     """
     向单个 provider 发送请求并处理响应
@@ -173,7 +174,9 @@ async def process_request(
     model_dict = provider["_model_dict_cache"]
     original_model = model_dict[request.model]
     
-    if is_local_api_key(provider['provider']):
+    if force_api_key:
+        api_key = force_api_key
+    elif is_local_api_key(provider['provider']):
         api_key = provider['provider']
     elif provider.get("api"):
         api_key = await provider_api_circular_list[provider['provider']].next(original_model)
@@ -809,6 +812,8 @@ class ModelRequestHandler:
         original_payload: Optional[Dict[str, Any]] = None,
         original_headers: Optional[Dict[str, str]] = None,
         passthrough_only: bool = False,
+        override_providers: Optional[List[Dict[str, Any]]] = None,
+        force_api_key: Optional[str] = None,
     ) -> Response:
         """
         处理模型请求
@@ -827,53 +832,61 @@ class ModelRequestHandler:
         """
         config = self.app.state.config
         request_model_name = request_data.model
-        
-        # 用户 API Key 限速（统一入口，标准路由和方言路由都经过此处）
-        try:
-            final_api_key = self.app.state.api_list[api_index]
-            await self.app.state.user_api_keys_rate_limit[final_api_key].next(request_model_name)
-        except HTTPException:
-            raise
-        except Exception:
-            raise HTTPException(status_code=429, detail="Too many requests")
 
-        if not safe_get(config, 'api_keys', api_index, 'model'):
-            raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
+        # ── override 模式：跳过用户限速和全局路由（测试/直接调用场景） ──
+        if override_providers is not None:
+            matching_providers = override_providers
+            num_matching_providers = len(matching_providers)
+            if num_matching_providers == 0:
+                raise HTTPException(status_code=400, detail="No providers specified for test")
+            scheduling_algorithm = "fixed_priority"
+            auto_retry = False
+            role = "test"
+        else:
+            # ── 正常路径：用户限速 + 全局路由 ──
+            try:
+                final_api_key = self.app.state.api_list[api_index]
+                await self.app.state.user_api_keys_rate_limit[final_api_key].next(request_model_name)
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(status_code=429, detail="Too many requests")
 
-        # 调度算法优先级：API Key preferences > 全局 preferences > 默认值
-        scheduling_algorithm = safe_get(
-            config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM",
-            default=safe_get(config, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
-        )
+            if not safe_get(config, 'api_keys', api_index, 'model'):
+                raise HTTPException(status_code=404, detail=f"No matching model found: {request_model_name}")
 
-        # 估算请求 token 数
-        request_total_tokens = 0
-        if request_data and isinstance(request_data, RequestModel):
-            for message in request_data.messages:
-                if message.content and isinstance(message.content, str):
-                    request_total_tokens += len(message.content)
-        request_total_tokens = int(request_total_tokens / 4)
+            scheduling_algorithm = safe_get(
+                config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM",
+                default=safe_get(config, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
+            )
 
-        matching_providers = await get_right_order_providers(
-            request_model_name, config, api_index, scheduling_algorithm, 
-            self.app, request_total_tokens=request_total_tokens
-        )
-        matching_providers = await self._build_attempt_providers(
-            matching_providers,
-            request_model_name=request_model_name,
-            scheduling_algorithm=scheduling_algorithm,
-            advance_cursor=True,
-        )
-        num_matching_providers = len(matching_providers)
+            request_total_tokens = 0
+            if request_data and isinstance(request_data, RequestModel):
+                for message in request_data.messages:
+                    if message.content and isinstance(message.content, str):
+                        request_total_tokens += len(message.content)
+            request_total_tokens = int(request_total_tokens / 4)
+
+            matching_providers = await get_right_order_providers(
+                request_model_name, config, api_index, scheduling_algorithm, 
+                self.app, request_total_tokens=request_total_tokens
+            )
+            matching_providers = await self._build_attempt_providers(
+                matching_providers,
+                request_model_name=request_model_name,
+                scheduling_algorithm=scheduling_algorithm,
+                advance_cursor=True,
+            )
+            num_matching_providers = len(matching_providers)
+
+            auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
+            role = safe_get(
+                config, 'api_keys', api_index, "role", 
+                default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8]
+            )
 
         status_code = 500
         error_message = None
-
-        auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
-        role = safe_get(
-            config, 'api_keys', api_index, "role", 
-            default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8]
-        )
 
         index = 0
         # 获取配置的最大重试次数上限，默认为 10
@@ -942,12 +955,13 @@ class ModelRequestHandler:
             # 检查是否所有 API 密钥都被速率限制
             model_dict = provider["_model_dict_cache"]
             original_model = model_dict[request_model_name]
-            if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
-                error_message = "All API keys are rate limited and stop auto retry!"
-                if num_matching_providers == 1:
-                    break
-                else:
-                    continue
+            if not override_providers and provider_name in provider_api_circular_list:
+                if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
+                    error_message = "All API keys are rate limited and stop auto retry!"
+                    if num_matching_providers == 1:
+                        break
+                    else:
+                        continue
 
             original_request_model = (original_model, request_data.model)
             
@@ -1022,7 +1036,8 @@ class ModelRequestHandler:
                 ) if process_fn is process_request_passthrough else await process_request(
                     request_data, provider, background_tasks, self.app,
                     self.request_info_getter, self.update_channel_stats_func,
-                    endpoint, role, local_timeout_value, keepalive_interval
+                    endpoint, role, local_timeout_value, keepalive_interval,
+                    force_api_key=force_api_key
                 )
 
                 # 成功时记录重试路径和重试次数

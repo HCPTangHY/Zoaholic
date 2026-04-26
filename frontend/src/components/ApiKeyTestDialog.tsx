@@ -98,7 +98,7 @@ export function ApiKeyTestDialog({
     if (!open) return;
 
     const firstModel = modelOptions[0] || '';
-    setModel(prev => (prev ? prev : firstModel));
+    setModel(firstModel);
 
     const init = new Map<number, KeyTestResult>();
     apiKeys.forEach((_, idx) => {
