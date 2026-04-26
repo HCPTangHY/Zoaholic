@@ -5,7 +5,7 @@ Stats 统计和使用量路由
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, Body
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_serializer, Field
 
@@ -686,14 +686,24 @@ async def get_usage_analysis(
 
     # 用当前配置价格实时计算每行费用（渠道级 > 全局级 > 0）
     from core.stats import get_current_model_prices
+    from core.default_prices import IMAGE_TOKENS_PER_REQUEST
     app = get_app()
     for entry in data:
         prompt_price, completion_price = get_current_model_prices(
             app, entry["model"], provider_name=entry["provider"]
         )
+        pt = entry["total_prompt_tokens"]
+        ct = entry["total_completion_tokens"]
+
+        # 图像模型 token 补估算：1000 tokens × 请求次数
+        if pt == 0 and ct == 0 and entry["request_count"] > 0 and "image" in entry["model"].lower():
+            ct = IMAGE_TOKENS_PER_REQUEST * entry["request_count"]
+            entry["total_completion_tokens"] = ct
+            entry["total_tokens"] = ct
+
         entry["total_cost"] = (
-            entry["total_prompt_tokens"] * prompt_price
-            + entry["total_completion_tokens"] * completion_price
+            pt * prompt_price
+            + ct * completion_price
         ) / 1_000_000
 
     return JSONResponse(content={
@@ -1649,3 +1659,33 @@ async def get_outbound_logs(
         search=search,
     )
     return JSONResponse(content=result)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 内置默认价格批量匹配
+# ═══════════════════════════════════════════════════════════════
+
+class ResolvePricesRequest(BaseModel):
+    models: List[str] = Field(..., max_length=500, description="模型名列表")
+
+
+@router.post("/v1/stats/resolve_prices", dependencies=[Depends(rate_limit_dependency)])
+async def resolve_default_prices(
+    token: str = Depends(verify_admin_api_key),
+    body: ResolvePricesRequest = Body(...),
+):
+    """
+    批量匹配模型名到内置默认价格库。
+
+    Response: { "prices": { "gpt-4o": [2.5, 10.0], ... }, "last_updated": "2026-04-08" }
+    """
+    from core.default_prices import match_default_price, PRICES_LAST_UPDATED
+
+    prices = {}
+    for name in body.models:
+        if name:
+            result = match_default_price(name)
+            if result is not None:
+                prices[name] = [result[0], result[1]]
+
+    return JSONResponse(content={"prices": prices, "last_updated": PRICES_LAST_UPDATED})

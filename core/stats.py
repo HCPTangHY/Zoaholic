@@ -354,7 +354,8 @@ def get_current_model_prices(app, model_name: str, provider_name: str = None):
     查找优先级：
     1. 渠道级 provider.preferences.model_price（前缀匹配）
     2. 全局 preferences.model_price（前缀匹配）
-    3. 都未配置 → 返回 (0, 0)，即不计费
+    3. 内置默认价格库（后缀归一化 + 前缀匹配）
+    4. 都未配置 → 返回 (0, 0)，即不计费
 
     Args:
         app: FastAPI 应用实例
@@ -383,7 +384,13 @@ def get_current_model_prices(app, model_name: str, provider_name: str = None):
         if result is not None:
             return result
 
-        # 3. 都未配置，不计费
+        # 3. 内置默认价格库（后缀归一化 + 前缀匹配）
+        from core.default_prices import match_default_price
+        result = match_default_price(model_name)
+        if result is not None:
+            return result
+
+        # 4. 都未配置，不计费
         return 0.0, 0.0
     except Exception:
         return 0.0, 0.0
@@ -518,8 +525,17 @@ async def update_stats(current_info: dict, app=None, get_model_prices_func=None)
                 prompt_price, completion_price = 0.0, 0.0
             current_info["prompt_price"] = prompt_price
             current_info["completion_price"] = completion_price
+
+            # 图像模型 token 注入：上游不返回 token 时按 1000 tokens = 1 张图注入
+            if (current_info.get("prompt_tokens", 0) == 0
+                    and current_info.get("completion_tokens", 0) == 0
+                    and "image" in current_info["model"].lower()):
+                from core.default_prices import IMAGE_TOKENS_PER_REQUEST
+                current_info["completion_tokens"] = IMAGE_TOKENS_PER_REQUEST
+                current_info["total_tokens"] = IMAGE_TOKENS_PER_REQUEST
     except Exception:
-        pass
+        logger.warning("Failed to snapshot price/token for model=%s",
+                       current_info.get("model", "?"), exc_info=True)
 
     # 使用重试机制写入数据库
     for attempt in range(SQLITE_MAX_RETRIES):
