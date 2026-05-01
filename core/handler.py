@@ -193,6 +193,12 @@ async def process_request(
         request.stream = stream_override
 
     channel_id = f"{provider['provider']}"
+    # 记录 provider 活跃度（内存级，O(1)）
+    try:
+        from routes.stats import record_provider_activity
+        record_provider_activity(channel_id)
+    except Exception:
+        pass
     if engine != "moderation":
         logger.info(f"provider: {channel_id[:11]:<11} model: {request.model:<22} engine: {engine[:13]:<13} role: {role}")
 

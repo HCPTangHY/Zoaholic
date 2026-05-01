@@ -49,6 +49,16 @@ BALANCE_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "value_type": "'amount'",
         },
     },
+    "deepseek": {
+        "endpoint": "https://api.deepseek.com/user/balance",
+        "method": "GET",
+        "auth": "bearer",
+        "mapping": {
+            "available": "balance_infos.0.total_balance",
+            "currency": "balance_infos.0.currency",
+            "value_type": "'amount'",
+        },
+    },
 }
 
 

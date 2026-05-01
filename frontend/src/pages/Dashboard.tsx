@@ -269,8 +269,22 @@ export default function Dashboard() {
         const result = await res.json();
         const data: AnalysisEntry[] = result.data || [];
         
+        // 批量从后端查价格（走完整 6 层级联）
+        let backendPrices: Record<string, { prompt: number; completion: number }> = {};
+        try {
+          const uniqueModels = data.map(e => ({ model: e.model, provider: e.provider }));
+          const priceRes = await apiFetch('/v1/stats/resolve_prices', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ models: uniqueModels }),
+          });
+          if (priceRes.ok) {
+            const priceData = await priceRes.json();
+            backendPrices = priceData.prices || {};
+          }
+        } catch { /* fallback to local matching */ }
+
         setAnalysisData(prevData => {
-          // 修复价格保留逻辑：根据 provider+model 匹配旧价格
           const newPrices: Record<number, RowPrice> = {};
           data.forEach((entry, i) => {
             const key = `${entry.provider}:${entry.model}`;
@@ -278,9 +292,14 @@ export default function Dashboard() {
             if (oldIdx !== -1 && rowPrices[oldIdx]) {
               newPrices[i] = rowPrices[oldIdx];
             } else {
-              // 自动从全局 model_price 前缀匹配填充
-              const auto = matchModelPrice(globalModelPrice, entry.model);
-              newPrices[i] = auto || { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
+              // 优先用后端价格，fallback 到本地匹配
+              const bp = backendPrices[entry.model];
+              if (bp && (bp.prompt > 0 || bp.completion > 0)) {
+                newPrices[i] = bp;
+              } else {
+                const auto = matchModelPrice(globalModelPrice, entry.model);
+                newPrices[i] = auto || { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
+              }
             }
           });
           setRowPrices(newPrices);
@@ -317,7 +336,29 @@ export default function Dashboard() {
     }
   };
 
-  const applyDefaultPricesToAll = () => {
+  const applyDefaultPricesToAll = async () => {
+    // 走后端完整价格链
+    try {
+      const models = analysisData.map(e => ({ model: e.model, provider: e.provider }));
+      const priceRes = await apiFetch('/v1/stats/resolve_prices', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ models }),
+      });
+      if (priceRes.ok) {
+        const { prices: bp } = await priceRes.json();
+        const newPrices: Record<number, RowPrice> = {};
+        analysisData.forEach((entry, i) => {
+          const p = bp[entry.model];
+          newPrices[i] = (p && (p.prompt > 0 || p.completion > 0))
+            ? p
+            : matchModelPrice(globalModelPrice, entry.model) || { prompt: defaultPromptPrice, completion: defaultCompletionPrice };
+        });
+        setRowPrices(newPrices);
+        return;
+      }
+    } catch { /* fallback */ }
+    // fallback 到本地匹配
     const prices: Record<number, RowPrice> = {};
     analysisData.forEach((_, i) => {
       const auto = matchModelPrice(globalModelPrice, analysisData[i].model);

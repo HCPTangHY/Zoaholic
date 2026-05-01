@@ -246,6 +246,7 @@ function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus
 
 export default function Channels() {
   const [providers, setProviders] = useState<any[]>([]);
+  const [providerActivity, setProviderActivity] = useState<Record<string, string>>({});
   const [channelTypes, setChannelTypes] = useState<ChannelOption[]>([]);
   const [allPlugins, setAllPlugins] = useState<PluginOption[]>([]);
   const [loading, setLoading] = useState(true);
@@ -320,10 +321,11 @@ export default function Channels() {
         setLocalCountdowns(countdowns);
       }).catch(() => {});
 
-      const [configRes, typesRes, pluginsRes] = await Promise.all([
+      const [configRes, typesRes, pluginsRes, activityRes] = await Promise.all([
         apiFetch('/v1/api_config', { headers }),
         apiFetch('/v1/channels', { headers }),
-        apiFetch('/v1/plugins/interceptors', { headers })
+        apiFetch('/v1/plugins/interceptors', { headers }),
+        apiFetch('/v1/stats/provider_activity', { headers }).catch(() => null),
       ]);
 
       if (configRes.ok) {
@@ -346,6 +348,10 @@ export default function Channels() {
       if (pluginsRes.ok) {
         const data = await pluginsRes.json();
         setAllPlugins(data.interceptor_plugins || []);
+      }
+      if (activityRes?.ok) {
+        const data = await activityRes.json();
+        setProviderActivity(data.activity || {});
       }
     } catch (err) {
       console.error('Failed to fetch initial data', err);
@@ -900,7 +906,7 @@ export default function Channels() {
   const handleDeleteSubChannel = async (parentIdx: number, subIdx: number) => {
     const parent = providers[parentIdx];
     const sub = (parent.sub_channels || [])[subIdx];
-    const name = sub?.engine || `子渠道 ${subIdx + 1}`;
+    const name = sub?.remark || sub?.engine || `子渠道 ${subIdx + 1}`;
     if (!confirm(`确定要删除子渠道 "${name}" 吗？`)) return;
     const subs = (parent.sub_channels || []).filter((_: any, i: number) => i !== subIdx);
     const newProviders = [...providers];
@@ -1326,7 +1332,7 @@ export default function Channels() {
                   <div className="flex items-center gap-2 min-w-0">
                     <span className="text-muted-foreground text-xs">└</span>
                     <div className="min-w-0">
-                      <div className="text-xs font-medium text-foreground truncate">{sub.engine || '?'}</div>
+                      <div className="text-xs font-medium text-foreground truncate">{sub.remark || sub.engine || '?'}</div>
                       <div className="text-[10px] text-muted-foreground">{subModels.length} 模型</div>
                     </div>
                     {!subEnabled && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/10 text-red-500 flex-shrink-0">禁用</span>}
@@ -1442,6 +1448,51 @@ export default function Channels() {
 
   const hasActiveFilters = filterKeyword || filterEngine || filterGroup || filterStatus;
 
+  // 按活跃度标记：30天内有请求的为活跃
+  const INACTIVE_DAYS = 30;
+  const isProviderInactive = (provider: any): boolean => {
+    const hasActivityData = Object.keys(providerActivity).length > 0;
+    if (!hasActivityData) return false;
+    const lastSeen = providerActivity[provider.provider];
+    if (!lastSeen) return false;
+    return (Date.now() / 1000 - Number(lastSeen)) > INACTIVE_DAYS * 86400;
+  };
+
+  // 折叠状态
+  const [expandedInactiveGroups, setExpandedInactiveGroups] = useState<Set<number>>(new Set());
+  const toggleInactiveGroup = (groupKey: number) => {
+    setExpandedInactiveGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(groupKey)) next.delete(groupKey); else next.add(groupKey);
+      return next;
+    });
+  };
+
+  // 分段：连续不活跃的合并成一个可折叠 group
+  type Segment = { type: 'active'; item: typeof filteredProviders[0] } | { type: 'inactive'; items: typeof filteredProviders; startIndex: number };
+  const segments: Segment[] = useMemo(() => {
+    const segs: Segment[] = [];
+    let buf: typeof filteredProviders = [];
+    let bufStart = 0;
+    const flush = () => {
+      if (buf.length > 0) {
+        segs.push({ type: 'inactive', items: [...buf], startIndex: bufStart });
+        buf = [];
+      }
+    };
+    filteredProviders.forEach((item, i) => {
+      if (isProviderInactive(item.p)) {
+        if (buf.length === 0) bufStart = i;
+        buf.push(item);
+      } else {
+        flush();
+        segs.push({ type: 'active', item });
+      }
+    });
+    flush();
+    return segs;
+  }, [filteredProviders, providerActivity]);
+
   return (
     <div className="space-y-6 animate-in fade-in duration-500 font-sans">
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
@@ -1542,7 +1593,23 @@ export default function Channels() {
         ) : filteredProviders.length === 0 ? (
           <div className="p-12 text-center text-muted-foreground">{providers.length === 0 ? '暂无渠道配置，点击上方按钮添加。' : '没有符合筛选条件的渠道。'}</div>
         ) : (
-          filteredProviders.map(({ p, idx }) => <ProviderCard key={idx} p={p} idx={idx} />)
+          <>
+            {segments.map((seg, si) => seg.type === 'active' ? (
+              <ProviderCard key={`a-${seg.item.idx}`} p={seg.item.p} idx={seg.item.idx} />
+            ) : (
+              <div key={`i-${seg.startIndex}`} className="border border-border rounded-xl overflow-hidden">
+                <button onClick={() => toggleInactiveGroup(seg.startIndex)} className="w-full flex items-center justify-between px-4 py-3 bg-muted/30 hover:bg-muted/50 transition-colors text-sm">
+                  <span className="text-muted-foreground">不活跃渠道 ({seg.items.length})</span>
+                  <span className="text-xs text-muted-foreground">{expandedInactiveGroups.has(seg.startIndex) ? '▲' : '▼'}</span>
+                </button>
+                {expandedInactiveGroups.has(seg.startIndex) && (
+                  <div className="space-y-4 p-2 opacity-70">
+                    {seg.items.map(({ p, idx }) => <ProviderCard key={idx} p={p} idx={idx} />)}
+                  </div>
+                )}
+              </div>
+            ))}
+          </>
         )}
       </div>
 
@@ -1566,7 +1633,32 @@ export default function Channels() {
               </tr>
             </thead>
             <tbody className="divide-y divide-border text-sm">
-              {filteredProviders.map(({ p, idx }) => {
+              {(() => {
+                const rows: any[] = [];
+                segments.forEach((seg) => {
+                  if (seg.type === 'active') {
+                    rows.push({ p: seg.item.p, idx: seg.item.idx, inactive: false });
+                  } else {
+                    rows.push({ type: 'collapse-btn', startIndex: seg.startIndex, count: seg.items.length });
+                    if (expandedInactiveGroups.has(seg.startIndex)) {
+                      seg.items.forEach(item => rows.push({ p: item.p, idx: item.idx, inactive: true }));
+                    }
+                  }
+                });
+                return rows.map((row, ri) => {
+                  if (row.type === 'collapse-btn') {
+                    return (
+                      <tr key={`ig-${row.startIndex}`}>
+                        <td colSpan={7} className="p-0">
+                          <button onClick={() => toggleInactiveGroup(row.startIndex)} className="w-full flex items-center justify-between px-4 py-2 bg-muted/20 hover:bg-muted/40 transition-colors">
+                            <span className="text-muted-foreground text-xs">不活跃渠道 ({row.count})</span>
+                            <span className="text-xs text-muted-foreground">{expandedInactiveGroups.has(row.startIndex) ? '▲' : '▼'}</span>
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  }
+                  const { p, idx, inactive: isInactive } = row;
                 const isEnabled = p.enabled !== false;
                 const groups = Array.isArray(p.groups) ? p.groups : p.group ? [p.group] : ['default'];
                 const plugins = p.preferences?.enabled_plugins || [];
@@ -1586,7 +1678,7 @@ export default function Channels() {
                 const matchedModels = getMatchedModels(p);
 
                 return (<>
-                  <tr key={idx} className={`transition-colors ${isEnabled ? 'hover:bg-muted/50' : 'bg-muted/30 opacity-60'}`}>
+                  <tr key={idx} className={`transition-colors ${isInactive ? 'opacity-50' : ''} ${isEnabled ? 'hover:bg-muted/50' : 'bg-muted/30 opacity-60'}`}>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">
                         <ProviderLogo name={p.provider} engine={p.engine} />
@@ -1688,12 +1780,12 @@ export default function Channels() {
                         <td className="px-4 py-2 pl-10" colSpan={1}>
                           <div className="flex items-center gap-2">
                             <span className="text-muted-foreground text-xs">└</span>
-                            <span className="text-xs font-medium text-foreground">{sub.engine || '?'}</span>
+                            <span className="text-xs font-medium text-foreground">{sub.remark || sub.engine || '?'}</span>
                             <span className="text-[10px] text-muted-foreground">({subModelCount} 模型)</span>
                           </div>
                         </td>
                         <td className="px-4 py-2">
-                          <span className="text-xs text-muted-foreground font-mono">{sub.engine || '-'}</span>
+                          <span className="text-xs text-muted-foreground font-mono">{sub.remark || sub.engine || '-'}</span>
                         </td>
                         <td className="px-4 py-2 text-center">
                           <span className="text-xs text-muted-foreground">共享</span>
@@ -1732,7 +1824,8 @@ export default function Channels() {
                   })}
                 </>
                 );
-              })}
+              });
+              })()}
             </tbody>
           </table>
         )}
@@ -1746,7 +1839,7 @@ export default function Channels() {
             <div className="p-4 sm:p-5 border-b border-border flex justify-between items-center bg-muted/30 flex-shrink-0">
               <Dialog.Title className="text-lg sm:text-xl font-bold text-foreground flex items-center gap-2">
                 <Server className="w-5 h-5 text-primary" />
-                {editingSubChannel ? `编辑子渠道: ${formData?.engine || ''}` : originalIndex !== null ? `编辑: ${formData?.provider}` : '新增渠道'}
+                {editingSubChannel ? `编辑子渠道: ${formData?.remark || formData?.engine || ''}` : originalIndex !== null ? `编辑: ${formData?.provider}` : '新增渠道'}
               </Dialog.Title>
               <Dialog.Close className="text-muted-foreground hover:text-foreground"><X className="w-5 h-5" /></Dialog.Close>
             </div>
@@ -1761,8 +1854,12 @@ export default function Channels() {
                   <div className="space-y-4">
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                       <div>
-                        <label className="text-sm font-medium text-foreground mb-1.5 block">渠道标识 (Provider)</label>
-                        <input type="text" value={formData.provider} onChange={e => updateFormData('provider', e.target.value)} placeholder="e.g. openai" className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm outline-none text-foreground" />
+                        <label className="text-sm font-medium text-foreground mb-1.5 block">{editingSubChannel ? '子渠道名称' : '渠道标识 (Provider)'}</label>
+                        {editingSubChannel ? (
+                          <input type="text" value={formData.remark} onChange={e => updateFormData('remark', e.target.value)} placeholder="给子渠道起个名字" className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm outline-none text-foreground" />
+                        ) : (
+                          <input type="text" value={formData.provider} onChange={e => updateFormData('provider', e.target.value)} placeholder="e.g. openai" className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm outline-none text-foreground" />
+                        )}
                       </div>
                       <div>
                         <label className="text-sm font-medium text-foreground mb-1.5 block">核心引擎 (Engine)</label>

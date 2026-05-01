@@ -316,28 +316,8 @@ async def create_tables():
 
 # ============== 成本计算 ==============
 
-def _match_model_price(model_price_dict: dict, model_name: str):
-    """
-    在一个 model_price 字典中，按前缀匹配模型名，返回 (prompt_price, completion_price) 或 None。
-
-    匹配规则：遍历字典 key，如果 model_name 以该 key 开头则命中；
-    多个前缀同时匹配时，取最长的那个（最精确匹配）。
-    未命中任何 key 时，尝试 "default" 兜底。都没有则返回 None。
-    """
-    if not model_price_dict or not model_name:
-        return None
-    # 前缀匹配：收集所有命中的 key，取最长的（最精确）
-    matched = [(k, model_price_dict[k]) for k in model_price_dict if k and k != "default" and model_name.startswith(k)]
-    if matched:
-        matched.sort(key=lambda x: len(x[0]), reverse=True)
-        price_str = matched[0][1]
-    else:
-        price_str = None
-    # 兜底 default
-    if price_str is None:
-        price_str = model_price_dict.get("default")
-    if price_str is None:
-        return None
+def _parse_price_str(price_str) -> tuple:
+    """解析 '输入,输出' 格式的价格字符串"""
     parts = [p.strip() for p in str(price_str).split(",")]
     try:
         prompt_price = float(parts[0]) if len(parts) > 0 and parts[0] != "" else 0.0
@@ -345,6 +325,29 @@ def _match_model_price(model_price_dict: dict, model_name: str):
     except (ValueError, TypeError):
         return None
     return prompt_price, completion_price
+
+
+def _match_model_price(model_price_dict: dict, model_name: str, *, use_default: bool = True):
+    """
+    在一个 model_price 字典中，按前缀匹配模型名，返回 (prompt_price, completion_price) 或 None。
+
+    匹配规则：遍历字典 key，如果 model_name 以该 key 开头则命中；
+    多个前缀同时匹配时，取最长的那个（最精确匹配）。
+    use_default=True 时，未命中前缀也会尝试 "default" 兜底。
+    """
+    if not model_price_dict or not model_name:
+        return None
+    # 前缀匹配：收集所有命中的 key，取最长的（最精确）
+    matched = [(k, model_price_dict[k]) for k in model_price_dict if k and k != "default" and model_name.startswith(k)]
+    if matched:
+        matched.sort(key=lambda x: len(x[0]), reverse=True)
+        return _parse_price_str(matched[0][1])
+    # 兜底 default
+    if use_default:
+        default_str = model_price_dict.get("default")
+        if default_str is not None:
+            return _parse_price_str(default_str)
+    return None
 
 
 def get_current_model_prices(app, model_name: str, provider_name: str = None):
@@ -366,24 +369,51 @@ def get_current_model_prices(app, model_name: str, provider_name: str = None):
     """
     from utils import safe_get
     try:
-        # 1. 渠道级查找
+        provider_prices = {}
+        global_prices = safe_get(app.state.config, 'preferences', 'model_price', default={})
+
+        # 1. 渠道级：去 model_prefix + 精确/前缀匹配（不用 default）
         if provider_name:
             providers = safe_get(app.state.config, 'providers', default=[])
             for p in providers:
                 if p.get('provider') == provider_name:
+                    # 去掉渠道 model_prefix（如 [eve]claude-sonnet-4.5 → claude-sonnet-4.5）
+                    prefix = (p.get('model_prefix') or '').strip()
+                    if prefix and model_name.startswith(prefix):
+                        model_name = model_name[len(prefix):]
                     provider_prices = safe_get(p, 'preferences', 'model_price', default={})
-                    result = _match_model_price(provider_prices, model_name)
+                    result = _match_model_price(provider_prices, model_name, use_default=False)
                     if result is not None:
                         return result
                     break
 
-        # 2. 全局查找
-        global_prices = safe_get(app.state.config, 'preferences', 'model_price', default={})
-        result = _match_model_price(global_prices, model_name)
+        # 2. 全局精确/前缀匹配（不用 default）
+        result = _match_model_price(global_prices, model_name, use_default=False)
         if result is not None:
             return result
 
-        # 3. 都未配置，不计费
+        # 3. 外部价格库 fallback
+        try:
+            from .default_prices import lookup_price
+            result = lookup_price(model_name)
+            if result is not None:
+                return result
+        except Exception:
+            pass
+
+        # 4. 渠道 default 兜底
+        if provider_prices.get("default") is not None:
+            result = _parse_price_str(provider_prices["default"])
+            if result is not None:
+                return result
+
+        # 5. 全局 default 兜底
+        if global_prices.get("default") is not None:
+            result = _parse_price_str(global_prices["default"])
+            if result is not None:
+                return result
+
+        # 6. 都未配置，不计费
         return 0.0, 0.0
     except Exception:
         return 0.0, 0.0

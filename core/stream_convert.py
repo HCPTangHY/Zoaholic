@@ -87,7 +87,7 @@ async def assemble_stream_to_json(stream_generator):
                     if "reasoning_content" in delta and isinstance(delta["reasoning_content"], str):
                         reasoning_content += delta["reasoning_content"]
 
-                    if "tool_calls" in delta:
+                    if delta.get("tool_calls"):
                         for tc in delta["tool_calls"]:
                             idx = tc.get("index", 0)
                             if idx not in tool_calls_accum:

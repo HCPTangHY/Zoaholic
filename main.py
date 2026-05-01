@@ -525,6 +525,37 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.debug(f"Failed to restore auto-disabled keys: {e}")
 
+    # 启动一次性初始化 + 统一每日维护循环
+    try:
+        from core.default_prices import fetch_prices
+        await fetch_prices()
+    except Exception as e:
+        logger.debug(f"Failed to fetch default prices: {e}")
+    try:
+        from routes.stats import warm_provider_activity
+        asyncio.get_running_loop().create_task(warm_provider_activity())
+    except Exception as e:
+        logger.debug(f"Failed to schedule provider activity warm: {e}")
+
+    async def daily_maintenance():
+        """统一每日维护：价格库刷新 + 活跃度刷新"""
+        while True:
+            await asyncio.sleep(86400)
+            try:
+                from core.default_prices import fetch_prices
+                await fetch_prices(force=True)
+                logger.info("[daily_maintenance] Prices refreshed")
+            except Exception as e:
+                logger.warning(f"[daily_maintenance] Price refresh failed: {e}")
+            try:
+                from routes.stats import warm_provider_activity
+                await warm_provider_activity()
+                logger.info("[daily_maintenance] Provider activity refreshed")
+            except Exception as e:
+                logger.warning(f"[daily_maintenance] Activity refresh failed: {e}")
+
+    asyncio.get_running_loop().create_task(daily_maintenance())
+
     app.state.startup_completed = True
     yield
     # 关闭时的代码
