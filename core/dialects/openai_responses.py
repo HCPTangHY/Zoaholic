@@ -9,7 +9,9 @@ OpenAI Responses API 方言
 
 from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
 
+from core.json_utils import json_loads, json_dumps_text
 from core.models import RequestModel, Message, ContentItem
+from core.usage import extract_cache_usage
 
 from .registry import DialectDefinition, EndpointDefinition, register_dialect
 
@@ -259,6 +261,24 @@ async def parse_responses_request(
     return RequestModel(**request_data)
 
 
+def _responses_usage_from_canonical(usage: Any) -> Dict[str, Any]:
+    """将内核 OpenAI usage 转为 Responses API usage。
+
+    Responses API 的缓存命中字段位于 input_tokens_details.cached_tokens；集中转换可以同时覆盖
+    非流式响应和 usage-only 流式事件。
+    """
+    usage = usage if isinstance(usage, dict) else {}
+    response_usage: Dict[str, Any] = {
+        "input_tokens": usage.get("prompt_tokens", 0),
+        "output_tokens": usage.get("completion_tokens", 0),
+        "total_tokens": usage.get("total_tokens", 0),
+    }
+    cache_usage = extract_cache_usage(usage)
+    if cache_usage["cached_tokens"] > 0:
+        response_usage["input_tokens_details"] = {"cached_tokens": cache_usage["cached_tokens"]}
+    return response_usage
+
+
 async def render_responses_response(
     canonical_response: Dict[str, Any],
     model: str,
@@ -386,11 +406,8 @@ async def render_responses_response(
     # 添加 usage
     usage = canonical_response.get("usage")
     if usage:
-        response["usage"] = {
-            "input_tokens": usage.get("prompt_tokens", 0),
-            "output_tokens": usage.get("completion_tokens", 0),
-            "total_tokens": usage.get("total_tokens", 0)
-        }
+        # Responses 方言出口需要把 OAI 缓存命中字段转为 input_tokens_details.cached_tokens。
+        response["usage"] = _responses_usage_from_canonical(usage)
 
     return response
 
@@ -406,8 +423,34 @@ async def render_responses_stream(canonical_sse_chunk: str) -> str:
     event: response.output_text.delta
     data: {"type": "response.output_text.delta", "delta": "..."}
     """
-    # 对于透传模式，直接返回原始内容
-    # 实际的格式转换在 channel 层处理
+    if not isinstance(canonical_sse_chunk, str) or not canonical_sse_chunk.startswith("data: "):
+        return canonical_sse_chunk
+
+    data_str = canonical_sse_chunk[6:].strip()
+    if data_str == "[DONE]":
+        return canonical_sse_chunk
+
+    try:
+        canonical = json_loads(data_str)
+    except Exception:
+        return canonical_sse_chunk
+
+    usage = canonical.get("usage")
+    if isinstance(usage, dict):
+        # 经过内核重组的 usage-only chunk 在 Responses API 中用 response.completed 表达。
+        event = {
+            "type": "response.completed",
+            "response": {
+                "id": canonical.get("id", ""),
+                "object": "response",
+                "status": "completed",
+                "model": canonical.get("model", ""),
+                "usage": _responses_usage_from_canonical(usage),
+            },
+        }
+        return f"event: response.completed\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
+
+    # 其它流式内容保持原有行为，避免在本次缓存字段修复中改变文本与工具调用事件结构。
     return canonical_sse_chunk
 
 
@@ -423,7 +466,14 @@ def parse_responses_usage(data: Any) -> Optional[Dict[str, int]]:
             prompt = usage.get("input_tokens", 0)
             completion = usage.get("output_tokens", 0)
             total = usage.get("total_tokens", 0) or (prompt + completion)
-            return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+            # Responses API 的缓存命中字段位于 input_tokens_details，需要和普通 token 同步回传。
+            cache_usage = extract_cache_usage(usage)
+            return {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": total,
+                **cache_usage,
+            }
 
     # 非流式响应
     usage = data.get("usage")
@@ -431,8 +481,15 @@ def parse_responses_usage(data: Any) -> Optional[Dict[str, int]]:
         prompt = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
         completion = usage.get("output_tokens") or usage.get("completion_tokens") or 0
         total = usage.get("total_tokens") or (prompt + completion)
-        if prompt or completion:
-            return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+        # 非流式 Responses API 同样携带 input_tokens_details.cached_tokens，这里避免只解析 token 总数。
+        cache_usage = extract_cache_usage(usage)
+        if prompt or completion or cache_usage["cached_tokens"] or cache_usage["cache_creation_tokens"]:
+            return {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": total,
+                **cache_usage,
+            }
 
     return None
 

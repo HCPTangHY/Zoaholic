@@ -464,8 +464,15 @@ def _expand_sub_channels(providers: list) -> list:
 
 
 async def update_config(config_data, use_config_url=False, skip_model_fetch=False, save_to_file=True, save_to_db: bool = False):
+    # 修改原因：/v1/api_config/update 可以只保存 preferences，此时传入的是已经包含运行时子渠道的 app.state.config。
+    # 修改方式：展开子渠道前先移除 _is_sub_channel 运行时 provider，再从主渠道重新展开。
+    # 目的：避免多次保存全局设置后，子渠道在运行时 providers 中重复累积。
+    base_providers = [
+        p for p in (config_data.get('providers') or [])
+        if not (isinstance(p, dict) and p.get('_is_sub_channel'))
+    ]
     # 展开子渠道为独立 provider（路由层无感知）
-    config_data['providers'] = _expand_sub_channels(config_data['providers'])
+    config_data['providers'] = _expand_sub_channels(base_providers)
 
     for index, provider in enumerate(config_data['providers']):
         _strip_provider_fields(provider)
@@ -644,6 +651,12 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
 
     api_list = [item["api"] for item in api_keys_db]
     # logger.info(json.dumps(config_data, indent=4, ensure_ascii=False))
+
+    # 修改原因：虚拟模型允许覆盖同名真实模型，但链条递归等结构性错误仍必须在启动或保存时被发现。
+    # 修改方式：在 provider 模型缓存和 API Key 模型数组都完成规范化之后执行集中校验。
+    # 目的：允许同名覆盖普通路由，同时阻止链条中出现嵌套虚拟模型。
+    from core.virtual_routing import validate_virtual_models_config
+    validate_virtual_models_config(config_data)
 
     # 管理阶段：只在显式请求保存时（save_to_file=True）才同步写回本地 api.yaml。
     if not use_config_url and save_to_file:
@@ -1287,6 +1300,55 @@ async def error_handling_wrapper(
         logger.warning(f"provider: {channel_id:<11} empty response [{type(first_item_str)}]: {first_item_str}")
         raise HTTPException(status_code=502, detail="Upstream server returned an empty response.")
 
+def _append_model_info_if_missing(all_models, unique_models, model_id):
+    """向 /v1/models 返回值追加一个模型条目。"""
+    # 修改原因：真实模型和虚拟模型都需要构造同一种 OpenAI 兼容模型对象。
+    # 修改方式：集中去重并生成固定结构的 model_info。
+    # 目的：避免新增虚拟模型暴露逻辑时重复拼装字段导致行为不一致。
+    if not model_id or model_id in unique_models:
+        return
+    unique_models.add(model_id)
+    all_models.append({
+        "id": model_id,
+        "object": "model",
+        "created": 1720524448858,
+        "owned_by": "Zoaholic",
+    })
+
+
+def _append_authorized_virtual_models(all_models, unique_models, config, api_index):
+    """按当前 API Key 的 model 授权追加启用的虚拟模型。"""
+    # 修改原因：虚拟模型名需要出现在 /v1/models 中，但只能展示当前 API Key 有权限访问的条目。
+    # 修改方式：读取 preferences.virtual_models，保留 enabled 不为 false 且被 model 数组或 all 授权的虚拟名。
+    # 目的：让客户端可以发现可用虚拟模型，同时不引入新的授权机制。
+    virtual_models = safe_get(config, 'preferences', 'virtual_models', default={}) or {}
+    if not isinstance(virtual_models, dict):
+        return
+
+    model_rules = safe_get(config, 'api_keys', api_index, 'model', default=[]) or []
+    normalized_rules = []
+    for rule in model_rules:
+        if isinstance(rule, dict) and rule:
+            rule = next(iter(rule.keys()))
+        if isinstance(rule, str):
+            normalized_rules.append(rule)
+
+    allow_all = "all" in normalized_rules
+    allowed_names = set(normalized_rules)
+
+    for virtual_name, virtual_config in virtual_models.items():
+        if not isinstance(virtual_config, dict):
+            continue
+        enabled_value = virtual_config.get("enabled", True)
+        if isinstance(enabled_value, str):
+            enabled_value = enabled_value.strip().lower() not in {"false", "0", "no", "off"}
+        if enabled_value is False:
+            continue
+        virtual_name = str(virtual_name).strip()
+        if allow_all or virtual_name in allowed_names:
+            _append_model_info_if_missing(all_models, unique_models, virtual_name)
+
+
 def post_all_models(api_index, config, api_list, models_list):
     all_models = []
     unique_models = set()
@@ -1303,7 +1365,11 @@ def post_all_models(api_index, config, api_list, models_list):
         for model in config['api_keys'][api_index]['model']:
             if model == "all":
                 # 如果模型名为 all，则返回所有模型并去重，按分组过滤
-                return get_all_models(config, allowed_groups)
+                all_models = get_all_models(config, allowed_groups)
+                unique_models = {item["id"] for item in all_models}
+                _append_authorized_virtual_models(all_models, unique_models, config, api_index)
+                all_models.sort(key=lambda x: x["id"])
+                return all_models
             if "/" in model:
                 provider = model.split("/")[0]
                 model = model.split("/")[1]
@@ -1440,16 +1506,17 @@ def post_all_models(api_index, config, api_list, models_list):
             if is_local_api_key(model) and model in api_list:
                 continue
 
+            virtual_models_cfg = safe_get(config, 'preferences', 'virtual_models', default={}) or {}
+            if isinstance(virtual_models_cfg, dict) and model in virtual_models_cfg:
+                # 修改原因：虚拟模型是否展示取决于 virtual_models.enabled 和 API Key 授权，不能被普通模型兜底逻辑提前加入。
+                # 修改方式：遇到已配置的虚拟模型名时跳过普通追加，统一交给 _append_authorized_virtual_models 处理。
+                # 目的：避免 disabled 的虚拟模型仍然出现在 /v1/models 中。
+                continue
+
             # 直接使用配置的模型名，不做归一化
-            if model not in unique_models:
-                unique_models.add(model)
-                model_info = {
-                    "id": model,
-                    "object": "model",
-                    "created": 1720524448858,
-                    "owned_by": "Zoaholic"
-                }
-                all_models.append(model_info)
+            _append_model_info_if_missing(all_models, unique_models, model)
+
+    _append_authorized_virtual_models(all_models, unique_models, config, api_index)
 
     # 按模型 ID 进行 Unicode 排序
     all_models.sort(key=lambda x: x["id"])

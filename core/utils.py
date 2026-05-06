@@ -19,6 +19,7 @@ from urllib.parse import urlparse, urlunparse
 from .log_config import logger
 from .json_utils import json_dumps_text, json_loads
 from .file_utils import split_data_uri_prefix_and_data, extract_base64_data, fetch_url_content
+from .usage import build_openai_usage
 
 # 本地 API Key 前缀：用于判断 provider 名是否为本地聚合器 Key
 # sk- 是历史前缀，zk- 是新版本前缀，两者都需要兼容
@@ -96,13 +97,19 @@ def get_model_dict(provider):
     - 字典：`{upstream: alias}` 格式，key 是上游模型名，value 是对外展示的别名
       例：`- gemini-2.5-pro: my-alias` → upstream="gemini-2.5-pro", alias="my-alias"
     
-    如果 provider 配置了 model_prefix，会同时生成：
-    - 带前缀的别名 -> 上游模型（用于模型列表展示和带前缀请求匹配）
-    - 不带前缀的别名 -> 上游模型（用于不带前缀请求的路由匹配）
+    如果 provider 配置了 model_prefix，只生成带前缀的对外别名 -> 上游模型。
+    无前缀请求是否能命中带前缀渠道，由 routing.py 的 pool_sharing 显式控制。
+    这样做的目的，是避免未开启 pool_sharing 的旧渠道被无前缀模型名误命中。
     
     Returns:
         dict: {alias: upstream_model} 映射
     """
+    if provider.get("_virtual_route_provider") and isinstance(provider.get("_model_dict_cache"), dict):
+        # 修改原因：虚拟模型临时 provider 会保留原渠道的 model_prefix，但请求链路中有部分代码会调用 get_model_dict。
+        # 修改方式：对带 _virtual_route_provider 标记的临时 provider，优先返回已注入虚拟名映射的运行时缓存副本。
+        # 目的：确保 request.model 为虚拟模型名时，所有渠道实现都能解析到真实上游模型名。
+        return dict(provider["_model_dict_cache"])
+
     model_dict = {}
     prefix = provider.get('model_prefix', '').strip()
     
@@ -112,10 +119,15 @@ def get_model_dict(provider):
         
     for model in provider['model']:
         if isinstance(model, str):
-            # 字符串模型：别名和上游都是自己
-            if prefix:
+            # 字符串模型：别名和上游都是自己。
+            # 修改原因：model_prefix 渠道默认只能暴露带前缀外部名；无前缀共享必须由 pool_sharing 单独开启。
+            # 修改方式：普通模型只写入 prefix+model；通配符 "*" 是路由标记，不加前缀，保持既有透传能力。
+            if model == "*":
+                model_dict[model] = model
+            elif prefix:
                 model_dict[f"{prefix}{model}"] = model  # 带前缀别名 -> 上游
-            model_dict[model] = model  # 原始名 -> 上游（用于路由匹配）
+            else:
+                model_dict[model] = model  # 无前缀渠道：原始名 -> 上游
             
         if isinstance(model, dict):
             # dict 模型格式: {upstream: alias}
@@ -124,9 +136,13 @@ def get_model_dict(provider):
             for upstream, alias in model.items():
                 alias_str = str(alias)
                 upstream_str = str(upstream)
+                # 修改原因：保持 model_dict 的 key 始终为对外模型名，value 始终为上游原始名。
+                # 修改方式：有前缀时只写入带前缀别名；无前缀时写入原别名。
+                # 目的：让 pool_sharing 成为无前缀路由池共享的唯一入口。
                 if prefix:
                     model_dict[f"{prefix}{alias_str}"] = upstream_str  # 带前缀别名 -> 上游
-                model_dict[alias_str] = upstream_str  # 原始别名 -> 上游（用于路由匹配）
+                else:
+                    model_dict[alias_str] = upstream_str  # 无前缀渠道：别名 -> 上游
                 
     return model_dict
 
@@ -1007,7 +1023,9 @@ async def generate_sse_response(
     completion_tokens=0,
     reasoning_content=None,
     stop=None,
-    thought_signature=None
+    thought_signature=None,
+    cached_tokens=0,
+    cache_creation_tokens=0
 ):
     """
     生成 OpenAI Chat Completions 格式的 SSE 响应
@@ -1026,6 +1044,8 @@ async def generate_sse_response(
         reasoning_content: 推理内容
         stop: 停止原因（如 "stop", "tool_calls"）
         thought_signature: Gemini 思考签名
+        cached_tokens: 上游缓存命中 token 数，用于输出 prompt_tokens_details.cached_tokens
+        cache_creation_tokens: 上游缓存创建 token 数，作为内核补充字段供 Claude 方言还原
     """
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
@@ -1098,11 +1118,14 @@ async def generate_sse_response(
     
     # usage chunk 特殊处理：清空 choices，设置 usage
     if total_tokens:
-        sample_data["usage"] = {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens
-        }
+        # usage chunk 是内核到下游的统一出口；这里集中补充缓存字段，避免各通道重复拼装且出现遗漏。
+        sample_data["usage"] = build_openai_usage(
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
         sample_data["choices"] = []
 
     json_data = json_dumps_text(sample_data, ensure_ascii=False)
@@ -1110,7 +1133,7 @@ async def generate_sse_response(
 
     return sse_response
 
-async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, image_base64=None, thought_signature=None, return_dict: bool = False):
+async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, image_base64=None, thought_signature=None, cached_tokens=0, cache_creation_tokens=0, return_dict: bool = False):
 
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
@@ -1193,7 +1216,14 @@ async def generate_no_stream_response(timestamp, model, content=None, tools_id=N
         total_tokens = None
 
     if total_tokens:
-        sample_data["usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}
+        # 非流式响应与 SSE usage chunk 使用同一构造函数，目的在于让缓存字段在两种输出模式中保持一致。
+        sample_data["usage"] = build_openai_usage(
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
 
     if return_dict:
         return sample_data

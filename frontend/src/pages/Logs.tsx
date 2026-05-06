@@ -22,6 +22,9 @@ interface LogEntry {
   prompt_tokens?: number;
   completion_tokens?: number;
   total_tokens?: number;
+  // Prompt Caching 字段来自后端 request_stats，用于展示缓存命中和缓存创建 token。
+  cached_tokens?: number;
+  cache_creation_tokens?: number;
   prompt_price?: number;
   completion_price?: number;
   success: boolean;
@@ -289,6 +292,10 @@ export default function Logs() {
   const LogAccordionItem = ({ log }: { log: LogEntry }) => {
     const isExpanded = expandedIds.has(log.id);
     const speedInfo = calculateSpeed(log);
+    // 缓存字段统一转成数字，目的是避免旧日志缺字段时影响列表和展开详情渲染。
+    const cachedTokens = log.cached_tokens || 0;
+    const cacheCreationTokens = log.cache_creation_tokens || 0;
+    const hasCacheInfo = cachedTokens > 0 || cacheCreationTokens > 0;
     return (
       <div className="bg-card border border-border rounded-xl overflow-hidden">
         <div className="cursor-pointer hover:bg-muted/50 transition-colors" onClick={() => toggleExpand(log.id)}>
@@ -339,12 +346,18 @@ export default function Logs() {
               <Globe className="w-3.5 h-3.5" /><span>{log.client_ip || '-'}</span>
             </div>
             <div className="flex-1" />
-            <div className="flex items-center gap-1 font-mono">
-              <span className="text-muted-foreground">{log.prompt_tokens || 0}</span>
-              <span className="text-muted-foreground/50">+</span>
+            <div className="flex items-center gap-1 font-mono" title={`输入: ${log.prompt_tokens || 0}${cachedTokens > 0 ? `，缓存命中 ${cachedTokens}` : ''}${cacheCreationTokens > 0 ? `，缓存创建 ${cacheCreationTokens}` : ''}；输出: ${log.completion_tokens || 0}；总计: ${log.total_tokens || 0}`}>
+              {/* 列表摘要只在命中缓存时追加弱化文本，避免缓存数字抢占主要 token 信息。 */}
+              {cachedTokens > 0 ? (
+                <>
+                  <span className="text-muted-foreground">{(log.prompt_tokens || 0) - cachedTokens}</span>
+                  <span className="text-[10px] text-emerald-600/80 dark:text-emerald-400/80">(+{cachedTokens} {(cachedTokens / (log.prompt_tokens || 1) * 100).toFixed(1)}%)</span>
+                </>
+              ) : (
+                <span className="text-muted-foreground">{log.prompt_tokens || 0}</span>
+              )}
+              <span className="text-muted-foreground/50">→</span>
               <span className="text-blue-600 dark:text-blue-400">{log.completion_tokens || 0}</span>
-              <span className="text-muted-foreground/50">=</span>
-              <span className="text-foreground">{log.total_tokens || 0}</span>
             </div>
             {log.success && (log.prompt_price || log.completion_price) ? (() => {
               const cost = ((log.prompt_tokens || 0) * (log.prompt_price || 0) + (log.completion_tokens || 0) * (log.completion_price || 0)) / 1_000_000;
@@ -379,6 +392,7 @@ export default function Logs() {
               <InfoItem label="Provider ID" value={log.provider_id || '-'} />
               {log.raw_data_expires_at && <InfoItem label="数据过期" value={formatFullTimestamp(log.raw_data_expires_at)} />}
             </div>
+
             {log.retry_path && (
               <div className="space-y-1">
                 <div className="text-xs font-medium text-muted-foreground flex items-center gap-1">

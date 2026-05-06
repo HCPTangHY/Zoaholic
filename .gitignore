@@ -87,3 +87,8 @@ plugins/secret_plugins/
 
 .limcode/
 test/
+# 修改原因：根级 test/ 忽略规则会覆盖 frontend/test，导致前端回归测试文件默认无法进入版本控制。
+# 修改方式：只对 frontend/test 目录追加例外，不改变根目录运行时 test 数据的忽略行为。
+# 目的：让前端轻量回归测试可以随源码一起保存，避免移动端抽屉布局问题回退。
+!frontend/test/
+!frontend/test/**frontend/test/

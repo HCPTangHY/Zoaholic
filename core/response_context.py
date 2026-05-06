@@ -58,12 +58,15 @@ def merge_usage(
     prompt_tokens: Optional[int] = None,
     completion_tokens: Optional[int] = None,
     total_tokens: Optional[int] = None,
+    cached_tokens: Optional[int] = None,
+    cache_creation_tokens: Optional[int] = None,
 ) -> None:
     """合并 usage 到当前请求上下文。
 
     规则：
     - 仅用正数（> 0）覆盖 prompt/completion，0 不覆盖已有值。
     - total_tokens 若为正数则直接写入。
+    - cached/cache_creation 仅用正数覆盖，避免后续空 usage 覆盖已采集的缓存信息。
     - 否则按 prompt+completion 重算。
     """
     current = get_current_request_info()
@@ -73,11 +76,19 @@ def merge_usage(
     prompt_val = _to_non_negative_int(prompt_tokens)
     completion_val = _to_non_negative_int(completion_tokens)
     total_val = _to_non_negative_int(total_tokens)
+    cached_val = _to_non_negative_int(cached_tokens)
+    cache_creation_val = _to_non_negative_int(cache_creation_tokens)
 
     if prompt_val is not None and prompt_val > 0:
         current["prompt_tokens"] = prompt_val
     if completion_val is not None and completion_val > 0:
         current["completion_tokens"] = completion_val
+
+    # 缓存字段与普通 token 一起写入 current_info，目的在于让通道适配器路径和方言解析路径统计一致。
+    if cached_val is not None and cached_val > 0:
+        current["cached_tokens"] = cached_val
+    if cache_creation_val is not None and cache_creation_val > 0:
+        current["cache_creation_tokens"] = cache_creation_val
 
     if total_val is not None and total_val > 0:
         current["total_tokens"] = total_val

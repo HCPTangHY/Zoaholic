@@ -115,6 +115,9 @@ class LogEntry(BaseModel):
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
+    # Prompt Caching 统计随日志返回给前端，用于列表摘要和展开详情展示。
+    cached_tokens: Optional[int] = None
+    cache_creation_tokens: Optional[int] = None
     success: bool = False
     status_code: Optional[int] = None
     prompt_price: Optional[float] = None
@@ -1412,6 +1415,9 @@ async def get_logs(
                     prompt_tokens=int(row.get("prompt_tokens") or 0),
                     completion_tokens=int(row.get("completion_tokens") or 0),
                     total_tokens=int(row.get("total_tokens") or 0),
+                    # D1 旧表可能尚无缓存列，使用 get 默认 0 保持兼容。
+                    cached_tokens=int(row.get("cached_tokens") or 0),
+                    cache_creation_tokens=int(row.get("cache_creation_tokens") or 0),
                     success=_bool_from_db(row.get("success")),
                     status_code=int(row.get("status_code")) if row.get("status_code") is not None else None,
                     prompt_price=float(row.get("prompt_price")) if row.get("prompt_price") is not None else None,
@@ -1551,6 +1557,9 @@ async def get_logs(
                 prompt_tokens=row.prompt_tokens,
                 completion_tokens=row.completion_tokens,
                 total_tokens=row.total_tokens,
+                # SQLAlchemy 分支直接读取 ORM 字段，旧数据为空时前端按 0 展示。
+                cached_tokens=getattr(row, 'cached_tokens', 0) or 0,
+                cache_creation_tokens=getattr(row, 'cache_creation_tokens', 0) or 0,
                 success=row.success if hasattr(row, 'success') else False,
                 status_code=row.status_code if hasattr(row, 'status_code') else None,
                 prompt_price=getattr(row, 'prompt_price', None),

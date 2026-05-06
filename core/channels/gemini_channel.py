@@ -25,6 +25,7 @@ from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text
 from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
 from ..file_utils import extract_base64_data
 from urllib.parse import urlparse
 
@@ -755,10 +756,13 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
         total_tokens = safe_get(usage_metadata, "totalTokenCount", default=totalTokenCount)
 
         mark_adapter_metrics_managed()
+        # Gemini 的 cachedContentTokenCount 与普通 token 同在 usageMetadata，需要同步写入日志统计和下游响应。
+        cache_usage = extract_cache_usage(usage_metadata)
         merge_usage(
             prompt_tokens=prompt_tokens,
             completion_tokens=candidates_tokens,
             total_tokens=total_tokens,
+            **cache_usage,
         )
 
         # 检查是否返回了有效内容
@@ -825,7 +829,11 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
             function_call_name=function_call_name, function_call_content=function_full_response, 
             role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens, 
             completion_tokens=candidates_tokens, reasoning_content=reasoning_content, 
-            image_base64=image_base64, thought_signature=thought_signature, return_dict=True
+            image_base64=image_base64, thought_signature=thought_signature,
+            # 非流式 Gemini 输出需要继续携带缓存命中字段，供 OAI 与下游方言转换使用。
+            cached_tokens=cache_usage["cached_tokens"],
+            cache_creation_tokens=cache_usage["cache_creation_tokens"],
+            return_dict=True
         )
         return
 
@@ -843,6 +851,8 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
         promptTokenCount = 0
         candidatesTokenCount = 0
         totalTokenCount = 0
+        # 流式 Gemini 的缓存命中数量跟随 usageMetadata 出现，跨 chunk 保留后写入 current_info。
+        cachedContentTokenCount = 0
         parts_json = ""
         
         # 用于追踪整个流中是否有有效内容
@@ -892,10 +902,15 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
                     has_function_call = True
 
             if totalTokenCount > 0 or promptTokenCount > 0 or candidatesTokenCount > 0:
+                _cache_usage = extract_cache_usage(safe_get(response_json, "usageMetadata", default={}) or {})
+                if _cache_usage["cached_tokens"]:
+                    cachedContentTokenCount = _cache_usage["cached_tokens"]
                 merge_usage(
                     prompt_tokens=promptTokenCount,
                     completion_tokens=candidatesTokenCount,
                     total_tokens=totalTokenCount,
+                    cached_tokens=cachedContentTokenCount,
+                    cache_creation_tokens=_cache_usage["cache_creation_tokens"],
                 )
 
             if is_thinking:
@@ -1005,7 +1020,13 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
         
         # 发送 usage chunk（如果有）
         if totalTokenCount > 0:
-            sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, totalTokenCount, promptTokenCount, candidatesTokenCount)
+            sse_string = await generate_sse_response(
+                timestamp, model, None, None, None, None, None,
+                totalTokenCount, promptTokenCount, candidatesTokenCount,
+                # 流式 Gemini 最终 usage chunk 需要带回跨 chunk 保存的 cachedContentTokenCount。
+                cached_tokens=cachedContentTokenCount,
+                cache_creation_tokens=0,
+            )
             yield sse_string
 
     yield "data: [DONE]" + end_of_line

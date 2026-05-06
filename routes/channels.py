@@ -293,80 +293,97 @@ async def test_channel(
     except Exception:
         timeout = 30
 
-    channel = get_channel(engine)
-    if not channel:
-        raise HTTPException(status_code=404, detail=f"Channel type '{engine}' not found")
-
-    provider["provider"] = provider.get("provider") or f"test_{engine or 'channel'}"
-    provider["engine"] = engine
-
-    base_url = test_config.get("base_url") or provider.get("base_url", "")
-    base_url = str(base_url).strip() if base_url else ""
-
-    # 如果 base_url 为空，使用渠道默认值
-    if not base_url:
-        if channel.default_base_url:
-            base_url = channel.default_base_url
-            logger.info(f"Using default base_url for channel '{engine}': {base_url}")
-        else:
-            raise HTTPException(status_code=400, detail="base_url 是必填项（该渠道类型没有默认地址）")
-
-    # 验证 base_url 格式
-    if not base_url.startswith(("http://", "https://")):
-        # 自动添加 https:// 前缀
-        base_url = f"https://{base_url}"
-        logger.info(f"Auto-prefixed base_url: {base_url}")
-    provider["base_url"] = base_url.rstrip('/')
-
-    # 解析测试使用 API Key：显式传参 > provider.api / provider.api_keys
-    explicit_api_key = test_config.get("api_key") or test_config.get("api")
+    # 修改原因：虚拟路由测试不能按单个 provider_snapshot 直连测试，否则不会经过 preferences.virtual_models 的 chain 解析。
+    # 修改方式：当前端传 virtual_route_test 或 _virtual_route_test 标记时，直接用后端当前配置解析虚拟模型候选 provider。
+    # 目的：ChannelTestDialog 中选择虚拟模型名测试时，能走与正式请求相同的虚拟路由链条。
+    virtual_route_test = bool(test_config.get("virtual_route_test") or provider.get("_virtual_route_test"))
     selected_api_key = None
-    if isinstance(explicit_api_key, str) and explicit_api_key.strip():
-        selected_api_key = explicit_api_key.strip()
-        if selected_api_key.startswith("!"):
-            selected_api_key = selected_api_key[1:]
+    override_providers = None
+
+    if virtual_route_test:
+        from core.virtual_routing import resolve_virtual_model
+
+        override_providers = resolve_virtual_model(model, app.state.config, 0, app)
+        if override_providers is None:
+            raise HTTPException(status_code=400, detail=f"model '{model}' 不是已配置的虚拟模型")
+        if not override_providers:
+            raise HTTPException(status_code=400, detail=f"虚拟模型 '{model}' 没有可用的路由链条")
     else:
-        candidates = _collect_key_candidates(provider.get("api"))
-        candidates.extend(_collect_key_candidates(provider.get("api_keys")))
+        channel = get_channel(engine)
+        if not channel:
+            raise HTTPException(status_code=404, detail=f"Channel type '{engine}' not found")
 
-        for key in candidates:
-            if not key.startswith("!"):
-                selected_api_key = key
-                break
+        provider["provider"] = provider.get("provider") or f"test_{engine or 'channel'}"
+        provider["engine"] = engine
 
-        if not selected_api_key and candidates:
-            selected_api_key = candidates[0][1:] if candidates[0].startswith("!") else candidates[0]
+        base_url = test_config.get("base_url") or provider.get("base_url", "")
+        base_url = str(base_url).strip() if base_url else ""
 
-    if selected_api_key:
-        provider["api"] = selected_api_key
+        # 如果 base_url 为空，使用渠道默认值
+        if not base_url:
+            if channel.default_base_url:
+                base_url = channel.default_base_url
+                logger.info(f"Using default base_url for channel '{engine}': {base_url}")
+            else:
+                raise HTTPException(status_code=400, detail="base_url 是必填项（该渠道类型没有默认地址）")
 
-    # 确保模型映射存在，兼容别名测试
-    provider_models = provider.get("model")
-    if not isinstance(provider_models, list):
-        fallback_models = provider.get("models")
-        provider_models = copy.deepcopy(fallback_models) if isinstance(fallback_models, list) else []
+        # 验证 base_url 格式
+        if not base_url.startswith(("http://", "https://")):
+            # 自动添加 https:// 前缀
+            base_url = f"https://{base_url}"
+            logger.info(f"Auto-prefixed base_url: {base_url}")
+        provider["base_url"] = base_url.rstrip('/')
 
-    if not provider_models:
-        if upstream_model_hint and upstream_model_hint != model:
-            provider_models = [{upstream_model_hint: model}]
+        # 解析测试使用 API Key：显式传参 > provider.api / provider.api_keys
+        explicit_api_key = test_config.get("api_key") or test_config.get("api")
+        if isinstance(explicit_api_key, str) and explicit_api_key.strip():
+            selected_api_key = explicit_api_key.strip()
+            if selected_api_key.startswith("!"):
+                selected_api_key = selected_api_key[1:]
         else:
-            provider_models = [model]
+            candidates = _collect_key_candidates(provider.get("api"))
+            candidates.extend(_collect_key_candidates(provider.get("api_keys")))
 
-    provider["model"] = provider_models
-    provider.pop("models", None)
+            for key in candidates:
+                if not key.startswith("!"):
+                    selected_api_key = key
+                    break
 
-    model_dict = get_model_dict(provider)
-    if model not in model_dict:
-        if upstream_model_hint and upstream_model_hint != model:
-            provider["model"].append({upstream_model_hint: model})
-        else:
-            provider["model"].append(model)
+            if not selected_api_key and candidates:
+                selected_api_key = candidates[0][1:] if candidates[0].startswith("!") else candidates[0]
+
+        if selected_api_key:
+            provider["api"] = selected_api_key
+
+        # 确保模型映射存在，兼容别名测试
+        provider_models = provider.get("model")
+        if not isinstance(provider_models, list):
+            fallback_models = provider.get("models")
+            provider_models = copy.deepcopy(fallback_models) if isinstance(fallback_models, list) else []
+
+        if not provider_models:
+            if upstream_model_hint and upstream_model_hint != model:
+                provider_models = [{upstream_model_hint: model}]
+            else:
+                provider_models = [model]
+
+        provider["model"] = provider_models
+        provider.pop("models", None)
+
         model_dict = get_model_dict(provider)
+        if model not in model_dict:
+            if upstream_model_hint and upstream_model_hint != model:
+                provider["model"].append({upstream_model_hint: model})
+            else:
+                provider["model"].append(model)
+            model_dict = get_model_dict(provider)
 
-    provider["_model_dict_cache"] = model_dict
+        provider["_model_dict_cache"] = model_dict
 
-    if model not in model_dict:
-        raise HTTPException(status_code=400, detail=f"model '{model}' 不在当前渠道模型配置中")
+        if model not in model_dict:
+            raise HTTPException(status_code=400, detail=f"model '{model}' 不在当前渠道模型配置中")
+
+        override_providers = [provider]
 
     # 构建测试请求（允许外部覆盖部分参数，默认保持轻量）
     prompt = test_config.get("prompt") or "Hi"
@@ -410,8 +427,9 @@ async def test_channel(
             request_data=test_request,
             api_index=0,  # override 模式下不使用
             background_tasks=bg_tasks,
-            override_providers=[provider],
+            override_providers=override_providers,
             force_api_key=selected_api_key,
+            override_auto_retry=virtual_route_test,
         )
 
         latency_ms = int((time() - start_time) * 1000)

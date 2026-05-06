@@ -27,6 +27,7 @@ from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text
 from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
 from ..file_utils import extract_base64_data
 from .claude_channel import gpt2claude_tools_json
 
@@ -303,14 +304,21 @@ async def fetch_aws_response(client, url, headers, payload, model, timeout):
     response_json = await asyncio.to_thread(json_loads, response_bytes)
     mark_adapter_metrics_managed()
     
-    # 解析 AWS Bedrock Claude 格式
+    # 解析 AWS Bedrock Claude 格式；Claude 的缓存字段需要计入统一 prompt_tokens 口径。
     content = safe_get(response_json, "content", 0, "text", default="")
-    prompt_tokens = safe_get(response_json, "usage", "input_tokens", default=0)
-    output_tokens = safe_get(response_json, "usage", "output_tokens", default=0)
+    usage = safe_get(response_json, "usage", default={}) or {}
+    cache_usage = extract_cache_usage(usage)
+    prompt_tokens = (
+        (usage.get("input_tokens") or 0)
+        + cache_usage["cached_tokens"]
+        + cache_usage["cache_creation_tokens"]
+    )
+    output_tokens = usage.get("output_tokens", 0)
     merge_usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=output_tokens,
         total_tokens=prompt_tokens + output_tokens,
+        **cache_usage,
     )
     if content:
         mark_content_start()
@@ -318,7 +326,11 @@ async def fetch_aws_response(client, url, headers, payload, model, timeout):
     yield await generate_no_stream_response(
         timestamp, model, content=content, role="assistant",
         total_tokens=prompt_tokens + output_tokens,
-        prompt_tokens=prompt_tokens, completion_tokens=output_tokens, return_dict=True
+        prompt_tokens=prompt_tokens, completion_tokens=output_tokens,
+        # Bedrock 非流式返回 Claude usage 时，需要把缓存字段继续传给下游输出函数。
+        cached_tokens=cache_usage["cached_tokens"],
+        cache_creation_tokens=cache_usage["cache_creation_tokens"],
+        return_dict=True
     )
 
 
@@ -335,6 +347,11 @@ async def fetch_aws_response_stream(client, url, headers, payload, model, timeou
             return
 
         mark_adapter_metrics_managed()
+        # Bedrock 流式响应可能先返回 Claude usage，再在 invocationMetrics 中返回总量；缓存字段需要跨事件暂存。
+        input_tokens = 0
+        output_tokens = 0
+        cached_tokens = 0
+        cache_creation_tokens = 0
         async for line in aiter_decoded_lines(response.aiter_bytes(), delimiter=b"\r"):
                 if not line or \
                 line.strip() == "" or \
@@ -355,6 +372,21 @@ async def fetch_aws_response_stream(client, url, headers, payload, model, timeou
                     decoded_bytes = base64.b64decode(chunk_data["bytes"])
                     payload_chunk = json_loads(decoded_bytes)
 
+                    claude_usage = safe_get(payload_chunk, "message", "usage", default={}) or safe_get(payload_chunk, "usage", default={}) or {}
+                    if claude_usage:
+                        # Claude 流式 usage 中的 input_tokens 不含缓存部分，这里先还原为统一 prompt_tokens。
+                        _cache_usage = extract_cache_usage(claude_usage)
+                        cached_tokens = _cache_usage["cached_tokens"] or cached_tokens
+                        cache_creation_tokens = _cache_usage["cache_creation_tokens"] or cache_creation_tokens
+                        if claude_usage.get("input_tokens") is not None:
+                            input_tokens = (
+                                (claude_usage.get("input_tokens") or 0)
+                                + cached_tokens
+                                + cache_creation_tokens
+                            )
+                        if claude_usage.get("output_tokens"):
+                            output_tokens = claude_usage.get("output_tokens", 0)
+
                     text = safe_get(payload_chunk, "delta", "text", default="")
                     if text:
                         mark_content_start()
@@ -363,11 +395,24 @@ async def fetch_aws_response_stream(client, url, headers, payload, model, timeou
 
                     usage = safe_get(payload_chunk, "amazon-bedrock-invocationMetrics", default="")
                     if usage:
-                        input_tokens = usage.get("inputTokenCount", 0)
-                        output_tokens = usage.get("outputTokenCount", 0)
+                        raw_input_tokens = usage.get("inputTokenCount", 0)
+                        output_tokens = usage.get("outputTokenCount", output_tokens)
+                        input_tokens = input_tokens or raw_input_tokens
                         total_tokens = input_tokens + output_tokens
-                        merge_usage(prompt_tokens=input_tokens, completion_tokens=output_tokens, total_tokens=total_tokens)
-                        sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, total_tokens, input_tokens, output_tokens)
+                        merge_usage(
+                            prompt_tokens=input_tokens,
+                            completion_tokens=output_tokens,
+                            total_tokens=total_tokens,
+                            cached_tokens=cached_tokens,
+                            cache_creation_tokens=cache_creation_tokens,
+                        )
+                        sse_string = await generate_sse_response(
+                            timestamp, model, None, None, None, None, None,
+                            total_tokens, input_tokens, output_tokens,
+                            # Bedrock invocationMetrics 触发最终 usage chunk，需要带上先前 Claude usage 中的缓存字段。
+                            cached_tokens=cached_tokens,
+                            cache_creation_tokens=cache_creation_tokens,
+                        )
                         yield sse_string
 
     yield "data: [DONE]" + end_of_line

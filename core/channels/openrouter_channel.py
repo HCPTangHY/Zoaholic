@@ -19,6 +19,7 @@ from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text
 from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
 
 
 # ============================================================
@@ -164,10 +165,12 @@ async def fetch_openrouter_response(client, url, headers, payload, model, timeou
     response_json = await asyncio.to_thread(json_loads, response_bytes)
     mark_adapter_metrics_managed()
     usage = response_json.get("usage", {}) if isinstance(response_json, dict) else {}
+    # OpenRouter 透出 OpenAI 兼容 usage 时也可能包含缓存命中字段，统一写入日志统计。
     merge_usage(
         prompt_tokens=usage.get("prompt_tokens", 0),
         completion_tokens=usage.get("completion_tokens", 0),
         total_tokens=usage.get("total_tokens", 0),
+        **extract_cache_usage(usage),
     )
     if safe_get(response_json, "choices", 0, "message", "content", default=None):
         mark_content_start()
@@ -253,12 +256,21 @@ async def fetch_openrouter_response_stream(client, url, headers, payload, model,
                             finish_reason = choices[0].get("finish_reason")
                             if finish_reason:
                                 usage = json_data.get("usage", {})
-                                merge_usage(prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0), total_tokens=usage.get("total_tokens", 0))
+                                cache_usage = extract_cache_usage(usage)
+                                # 流式结束 chunk 中的缓存字段需要在生成 usage SSE 前写入 current_info，并继续返回给下游。
+                                merge_usage(
+                                    prompt_tokens=usage.get("prompt_tokens", 0),
+                                    completion_tokens=usage.get("completion_tokens", 0),
+                                    total_tokens=usage.get("total_tokens", 0),
+                                    **cache_usage,
+                                )
                                 sse_string = await generate_sse_response(
                                     timestamp, model, None, None, None, None, None,
                                     usage.get("total_tokens", 0),
                                     usage.get("prompt_tokens", 0),
-                                    usage.get("completion_tokens", 0)
+                                    usage.get("completion_tokens", 0),
+                                    cached_tokens=cache_usage["cached_tokens"],
+                                    cache_creation_tokens=cache_usage["cache_creation_tokens"],
                                 )
                                 yield sse_string
                     except json.JSONDecodeError:

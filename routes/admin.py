@@ -136,6 +136,16 @@ async def api_config_update(
             raise HTTPException(status_code=400, detail=f"Invalid rate_limit configuration: {e}") from e
         apply_backend_log_preferences((app.state.config or {}).get("preferences") or {})
 
+    except HTTPException:
+        # 修改原因：内部已经构造出的 HTTPException 应保留原始状态码。
+        # 修改方式：在通用异常包装前直接重新抛出。
+        # 目的：避免配置校验类错误被误包装成 500。
+        raise
+    except ValueError as e:
+        # 修改原因：虚拟模型命名冲突和嵌套引用属于用户配置错误。
+        # 修改方式：将 update_config 抛出的 ValueError 转为 400 响应。
+        # 目的：保存配置时给前端明确反馈，而不是表现为服务端持久化失败。
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         # 不允许“假成功”：只要持久化过程有异常，直接返回非 200
         raise HTTPException(status_code=500, detail=f"Failed to update/persist config: {e}") from e

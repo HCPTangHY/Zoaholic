@@ -21,6 +21,7 @@ from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text
 from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
 
 
 # ============================================================
@@ -156,10 +157,12 @@ async def fetch_azure_response(client, url, headers, payload, model, timeout):
     response_json = await asyncio.to_thread(json_loads, response_bytes)
     mark_adapter_metrics_managed()
     usage = response_json.get("usage", {}) if isinstance(response_json, dict) else {}
+    # Azure OpenAI 返回 OpenAI 兼容 usage；这里同步支持 prompt_tokens_details.cached_tokens。
     merge_usage(
         prompt_tokens=usage.get("prompt_tokens", 0),
         completion_tokens=usage.get("completion_tokens", 0),
         total_tokens=usage.get("total_tokens", 0),
+        **extract_cache_usage(usage),
     )
     if safe_get(response_json, "choices", 0, "message", "content", default=None):
         mark_content_start()
@@ -226,9 +229,25 @@ async def fetch_azure_response_stream(client, url, headers, payload, model, time
                         total_tokens = safe_get(line, "usage", "total_tokens", default=0)
                         if no_stream_content or content:
                             mark_content_start()
+                        usage = safe_get(line, "usage", default={}) or {}
+                        cache_usage = extract_cache_usage(usage)
                         if total_tokens or input_tokens or output_tokens:
-                            merge_usage(prompt_tokens=input_tokens, completion_tokens=output_tokens, total_tokens=total_tokens)
-                        sse_string = await generate_sse_response(timestamp, safe_get(line, "model", default=None), content=no_stream_content or content, total_tokens=total_tokens, prompt_tokens=input_tokens, completion_tokens=output_tokens)
+                            # 流式 usage chunk 中可能带缓存命中信息，需要与普通 token 同步写入 current_info 和下游响应。
+                            merge_usage(
+                                prompt_tokens=input_tokens,
+                                completion_tokens=output_tokens,
+                                total_tokens=total_tokens,
+                                **cache_usage,
+                            )
+                        sse_string = await generate_sse_response(
+                            timestamp, safe_get(line, "model", default=None),
+                            content=no_stream_content or content,
+                            total_tokens=total_tokens,
+                            prompt_tokens=input_tokens,
+                            completion_tokens=output_tokens,
+                            cached_tokens=cache_usage["cached_tokens"],
+                            cache_creation_tokens=cache_usage["cache_creation_tokens"],
+                        )
                         yield sse_string
                     else:
                         if no_stream_content:

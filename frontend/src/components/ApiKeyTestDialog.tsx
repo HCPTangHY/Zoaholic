@@ -83,6 +83,10 @@ export function ApiKeyTestDialog({
   const [results, setResults] = useState<Map<number, KeyTestResult>>(new Map());
   const [lastPreviewIdx, setLastPreviewIdx] = useState<number | null>(null);
   const [copiedKeyIndex, setCopiedKeyIndex] = useState<number | null>(null);
+  // 错误详情不再依赖 title 悬浮提示：移动端没有 hover，且 title 文本无法复制。
+  // 这里记录展开的 Key 和复制反馈，让每个 Key 的错误可以内联展开、选择并复制，同时保持默认列表简洁。
+  const [expandedErrorKeyIndex, setExpandedErrorKeyIndex] = useState<number | null>(null);
+  const [copiedErrorKeyIndex, setCopiedErrorKeyIndex] = useState<number | null>(null);
 
   const modelOptions = useMemo(() => {
     const set = new Set<string>();
@@ -105,6 +109,9 @@ export function ApiKeyTestDialog({
       init.set(idx, { status: 'pending' });
     });
     setResults(init);
+    // 重新打开弹窗时清空旧错误面板，避免用户看到上一次测试的详情。
+    setExpandedErrorKeyIndex(null);
+    setCopiedErrorKeyIndex(null);
 
     // 如果是单 key 测试入口，自动触发
     if (typeof initialKeyIndex === 'number' && initialKeyIndex >= 0) {
@@ -275,6 +282,17 @@ export function ApiKeyTestDialog({
     navigator.clipboard.writeText(apiKey);
     setCopiedKeyIndex(idx);
     setTimeout(() => setCopiedKeyIndex(null), 1500);
+  };
+
+  const copyErrorText = async (idx: number, errorText: string) => {
+    try {
+      await navigator.clipboard.writeText(errorText);
+      setCopiedErrorKeyIndex(idx);
+      setTimeout(() => setCopiedErrorKeyIndex(null), 1500);
+    } catch (error) {
+      // 复制失败只记录到控制台，避免用弹窗或临时 Toast 打断批量 Key 测试流程。
+      console.error('Failed to copy API key test error', error);
+    }
   };
 
   const statusIcon = (r: KeyTestResult, small = false) => {
@@ -448,79 +466,103 @@ export function ApiKeyTestDialog({
                   const keyText = k.key?.trim() || '';
                   const isSkipped = !includeDisabled && k.disabled;
 
+                  const errorText = r.error || '测试失败';
+                  const errorSummary = errorText.length > 36 ? `${errorText.slice(0, 36)}...` : errorText;
+                  const isErrorExpanded = r.status === 'error' && expandedErrorKeyIndex === idx;
+
                   return (
                     <div
                       key={idx}
-                      className={`flex items-center gap-2 px-4 py-2 group transition-colors hover:bg-muted/30 ${isSkipped ? 'opacity-40' : ''}`}
+                      className={`group transition-colors hover:bg-muted/30 ${isSkipped ? 'opacity-40' : ''}`}
                     >
-                      {/* 状态图标 */}
-                      <div className="w-6 flex items-center justify-center flex-shrink-0">
-                        {statusIcon(r)}
-                      </div>
+                      <div className="flex items-center gap-2 px-4 py-2">
+                        {/* 状态图标 */}
+                        <div className="w-6 flex items-center justify-center flex-shrink-0">
+                          {statusIcon(r)}
+                        </div>
 
-                      {/* 序号 */}
-                      <span className="text-[11px] text-muted-foreground w-5 text-right flex-shrink-0 font-mono tabular-nums">
-                        {idx + 1}
-                      </span>
-
-                      {/* Key 文本 + 状态信息 */}
-                      <div className="flex-1 min-w-0 flex items-center gap-2">
-                        <span
-                          className={`font-mono text-xs truncate ${
-                            k.disabled ? 'line-through text-muted-foreground' : 'text-foreground'
-                          }`}
-                          title={keyText}
-                        >
-                          {keyText ? maskKey(keyText) : '(空)'}
+                        {/* 序号 */}
+                        <span className="text-[11px] text-muted-foreground w-5 text-right flex-shrink-0 font-mono tabular-nums">
+                          {idx + 1}
                         </span>
 
-                        {/* 复制按钮 */}
-                        {keyText && (
-                          copiedKeyIndex === idx ? (
-                            <CopyCheck className="w-3 h-3 text-emerald-500 flex-shrink-0" />
-                          ) : (
-                            <button
-                              className="text-muted-foreground hover:text-foreground opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0"
-                              onClick={() => copyKey(idx)}
-                              title="复制 Key"
-                            >
-                              <Copy className="w-3 h-3" />
-                            </button>
-                          )
-                        )}
-                      </div>
-
-                      {/* 测试结果信息 */}
-                      <div className="flex items-center gap-1.5 flex-shrink-0 min-w-0 max-w-[260px]">
-                        {r.status === 'success' && (
-                          <span className="text-[11px] font-mono text-emerald-600 dark:text-emerald-400 flex-shrink-0">
-                            {r.latency_ms ?? '-'}ms
-                            {r.upstream_status_code ? ` · ${r.upstream_status_code}` : ''}
-                          </span>
-                        )}
-                        {r.status === 'error' && (
+                        {/* Key 文本 + 状态信息 */}
+                        <div className="flex-1 min-w-0 flex items-center gap-2">
                           <span
-                            className="text-[11px] text-red-600 dark:text-red-400 truncate"
-                            title={r.error || '测试失败'}
+                            className={`font-mono text-xs truncate ${
+                              k.disabled ? 'line-through text-muted-foreground' : 'text-foreground'
+                            }`}
+                            title={keyText}
                           >
-                            {r.auth_failed && <span className="font-mono mr-1">[auth]</span>}
-                            {r.error || '测试失败'}
+                            {keyText ? maskKey(keyText) : '(空)'}
                           </span>
-                        )}
-                        {r.status === 'testing' && (
-                          <span className="text-[11px] text-blue-500">测试中</span>
-                        )}
+
+                          {/* 复制按钮 */}
+                          {keyText && (
+                            copiedKeyIndex === idx ? (
+                              <CopyCheck className="w-3 h-3 text-emerald-500 flex-shrink-0" />
+                            ) : (
+                              <button
+                                className="text-muted-foreground hover:text-foreground opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0"
+                                onClick={() => copyKey(idx)}
+                                title="复制 Key"
+                              >
+                                <Copy className="w-3 h-3" />
+                              </button>
+                            )
+                          )}
+                        </div>
+
+                        {/* 测试结果信息 */}
+                        <div className="flex items-center gap-1.5 flex-shrink-0 min-w-0 max-w-[260px]">
+                          {r.status === 'success' && (
+                            <span className="text-[11px] font-mono text-emerald-600 dark:text-emerald-400 flex-shrink-0">
+                              {r.latency_ms ?? '-'}ms
+                              {r.upstream_status_code ? ` · ${r.upstream_status_code}` : ''}
+                            </span>
+                          )}
+                          {r.status === 'error' && (
+                            <button
+                              type="button"
+                              onClick={() => setExpandedErrorKeyIndex(current => current === idx ? null : idx)}
+                              className="max-w-full truncate text-left text-[11px] text-red-600 dark:text-red-400 hover:underline"
+                            >
+                              {isErrorExpanded ? '收起错误详情' : `${r.auth_failed ? '[auth] ' : ''}查看错误：${errorSummary}`}
+                            </button>
+                          )}
+                          {r.status === 'testing' && (
+                            <span className="text-[11px] text-blue-500">测试中</span>
+                          )}
+                        </div>
+
+                        {/* 单个测试按钮 */}
+                        <button
+                          onClick={() => void testSingleKey(idx)}
+                          disabled={r.status === 'testing' || isSkipped || !keyText}
+                          className="p-1.5 rounded-md text-primary hover:bg-primary/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0"
+                          title="测试此 Key"
+                        >
+                          <Play className="w-3.5 h-3.5" />
+                        </button>
                       </div>
 
-                      {/* 单个测试按钮 */}
-                      <button
-                        onClick={() => void testSingleKey(idx)}
-                        disabled={r.status === 'testing' || isSkipped || !keyText}
-                        className="p-1.5 rounded-md text-primary hover:bg-primary/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0"
-                        title="测试此 Key"
-                      >
-                        <Play className="w-3.5 h-3.5" />
-                      </button>
+                      {isErrorExpanded && (
+                        <div className="mx-4 mb-2 ml-14 rounded-lg border border-red-500/20 bg-red-500/5 p-3">
+                          {/* 错误正文使用 pre 保留换行，并开启 select-text；这样手机端和桌面端都能完整查看并选择复制。 */}
+                          <div className="flex items-center justify-between gap-3 text-[11px] text-red-600 dark:text-red-400">
+                            <span>Key #{idx + 1} 错误详情</span>
+                            <button
+                              type="button"
+                              onClick={() => void copyErrorText(idx, errorText)}
+                              className="inline-flex items-center gap-1 rounded-md border border-red-500/20 bg-background px-2 py-1 hover:bg-red-500/10 transition-colors"
+                            >
+                              {copiedErrorKeyIndex === idx ? <CopyCheck className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                              {copiedErrorKeyIndex === idx ? '已复制' : '复制'}
+                            </button>
+                          </div>
+                          <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words select-text text-[11px] leading-relaxed text-red-700 dark:text-red-300 font-mono">{errorText}</pre>
+                        </div>
+                      )}
                     </div>
                   );
                 })}

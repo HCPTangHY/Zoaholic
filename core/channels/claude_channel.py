@@ -22,6 +22,7 @@ from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text
 from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
 from ..file_utils import extract_base64_data
 
 
@@ -495,18 +496,22 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
     content = "".join(text_parts) if text_parts else None
     reasoning_content = "".join(thinking_parts) if thinking_parts else None
 
+    usage = safe_get(response_json, "usage", default={}) or {}
+    cache_usage = extract_cache_usage(usage)
+    # Claude 的 input_tokens 不包含缓存创建和读取 token；prompt_tokens 需要按计量口径补齐。
     prompt_tokens = (
-        (safe_get(response_json, "usage", "input_tokens") or 0)
-        + (safe_get(response_json, "usage", "cache_creation_input_tokens") or 0)
-        + (safe_get(response_json, "usage", "cache_read_input_tokens") or 0)
+        (usage.get("input_tokens") or 0)
+        + cache_usage["cache_creation_tokens"]
+        + cache_usage["cached_tokens"]
     ) or None
-    output_tokens = safe_get(response_json, "usage", "output_tokens")
+    output_tokens = usage.get("output_tokens")
     total_tokens = (prompt_tokens or 0) + (output_tokens or 0)
 
     merge_usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=output_tokens,
         total_tokens=total_tokens,
+        **cache_usage,
     )
     if content or reasoning_content or function_call_name:
         mark_content_start()
@@ -517,7 +522,11 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
         timestamp, model, content=content, tools_id=tools_id,
         function_call_name=function_call_name, function_call_content=function_call_content,
         role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens,
-        completion_tokens=output_tokens, reasoning_content=reasoning_content, return_dict=True
+        completion_tokens=output_tokens, reasoning_content=reasoning_content,
+        # Claude 非流式缓存字段已统一提取；传给出口函数后才能继续给下游方言使用。
+        cached_tokens=cache_usage["cached_tokens"],
+        cache_creation_tokens=cache_usage["cache_creation_tokens"],
+        return_dict=True
     )
 
 
@@ -532,6 +541,9 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
             return
         mark_adapter_metrics_managed()
         input_tokens = 0
+        # Claude 流式缓存字段出现在 message_start 的 usage 中，先暂存，等 output_tokens 到达时一起写入。
+        cached_tokens = 0
+        cache_creation_tokens = 0
         # 跟踪当前 content_block 类型，用于区分服务器端工具和客户端工具
         current_block_type = None
         current_block_id = None
@@ -540,19 +552,34 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                 if line.startswith("data:") and (line := line.lstrip("data: ")):
                     resp: dict = json_loads(line)
 
-                    if not input_tokens:
+                    if not input_tokens and not cached_tokens and not cache_creation_tokens:
                         msg_usage = safe_get(resp, "message", "usage", default={})
                         if msg_usage:
+                            _cache_usage = extract_cache_usage(msg_usage)
+                            cached_tokens = _cache_usage["cached_tokens"]
+                            cache_creation_tokens = _cache_usage["cache_creation_tokens"]
                             input_tokens = (
                                 (msg_usage.get("input_tokens") or 0)
-                                + (msg_usage.get("cache_creation_input_tokens") or 0)
-                                + (msg_usage.get("cache_read_input_tokens") or 0)
+                                + cache_creation_tokens
+                                + cached_tokens
                             )
                     output_tokens = safe_get(resp, "usage", "output_tokens", default=0)
                     if output_tokens:
                         total_tokens = input_tokens + output_tokens
-                        merge_usage(prompt_tokens=input_tokens, completion_tokens=output_tokens, total_tokens=total_tokens)
-                        sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, total_tokens, input_tokens, output_tokens)
+                        merge_usage(
+                            prompt_tokens=input_tokens,
+                            completion_tokens=output_tokens,
+                            total_tokens=total_tokens,
+                            cached_tokens=cached_tokens,
+                            cache_creation_tokens=cache_creation_tokens,
+                        )
+                        sse_string = await generate_sse_response(
+                            timestamp, model, None, None, None, None, None,
+                            total_tokens, input_tokens, output_tokens,
+                            # 流式 Claude 的缓存字段在 message_start 中采集，最终 usage chunk 需要一起输出。
+                            cached_tokens=cached_tokens,
+                            cache_creation_tokens=cache_creation_tokens,
+                        )
                         yield sse_string
                         break
 

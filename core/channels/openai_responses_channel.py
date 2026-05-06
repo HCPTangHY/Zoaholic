@@ -29,6 +29,7 @@ from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text
 from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
 
 
 # ============================================================
@@ -526,10 +527,13 @@ async def fetch_responses_response(client, url, headers, payload, model, timeout
     converted = await convert_responses_to_chat_completions(response_json, model)
     mark_adapter_metrics_managed()
     usage = converted.get("usage") or {}
+    raw_usage = response_json.get("usage") or {}
+    # 转换后的 usage 不保留 input_tokens_details，因此缓存字段要从 Responses API 原始 usage 中提取。
     merge_usage(
         prompt_tokens=usage.get("prompt_tokens", 0),
         completion_tokens=usage.get("completion_tokens", 0),
         total_tokens=usage.get("total_tokens", 0),
+        **extract_cache_usage(raw_usage),
     )
     if safe_get(converted, "choices", 0, "message", "content", default=None):
         mark_content_start()
@@ -626,11 +630,17 @@ async def convert_responses_to_chat_completions(response: dict, model: str) -> d
     # 添加 usage
     usage = response.get("usage", {})
     if usage:
+        # Responses 非流式转换为 Chat Completions 时保留 input_tokens_details.cached_tokens。
+        cache_usage = extract_cache_usage(usage)
         result["usage"] = {
             "prompt_tokens": usage.get("input_tokens", 0),
             "completion_tokens": usage.get("output_tokens", 0),
             "total_tokens": usage.get("total_tokens", 0)
         }
+        if cache_usage["cached_tokens"] > 0:
+            result["usage"]["prompt_tokens_details"] = {"cached_tokens": cache_usage["cached_tokens"]}
+        if cache_usage["cache_creation_tokens"] > 0:
+            result["usage"]["cache_creation_tokens"] = cache_usage["cache_creation_tokens"]
 
     return result
 
@@ -667,6 +677,9 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
         mark_adapter_metrics_managed()
         input_tokens = 0
         output_tokens = 0
+        # Responses API 的缓存字段只在 completed 事件 usage 中出现，先暂存再写入 current_info。
+        cached_tokens = 0
+        cache_creation_tokens = 0
         has_sent_role = False
         has_sent_content = False  # 追踪是否已发送任何内容
 
@@ -794,7 +807,17 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                         usage = response_data.get("usage", {})
                         input_tokens = usage.get("input_tokens", 0)
                         output_tokens = usage.get("output_tokens", 0)
-                        merge_usage(prompt_tokens=input_tokens, completion_tokens=output_tokens, total_tokens=input_tokens + output_tokens)
+                        # completed 事件携带 input_tokens_details.cached_tokens，需要在转换为 Chat SSE 前保存。
+                        _cache_usage = extract_cache_usage(usage)
+                        cached_tokens = _cache_usage["cached_tokens"] or cached_tokens
+                        cache_creation_tokens = _cache_usage["cache_creation_tokens"] or cache_creation_tokens
+                        merge_usage(
+                            prompt_tokens=input_tokens,
+                            completion_tokens=output_tokens,
+                            total_tokens=input_tokens + output_tokens,
+                            cached_tokens=cached_tokens,
+                            cache_creation_tokens=cache_creation_tokens,
+                        )
                         
                         # 如果还没发送 stop，在这里发送
                         if has_sent_content:
@@ -809,7 +832,10 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                 timestamp, model,
                 total_tokens=input_tokens + output_tokens,
                 prompt_tokens=input_tokens,
-                completion_tokens=output_tokens
+                completion_tokens=output_tokens,
+                # Responses API 的缓存字段在 completed 事件中暂存，最终 Chat SSE usage chunk 需要一并输出。
+                cached_tokens=cached_tokens,
+                cache_creation_tokens=cache_creation_tokens,
             )
             yield sse_string
 

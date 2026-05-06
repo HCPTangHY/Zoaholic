@@ -53,6 +53,7 @@ export default function Admin() {
   const [formModels, setFormModels] = useState<string[]>([]);
   const [formCredits, setFormCredits] = useState('');
   const [formRateLimit, setFormRateLimit] = useState('');
+  const [formModelRateLimits, setFormModelRateLimits] = useState<{model: string; rate: string}[]>([]);
   const [formExcludedChannels, setFormExcludedChannels] = useState<string[]>([]);
   const [formExcludedModels, setFormExcludedModels] = useState<string[]>([]);
 
@@ -140,7 +141,15 @@ export default function Admin() {
 
       setFormModels(Array.isArray(source.model) ? [...source.model] : []);
       setFormCredits(source.preferences?.credits !== undefined ? String(source.preferences.credits) : '');
-      setFormRateLimit(source.preferences?.rate_limit || '');
+      // rate_limit: string | dict
+      const rl = source.preferences?.rate_limit;
+      if (rl && typeof rl === 'object') {
+        setFormRateLimit((rl as any).default || '');
+        setFormModelRateLimits(Object.entries(rl).filter(([k]) => k !== 'default').map(([model, rate]) => ({ model, rate: String(rate) })));
+      } else {
+        setFormRateLimit(typeof rl === 'string' ? rl : '');
+        setFormModelRateLimits([]);
+      }
       // 黑名单
       const ec = source.preferences?.excluded_channels;
       setFormExcludedChannels(Array.isArray(ec) ? [...ec] : (typeof ec === 'string' && ec.trim() ? ec.split(',').map((s: string) => s.trim()).filter(Boolean) : []));
@@ -154,6 +163,7 @@ export default function Admin() {
       setFormModels([]);
       setFormCredits('');
       setFormRateLimit('');
+      setFormModelRateLimits([]);
       setFormExcludedChannels([]);
       setFormExcludedModels([]);
     }
@@ -317,7 +327,14 @@ export default function Admin() {
         }
       }
     }
-    if (formRateLimit.trim()) {
+    // rate_limit: 有模型规则时存 dict，否则存字符串（向后兼容）
+    const validModelLimits = formModelRateLimits.filter(r => r.model.trim() && r.rate.trim());
+    if (validModelLimits.length > 0) {
+      const rlDict: Record<string, string> = {};
+      if (formRateLimit.trim()) rlDict.default = formRateLimit.trim();
+      validModelLimits.forEach(r => { rlDict[r.model.trim()] = r.rate.trim(); });
+      prefs.rate_limit = rlDict;
+    } else if (formRateLimit.trim()) {
       prefs.rate_limit = formRateLimit.trim();
     }
     // 黑名单字段始终写入 prefs（即使为空数组也写入，用于后续清空逻辑）
@@ -597,7 +614,9 @@ export default function Admin() {
                         <div className="text-xs text-muted-foreground/60 mt-1">创建: {state.created_at}</div>
                       )}
                       {keyObj.preferences?.rate_limit && (
-                        <div className="text-[10px] text-muted-foreground/50 mt-0.5">限流: {keyObj.preferences.rate_limit}</div>
+                        <div className="text-[10px] text-muted-foreground/50 mt-0.5">限流: {typeof keyObj.preferences.rate_limit === 'object'
+                          ? `${(keyObj.preferences.rate_limit as any).default || '无全局'} + ${Object.keys(keyObj.preferences.rate_limit).filter(k => k !== 'default').length} 条模型规则`
+                          : keyObj.preferences.rate_limit}</div>
                       )}
                     </td>
                     <td className="px-6 py-4">
@@ -749,7 +768,62 @@ export default function Admin() {
                     placeholder="例如: 60/min, 1000/day"
                     className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
                   />
-                  <p className="text-xs text-muted-foreground mt-1">控制此 Key 的请求速率，支持多段（如 10/min,1000/day）。留空使用全局默认限流。</p>
+                  <p className="text-xs text-muted-foreground mt-1">全局限速：此 Key 所有模型共享的总量上限。留空使用全局默认。</p>
+
+                  {/* 模型专属限速 */}
+                  <div className="mt-3">
+                    <div
+                      className="flex items-center gap-1.5 cursor-pointer select-none text-xs text-muted-foreground hover:text-foreground transition-colors"
+                      onClick={() => {
+                        if (formModelRateLimits.length === 0) setFormModelRateLimits([{ model: '', rate: '' }]);
+                        else setFormModelRateLimits([]);
+                      }}
+                    >
+                      <span className="text-[10px]">{formModelRateLimits.length > 0 ? '▾' : '▸'}</span>
+                      模型专属限速{formModelRateLimits.length > 0 ? ` (${formModelRateLimits.filter(r => r.model.trim()).length})` : ''}
+                    </div>
+                    {formModelRateLimits.length > 0 && (
+                      <div className="mt-2 space-y-2">
+                        {formModelRateLimits.map((entry, idx) => (
+                          <div key={idx} className="flex gap-2 items-center">
+                            <input
+                              value={entry.model}
+                              onChange={e => {
+                                const next = [...formModelRateLimits];
+                                next[idx] = { ...next[idx], model: e.target.value };
+                                setFormModelRateLimits(next);
+                              }}
+                              placeholder="模型名（支持模糊匹配）"
+                              className="flex-1 bg-background border border-border px-3 py-1.5 rounded-lg text-xs font-mono text-foreground"
+                            />
+                            <input
+                              value={entry.rate}
+                              onChange={e => {
+                                const next = [...formModelRateLimits];
+                                next[idx] = { ...next[idx], rate: e.target.value };
+                                setFormModelRateLimits(next);
+                              }}
+                              placeholder="10/min"
+                              className="w-28 bg-background border border-border px-3 py-1.5 rounded-lg text-xs font-mono text-foreground"
+                            />
+                            <button
+                              onClick={() => setFormModelRateLimits(formModelRateLimits.filter((_, i) => i !== idx))}
+                              className="text-muted-foreground hover:text-destructive transition-colors"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                        <button
+                          onClick={() => setFormModelRateLimits([...formModelRateLimits, { model: '', rate: '' }])}
+                          className="text-xs text-primary hover:text-primary/80 flex items-center gap-1"
+                        >
+                          <Plus className="w-3 h-3" /> 添加规则
+                        </button>
+                        <p className="text-[10px] text-muted-foreground">模型名支持模糊匹配（如 "claude" 匹配所有 claude 模型）。专属规则只计该模型请求数，全局规则汇总所有模型。</p>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </section>
 

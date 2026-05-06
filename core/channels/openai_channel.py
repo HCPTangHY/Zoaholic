@@ -25,6 +25,7 @@ from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text
 from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
 from ..file_utils import extract_base64_data
 
 
@@ -406,10 +407,12 @@ async def fetch_openai_response(client, url, headers, payload, model, timeout):
     response_json = await asyncio.to_thread(json_loads, response_bytes)
     mark_adapter_metrics_managed()
     usage = safe_get(response_json, "usage", default={}) or {}
+    # 非流式 OpenAI 兼容响应在同一个 usage 对象中携带缓存字段，随普通 token 一起写入 current_info。
     merge_usage(
         prompt_tokens=safe_get(usage, "prompt_tokens", default=0),
         completion_tokens=safe_get(usage, "completion_tokens", default=0),
         total_tokens=safe_get(usage, "total_tokens", default=0),
+        **extract_cache_usage(usage),
     )
 
     # 兼容原 core/response.py 中的特殊逻辑
@@ -465,6 +468,9 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
 
         input_tokens = 0
         output_tokens = 0
+        # 流式 usage 的缓存字段可能只在最后一个 chunk 出现，需要跨 chunk 暂存后统一 merge。
+        cached_tokens = 0
+        cache_creation_tokens = 0
         done_received = False
 
         async for line in aiter_decoded_lines(response.aiter_bytes()):
@@ -484,10 +490,16 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
                 if chunk_usage and isinstance(chunk_usage, dict):
                     _in = chunk_usage.get("prompt_tokens") if "prompt_tokens" in chunk_usage else chunk_usage.get("input_tokens", 0)
                     _out = chunk_usage.get("completion_tokens") if "completion_tokens" in chunk_usage else chunk_usage.get("output_tokens", 0)
+                    # OpenAI、Responses API 和 DeepSeek 的缓存字段都在 usage 内，这里统一提取并跨 chunk 保留。
+                    _cache_usage = extract_cache_usage(chunk_usage)
                     if _in:
                         input_tokens = _in
                     if _out:
                         output_tokens = _out
+                    if _cache_usage["cached_tokens"]:
+                        cached_tokens = _cache_usage["cached_tokens"]
+                    if _cache_usage["cache_creation_tokens"]:
+                        cache_creation_tokens = _cache_usage["cache_creation_tokens"]
 
                 # 检查返回的 JSON 是否包含错误信息
                 if 'error' in line:
@@ -512,9 +524,20 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
                     yield sse_string
                     continue
                 elif line.get("type") == "response.completed":
-                    input_tokens = safe_get(line, "response", "usage", "input_tokens", default=0)
-                    output_tokens = safe_get(line, "response", "usage", "output_tokens", default=0)
-                    merge_usage(prompt_tokens=input_tokens, completion_tokens=output_tokens, total_tokens=input_tokens + output_tokens)
+                    response_usage = safe_get(line, "response", "usage", default={}) or {}
+                    input_tokens = safe_get(response_usage, "input_tokens", default=0)
+                    output_tokens = safe_get(response_usage, "output_tokens", default=0)
+                    # Responses API 事件的缓存命中位于 input_tokens_details，需在转换为 Chat SSE 前保存。
+                    _cache_usage = extract_cache_usage(response_usage)
+                    cached_tokens = _cache_usage["cached_tokens"] or cached_tokens
+                    cache_creation_tokens = _cache_usage["cache_creation_tokens"] or cache_creation_tokens
+                    merge_usage(
+                        prompt_tokens=input_tokens,
+                        completion_tokens=output_tokens,
+                        total_tokens=input_tokens + output_tokens,
+                        cached_tokens=cached_tokens,
+                        cache_creation_tokens=cache_creation_tokens,
+                    )
                     continue
                 elif line.get("type", "").startswith("response."):
                     continue
@@ -641,8 +664,23 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
                 break
 
     if input_tokens or output_tokens:
-        merge_usage(prompt_tokens=input_tokens, completion_tokens=output_tokens, total_tokens=input_tokens + output_tokens)
-        sse_string = await generate_sse_response(timestamp, payload["model"], None, None, None, None, None, total_tokens=input_tokens + output_tokens, prompt_tokens=input_tokens, completion_tokens=output_tokens)
+        # 结束时再 merge 一次，确保只在末尾出现的缓存字段不会被遗漏。
+        merge_usage(
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+            cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
+        sse_string = await generate_sse_response(
+            timestamp, payload["model"], None, None, None, None, None,
+            total_tokens=input_tokens + output_tokens,
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            # 结束 usage chunk 需要带上前面跨 chunk 暂存的缓存字段，避免只写入统计而不返回给下游。
+            cached_tokens=cached_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
         yield sse_string
 
     yield "data: [DONE]" + end_of_line

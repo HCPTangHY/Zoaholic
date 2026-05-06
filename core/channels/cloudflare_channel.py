@@ -9,6 +9,7 @@ import asyncio
 from datetime import datetime
 
 from ..utils import (
+    safe_get,
     get_model_dict,
     get_base64_image,
     generate_sse_response,
@@ -16,8 +17,9 @@ from ..utils import (
 )
 from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text
-from ..response_context import mark_adapter_metrics_managed, mark_content_start
+from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
 
 
 # ============================================================
@@ -106,12 +108,32 @@ async def fetch_cloudflare_response(client, url, headers, payload, model, timeou
     # 我们将其转换为 OpenAI 兼容格式
     from ..utils import generate_no_stream_response
     content = response_json.get("result", {}).get("response", "")
+    usage = safe_get(response_json, "usage", default={}) or safe_get(response_json, "result", "usage", default={}) or {}
+    cache_usage = extract_cache_usage(usage)
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+    # 部分 OAI 兼容实现只给 prompt/completion；这里补算 total，确保非流式出口能生成 usage。
+    total_tokens = usage.get("total_tokens", 0) or (prompt_tokens + completion_tokens)
+    if usage:
+        # Cloudflare OAI 兼容 usage 可能携带 prompt_tokens_details.cached_tokens，需要写入统计并返回给下游。
+        merge_usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            **cache_usage,
+        )
     timestamp = int(datetime.timestamp(datetime.now()))
     if content:
         mark_content_start()
     
     yield await generate_no_stream_response(
-        timestamp, model, content=content, role="assistant", return_dict=True
+        timestamp, model, content=content, role="assistant",
+        total_tokens=total_tokens,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cached_tokens=cache_usage["cached_tokens"],
+        cache_creation_tokens=cache_usage["cache_creation_tokens"],
+        return_dict=True
     )
 
 
@@ -128,6 +150,12 @@ async def fetch_cloudflare_response_stream(client, url, headers, payload, model,
             yield error_message
             return
         mark_adapter_metrics_managed()
+        # Cloudflare 流式 OAI 兼容 usage 通常在后续 chunk 中出现，需要在输出 usage chunk 时一起带回缓存字段。
+        input_tokens = 0
+        output_tokens = 0
+        total_tokens = 0
+        cached_tokens = 0
+        cache_creation_tokens = 0
         
         async for line in aiter_decoded_lines(response.aiter_bytes()):
             line = line.strip()
@@ -142,6 +170,30 @@ async def fetch_cloudflare_response_stream(client, url, headers, payload, model,
                 try:
                     json_data = json_loads(line[6:])
                     response_text = json_data.get("response", "")
+                    usage = json_data.get("usage") or {}
+                    if usage:
+                        cache_usage = extract_cache_usage(usage)
+                        input_tokens = usage.get("prompt_tokens", input_tokens)
+                        output_tokens = usage.get("completion_tokens", output_tokens)
+                        total_tokens = usage.get("total_tokens", total_tokens or (input_tokens + output_tokens))
+                        cached_tokens = cache_usage["cached_tokens"] or cached_tokens
+                        cache_creation_tokens = cache_usage["cache_creation_tokens"] or cache_creation_tokens
+                        merge_usage(
+                            prompt_tokens=input_tokens,
+                            completion_tokens=output_tokens,
+                            total_tokens=total_tokens,
+                            cached_tokens=cached_tokens,
+                            cache_creation_tokens=cache_creation_tokens,
+                        )
+                        sse_string = await generate_sse_response(
+                            timestamp, model,
+                            total_tokens=total_tokens,
+                            prompt_tokens=input_tokens,
+                            completion_tokens=output_tokens,
+                            cached_tokens=cached_tokens,
+                            cache_creation_tokens=cache_creation_tokens,
+                        )
+                        yield sse_string
 
                     if response_text:
                         mark_content_start()

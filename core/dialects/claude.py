@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from core.json_utils import json_loads, json_dumps_text
 from core.models import RequestModel, Message, ContentItem
+from core.usage import extract_cache_usage
 
 from .registry import DialectDefinition, EndpointDefinition, register_dialect
 
@@ -253,6 +254,30 @@ async def parse_claude_request(
     )
 
 
+def _canonical_usage_to_claude_usage(usage: Any, include_input: bool = True) -> Dict[str, int]:
+    """将内核 OpenAI usage 转为 Claude usage。
+
+    Claude 原生 input_tokens 不包含缓存读取和缓存创建 token，因此这里从 prompt_tokens 中扣除缓存部分，
+    再把缓存字段还原为 cache_read_input_tokens 与 cache_creation_input_tokens。
+    """
+    usage = usage if isinstance(usage, dict) else {}
+    cache_usage = extract_cache_usage(usage)
+    cache_read_tokens = cache_usage["cached_tokens"]
+    cache_creation_tokens = cache_usage["cache_creation_tokens"]
+    prompt_tokens = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0
+    completion_tokens = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0
+    native_input_tokens = max((prompt_tokens or 0) - cache_read_tokens - cache_creation_tokens, 0)
+
+    claude_usage: Dict[str, int] = {"output_tokens": completion_tokens}
+    if include_input:
+        claude_usage["input_tokens"] = native_input_tokens
+    if cache_read_tokens > 0:
+        claude_usage["cache_read_input_tokens"] = cache_read_tokens
+    if cache_creation_tokens > 0:
+        claude_usage["cache_creation_input_tokens"] = cache_creation_tokens
+    return claude_usage
+
+
 async def render_claude_response(
     canonical_response: Dict[str, Any],
     model: str,
@@ -337,8 +362,8 @@ async def render_claude_response(
             stop_reason = "end_turn"
 
     usage = canonical_response.get("usage") or {}
-    prompt_tokens = usage.get("prompt_tokens", 0) or 0
-    completion_tokens = usage.get("completion_tokens", 0) or 0
+    # 非流式 Claude 出口需要把内核缓存字段还原为 Claude 原生字段，避免下游只看到合并后的 prompt_tokens。
+    claude_usage = _canonical_usage_to_claude_usage(usage, include_input=True)
 
     return {
         "type": "message",
@@ -346,10 +371,7 @@ async def render_claude_response(
         "model": model,
         "content": content,
         "stop_reason": stop_reason,
-        "usage": {
-            "input_tokens": prompt_tokens,
-            "output_tokens": completion_tokens,
-        },
+        "usage": claude_usage,
     }
 
 
@@ -470,8 +492,17 @@ class ClaudeStreamRenderer:
         except json.JSONDecodeError:
             return canonical_sse_chunk
 
+        usage = canonical.get("usage")
         choices = canonical.get("choices") or []
         if not choices:
+            if isinstance(usage, dict):
+                # 经过内核重组的 usage-only chunk 没有 choices；这里转成 Claude message_delta，保留缓存字段。
+                event = {
+                    "type": "message_delta",
+                    "delta": {},
+                    "usage": _canonical_usage_to_claude_usage(usage, include_input=True),
+                }
+                return f"event: message_delta\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
             return ""
 
         delta = choices[0].get("delta") or {}
@@ -557,9 +588,8 @@ class ClaudeStreamRenderer:
                     "stop_reason": stop_reason,
                     "stop_sequence": None,
                 },
-                "usage": {
-                    "output_tokens": canonical.get("usage", {}).get("completion_tokens", 0),
-                },
+                # 完成事件通常不携带完整 usage；若后续 usage-only chunk 到达，会再发送带缓存字段的 message_delta。
+                "usage": _canonical_usage_to_claude_usage(canonical.get("usage", {}), include_input=False),
             }
             result += f"event: message_delta\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
             return result
@@ -599,11 +629,22 @@ def parse_claude_usage(data: Any) -> Optional[Dict[str, int]]:
         usage = data.get("usage")
 
     if usage:
-        prompt = usage.get("input_tokens", 0)
+        # Claude 的 input_tokens 不含缓存创建和读取部分；统一 prompt_tokens 需要补齐这两类 token。
+        cache_usage = extract_cache_usage(usage)
+        prompt = (
+            (usage.get("input_tokens", 0) or 0)
+            + cache_usage["cached_tokens"]
+            + cache_usage["cache_creation_tokens"]
+        )
         completion = usage.get("output_tokens", 0)
         total = prompt + completion
-        if prompt or completion:
-            return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+        if prompt or completion or cache_usage["cached_tokens"] or cache_usage["cache_creation_tokens"]:
+            return {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": total,
+                **cache_usage,
+            }
     return None
 
 

@@ -68,6 +68,13 @@ const LINE_COLORS = [
   '#84cc16', // 黄绿
 ];
 
+const formatCompact = (n: number) => {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 10_000) return `${(n / 1_000).toFixed(1)}K`;
+  return n.toLocaleString();
+};
+
 const formatTokens = (n: number) => {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -203,34 +210,34 @@ export default function Dashboard() {
     if (!token) return;
     setLoading(true);
     try {
+      const end = new Date();
+      const start = new Date(end.getTime() - timeRange * 60 * 60 * 1000);
+      const tokenUrl = `/v1/token_usage?start_datetime=${encodeURIComponent(start.toISOString())}&end_datetime=${encodeURIComponent(end.toISOString())}`;
 
-      const statsRes = await apiFetch(`/v1/stats?hours=${timeRange}`);
+      // 并行请求，不串行等待
+      const [statsRes, tokenRes, configRes] = await Promise.all([
+        apiFetch(`/v1/stats?hours=${timeRange}`),
+        apiFetch(tokenUrl),
+        apiFetch('/v1/api_config').catch(() => null),
+      ]);
+
       if (statsRes.ok) {
         const data = await statsRes.json();
         setStats(data.stats || data);
         setTotalCost((data.stats || data).total_cost || 0);
       }
 
-      const end = new Date();
-      const start = new Date(end.getTime() - timeRange * 60 * 60 * 1000);
-      const tokenUrl = `/v1/token_usage?start_datetime=${encodeURIComponent(start.toISOString())}&end_datetime=${encodeURIComponent(end.toISOString())}`;
-
-      const tokenRes = await apiFetch(tokenUrl);
       if (tokenRes.ok) {
         const data = await tokenRes.json();
         const total = data.usage?.reduce((sum: number, item: { total_tokens?: number }) => sum + (item.total_tokens || 0), 0) || 0;
         setTotalTokens(total);
       }
 
-      // 获取全局 model_price 配置
-      try {
-        const configRes = await apiFetch('/v1/api_config');
-        if (configRes.ok) {
-          const cfgData = await configRes.json();
-          const prefs = cfgData.preferences || cfgData.api_config?.preferences || {};
-          setGlobalModelPrice(prefs.model_price || {});
-        }
-      } catch { /* ignore */ }
+      if (configRes?.ok) {
+        const cfgData = await configRes.json();
+        const prefs = cfgData.preferences || cfgData.api_config?.preferences || {};
+        setGlobalModelPrice(prefs.model_price || {});
+      }
     } catch (err) {
       console.error('Failed to fetch stats:', err);
     } finally {
@@ -405,8 +412,8 @@ export default function Dashboard() {
   }, 0);
 
   const topCards = [
-    { label: '总请求量', value: totalRequests.toLocaleString(), icon: Zap, color: 'text-amber-500', bg: 'bg-amber-500/10' },
-    { label: `Token 消耗 (${timeRangeLabel})`, value: totalTokens.toLocaleString(), icon: BarChart3, color: 'text-blue-500', bg: 'bg-blue-500/10' },
+    { label: '总请求量', value: formatCompact(totalRequests), icon: Zap, color: 'text-amber-500', bg: 'bg-amber-500/10' },
+    { label: `Token 消耗 (${timeRangeLabel})`, value: formatCompact(totalTokens), icon: BarChart3, color: 'text-blue-500', bg: 'bg-blue-500/10' },
     { label: '平均成功率', value: `${(avgSuccessRate * 100).toFixed(1)}%`, icon: CheckCircle2, color: 'text-emerald-500', bg: 'bg-emerald-500/10' },
     { label: '活跃渠道', value: activeChannels.toString(), icon: Cpu, color: 'text-purple-500', bg: 'bg-purple-500/10' },
     { label: `费用 (${timeRangeLabel})`, value: formatCost(totalCost), icon: DollarSign, color: 'text-amber-500', bg: 'bg-amber-500/10' },
@@ -469,7 +476,7 @@ export default function Dashboard() {
             <div className="flex justify-between items-start">
               <div>
                 <p className="text-sm font-medium text-muted-foreground">{stat.label}</p>
-                <h3 className="text-3xl font-bold text-foreground mt-2">{stat.value}</h3>
+                <h3 className="text-2xl sm:text-3xl font-bold text-foreground mt-2 truncate" title={stat.value}>{stat.value}</h3>
               </div>
               <div className={`p-2 rounded-lg ${stat.bg}`}>
                 <stat.icon className={`w-5 h-5 ${stat.color}`} />
@@ -813,7 +820,7 @@ export default function Dashboard() {
                   <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
                     <div className="bg-muted/50 rounded-lg p-3 text-center">
                       <p className="text-xs text-muted-foreground">总请求次数</p>
-                      <p className="text-lg font-bold text-foreground mt-1">{analysisTotalRequests.toLocaleString()}</p>
+                      <p className="text-lg font-bold text-foreground mt-1">{formatCompact(analysisTotalRequests)}</p>
                     </div>
                     <div className="bg-muted/50 rounded-lg p-3 text-center">
                       <p className="text-xs text-muted-foreground">输入 Token</p>
@@ -877,9 +884,9 @@ export default function Dashboard() {
                             <tr key={i} className="hover:bg-muted/50 transition-colors">
                               <td className="px-4 py-3 font-medium text-foreground">{entry.provider}</td>
                               <td className="px-4 py-3 text-foreground font-mono text-xs">{entry.model}</td>
-                              <td className="px-4 py-3 text-right text-muted-foreground">{entry.request_count.toLocaleString()}</td>
-                              <td className="px-4 py-3 text-right text-muted-foreground">{entry.total_prompt_tokens.toLocaleString()}</td>
-                              <td className="px-4 py-3 text-right text-muted-foreground">{entry.total_completion_tokens.toLocaleString()}</td>
+                              <td className="px-4 py-3 text-right text-muted-foreground">{formatCompact(entry.request_count)}</td>
+                              <td className="px-4 py-3 text-right text-muted-foreground">{formatTokens(entry.total_prompt_tokens)}</td>
+                              <td className="px-4 py-3 text-right text-muted-foreground">{formatTokens(entry.total_completion_tokens)}</td>
                               <td className="px-2 py-1 text-center">
                                 <input
                                   type="number"

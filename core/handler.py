@@ -903,31 +903,69 @@ class ModelRequestHandler:
         if not providers:
             return []
 
-        provider_names = [provider.get("provider") for provider in providers]
-        has_duplicate_slots = len(set(provider_names)) != len(provider_names)
-        should_rotate_slots = scheduling_algorithm != "fixed_priority" or has_duplicate_slots
+        async def build_unique_group(provider_slots: List[Dict[str, Any]], cursor_key: str) -> List[Dict[str, Any]]:
+            """在一个优先级组内执行原有轮转和去重逻辑。"""
+            # 修改原因：虚拟路由的 fallback 组间顺序必须稳定，但同组仍要保留原权重槽位轮转语义。
+            # 修改方式：把旧的全列表轮转和去重逻辑抽成组内函数，普通路由仍以整列表作为唯一分组。
+            # 目的：不改 handler 重试循环，只确保它收到的尝试列表已经符合链条降级顺序。
+            if not provider_slots:
+                return []
 
-        start_index = 0
-        if should_rotate_slots:
-            async with self.locks[request_model_name]:
-                if advance_cursor:
-                    self.last_provider_indices[request_model_name] = (
-                        self.last_provider_indices[request_model_name] + 1
-                    ) % len(providers)
-                elif self.last_provider_indices[request_model_name] < 0:
-                    self.last_provider_indices[request_model_name] = 0
-                start_index = self.last_provider_indices[request_model_name] % len(providers)
+            provider_names = [provider.get("provider") for provider in provider_slots]
+            has_duplicate_slots = len(set(provider_names)) != len(provider_names)
+            should_rotate_slots = scheduling_algorithm != "fixed_priority" or has_duplicate_slots
 
-        ordered_slots = providers[start_index:] + providers[:start_index]
+            start_index = 0
+            if should_rotate_slots:
+                async with self.locks[cursor_key]:
+                    if advance_cursor:
+                        self.last_provider_indices[cursor_key] = (
+                            self.last_provider_indices[cursor_key] + 1
+                        ) % len(provider_slots)
+                    elif self.last_provider_indices[cursor_key] < 0:
+                        self.last_provider_indices[cursor_key] = 0
+                    start_index = self.last_provider_indices[cursor_key] % len(provider_slots)
+
+            ordered_slots = provider_slots[start_index:] + provider_slots[:start_index]
+
+            unique_group: List[Dict[str, Any]] = []
+            seen_provider_names = set()
+            for provider in ordered_slots:
+                provider_name = provider.get("provider")
+                if provider_name in seen_provider_names:
+                    continue
+                seen_provider_names.add(provider_name)
+                unique_group.append(provider)
+            return unique_group
+
+        has_virtual_priorities = any(
+            provider.get("_virtual_route_provider") and "_virtual_priority" in provider
+            for provider in providers
+        )
+        if not has_virtual_priorities:
+            return await build_unique_group(providers, request_model_name)
+
+        # 修改原因：路由阶段会按 _virtual_priority 生成权重槽位，但旧构造逻辑可能因槽位轮转从 fallback 组开始。
+        # 修改方式：构造阶段再次按 _virtual_priority 拆组，只在组内轮转和去重，再按 priority 升序合并。
+        # 目的：让后续 while 重试循环自然先尝试完当前 chain 节点，再降级到下一个节点。
+        priority_groups: Dict[int, List[Dict[str, Any]]] = {}
+        for provider in providers:
+            try:
+                priority = int(provider.get("_virtual_priority", 0) or 0)
+            except (TypeError, ValueError):
+                priority = 0
+            priority_groups.setdefault(priority, []).append(provider)
 
         unique_providers: List[Dict[str, Any]] = []
         seen_provider_names = set()
-        for provider in ordered_slots:
-            provider_name = provider.get("provider")
-            if provider_name in seen_provider_names:
-                continue
-            seen_provider_names.add(provider_name)
-            unique_providers.append(provider)
+        for priority in sorted(priority_groups.keys()):
+            cursor_key = f"{request_model_name}::virtual_priority::{priority}"
+            for provider in await build_unique_group(priority_groups[priority], cursor_key):
+                provider_name = provider.get("provider")
+                if provider_name in seen_provider_names:
+                    continue
+                seen_provider_names.add(provider_name)
+                unique_providers.append(provider)
 
         return unique_providers
 
@@ -943,6 +981,7 @@ class ModelRequestHandler:
         passthrough_only: bool = False,
         override_providers: Optional[List[Dict[str, Any]]] = None,
         force_api_key: Optional[str] = None,
+        override_auto_retry: Optional[bool] = None,
     ) -> Response:
         """
         处理模型请求
@@ -955,6 +994,7 @@ class ModelRequestHandler:
             dialect_id: 入口方言 ID（原生路由传入）
             original_payload: 原始 native 请求体（透传用）
             original_headers: 原始请求头（透传用）
+            override_auto_retry: override provider 测试是否允许按候选列表自动重试
             
         Returns:
             响应对象
@@ -969,7 +1009,10 @@ class ModelRequestHandler:
             if num_matching_providers == 0:
                 raise HTTPException(status_code=400, detail="No providers specified for test")
             scheduling_algorithm = "fixed_priority"
-            auto_retry = False
+            # 修改原因：普通单渠道测试应只测当前渠道，但虚拟路由测试需要按 chain 候选继续尝试后续节点。
+            # 修改方式：保留默认不重试；只有调用方显式传 override_auto_retry=True 时才开启 override provider 列表内重试。
+            # 目的：不改变现有渠道测试语义，同时让虚拟模型测试能覆盖完整 fallback 链条。
+            auto_retry = bool(override_auto_retry)
             role = "test"
         else:
             # ── 正常路径：用户限速 + 全局路由 ──
@@ -1270,8 +1313,12 @@ class ModelRequestHandler:
                 channel_id = provider['provider']
 
                 if (self.app.state.channel_manager.cooldown_period > 0 
+                    and override_providers is None
                     and num_matching_providers > 1
                     and all(error not in error_message for error in exclude_error_rate_limit)):
+                    # 修改原因：override 模式中的 provider 列表可能是前端或虚拟路由测试构造的临时候选池。
+                    # 修改方式：只有正常请求才进入 channel_manager 冷却后重算全局路由；override 测试保持原候选列表顺序。
+                    # 目的：避免虚拟路由测试重试时因 api_index 授权或全局路由重算而脱离本次测试链条。
                     await self.app.state.channel_manager.exclude_model(channel_id, request_model_name)
                     matching_providers = await get_right_order_providers(
                         request_model_name, config, api_index, scheduling_algorithm, 

@@ -32,6 +32,7 @@ from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text
 from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..usage import extract_cache_usage
 from ..file_utils import extract_base64_data
 from .claude_channel import gpt2claude_tools_json
 
@@ -745,16 +746,23 @@ async def fetch_vertex_claude_response(client, url, headers, payload, model, tim
     response_json = await asyncio.to_thread(json_loads, response_bytes)
     mark_adapter_metrics_managed()
     
-    # Vertex Claude 格式解析与标准 Claude 类似
+    # Vertex Claude 格式解析与标准 Claude 类似；缓存字段也要按 Claude 口径补入 prompt_tokens。
     content = safe_get(response_json, "content", 0, "text")
-    prompt_tokens = safe_get(response_json, "usage", "input_tokens")
-    output_tokens = safe_get(response_json, "usage", "output_tokens")
-    total_tokens = (prompt_tokens or 0) + (output_tokens or 0)
+    usage = safe_get(response_json, "usage", default={}) or {}
+    cache_usage = extract_cache_usage(usage)
+    prompt_tokens = (
+        (usage.get("input_tokens") or 0)
+        + cache_usage["cached_tokens"]
+        + cache_usage["cache_creation_tokens"]
+    )
+    output_tokens = usage.get("output_tokens", 0)
+    total_tokens = prompt_tokens + (output_tokens or 0)
     role = safe_get(response_json, "role")
     merge_usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=output_tokens,
         total_tokens=total_tokens,
+        **cache_usage,
     )
     if content:
         mark_content_start()
@@ -762,7 +770,11 @@ async def fetch_vertex_claude_response(client, url, headers, payload, model, tim
     from ..utils import generate_no_stream_response
     yield await generate_no_stream_response(
         timestamp, model, content=content, role=role,
-        total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=output_tokens, return_dict=True
+        total_tokens=total_tokens, prompt_tokens=prompt_tokens, completion_tokens=output_tokens,
+        # Vertex Claude 非流式输出同样需要缓存字段，供下游 OpenAI 或方言转换使用。
+        cached_tokens=cache_usage["cached_tokens"],
+        cache_creation_tokens=cache_usage["cache_creation_tokens"],
+        return_dict=True
     )
 
 
@@ -786,6 +798,8 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
         promptTokenCount = 0
         candidatesTokenCount = 0
         totalTokenCount = 0
+        # Vertex 流式响应可能出现 Gemini 风格 cachedContentTokenCount，需跨 JSON 片段暂存到最终 usage chunk。
+        cachedContentTokenCount = 0
 
         async for line in aiter_decoded_lines(response.aiter_bytes()):
 
@@ -800,6 +814,10 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
                 if is_finish and '\"totalTokenCount\": ' in line:
                     json_data = parse_json_safely( "{" + line + "}")
                     totalTokenCount = json_data.get('totalTokenCount', 0)
+                if is_finish and '\"cachedContentTokenCount\": ' in line:
+                    # Vertex Gemini 风格流式 usage 可能分散在多行 JSON 片段中，这里单独采集缓存命中字段。
+                    json_data = parse_json_safely( "{" + line + "}")
+                    cachedContentTokenCount = json_data.get('cachedContentTokenCount', 0)
 
                 if line and '\"text\": \"' in line and is_finish == False:
                     try:
@@ -835,8 +853,16 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
             prompt_tokens=promptTokenCount,
             completion_tokens=candidatesTokenCount,
             total_tokens=totalTokenCount,
+            cached_tokens=cachedContentTokenCount,
+            cache_creation_tokens=0,
         )
-        sse_string = await generate_sse_response(timestamp, model, None, None, None, None, None, totalTokenCount, promptTokenCount, candidatesTokenCount)
+        sse_string = await generate_sse_response(
+            timestamp, model, None, None, None, None, None,
+            totalTokenCount, promptTokenCount, candidatesTokenCount,
+            # Vertex 流式最终 usage chunk 要保留 cachedContentTokenCount 映射后的 cached_tokens。
+            cached_tokens=cachedContentTokenCount,
+            cache_creation_tokens=0,
+        )
         yield sse_string
 
     yield "data: [DONE]" + end_of_line

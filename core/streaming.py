@@ -123,14 +123,20 @@ class LoggingStreamingResponse(Response):
         if dialect and dialect.parse_usage:
             usage_info = dialect.parse_usage(resp)
 
-        # 当前方言未解析出 usage 且不是 openai 时，用 openai 格式保底
+        # 当前方言未解析出 usage 且不是 openai 时，用 openai 格式保底。
         if not usage_info and d_id != "openai":
             o_dialect = get_dialect("openai")
             if o_dialect and o_dialect.parse_usage:
                 usage_info = o_dialect.parse_usage(resp)
 
+        if not usage_info:
+            # 透传响应可能是任意原生协议；最后用宽松 parser 覆盖缓存字段，避免 current_info 漏记。
+            from core.dialects.passthrough import parse_passthrough_usage
+            usage_info = parse_passthrough_usage(resp)
+
         if usage_info:
-            for _usage_key in ("prompt_tokens", "completion_tokens"):
+            # usage 解析同时覆盖普通 token 与 Prompt Caching 字段，保证透传流式响应也能入库缓存统计。
+            for _usage_key in ("prompt_tokens", "completion_tokens", "cached_tokens", "cache_creation_tokens"):
                 new_val = usage_info.get(_usage_key, 0)
                 if new_val > 0:
                     self.current_info[_usage_key] = new_val

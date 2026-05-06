@@ -29,6 +29,10 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
   const [concurrency, setConcurrency] = useState(3);
   const [isRunning, setIsRunning] = useState(false);
   const [copiedModel, setCopiedModel] = useState<string | null>(null);
+  // 错误详情不再依赖 title 悬浮提示：移动端没有 hover，且 title 文本无法复制。
+  // 这里记录展开项和复制反馈，让错误可以内联展开、选择并复制，目的在于保留列表简洁同时提供完整错误。
+  const [expandedErrorModel, setExpandedErrorModel] = useState<string | null>(null);
+  const [copiedErrorModel, setCopiedErrorModel] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
   // 解析模型列表
@@ -61,6 +65,9 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
       initialResults.set(m.display, { status: 'pending', latency: null, error: null });
     });
     setResults(initialResults);
+    // 切换测试对象时清空旧错误面板，避免展示上一渠道的错误详情。
+    setExpandedErrorModel(null);
+    setCopiedErrorModel(null);
   }, [provider]);
 
   // 关闭时停止测试
@@ -130,6 +137,10 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
         body: JSON.stringify({
           engine: provider.engine || 'openai',
           provider_snapshot: buildProviderSnapshot(),
+          // 修改原因：虚拟路由手风琴复用本弹窗，但它不能按单个真实渠道直连测试。
+          // 修改方式：当 provider 快照带 _virtual_route_test 时，在测试请求中同步传递 virtual_route_test 标记。
+          // 目的：后端可以进入虚拟路由解析分支，用虚拟模型名触发完整 chain，而不是把它当普通渠道模型。
+          virtual_route_test: provider._virtual_route_test === true,
           // 这里传别名模型，确保与正式路由保持一致（映射、覆写按别名匹配）
           model: display,
           upstream_model: upstream,
@@ -218,6 +229,17 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
     setTimeout(() => setCopiedModel(null), 2000);
   };
 
+  const copyErrorText = async (modelName: string, errorText: string) => {
+    try {
+      await navigator.clipboard.writeText(errorText);
+      setCopiedErrorModel(modelName);
+      setTimeout(() => setCopiedErrorModel(null), 1500);
+    } catch (error) {
+      // 复制失败只记录到控制台，避免用弹窗或临时 Toast 打断批量测试流程。
+      console.error('Failed to copy channel test error', error);
+    }
+  };
+
   const filteredModels = models.filter(m =>
     !searchKeyword || m.display.toLowerCase().includes(searchKeyword.toLowerCase())
   );
@@ -231,7 +253,7 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
     }
   };
 
-  const getStatusText = (result: TestResult) => {
+  const getStatusText = (result: TestResult, modelName: string) => {
     switch (result.status) {
       case 'pending': return <span className="text-muted-foreground">等待测试</span>;
       case 'testing': return <span className="text-blue-600 dark:text-blue-400">正在测试...</span>;
@@ -243,10 +265,23 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
             测试通过
           </span>
         );
-      case 'error':
+      case 'error': {
         const errorText = result.error || '测试失败';
         const truncated = errorText.length > 40 ? errorText.substring(0, 40) + '...' : errorText;
-        return <span className="text-red-600 dark:text-red-400" title={errorText}>{truncated}</span>;
+        const expanded = expandedErrorModel === modelName;
+        return (
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              setExpandedErrorModel(current => current === modelName ? null : modelName);
+            }}
+            className="max-w-full truncate text-left text-red-600 dark:text-red-400 hover:underline"
+          >
+            {expanded ? '收起错误详情' : `查看错误：${truncated}`}
+          </button>
+        );
+      }
     }
   };
 
@@ -324,42 +359,70 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
                     ? `${modelInfo.display} (${modelInfo.upstream})`
                     : modelInfo.display;
 
+                  const errorText = result.error || '测试失败';
+                  const isErrorExpanded = result.status === 'error' && expandedErrorModel === modelInfo.display;
+
                   return (
                     <li
                       key={modelInfo.display}
-                      className="flex items-center h-14 px-4 hover:bg-muted/50 transition-colors cursor-pointer group"
-                      onClick={() => copyModelName(modelInfo.display)}
-                      title="点击复制模型名"
+                      className="px-4 hover:bg-muted/50 transition-colors group"
                     >
-                      {/* Status Icon */}
-                      <div className="w-10 h-10 flex items-center justify-center flex-shrink-0">
-                        {getStatusIcon(result.status)}
-                      </div>
-
-                      {/* Content */}
-                      <div className="flex-1 min-w-0 ml-2">
-                        <div className="font-mono text-sm text-foreground truncate flex items-center gap-2">
-                          {displayText}
-                          {copiedModel === modelInfo.display ? (
-                            <CopyCheck className="w-3.5 h-3.5 text-emerald-500" />
-                          ) : (
-                            <Copy className="w-3.5 h-3.5 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
-                          )}
-                        </div>
-                        <div className="text-xs truncate">
-                          {getStatusText(result)}
-                        </div>
-                      </div>
-
-                      {/* Test Button */}
-                      <button
-                        onClick={(e) => { e.stopPropagation(); testSingleModel(modelInfo); }}
-                        disabled={result.status === 'testing'}
-                        className="p-2 text-primary hover:bg-primary/10 rounded-lg transition-colors disabled:opacity-50"
-                        title="测试此模型"
+                      <div
+                        className="flex items-center min-h-14 cursor-pointer"
+                        onClick={() => copyModelName(modelInfo.display)}
+                        title="点击复制模型名"
                       >
-                        <Play className="w-4 h-4" />
-                      </button>
+                        {/* Status Icon */}
+                        <div className="w-10 h-10 flex items-center justify-center flex-shrink-0">
+                          {getStatusIcon(result.status)}
+                        </div>
+
+                        {/* Content */}
+                        <div className="flex-1 min-w-0 ml-2">
+                          <div className="font-mono text-sm text-foreground truncate flex items-center gap-2">
+                            {displayText}
+                            {copiedModel === modelInfo.display ? (
+                              <CopyCheck className="w-3.5 h-3.5 text-emerald-500" />
+                            ) : (
+                              <Copy className="w-3.5 h-3.5 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
+                            )}
+                          </div>
+                          <div className="text-xs truncate">
+                            {getStatusText(result, modelInfo.display)}
+                          </div>
+                        </div>
+
+                        {/* Test Button */}
+                        <button
+                          onClick={(e) => { e.stopPropagation(); testSingleModel(modelInfo); }}
+                          disabled={result.status === 'testing'}
+                          className="p-2 text-primary hover:bg-primary/10 rounded-lg transition-colors disabled:opacity-50"
+                          title="测试此模型"
+                        >
+                          <Play className="w-4 h-4" />
+                        </button>
+                      </div>
+
+                      {isErrorExpanded && (
+                        <div
+                          className="ml-12 mb-3 rounded-lg border border-red-500/20 bg-red-500/5 p-3"
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          {/* 错误正文使用 pre 保留换行，并开启 select-text；这样手机端和桌面端都能完整查看并选择复制。 */}
+                          <div className="flex items-center justify-between gap-3 text-[11px] text-red-600 dark:text-red-400">
+                            <span>错误详情</span>
+                            <button
+                              type="button"
+                              onClick={() => void copyErrorText(modelInfo.display, errorText)}
+                              className="inline-flex items-center gap-1 rounded-md border border-red-500/20 bg-background px-2 py-1 hover:bg-red-500/10 transition-colors"
+                            >
+                              {copiedErrorModel === modelInfo.display ? <CopyCheck className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                              {copiedErrorModel === modelInfo.display ? '已复制' : '复制'}
+                            </button>
+                          </div>
+                          <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words select-text text-[11px] leading-relaxed text-red-700 dark:text-red-300 font-mono">{errorText}</pre>
+                        </div>
+                      )}
                     </li>
                   );
                 })}

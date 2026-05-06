@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from core.log_config import logger
+from core.usage import extract_cache_usage
 from core.utils import safe_get
 
 
@@ -176,3 +177,57 @@ def _apply_overrides(
                 _deep_merge(payload[key], value)
             else:
                 payload[key] = value
+
+
+def parse_passthrough_usage(data: Any) -> Optional[Dict[str, int]]:
+    """从透传响应中宽松提取 usage，并统一缓存字段。
+
+    透传路径不会经过通道适配器重组，因此这里同时兼容 OpenAI、Responses、Claude 和 Gemini 的
+    原始 usage 位置，目的在于让 LoggingStreamingResponse 能直接写入 current_info。
+    """
+    if not isinstance(data, dict):
+        return None
+
+    gemini_usage = data.get("usageMetadata")
+    if isinstance(gemini_usage, dict):
+        cache_usage = extract_cache_usage(gemini_usage)
+        prompt = gemini_usage.get("promptTokenCount", 0) or 0
+        completion = gemini_usage.get("candidatesTokenCount", 0) or 0
+        total = gemini_usage.get("totalTokenCount", 0) or (prompt + completion)
+        if prompt or completion or cache_usage["cached_tokens"] or cache_usage["cache_creation_tokens"]:
+            return {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": total,
+                **cache_usage,
+            }
+
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        message = data.get("message")
+        if isinstance(message, dict):
+            usage = message.get("usage")
+    if not isinstance(usage, dict):
+        response = data.get("response")
+        if isinstance(response, dict):
+            usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    cache_usage = extract_cache_usage(usage)
+    if "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage:
+        # Claude 原生 input_tokens 不含缓存部分；透传统计需要还原为统一 prompt_tokens 口径。
+        prompt = (usage.get("input_tokens", 0) or 0) + cache_usage["cached_tokens"] + cache_usage["cache_creation_tokens"]
+    else:
+        prompt = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+    completion = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+    total = usage.get("total_tokens") or (prompt + completion)
+
+    if prompt or completion or cache_usage["cached_tokens"] or cache_usage["cache_creation_tokens"]:
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+            **cache_usage,
+        }
+    return None

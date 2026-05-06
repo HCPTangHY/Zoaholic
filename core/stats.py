@@ -29,6 +29,9 @@ from core.d1_client import format_d1_datetime
 SQLITE_MAX_RETRIES = 3
 SQLITE_RETRY_DELAY = 0.5  # 初始重试延迟（秒）
 
+# Prompt Caching 新增列需要在各数据库的简易迁移中显式带 DEFAULT 0，避免旧表新增列后出现 NULL。
+PROMPT_CACHE_STAT_COLUMNS = {"cached_tokens", "cache_creation_tokens"}
+
 is_debug = env_bool("DEBUG", False)
 
 # 根据数据库类型，动态创建信号量
@@ -172,6 +175,8 @@ async def _create_tables_d1():
             prompt_tokens INTEGER DEFAULT 0,
             completion_tokens INTEGER DEFAULT 0,
             total_tokens INTEGER DEFAULT 0,
+            cached_tokens INTEGER DEFAULT 0,
+            cache_creation_tokens INTEGER DEFAULT 0,
             prompt_price REAL DEFAULT 0.0,
             completion_price REAL DEFAULT 0.0,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -238,6 +243,19 @@ async def _create_tables_d1():
     for sql in create_sqls + index_sqls:
         await d1_client.execute(sql)
 
+    # D1 的 CREATE TABLE IF NOT EXISTS 不会给旧表补列；这里按启动迁移补齐 Prompt Caching 字段。
+    existing_columns = {
+        row.get("name")
+        for row in await d1_client.query_all("PRAGMA table_info(request_stats)")
+        if row.get("name")
+    }
+    for column_name in PROMPT_CACHE_STAT_COLUMNS:
+        if column_name not in existing_columns:
+            await d1_client.execute(
+                f"ALTER TABLE request_stats ADD COLUMN {column_name} INTEGER DEFAULT 0"
+            )
+            logger.info("Added D1 request_stats column '%s' for Prompt Caching stats.", column_name)
+
 
 async def create_tables():
     """创建数据库表并执行简易列迁移"""
@@ -267,8 +285,12 @@ async def create_tables():
                             # 且 CockroachDB 对 JSONB 的兼容也可能返回 JSON。
                             col_type = column.type.compile(connection.dialect)
 
-                            # SQLite 允许 DEFAULT；Postgres/Cockroach 对 JSON 默认值较敏感，这里统一不加默认
-                            default = _get_default_sql(column.default) if db_type == "sqlite" else ""
+                            # Prompt Caching 字段需要跨数据库保持 DEFAULT 0；其它列沿用原有保守策略以避免 JSON 默认值兼容问题。
+                            if table_name == "request_stats" and column_name in PROMPT_CACHE_STAT_COLUMNS:
+                                default = " DEFAULT 0"
+                            else:
+                                # SQLite 允许 DEFAULT；Postgres/Cockroach 对 JSON 默认值较敏感，这里统一不加默认
+                                default = _get_default_sql(column.default) if db_type == "sqlite" else ""
 
                             # 使用标准的 ALTER TABLE 语法
                             qt = preparer.quote(table_name)

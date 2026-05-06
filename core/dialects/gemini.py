@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from core.json_utils import json_loads, json_dumps_text
 from core.models import RequestModel, Message, ContentItem, ImageUrl
+from core.usage import extract_cache_usage
 
 from .registry import DialectDefinition, EndpointDefinition, register_dialect
 
@@ -335,6 +336,15 @@ async def render_gemini_response(
             parts[-1]["thoughtSignature"] = msg.get("thoughtSignature")
 
     usage = canonical_response.get("usage") or {}
+    # Gemini 出口需要把 OpenAI prompt_tokens_details.cached_tokens 还原为 cachedContentTokenCount。
+    cache_usage = extract_cache_usage(usage)
+    usage_metadata = {
+        "promptTokenCount": usage.get("prompt_tokens", 0),
+        "candidatesTokenCount": usage.get("completion_tokens", 0),
+        "totalTokenCount": usage.get("total_tokens", 0),
+    }
+    if cache_usage["cached_tokens"] > 0:
+        usage_metadata["cachedContentTokenCount"] = cache_usage["cached_tokens"]
 
     return {
         "candidates": [
@@ -343,11 +353,7 @@ async def render_gemini_response(
                 "finishReason": "STOP",
             }
         ],
-        "usageMetadata": {
-            "promptTokenCount": usage.get("prompt_tokens", 0),
-            "candidatesTokenCount": usage.get("completion_tokens", 0),
-            "totalTokenCount": usage.get("total_tokens", 0),
-        },
+        "usageMetadata": usage_metadata,
     }
 
 
@@ -375,8 +381,20 @@ async def render_gemini_stream(canonical_sse_chunk: str) -> str:
     except json.JSONDecodeError:
         return canonical_sse_chunk
 
+    usage = canonical.get("usage")
     choices = canonical.get("choices") or []
     if not choices:
+        if isinstance(usage, dict):
+            # usage-only chunk 没有 choices；这里直接输出 Gemini usageMetadata，避免流式转换时丢失缓存命中字段。
+            cache_usage = extract_cache_usage(usage)
+            usage_metadata = {
+                "promptTokenCount": usage.get("prompt_tokens", 0),
+                "candidatesTokenCount": usage.get("completion_tokens", 0),
+                "totalTokenCount": usage.get("total_tokens", 0),
+            }
+            if cache_usage["cached_tokens"] > 0:
+                usage_metadata["cachedContentTokenCount"] = cache_usage["cached_tokens"]
+            return f"data: {json_dumps_text({'usageMetadata': usage_metadata}, ensure_ascii=False)}\n\n"
         return ""
 
     delta = choices[0].get("delta") or {}
@@ -439,11 +457,15 @@ async def render_gemini_stream(canonical_sse_chunk: str) -> str:
 
     usage = canonical.get("usage")
     if isinstance(usage, dict):
+        cache_usage = extract_cache_usage(usage)
         gemini_chunk["usageMetadata"] = {
             "promptTokenCount": usage.get("prompt_tokens", 0),
             "candidatesTokenCount": usage.get("completion_tokens", 0),
             "totalTokenCount": usage.get("total_tokens", 0),
         }
+        if cache_usage["cached_tokens"] > 0:
+            # 内容 chunk 和 usage chunk 都走同一个映射规则，目的在于保持流式 Gemini 输出格式一致。
+            gemini_chunk["usageMetadata"]["cachedContentTokenCount"] = cache_usage["cached_tokens"]
 
     json_data = json_dumps_text(gemini_chunk, ensure_ascii=False)
     return f"data: {json_data}\n\n"
@@ -458,8 +480,15 @@ def parse_gemini_usage(data: Any) -> Optional[Dict[str, int]]:
         prompt = usage.get("promptTokenCount", 0)
         completion = usage.get("candidatesTokenCount", 0)
         total = usage.get("totalTokenCount", prompt + completion)
-        if prompt or completion:
-            return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+        # Gemini 的缓存命中字段在 usageMetadata.cachedContentTokenCount，需映射为统一 cached_tokens。
+        cache_usage = extract_cache_usage(usage)
+        if prompt or completion or cache_usage["cached_tokens"] or cache_usage["cache_creation_tokens"]:
+            return {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": total,
+                **cache_usage,
+            }
     return None
 
 

@@ -289,6 +289,9 @@ class StatsMiddleware:
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
+            # Prompt Caching 字段随请求上下文初始化为 0，目的是让没有缓存信息的请求也能稳定写入新列。
+            "cached_tokens": 0,
+            "cache_creation_tokens": 0,
             # 扩展日志字段
             "provider_id": None,
             "provider_key_index": None,

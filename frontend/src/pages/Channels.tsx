@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { useEffect, useMemo, useRef, useState, KeyboardEvent, ClipboardEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, KeyboardEvent, ClipboardEvent, DragEvent } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
 import { toastSuccess, toastError, toastWarning, fmtErr } from '../components/Toast';
@@ -7,7 +7,7 @@ import {
   Plus, Edit, Brain, Trash2, ArrowRight, RefreshCw,
   Server, X, CheckCircle2, Settings2, Copy, ToggleRight, ToggleLeft,
   Folder, Puzzle, Network, CopyCheck, Power, Files, Play,
-  Search, Check, BarChart3, Wallet, XCircle
+  Search, Check, BarChart3, Wallet, XCircle, Link2, GripVertical
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as Switch from '@radix-ui/react-switch';
@@ -16,6 +16,15 @@ import { ChannelTestDialog } from '../components/ChannelTestDialog';
 import { ApiKeyTestDialog } from '../components/ApiKeyTestDialog';
 import { ChannelAnalyticsSheet } from '../components/ChannelAnalyticsSheet';
 import { ProviderLogo } from '../components/ProviderLogos';
+import {
+  buildProviderListItems,
+  buildVirtualProviderEntries,
+  buildVirtualProviderPanelItems,
+  buildVirtualRouteTestProvider,
+  buildVirtualRoutingProviderItems,
+  getProviderWeight,
+  summarizeVirtualChain,
+} from '../lib/virtualModels';
 
 // ========== Types ==========
 interface ApiKeyObj {
@@ -79,12 +88,51 @@ interface PluginOption {
   metadata?: any;
 }
 
+// 修改原因：前端需要编辑 preferences.virtual_models 中的优先级链条结构。
+// 修改方式：为虚拟模型配置和链条节点补充本页面内使用的类型定义。
+// 目的：让列表展示、弹窗编辑和保存 payload 使用同一份数据形状。
+interface VirtualModelChainNode {
+  type: 'model' | 'channel';
+  value: string;
+  model?: string;
+}
+
+interface VirtualModelConfig {
+  enabled: boolean;
+  chain: VirtualModelChainNode[];
+}
+
+// 修改原因：新的虚拟模型画布需要展示渠道模型的对外名和上游名。
+// 修改方式：把 provider.model 中的 string 与 {upstream: alias} 统一整理为页面可直接渲染的结构。
+// 目的：拖拽模型节点、渠道节点模型选择和链条说明都使用同一套模型名称解释。
+interface ProviderModelOption {
+  displayName: string;
+  upstreamName: string;
+  hasMapping: boolean;
+}
+
+// 修改原因：原生 Drag and Drop API 只能通过字符串传递拖拽数据。
+// 修改方式：为左侧模型、左侧渠道和链条内部节点定义统一 payload 类型。
+// 目的：drop 处理函数可以区分新建节点和链条排序，避免误把外部拖入当作内部排序。
+type VirtualDragPayload =
+  | { source: 'panel-model'; modelName: string }
+  | { source: 'panel-channel'; providerName: string }
+  | { source: 'chain-node'; virtualName: string; fromIndex: number };
+
 const SCHEDULE_ALGORITHMS = [
   { value: 'round_robin', label: '轮询 (Round Robin)' },
   { value: 'fixed_priority', label: '固定优先级 (Fixed)' },
   { value: 'random', label: '随机 (Random)' },
   { value: 'smart_round_robin', label: '智能轮询 (Smart)' },
 ];
+
+function readBooleanPreference(value: any): boolean {
+  // 修改原因：后端新增 pool_sharing 布尔开关，旧配置中也可能存在字符串形式的布尔值。
+  // 修改方式：统一把 true/1/yes/on 转为 true，其余值按 JavaScript 布尔语义处理。
+  // 目的：让表单初始化时能够稳定显示共享路由池开关的实际状态。
+  if (typeof value === 'string') return ['true', '1', 'yes', 'on'].includes(value.trim().toLowerCase());
+  return Boolean(value);
+}
 
 // ── 余额类型 ──
 interface BalanceResult {
@@ -283,6 +331,32 @@ export default function Channels() {
   // ── 全局配置（用于价格提示等）──
   const [globalModelPrice, setGlobalModelPrice] = useState<Record<string, string>>({});
 
+  // 修改原因：虚拟模型路由存储在全局 preferences.virtual_models 下，不属于单个真实渠道。
+  // 修改方式：保留全局配置草稿，同时新增抽屉编辑态，列表只展示折叠卡片或行。
+  // 目的：让虚拟模型混入渠道列表，避免顶部画布长期占用屏幕空间。
+  const [virtualModels, setVirtualModels] = useState<Record<string, VirtualModelConfig>>({});
+  const [virtualDraftName, setVirtualDraftName] = useState('');
+  const [virtualDraftEnabled, setVirtualDraftEnabled] = useState(true);
+  const [virtualModelsDirty, setVirtualModelsDirty] = useState(false);
+  const [expandedVirtualModels, setExpandedVirtualModels] = useState<Set<string>>(() => new Set());
+  const [expandedVirtualProviders, setExpandedVirtualProviders] = useState<Set<string>>(() => new Set());
+  const [virtualAddNodeTypes, setVirtualAddNodeTypes] = useState<Record<string, 'model' | 'channel'>>({});
+  const [isVirtualModalOpen, setIsVirtualModalOpen] = useState(false);
+  const [editingVirtualName, setEditingVirtualName] = useState<string | null>(null);
+  const [virtualEditorChain, setVirtualEditorChain] = useState<VirtualModelChainNode[]>([]);
+  // 修改原因：虚拟模型抽屉左栏在大屏下长期占用过多横向空间。
+  // 修改方式：新增左栏折叠状态，并默认折叠为窄侧边条。
+  // 目的：打开抽屉时优先保证右侧链条编辑区空间充足，按需再展开渠道列表。
+  const [isVirtualProviderPanelCollapsed, setIsVirtualProviderPanelCollapsed] = useState(true);
+  // 修改原因：移动端渠道面板需要默认折叠，但又不能复用桌面端窄侧栏的折叠形态。
+  // 修改方式：新增独立的移动端展开状态，只控制小屏顶部渠道面板的展开和收起。
+  // 目的：手机上先显示链条编辑区，同时允许用户按需查看完整渠道列表。
+  const [isVirtualMobileProviderPanelOpen, setIsVirtualMobileProviderPanelOpen] = useState(false);
+  // 修改原因：渠道列表顶部需要一个统一的虚拟路由手风琴，而不是每个虚拟模型各自占一行。
+  // 修改方式：新增独立展开状态，桌面表格和移动端卡片共用它控制子行或子卡片显示。
+  // 目的：让虚拟模型置顶收纳，同时保留测试、启用、编辑和删除入口。
+  const [isVirtualRoutesAccordionOpen, setIsVirtualRoutesAccordionOpen] = useState(false);
+
   const [isFetchModelsOpen, setIsFetchModelsOpen] = useState(false);
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [selectedModels, setSelectedModels] = useState<Set<string>>(() => new Set());
@@ -340,6 +414,16 @@ export default function Channels() {
         setProviders(sortedProviders);
         const globalPrefs = data.preferences || data.api_config?.preferences || {};
         setGlobalModelPrice(globalPrefs.model_price || {});
+        // 修改原因：虚拟模型路由由 /v1/api_config 的全局 preferences 返回。
+        // 修改方式：读取 preferences.virtual_models 并在缺失时回退为空对象。
+        // 目的：页面加载后立即展示已配置的全局虚拟模型路由。
+        const loadedVirtualModels = globalPrefs.virtual_models || {};
+        setVirtualModels(loadedVirtualModels);
+        setVirtualModelsDirty(false);
+        // 修改原因：虚拟模型现在通过渠道列表卡片进入抽屉编辑，旧画布展开状态不再承担主要展示职责。
+        // 修改方式：仍保留已有展开状态初始化，供历史函数和后续兼容逻辑使用。
+        // 目的：减少本次 UI 重构对既有状态和 CRUD 函数的破坏范围。
+        setExpandedVirtualModels(prev => prev.size > 0 ? prev : new Set(Object.keys(loadedVirtualModels).slice(0, 1)));
       }
       if (typesRes.ok) {
         const data = await typesRes.json();
@@ -533,6 +617,10 @@ export default function Channels() {
           proxy: basePreferences.proxy || '',
           tools: basePreferences.tools !== false,
           system_prompt: basePreferences.system_prompt || '',
+          // 修改原因：pool_sharing 是新增渠道级开关，旧配置没有该字段时必须保持默认关闭。
+          // 修改方式：初始化时从 preferences 中读取并归一化为布尔值。
+          // 目的：让表单保存时明确写入共享路由池状态，避免 undefined 被误解。
+          pool_sharing: readBooleanPreference(basePreferences.pool_sharing),
           enabled_plugins: Array.isArray(basePreferences.enabled_plugins) ? basePreferences.enabled_plugins : [],
         },
         sub_channels: subChannels,
@@ -552,7 +640,10 @@ export default function Channels() {
         groups: ['default'],
         models: [],
         mappings: [],
-        preferences: { weight: 10, api_key_schedule_algorithm: 'round_robin', tools: true, enabled_plugins: [], key_rules: [{ match: { status: [401, 403] }, duration: -1 }, { match: 'default', duration: 3 }] },
+        // 修改原因：新增渠道默认不能加入共享路由池，必须由用户在有 model_prefix 时显式开启。
+        // 修改方式：在默认 preferences 中写入 pool_sharing: false。
+        // 目的：保证新增渠道和旧渠道的默认行为一致。
+        preferences: { weight: 10, api_key_schedule_algorithm: 'round_robin', tools: true, pool_sharing: false, enabled_plugins: [], key_rules: [{ match: { status: [401, 403] }, duration: -1 }, { match: 'default', duration: 3 }] },
         sub_channels: [],
       });
     }
@@ -565,6 +656,17 @@ export default function Channels() {
 
   const updatePreference = (field: keyof ProviderFormData['preferences'], value: any) => {
     setFormData(prev => prev ? { ...prev, preferences: { ...prev.preferences, [field]: value } } : null);
+  };
+
+  const updateModelPrefix = (value: string) => {
+    // 修改原因：共享路由池只有在 model_prefix 存在时才有意义，清空前缀后不能保留隐藏的开启状态。
+    // 修改方式：更新 model_prefix 时，如果新值为空，就同步把 preferences.pool_sharing 置为 false。
+    // 目的：避免保存出无前缀但 pool_sharing=true 的冗余配置。
+    setFormData(prev => {
+      if (!prev) return null;
+      if (value.trim()) return { ...prev, model_prefix: value };
+      return { ...prev, model_prefix: value, preferences: { ...prev.preferences, pool_sharing: false } };
+    });
   };
 
   // ── 查询所有 Key 余额 ──
@@ -993,6 +1095,517 @@ export default function Channels() {
     }
   };
 
+  const getVirtualProviderWeight = (provider: any): number => {
+    // 修改原因：左侧渠道面板要求按 preferences.weight 降序展示，并把禁用渠道放到底部。
+    // 修改方式：统一读取 preferences.weight，缺失时回退到 provider.weight，最后回退为 0。
+    // 目的：避免不同位置重复实现权重读取规则导致排序不一致。
+    return Number(provider?.preferences?.weight ?? provider?.weight ?? 0) || 0;
+  };
+
+  const getProviderModelOptions = (provider: any): ProviderModelOption[] => {
+    // 修改原因：虚拟模型画布需要从真实渠道配置中提取可拖拽的对外模型名。
+    // 修改方式：遍历 provider.model 或 provider.models，将字符串模型和 {upstream: alias} 映射都转成 displayName/upstreamName。
+    // 目的：左栏模型列表、渠道节点下拉和节点说明使用一致的数据源。
+    const rawModels = Array.isArray(provider?.model) ? provider.model : Array.isArray(provider?.models) ? provider.models : [];
+    const prefix = String(provider?.model_prefix || '').trim();
+    const options: ProviderModelOption[] = [];
+    const seen = new Set<string>();
+
+    const appendOption = (displayName: string, upstreamName: string) => {
+      const cleanDisplay = String(displayName || '').trim();
+      const cleanUpstream = String(upstreamName || '').trim();
+      if (!cleanDisplay || !cleanUpstream) return;
+      const key = `${cleanDisplay}\u0000${cleanUpstream}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      options.push({ displayName: cleanDisplay, upstreamName: cleanUpstream, hasMapping: cleanDisplay !== cleanUpstream });
+    };
+
+    rawModels.forEach((model: any) => {
+      if (typeof model === 'string') {
+        const upstream = model.trim();
+        if (!upstream) return;
+        appendOption(model === '*' || !prefix ? upstream : `${prefix}${upstream}`, upstream);
+      } else if (model && typeof model === 'object') {
+        Object.entries(model).forEach(([upstream, alias]) => {
+          const aliasText = String(alias || '').trim();
+          const upstreamText = String(upstream || '').trim();
+          if (!aliasText || !upstreamText) return;
+          appendOption(prefix ? `${prefix}${aliasText}` : aliasText, upstreamText);
+        });
+      }
+    });
+
+    return options;
+  };
+
+  const findProviderModelOption = (provider: any, modelName: string): ProviderModelOption | null => {
+    // 修改原因：模型节点和渠道节点都需要显示它们最终会匹配到哪个渠道模型。
+    // 修改方式：先按对外名精确匹配，再按 pool_sharing 规则尝试 prefix + modelName。
+    // 目的：前端展示的“匹配到 N 个渠道”与后端虚拟路由匹配规则保持一致。
+    const requested = String(modelName || '').trim();
+    if (!requested) return null;
+    const options = getProviderModelOptions(provider);
+    const direct = options.find(option => option.displayName === requested);
+    if (direct) return direct;
+
+    const prefix = String(provider?.model_prefix || '').trim();
+    const poolSharing = readBooleanPreference(provider?.preferences?.pool_sharing);
+    if (!prefix || !poolSharing || requested.startsWith(prefix)) return null;
+    return options.find(option => option.displayName === `${prefix}${requested}`) || null;
+  };
+
+  const getProviderByName = (providerName: string): any | null => {
+    // 修改原因：渠道节点现在可以引用运行时展开后的子渠道 provider 名。
+    // 修改方式：改为在前端展开后的 virtualRoutingProviderItems 中按 provider 字段精确查找。
+    // 目的：让右侧链条、渠道模型下拉和节点说明都能识别子渠道。
+    return virtualRoutingProviderItems.find(provider => String(provider?.provider || '') === providerName) || null;
+  };
+
+  const getMatchingProviderCount = (modelName: string): number => {
+    // 修改原因：模型节点的全局匹配范围应与后端运行时 providers 一致，必须包含子渠道。
+    // 修改方式：复用 findProviderModelOption，并在前端展开后的 provider 列表中统计启用项。
+    // 目的：让“匹配到 N 个渠道”的提示不会漏掉子渠道模型。
+    return virtualRoutingProviderItems.filter(provider => provider?.enabled !== false && findProviderModelOption(provider, modelName)).length;
+  };
+
+  const formatProviderModelOption = (option: ProviderModelOption): string => {
+    // 修改原因：模型列表需要同时表达对外模型名和上游原名。
+    // 修改方式：两者不同时使用“对外名 → 上游名”，相同时只显示一个名称。
+    // 目的：让 mapping 和 prefix 造成的名称差异可以直接被看见。
+    return option.hasMapping ? `${option.displayName} → ${option.upstreamName}` : option.displayName;
+  };
+
+  const describeVirtualChannelNode = (node: VirtualModelChainNode, virtualName: string): string => {
+    // 修改原因：渠道节点需要展示“渠道名 + 使用的模型”，而不是只展示渠道名。
+    // 修改方式：使用节点 model 覆盖值或虚拟模型名回查渠道模型映射。
+    // 目的：用户可以在链条中直接确认该渠道节点会把请求发给哪个上游模型。
+    const provider = getProviderByName(node.value);
+    if (!provider) return '渠道未找到';
+    const requestedModel = String(node.model || virtualName || '').trim();
+    const matched = findProviderModelOption(provider, requestedModel);
+    if (!matched) return requestedModel ? `使用模型：${requestedModel}（未匹配）` : '未指定模型';
+    return `使用模型：${formatProviderModelOption(matched)}`;
+  };
+
+  const updateVirtualModelsDraft = (updater: (prev: Record<string, VirtualModelConfig>) => Record<string, VirtualModelConfig>) => {
+    // 修改原因：画布上的编辑应先成为本地草稿，点击保存后再写回后端。
+    // 修改方式：集中包装 setVirtualModels，并同步设置 dirty 标记。
+    // 目的：避免每一次拖拽或输入都立即请求后端，也提醒用户保存更改。
+    setVirtualModels(prev => updater(prev));
+    setVirtualModelsDirty(true);
+  };
+
+  const serializeVirtualModels = (source: Record<string, VirtualModelConfig>): Record<string, VirtualModelConfig> => {
+    // 修改原因：保存前必须把画布草稿清理成 preferences.virtual_models 所需格式。
+    // 修改方式：修剪模型名、移除空节点，并只为 channel 节点保留有效 model 覆盖。
+    // 目的：保证 POST /v1/api_config/update 收到的 chain 数组结构简洁、稳定。
+    const cleaned: Record<string, VirtualModelConfig> = {};
+    Object.entries(source).forEach(([rawName, config]) => {
+      const name = String(rawName || '').trim();
+      if (!name || !config || typeof config !== 'object') return;
+      const chain = (Array.isArray(config.chain) ? config.chain : [])
+        .map(node => ({
+          type: node.type === 'channel' ? 'channel' as const : 'model' as const,
+          value: String(node.value || '').trim(),
+          model: node.type === 'channel' && node.model ? String(node.model).trim() : undefined,
+        }))
+        .filter(node => node.value)
+        .map(node => {
+          if (node.type === 'channel' && node.model) return node;
+          const { model: _unused, ...rest } = node;
+          return rest;
+        });
+      cleaned[name] = { enabled: config.enabled !== false, chain };
+    });
+    return cleaned;
+  };
+
+  const saveVirtualModels = async (nextVirtualModels: Record<string, VirtualModelConfig>) => {
+    // 修改原因：虚拟模型配置保存在全局 preferences 下，不能通过 providers 保存接口混入渠道列表。
+    // 修改方式：向 /v1/api_config/update 只提交 preferences.virtual_models 字段。
+    // 目的：减少保存影响范围，并复用后端现有配置持久化流程。
+    const res = await apiFetch('/v1/api_config/update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ preferences: { virtual_models: nextVirtualModels } }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(fmtErr(err, res.status));
+    }
+    setVirtualModels(nextVirtualModels);
+    setVirtualModelsDirty(false);
+  };
+
+  const handleSaveVirtualModelsDraft = async () => {
+    // 修改原因：新 UI 支持一次编辑多个虚拟模型和链条节点。
+    // 修改方式：保存按钮统一序列化当前 virtualModels 草稿后提交 preferences.virtual_models。
+    // 目的：让拖拽排序、节点删除和启用状态可以一次性落盘。
+    try {
+      const cleaned = serializeVirtualModels(virtualModels);
+      await saveVirtualModels(cleaned);
+      toastSuccess('虚拟模型路由已保存');
+    } catch (err: any) {
+      toastError(`保存失败: ${err?.message || err}`);
+    }
+  };
+
+  const handleAddVirtualModel = () => {
+    // 修改原因：右侧编辑区顶部需要直接新建虚拟模型，不再打开弹窗。
+    // 修改方式：读取虚拟模型名输入框和启用开关，创建空链条草稿并默认展开。
+    // 目的：用户可以创建后立即从左侧拖拽模型或渠道到链条中。
+    const name = virtualDraftName.trim();
+    if (!name) {
+      toastWarning('虚拟模型名为必填项');
+      return;
+    }
+    if (virtualModels[name]) {
+      toastWarning('该虚拟模型已存在');
+      return;
+    }
+    updateVirtualModelsDraft(prev => ({ ...prev, [name]: { enabled: virtualDraftEnabled, chain: [] } }));
+    setExpandedVirtualModels(prev => new Set(prev).add(name));
+    setVirtualDraftName('');
+    setVirtualDraftEnabled(true);
+  };
+
+  const updateVirtualModelConfig = (name: string, patch: Partial<VirtualModelConfig>) => {
+    // 修改原因：启用状态和链条内容都在折叠卡片内直接编辑。
+    // 修改方式：按虚拟模型名合并更新局部字段，并保持其他模型不变。
+    // 目的：避免局部编辑覆盖同一页面中的其他虚拟模型草稿。
+    updateVirtualModelsDraft(prev => ({
+      ...prev,
+      [name]: { enabled: prev[name]?.enabled !== false, chain: Array.isArray(prev[name]?.chain) ? prev[name].chain : [], ...patch },
+    }));
+  };
+
+  const updateVirtualNode = (virtualName: string, idx: number, patch: Partial<VirtualModelChainNode>) => {
+    // 修改原因：节点类型、模型名、渠道名和渠道模型覆盖都需要在画布内直接调整。
+    // 修改方式：按虚拟模型名和节点索引更新链条，并在切回 model 类型时删除 model 覆盖字段。
+    // 目的：保存到 preferences.virtual_models 的节点结构保持清晰。
+    const current = virtualModels[virtualName];
+    if (!current) return;
+    const nextChain = (Array.isArray(current.chain) ? current.chain : []).map((node, nodeIdx) => {
+      if (nodeIdx !== idx) return node;
+      const nextNode = { ...node, ...patch };
+      if (patch.type === 'model') delete nextNode.model;
+      return nextNode;
+    });
+    updateVirtualModelConfig(virtualName, { chain: nextChain });
+  };
+
+  const moveVirtualNode = (virtualName: string, fromIdx: number, toIdx: number) => {
+    // 修改原因：链条节点顺序就是虚拟路由优先级，需要支持原生拖拽重排。
+    // 修改方式：在指定虚拟模型的 chain 数组中移动元素，不立即保存到后端。
+    // 目的：用户可以调整完整链条后再统一保存。
+    const current = virtualModels[virtualName];
+    if (!current || fromIdx === toIdx) return;
+    const nextChain = [...(Array.isArray(current.chain) ? current.chain : [])];
+    if (fromIdx < 0 || fromIdx >= nextChain.length) return;
+    const [item] = nextChain.splice(fromIdx, 1);
+    const safeToIdx = Math.max(0, Math.min(toIdx, nextChain.length));
+    nextChain.splice(safeToIdx, 0, item);
+    updateVirtualModelConfig(virtualName, { chain: nextChain });
+  };
+
+  const insertVirtualNode = (virtualName: string, node: VirtualModelChainNode, insertIndex?: number) => {
+    // 修改原因：左侧拖拽和底部添加按钮都需要把新节点插入某个虚拟模型链条。
+    // 修改方式：复制目标 chain 后按传入索引插入，未传索引时追加到末尾。
+    // 目的：统一外部拖入、手动添加和后续扩展的节点创建行为。
+    const current = virtualModels[virtualName];
+    if (!current) return;
+    const nextChain = [...(Array.isArray(current.chain) ? current.chain : [])];
+    const targetIndex = insertIndex == null ? nextChain.length : Math.max(0, Math.min(insertIndex, nextChain.length));
+    nextChain.splice(targetIndex, 0, node);
+    updateVirtualModelConfig(virtualName, { chain: nextChain });
+    setExpandedVirtualModels(prev => new Set(prev).add(virtualName));
+  };
+
+  const appendVirtualNodeByType = (virtualName: string) => {
+    // 修改原因：链条底部需要一个保底添加入口，便于不使用拖拽时也能编辑。
+    // 修改方式：读取当前虚拟模型的添加类型选择，追加空 model 或 channel 节点。
+    // 目的：满足键盘输入和移动端场景下的节点创建需求。
+    const nodeType = virtualAddNodeTypes[virtualName] || 'model';
+    insertVirtualNode(virtualName, { type: nodeType, value: '' });
+  };
+
+  const toggleVirtualModelExpanded = (name: string) => {
+    // 修改原因：右侧虚拟模型列表需要可折叠，减少多链条同时展开时的页面高度。
+    // 修改方式：用 Set 保存已展开的虚拟模型名，点击标题时切换存在状态。
+    // 目的：让用户可以专注编辑单个虚拟链条。
+    setExpandedVirtualModels(prev => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name); else next.add(name);
+      return next;
+    });
+  };
+
+  const toggleVirtualProviderExpanded = (name: string) => {
+    // 修改原因：左侧渠道面板可能包含大量模型，需要按渠道折叠展示。
+    // 修改方式：用 Set 保存已展开的渠道名，点击渠道头部时切换。
+    // 目的：保持画布轻量，同时让模型列表可按需查看和拖拽。
+    setExpandedVirtualProviders(prev => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name); else next.add(name);
+      return next;
+    });
+  };
+
+  const getPreferredVirtualTarget = (): string | null => {
+    // 修改原因：左侧模型行的“+”按钮需要知道要添加到哪个虚拟模型。
+    // 修改方式：优先选择当前已展开的第一个虚拟模型，否则选择列表中的第一个虚拟模型。
+    // 目的：在不弹出额外选择器的情况下提供快速添加能力。
+    const names = Object.keys(virtualModels);
+    return names.find(name => expandedVirtualModels.has(name)) || names[0] || null;
+  };
+
+  const handlePanelModelQuickAdd = (modelName: string) => {
+    // 修改原因：左栏每个模型除了可拖拽，也需要提供轻量的“+”添加入口。
+    // 修改方式：把模型节点追加到当前优先目标虚拟模型链条。
+    // 目的：用户不方便拖拽时仍可快速构造 model 节点。
+    const target = getPreferredVirtualTarget();
+    if (!target) {
+      toastWarning('请先新建虚拟模型');
+      return;
+    }
+    insertVirtualNode(target, { type: 'model', value: modelName });
+  };
+
+  const handlePanelChannelQuickAdd = (providerName: string) => {
+    // 修改原因：渠道卡片整体可拖拽，但也需要按钮形式的备用入口。
+    // 修改方式：把 channel 节点追加到当前优先目标虚拟模型链条。
+    // 目的：兼顾不使用拖拽的操作方式。
+    const target = getPreferredVirtualTarget();
+    if (!target) {
+      toastWarning('请先新建虚拟模型');
+      return;
+    }
+    insertVirtualNode(target, { type: 'channel', value: providerName });
+  };
+
+  const handleDeleteVirtualModel = async (name: string) => {
+    // 修改原因：虚拟模型现在是渠道列表中的特殊卡片，删除操作应与普通渠道一样直接生效。
+    // 修改方式：确认后从 preferences.virtual_models 草稿中移除目标项，并复用 saveVirtualModels 提交后端。
+    // 目的：避免用户删除列表卡片后还需要寻找旧画布中的“保存全部”按钮。
+    const displayName = name || '未命名虚拟模型';
+    if (!confirm(`确定要删除虚拟模型 "${displayName}" 吗？此操作会立即写回配置。`)) return;
+    const nextVirtualModels = { ...virtualModels };
+    delete nextVirtualModels[name];
+    try {
+      await saveVirtualModels(serializeVirtualModels(nextVirtualModels));
+      setExpandedVirtualModels(prev => {
+        const next = new Set(prev);
+        next.delete(name);
+        return next;
+      });
+      if (editingVirtualName === name) setIsVirtualModalOpen(false);
+      toastWarning(`已删除虚拟模型 "${displayName}"`);
+    } catch (err: any) {
+      toastError(`删除失败: ${err?.message || err}`);
+    }
+  };
+
+  const setVirtualDragPayload = (e: DragEvent<HTMLElement>, payload: VirtualDragPayload) => {
+    // 修改原因：原生拖拽事件的数据通道只接受字符串。
+    // 修改方式：把拖拽来源、模型名、渠道名或节点索引序列化为 JSON 存入 dataTransfer。
+    // 目的：drop 时可以可靠地区分从左栏创建节点和链条内部排序。
+    const raw = JSON.stringify(payload);
+    e.dataTransfer.setData('application/json', raw);
+    e.dataTransfer.setData('text/plain', raw);
+    e.dataTransfer.effectAllowed = payload.source === 'chain-node' ? 'move' : 'copy';
+  };
+
+  const readVirtualDragPayload = (e: DragEvent<HTMLElement>): VirtualDragPayload | null => {
+    // 修改原因：不同浏览器对自定义 MIME 类型支持存在差异。
+    // 修改方式：优先读 application/json，失败时回退 text/plain，并捕获 JSON 解析错误。
+    // 目的：让原生拖拽在更多浏览器中稳定工作。
+    const raw = e.dataTransfer.getData('application/json') || e.dataTransfer.getData('text/plain');
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as VirtualDragPayload;
+    } catch {
+      return null;
+    }
+  };
+
+  const handlePanelModelDragStart = (e: DragEvent<HTMLElement>, modelName: string) => {
+    // 修改原因：从左栏模型名拖入右侧链条时需要创建 model 节点。
+    // 修改方式：把模型对外名写入拖拽 payload。
+    // 目的：drop 到任意虚拟链条后可以直接生成 {type: 'model', value: modelName}。
+    e.stopPropagation();
+    setVirtualDragPayload(e, { source: 'panel-model', modelName });
+  };
+
+  const handlePanelChannelDragStart = (e: DragEvent<HTMLElement>, providerName: string) => {
+    // 修改原因：从左栏渠道卡片拖入右侧链条时需要创建 channel 节点。
+    // 修改方式：把渠道名写入拖拽 payload。
+    // 目的：drop 后自动填入渠道名，用户再按需选择模型覆盖。
+    setVirtualDragPayload(e, { source: 'panel-channel', providerName });
+  };
+
+  const handleChainNodeDragStart = (e: DragEvent<HTMLElement>, virtualName: string, fromIndex: number) => {
+    // 修改原因：链条内部节点可拖拽重排，但不能与左栏拖入混淆。
+    // 修改方式：payload 中保存虚拟模型名和原始索引。
+    // 目的：drop 时只在同一个虚拟模型链条内执行移动。
+    setVirtualDragPayload(e, { source: 'chain-node', virtualName, fromIndex });
+  };
+
+  const handleVirtualDrop = (e: DragEvent<HTMLElement>, virtualName: string, insertIndex?: number) => {
+    // 修改原因：右侧链条既接收左栏拖入的新节点，也接收内部重排。
+    // 修改方式：根据 payload.source 分别执行插入 model、插入 channel 或移动节点。
+    // 目的：用原生 HTML5 Drag and Drop API 完成可视化链条编辑，避免引入拖拽库。
+    e.preventDefault();
+    const payload = readVirtualDragPayload(e);
+    if (!payload) return;
+
+    if (payload.source === 'panel-model') {
+      insertVirtualNode(virtualName, { type: 'model', value: payload.modelName }, insertIndex);
+    } else if (payload.source === 'panel-channel') {
+      insertVirtualNode(virtualName, { type: 'channel', value: payload.providerName }, insertIndex);
+    } else if (payload.source === 'chain-node' && payload.virtualName === virtualName) {
+      const currentLength = virtualModels[virtualName]?.chain?.length || 0;
+      const targetIndex = insertIndex == null ? Math.max(0, currentLength - 1) : insertIndex;
+      moveVirtualNode(virtualName, payload.fromIndex, targetIndex);
+    }
+  };
+
+  const openVirtualModelModal = (name: string | null = null) => {
+    // 修改原因：虚拟模型从内联画布迁移到独立抽屉，需要在打开时准备一份可取消的编辑草稿。
+    // 修改方式：把原始名称、名称输入、启用状态和 chain 深拷贝到抽屉状态中。
+    // 目的：用户点击列表中的编辑或新建按钮后，可以在抽屉中完成完整链条编辑再保存。
+    const config = name ? virtualModels[name] : null;
+    setEditingVirtualName(name);
+    setVirtualDraftName(name || '');
+    setVirtualDraftEnabled(config?.enabled !== false);
+    setVirtualEditorChain((Array.isArray(config?.chain) ? config!.chain : []).map(node => ({ ...node })));
+    setVirtualModelsDirty(false);
+    // 修改原因：移动端渠道面板的默认状态应为折叠，避免重新打开抽屉时沿用上一次展开状态。
+    // 修改方式：每次打开虚拟模型抽屉时重置移动端面板展开状态。
+    // 目的：保证用户进入抽屉后优先看到链条编辑区。
+    setIsVirtualMobileProviderPanelOpen(false);
+    setIsVirtualModalOpen(true);
+  };
+
+  const updateVirtualEditorChainDraft = (updater: (prev: VirtualModelChainNode[]) => VirtualModelChainNode[]) => {
+    // 修改原因：抽屉编辑应先修改本地 chain 草稿，不能在保存前污染全局 virtualModels。
+    // 修改方式：集中包装 setVirtualEditorChain，并同步记录未保存状态。
+    // 目的：让取消关闭抽屉时可以丢弃本次编辑，保存时再提交 preferences.virtual_models。
+    setVirtualEditorChain(prev => updater(prev));
+    setVirtualModelsDirty(true);
+  };
+
+  const updateVirtualEditorNode = (idx: number, patch: Partial<VirtualModelChainNode>) => {
+    // 修改原因：抽屉右栏节点需要独立编辑类型、渠道、模型和模型覆盖。
+    // 修改方式：按索引合并补丁，切回 model 节点时移除 channel 专用的 model 字段。
+    // 目的：保证保存后的 chain 结构仍符合后端的 preferences.virtual_models 格式。
+    updateVirtualEditorChainDraft(prev => prev.map((node, nodeIdx) => {
+      if (nodeIdx !== idx) return node;
+      const nextNode = { ...node, ...patch };
+      if (patch.type === 'model') delete nextNode.model;
+      return nextNode;
+    }));
+  };
+
+  const insertVirtualEditorNode = (node: VirtualModelChainNode, insertIndex?: number) => {
+    // 修改原因：左栏加号、拖拽投放和底部添加按钮都需要向抽屉 chain 插入节点。
+    // 修改方式：复制当前 chain，并把新节点插入到指定位置，缺省时追加到末尾。
+    // 目的：统一所有入口的节点创建行为，避免不同 UI 产生不同数据结构。
+    updateVirtualEditorChainDraft(prev => {
+      const next = [...prev];
+      const targetIndex = insertIndex == null ? next.length : Math.max(0, Math.min(insertIndex, next.length));
+      next.splice(targetIndex, 0, node);
+      return next;
+    });
+  };
+
+  const moveVirtualEditorNode = (fromIdx: number, toIdx: number) => {
+    // 修改原因：虚拟模型链条顺序表示路由优先级，抽屉中仍需要支持拖拽排序。
+    // 修改方式：在本地 chain 草稿内移动数组元素，并限制目标索引边界。
+    // 目的：不引入新依赖也能保留原生 HTML5 拖拽排序能力。
+    updateVirtualEditorChainDraft(prev => {
+      if (fromIdx === toIdx || fromIdx < 0 || fromIdx >= prev.length) return prev;
+      const next = [...prev];
+      const [item] = next.splice(fromIdx, 1);
+      const safeToIdx = Math.max(0, Math.min(toIdx, next.length));
+      next.splice(safeToIdx, 0, item);
+      return next;
+    });
+  };
+
+  const appendVirtualEditorNodeByType = () => {
+    // 修改原因：移动端或不使用拖拽的场景仍需要显式添加节点入口。
+    // 修改方式：读取当前虚拟模型的添加类型状态，向抽屉 chain 追加空节点。
+    // 目的：满足用户通过表单逐项填写 model 或 channel 节点的操作方式。
+    const key = virtualDraftName.trim() || editingVirtualName || '__new_virtual_model__';
+    const nodeType = virtualAddNodeTypes[key] || 'model';
+    insertVirtualEditorNode({ type: nodeType, value: '' });
+  };
+
+  const handleVirtualEditorDrop = (e: DragEvent<HTMLElement>, insertIndex?: number) => {
+    // 修改原因：抽屉右栏只编辑当前虚拟模型，需要单独处理左栏拖入和内部重排。
+    // 修改方式：识别拖拽 payload，外部模型或渠道创建新节点，内部节点只在本抽屉内移动。
+    // 目的：让新的抽屉编辑器继续使用原生 HTML5 drag and drop，不增加依赖。
+    e.preventDefault();
+    const payload = readVirtualDragPayload(e);
+    if (!payload) return;
+
+    if (payload.source === 'panel-model') {
+      insertVirtualEditorNode({ type: 'model', value: payload.modelName }, insertIndex);
+    } else if (payload.source === 'panel-channel') {
+      insertVirtualEditorNode({ type: 'channel', value: payload.providerName }, insertIndex);
+    } else if (payload.source === 'chain-node' && payload.virtualName === '__virtual_editor__') {
+      const targetIndex = insertIndex == null ? Math.max(0, virtualEditorChain.length - 1) : insertIndex;
+      moveVirtualEditorNode(payload.fromIndex, targetIndex);
+    }
+  };
+
+  const handleSaveVirtualEditor = async () => {
+    // 修改原因：抽屉保存需要把当前名称作为 preferences.virtual_models 的 key，同时支持新建和重命名。
+    // 修改方式：校验名称冲突后合并到 virtualModels，再复用 serializeVirtualModels 和 saveVirtualModels 提交后端。
+    // 目的：保持后端交互和数据格式不变，只改变前端编辑入口。
+    const name = virtualDraftName.trim();
+    if (!name) {
+      toastWarning('虚拟模型名为必填项');
+      return;
+    }
+    if (editingVirtualName !== name && virtualModels[name]) {
+      toastWarning('该虚拟模型已存在');
+      return;
+    }
+
+    const nextVirtualModels = { ...virtualModels };
+    if (editingVirtualName && editingVirtualName !== name) delete nextVirtualModels[editingVirtualName];
+    nextVirtualModels[name] = { enabled: virtualDraftEnabled, chain: virtualEditorChain };
+
+    try {
+      const cleaned = serializeVirtualModels(nextVirtualModels);
+      await saveVirtualModels(cleaned);
+      setEditingVirtualName(name);
+      setVirtualEditorChain(cleaned[name]?.chain || []);
+      setVirtualModelsDirty(false);
+      setIsVirtualModalOpen(false);
+      toastSuccess('虚拟模型路由已保存');
+    } catch (err: any) {
+      toastError(`保存失败: ${err?.message || err}`);
+    }
+  };
+
+  const handleToggleVirtualModelCard = async (name: string, enabled: boolean) => {
+    // 修改原因：虚拟模型折叠卡片需要像普通渠道一样提供启用开关。
+    // 修改方式：只修改目标虚拟模型的 enabled 字段，并立即提交 preferences.virtual_models。
+    // 目的：列表中的快速开关不依赖打开抽屉，也不会影响真实渠道保存接口。
+    const current = virtualModels[name];
+    if (!current) return;
+    const nextVirtualModels = serializeVirtualModels({ ...virtualModels, [name]: { ...current, enabled } });
+    try {
+      await saveVirtualModels(nextVirtualModels);
+      toastSuccess(enabled ? '虚拟模型已启用' : '虚拟模型已禁用');
+    } catch (err: any) {
+      toastError(`操作失败: ${err?.message || err}`);
+    }
+  };
+
   const openTestDialog = (provider: any) => {
     setTestingProvider(provider);
     setTestDialogOpen(true);
@@ -1034,6 +1647,11 @@ export default function Channels() {
       if (statusCodeOverridesJson.trim()) statusCodeOverridesObj = JSON.parse(statusCodeOverridesJson);
     } catch { /* ignore */ }
 
+    // 修改原因：pool_sharing 只应在 model_prefix 存在时保存为 true。
+    // 修改方式：构造预览/测试 payload 时同步归一化该字段。
+    // 目的：避免测试渠道时使用与正式保存不同的路由池共享状态。
+    const normalizedPoolSharing = formData.model_prefix.trim() ? !!formData.preferences.pool_sharing : false;
+
     return {
       provider: formData.provider,
       remark: formData.remark || undefined,
@@ -1046,6 +1664,7 @@ export default function Channels() {
       groups: formData.groups,
       preferences: {
         ...formData.preferences,
+        pool_sharing: normalizedPoolSharing,
         headers: headersObj,
         post_body_parameter_overrides: overridesObj,
         status_code_overrides: statusCodeOverridesObj,
@@ -1148,6 +1767,11 @@ export default function Channels() {
       cleanedModelPrice = validEntries.length > 0 ? Object.fromEntries(validEntries) : undefined;
     }
 
+    // 修改原因：pool_sharing 是依赖 model_prefix 的渠道级开关，清空前缀后应强制关闭。
+    // 修改方式：保存前统一计算 normalizedPoolSharing，并覆盖 preferences 中的同名字段。
+    // 目的：保证后端收到的配置不会出现无前缀但共享路由池开启的状态。
+    const normalizedPoolSharing = formData.model_prefix.trim() ? !!formData.preferences.pool_sharing : false;
+
     // 序列化子渠道
     const serializedSubChannels = formData.sub_channels
       .filter(sub => sub.engine) // 过滤掉空的
@@ -1180,6 +1804,7 @@ export default function Channels() {
       groups: formData.groups,
       preferences: {
         ...formData.preferences,
+        pool_sharing: normalizedPoolSharing,
         model_price: cleanedModelPrice,
         headers: headersObj,
         post_body_parameter_overrides: overridesObj,
@@ -1200,6 +1825,7 @@ export default function Channels() {
       const subPrefs: Record<string, any> = {};
       const mergedPrefs = {
         ...formData.preferences,
+        pool_sharing: normalizedPoolSharing,
         model_price: cleanedModelPrice,
         headers: headersObj,
         post_body_parameter_overrides: overridesObj,
@@ -1384,12 +2010,52 @@ export default function Channels() {
     return names;
   };
 
+  // ── 虚拟模型列表和渠道下拉选项 ──
+  const virtualProviderEntries = useMemo(() => {
+    // 修改原因：虚拟模型现在由独立手风琴置顶渲染，不能再依赖主渠道列表生成伪行。
+    // 修改方式：单独调用 buildVirtualProviderEntries，把 preferences.virtual_models 转成稳定排序的 provider-like entries。
+    // 目的：桌面表格、移动端卡片和测试弹窗共用同一份虚拟模型数据源。
+    return buildVirtualProviderEntries(virtualModels);
+  }, [virtualModels]);
+
+  const virtualRoutingProviderItems = useMemo(() => {
+    // 修改原因：/v1/api_config 返回的是持久化配置，子渠道不会作为独立 provider 出现在 providers state 中。
+    // 修改方式：在前端按后端展开规则生成“主渠道 + 子渠道”的虚拟路由 provider 列表。
+    // 目的：虚拟模型的 channel 节点、模型匹配统计和左栏数据源都能引用子渠道。
+    return buildVirtualRoutingProviderItems(providers);
+  }, [providers]);
+
+  const virtualProviderPanelItems = useMemo(() => {
+    // 修改原因：移动端渠道面板和渠道节点下拉都需要更直观的排序，子渠道不能被全局排序拆离主渠道。
+    // 修改方式：使用纯 helper 按主渠道 weight 降序分组，再让子渠道按 weight 降序紧跟所属主渠道。
+    // 目的：左侧面板、移动端面板和下拉列表共享同一份有层级的渠道顺序。
+    return buildVirtualProviderPanelItems(providers);
+  }, [providers]);
+
+  const providerNames = useMemo(() => {
+    // 修改原因：渠道节点下拉框需要沿用渠道面板的直观排序，而不是按名称字母序打散子渠道。
+    // 修改方式：从已排序的 virtualProviderPanelItems 提取 provider 字段，并保持当前链条中的旧值兜底显示。
+    // 目的：手动选择 channel 节点时也能看到“主渠道后跟子渠道”的顺序。
+    return Array.from(new Set(virtualProviderPanelItems.map(p => String(p.provider || '').trim()).filter(Boolean)));
+  }, [virtualProviderPanelItems]);
+
+  const providerListItems = useMemo(() => {
+    // 修改原因：虚拟模型已由手风琴单独收纳，主列表只应该参与真实渠道排序和真实渠道操作。
+    // 修改方式：调用 helper 只生成真实渠道条目，并保留原始 providers 下标。
+    // 目的：避免虚拟模型进入不活跃分段、真实渠道编辑和删除逻辑。
+    return buildProviderListItems(providers);
+  }, [providers]);
+
   // ── 可用引擎列表和分组列表（从当前渠道数据中提取） ──
   const availableEngines = useMemo(() => {
+    // 修改原因：虚拟模型从主列表移到手风琴后，筛选器仍然需要能只看虚拟路由。
+    // 修改方式：存在虚拟 entries 时加入“虚拟路由”，真实渠道仍读取原 engine。
+    // 目的：用户可以通过引擎筛选快速只看虚拟路由或真实渠道。
     const set = new Set<string>();
+    if (virtualProviderEntries.length > 0) set.add('虚拟路由');
     providers.forEach(p => set.add(p.engine || 'openai'));
     return Array.from(set).sort();
-  }, [providers]);
+  }, [providers, virtualProviderEntries]);
 
   const availableGroups = useMemo(() => {
     const set = new Set<string>();
@@ -1411,33 +2077,55 @@ export default function Channels() {
     return names.join(',');
   };
 
-  // ── 筛选后的渠道列表（保留原始 index 用于操作） ──
-  const filteredProviders = useMemo(() => {
+  const filteredVirtualProviderEntries = useMemo(() => {
+    // 修改原因：虚拟模型已经脱离主列表，但搜索、状态和引擎筛选仍应作用到手风琴内容。
+    // 修改方式：对虚拟 entries 单独执行筛选；分组筛选只属于真实渠道，因此有分组条件时隐藏虚拟模型。
+    // 目的：筛选统计和置顶手风琴保持一致，不把虚拟模型重新混入真实渠道 segments。
     const kw = filterKeyword.trim().toLowerCase();
-    return providers
-      .map((p, idx) => ({ p, idx }))
-      .filter(({ p }) => {
-        // 状态筛选
-        if (filterStatus === 'enabled' && p.enabled === false) return false;
-        if (filterStatus === 'disabled' && p.enabled !== false) return false;
-        // 引擎筛选
-        if (filterEngine && (p.engine || 'openai') !== filterEngine) return false;
-        // 分组筛选
-        if (filterGroup) {
-          const groups = Array.isArray(p.groups) ? p.groups : p.group ? [p.group] : ['default'];
-          if (!groups.includes(filterGroup)) return false;
-        }
-        // 关键词搜索：匹配渠道名、备注、模型名
-        if (kw) {
-          const nameMatch = (p.provider || '').toLowerCase().includes(kw);
-          const remarkMatch = (p.remark || '').toLowerCase().includes(kw);
-          const modelNames = getProviderModelNames(p);
-          const modelMatch = modelNames.some(n => n.toLowerCase().includes(kw));
-          if (!nameMatch && !remarkMatch && !modelMatch) return false;
-        }
-        return true;
-      });
-  }, [providers, filterKeyword, filterEngine, filterGroup, filterStatus]);
+    return virtualProviderEntries.filter(p => {
+      const enabled = p.enabled !== false;
+      if (filterStatus === 'enabled' && !enabled) return false;
+      if (filterStatus === 'disabled' && enabled) return false;
+      if (filterEngine && filterEngine !== '虚拟路由') return false;
+      if (filterGroup) return false;
+      if (kw) {
+        const nameMatch = (p.provider || '').toLowerCase().includes(kw);
+        const chainMatch = summarizeVirtualChain(p.chain, p.provider, Number.MAX_SAFE_INTEGER).toLowerCase().includes(kw);
+        if (!nameMatch && !chainMatch) return false;
+      }
+      return true;
+    });
+  }, [virtualProviderEntries, filterKeyword, filterEngine, filterGroup, filterStatus]);
+
+  // ── 筛选后的真实渠道列表（真实行保留原始 index 用于操作） ──
+  const filteredProviders = useMemo(() => {
+    // 修改原因：虚拟模型从主列表移出后，真实渠道筛选不再需要理解 _isVirtual 分支。
+    // 修改方式：只按真实渠道的启用状态、引擎、分组、备注和模型名筛选 providerListItems。
+    // 目的：真实渠道 segments 保持简单，避免虚拟模型误传给真实渠道操作函数。
+    const kw = filterKeyword.trim().toLowerCase();
+    return providerListItems.filter(({ p }) => {
+      const enabled = p.enabled !== false;
+      if (filterStatus === 'enabled' && !enabled) return false;
+      if (filterStatus === 'disabled' && enabled) return false;
+
+      const engineName = p.engine || 'openai';
+      if (filterEngine && engineName !== filterEngine) return false;
+
+      if (filterGroup) {
+        const groups = Array.isArray(p.groups) ? p.groups : p.group ? [p.group] : ['default'];
+        if (!groups.includes(filterGroup)) return false;
+      }
+
+      if (kw) {
+        const nameMatch = (p.provider || '').toLowerCase().includes(kw);
+        const remarkMatch = (p.remark || '').toLowerCase().includes(kw);
+        const modelNames = getProviderModelNames(p);
+        const modelMatch = modelNames.some(n => n.toLowerCase().includes(kw));
+        if (!nameMatch && !remarkMatch && !modelMatch) return false;
+      }
+      return true;
+    });
+  }, [providerListItems, filterKeyword, filterEngine, filterGroup, filterStatus]);
 
   // 关键词是否命中了某个 provider 的模型（用于高亮提示）
   const getMatchedModels = (p: any): string[] => {
@@ -1447,6 +2135,11 @@ export default function Channels() {
   };
 
   const hasActiveFilters = filterKeyword || filterEngine || filterGroup || filterStatus;
+  // 修改原因：虚拟模型现在不在 providerListItems 中，但空状态和筛选统计仍要把手风琴条目算进去。
+  // 修改方式：分别统计真实渠道条目和虚拟模型 entries，再在页面判断中使用合计值。
+  // 目的：当页面只有虚拟模型或筛选只命中虚拟模型时，列表不会错误显示为空。
+  const totalListItemCount = providerListItems.length + virtualProviderEntries.length;
+  const visibleListItemCount = filteredProviders.length + filteredVirtualProviderEntries.length;
 
   // 按活跃度标记：30天内有请求的为活跃
   const INACTIVE_DAYS = 30;
@@ -1493,6 +2186,309 @@ export default function Channels() {
     return segs;
   }, [filteredProviders, providerActivity]);
 
+  const renderVirtualProviderPanelCollapsedRail = () => {
+    // 修改原因：桌面端仍需要保留原来的窄侧栏，方便在不展开面板时快速添加渠道节点。
+    // 修改方式：把原先 aside 折叠分支抽成渲染函数，供桌面端专用容器调用。
+    // 目的：移动端可以复用完整列表渲染，同时不破坏桌面端既有交互。
+    return (
+      <div className="space-y-2">
+        <div className="text-[10px] text-muted-foreground text-center">{virtualProviderPanelItems.length}</div>
+        {virtualProviderPanelItems.length === 0 ? (
+          <div className="text-[10px] text-muted-foreground text-center border border-dashed border-border rounded-lg px-1 py-3">无</div>
+        ) : virtualProviderPanelItems.map(provider => {
+          const providerName = String(provider?.provider || '未命名渠道');
+          const isSubChannel = provider?._is_sub_channel === true;
+          return (
+            <div
+              key={providerName}
+              draggable
+              onDragStart={e => handlePanelChannelDragStart(e, providerName)}
+              className="relative"
+            >
+              <button
+                type="button"
+                onClick={() => insertVirtualEditorNode({ type: 'channel', value: providerName })}
+                className={`w-full h-11 rounded-lg border bg-background hover:bg-purple-500/10 flex items-center justify-center transition-colors ${isSubChannel ? 'border-cyan-500/30' : 'border-border'}`}
+                title={`添加渠道节点：${providerName}`}
+              >
+                <ProviderLogo name={providerName} engine={provider?.engine} />
+              </button>
+              {isSubChannel && <span className="absolute -right-0.5 -top-0.5 w-2 h-2 rounded-full bg-cyan-500" />}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  const renderVirtualProviderPanelList = () => {
+    // 修改原因：移动端展开态需要展示与桌面展开态一致的完整渠道列表，避免再依赖底部下拉理解顺序。
+    // 修改方式：把原先 aside 展开分支抽成渲染函数，由移动端展开区域和桌面展开侧栏共同复用。
+    // 目的：保证渠道内容、拖拽入口、快速添加入口和模型展开行为在不同屏幕宽度下一致。
+    return (
+      <div className="space-y-2">
+        {/* 修改原因：子渠道在后端是独立 provider，虚拟模型链条也需要把它当作可拖拽渠道。
+            修改方式：左栏把子渠道渲染成带“子渠道”标记和缩进的紧凑卡片，模型列表继续默认折叠。
+            目的：用户能直接拖拽或点击子渠道卡片，同时减少左栏常驻高度和宽度。 */}
+        {virtualProviderPanelItems.length === 0 ? (
+          <div className="text-sm text-muted-foreground text-center border border-dashed border-border rounded-lg p-4">暂无可用渠道。</div>
+        ) : virtualProviderPanelItems.map(provider => {
+          const providerName = String(provider?.provider || '未命名渠道');
+          const isSubChannel = provider?._is_sub_channel === true;
+          const parentProviderName = String(provider?._parent_provider || '').trim();
+          const isExpanded = expandedVirtualProviders.has(providerName);
+          const weight = getProviderWeight(provider);
+          const modelOptions = getProviderModelOptions(provider);
+          return (
+            <div
+              key={providerName}
+              draggable
+              onDragStart={e => handlePanelChannelDragStart(e, providerName)}
+              className={`border rounded-lg bg-background transition-colors ${isSubChannel ? 'ml-2 border-cyan-500/30' : 'border-border'}`}
+            >
+              <div className="flex items-center gap-2 px-2.5 py-2">
+                <GripVertical className="w-3.5 h-3.5 text-muted-foreground cursor-grab flex-shrink-0" />
+                <button
+                  type="button"
+                  onClick={() => toggleVirtualProviderExpanded(providerName)}
+                  className="flex-1 min-w-0 flex items-center gap-2 text-left"
+                >
+                  <ProviderLogo name={providerName} engine={provider?.engine} />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className="text-xs font-medium text-foreground truncate">{providerName}</span>
+                      {isSubChannel && <span className="text-[10px] px-1 py-0.5 rounded bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 flex-shrink-0">子</span>}
+                      <span className="text-[10px] px-1 py-0.5 rounded bg-muted text-muted-foreground font-mono flex-shrink-0">{provider?.engine || 'openai'}</span>
+                    </div>
+                    <div className="text-[10px] text-muted-foreground mt-0.5 truncate">
+                      {isSubChannel && parentProviderName ? `${parentProviderName} · ` : ''}权重 {weight} · {modelOptions.length} 模型
+                    </div>
+                  </div>
+                  <span className="text-[10px] text-muted-foreground flex-shrink-0">{isExpanded ? '收起' : '模型'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={e => { e.stopPropagation(); insertVirtualEditorNode({ type: 'channel', value: providerName }); }}
+                  className="p-1 text-purple-600 dark:text-purple-400 hover:bg-purple-500/10 rounded-md transition-colors flex-shrink-0"
+                  title="添加为渠道节点"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              {isExpanded && (
+                <div className="border-t border-border px-2.5 py-2 space-y-1.5">
+                  {modelOptions.length === 0 ? (
+                    <div className="text-xs text-muted-foreground italic">该渠道未配置模型。</div>
+                  ) : modelOptions.map(option => (
+                    <div
+                      key={`${providerName}-${option.displayName}-${option.upstreamName}`}
+                      draggable
+                      onDragStart={e => handlePanelModelDragStart(e, option.displayName)}
+                      className="group flex items-center gap-2 rounded-md border border-border bg-muted/30 px-2 py-1.5 hover:bg-muted/60 transition-colors cursor-grab"
+                    >
+                      <GripVertical className="w-3 h-3 text-muted-foreground flex-shrink-0" />
+                      <div className="min-w-0 flex-1 font-mono text-[11px]">
+                        <div className="truncate text-foreground" title={option.displayName}>{option.displayName}</div>
+                        {option.hasMapping && <div className="truncate text-[10px] text-muted-foreground" title={option.upstreamName}>→ {option.upstreamName}</div>}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={e => { e.stopPropagation(); insertVirtualEditorNode({ type: 'model', value: option.displayName }); }}
+                        className="p-1 text-purple-600 dark:text-purple-400 hover:bg-purple-500/10 rounded-md opacity-80 group-hover:opacity-100 transition-colors"
+                        title="添加为模型节点"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  const getFullVirtualChainSummary = (p: any): string => {
+    // 修改原因：渠道列表中的虚拟模型摘要不再使用 tooltip，必须直接显示完整链条文本。
+    // 修改方式：调用 summarizeVirtualChain 时传入最大安全整数，禁用默认的 6 段截断。
+    // 目的：桌面表格和移动端子卡片都能通过换行完整展示 chain 摘要。
+    return summarizeVirtualChain(p.chain, p.provider, Number.MAX_SAFE_INTEGER);
+  };
+
+  const openVirtualRouteTestDialog = (entries: any[]) => {
+    // 修改原因：虚拟路由手风琴标题行要测试全部虚拟模型，子行要只测试当前虚拟模型。
+    // 修改方式：用 buildVirtualRouteTestProvider 生成 ChannelTestDialog 可识别的临时 provider，再复用 openTestDialog。
+    // 目的：测试请求直接使用虚拟模型名作为 model，并携带 _virtual_route_test 标记触发后端虚拟链路。
+    const testProvider = buildVirtualRouteTestProvider(entries);
+    if (!testProvider) {
+      toastWarning('暂无可测试的虚拟模型');
+      return;
+    }
+    openTestDialog(testProvider);
+  };
+
+  const renderDesktopVirtualRoutesAccordionRows = () => {
+    // 修改原因：桌面端虚拟模型需要置顶收纳在表格内，而不是作为普通 provider 行参与 segments。
+    // 修改方式：先渲染一个跨 7 列的标题行，展开后再渲染 7 列子行复用渠道表格列宽。
+    // 目的：保持普通渠道表格结构不变，同时让虚拟模型操作按钮与普通渠道右侧按钮对齐。
+    if (filteredVirtualProviderEntries.length === 0) return null;
+    return (
+      <>
+        <tr className="bg-purple-500/5">
+          <td colSpan={7} className="p-0">
+            <div className="flex items-center gap-2 px-4 py-3 border-l-4 border-l-purple-500/70">
+              <button
+                type="button"
+                onClick={() => setIsVirtualRoutesAccordionOpen(prev => !prev)}
+                aria-expanded={isVirtualRoutesAccordionOpen}
+                className="flex-1 min-w-0 flex items-center gap-2 text-left text-sm font-medium text-purple-700 dark:text-purple-300"
+              >
+                <span className="truncate">🔗 虚拟路由 ({filteredVirtualProviderEntries.length})</span>
+              </button>
+              <button
+                type="button"
+                onClick={e => { e.stopPropagation(); openVirtualRouteTestDialog(filteredVirtualProviderEntries); }}
+                className="p-1.5 text-blue-600 dark:text-blue-400 hover:bg-blue-500/10 rounded-md transition-colors flex-shrink-0"
+                title="测试全部虚拟模型"
+              >
+                <Play className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsVirtualRoutesAccordionOpen(prev => !prev)}
+                className="px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors flex-shrink-0"
+                title={isVirtualRoutesAccordionOpen ? '收起虚拟路由' : '展开虚拟路由'}
+              >
+                {isVirtualRoutesAccordionOpen ? '▲' : '▼'}
+              </button>
+            </div>
+          </td>
+        </tr>
+        {isVirtualRoutesAccordionOpen && filteredVirtualProviderEntries.map(p => {
+          const isEnabled = p.enabled !== false;
+          const chainSummary = getFullVirtualChainSummary(p);
+          return (
+            <tr key={`virtual-${p.provider}`} className={`transition-colors border-l-4 border-l-purple-500/40 bg-purple-500/[0.03] hover:bg-purple-500/10 ${!isEnabled ? 'opacity-60' : ''}`}>
+              <td className="px-4 py-3 align-top">
+                <div className="font-medium text-purple-700 dark:text-purple-300 break-words">{p.provider}</div>
+              </td>
+              <td className="px-4 py-3 align-top">
+                <span className="inline-flex items-center gap-1 w-fit bg-purple-500/10 text-purple-700 dark:text-purple-300 px-1.5 py-0.5 rounded text-xs">
+                  <Link2 className="w-3 h-3" /> 虚拟路由
+                </span>
+              </td>
+              <td className="px-4 py-3 text-center align-top">
+                <span className="text-xs font-mono text-muted-foreground">{Array.isArray(p.chain) ? p.chain.length : 0} 节点</span>
+              </td>
+              <td className="px-4 py-3 align-top">
+                <span className="block text-xs text-foreground font-mono truncate max-w-[280px] cursor-help" title={chainSummary}>{chainSummary}</span>
+              </td>
+              <td className="px-4 py-3 text-center align-top"><span className="text-muted-foreground/50">—</span></td>
+              <td className="px-4 py-3 text-center align-top">
+                <span className="font-mono text-sm text-purple-700 dark:text-purple-300">∞</span>
+              </td>
+              <td className="px-4 py-3 text-right align-top">
+                <div className="flex items-center justify-end gap-1">
+                  {/* 修改原因：普通渠道行的按钮是“分析/测试/开关/复制/编辑/删除”，虚拟行没有分析和复制。
+                      修改方式：用不可见占位对齐缺失的分析和复制按钮，但可见按钮仍保持“测试/开关/编辑/删除”的顺序。
+                      目的：让虚拟模型测试按钮与普通渠道测试按钮大致处于同一横向位置。 */}
+                  <span className="w-7 flex-shrink-0" aria-hidden="true" />
+                  <button onClick={() => openVirtualRouteTestDialog([p])} className="p-1.5 text-blue-600 dark:text-blue-400 hover:bg-blue-500/10 rounded-md transition-colors" title="测试虚拟模型">
+                    <Play className="w-4 h-4" />
+                  </button>
+                  <button onClick={() => handleToggleVirtualModelCard(p.provider, !isEnabled)} className={`p-1.5 rounded-md transition-colors ${isEnabled ? 'text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10' : 'text-muted-foreground hover:bg-muted'}`} title={isEnabled ? '禁用虚拟模型' : '启用虚拟模型'}>
+                    <Power className="w-4 h-4" />
+                  </button>
+                  <span className="w-7 flex-shrink-0" aria-hidden="true" />
+                  <button onClick={() => openVirtualModelModal(p.provider)} className="p-1.5 text-muted-foreground hover:text-purple-600 dark:hover:text-purple-300 hover:bg-purple-500/10 rounded-md transition-colors" title="编辑虚拟模型">
+                    <Edit className="w-4 h-4" />
+                  </button>
+                  <button onClick={() => handleDeleteVirtualModel(p.provider)} className="p-1.5 text-red-600 dark:text-red-500 hover:bg-red-500/10 rounded-md transition-colors" title="删除虚拟模型">
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              </td>
+            </tr>
+          );
+        })}
+      </>
+    );
+  };
+
+  const renderMobileVirtualRoutesAccordion = () => {
+    // 修改原因：移动端虚拟模型也需要收纳，避免多个独立紫色卡片挤占渠道列表顶部空间。
+    // 修改方式：折叠态显示紫色边框标题卡片，展开后为每个虚拟模型渲染紧凑子卡片和操作按钮。
+    // 目的：手机上保留名称、完整 chain 摘要和测试/开关/编辑/删除入口，同时减少默认高度。
+    if (filteredVirtualProviderEntries.length === 0) return null;
+    return (
+      <div className="border border-purple-500/40 bg-purple-500/5 rounded-xl overflow-hidden">
+        <div className="flex items-center gap-2 px-4 py-3">
+          <button
+            type="button"
+            onClick={() => setIsVirtualRoutesAccordionOpen(prev => !prev)}
+            aria-expanded={isVirtualRoutesAccordionOpen}
+            className="flex-1 min-w-0 text-left text-sm font-medium text-purple-700 dark:text-purple-300"
+          >
+            <span className="truncate block">🔗 虚拟路由 ({filteredVirtualProviderEntries.length})</span>
+          </button>
+          <button
+            type="button"
+            onClick={e => { e.stopPropagation(); openVirtualRouteTestDialog(filteredVirtualProviderEntries); }}
+            className="p-1.5 text-blue-600 dark:text-blue-400 hover:bg-blue-500/10 rounded-md transition-colors flex-shrink-0"
+            title="测试全部虚拟模型"
+          >
+            <Play className="w-4 h-4" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setIsVirtualRoutesAccordionOpen(prev => !prev)}
+            className="px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted rounded-md transition-colors flex-shrink-0"
+            title={isVirtualRoutesAccordionOpen ? '收起虚拟路由' : '展开虚拟路由'}
+          >
+            {isVirtualRoutesAccordionOpen ? '▲' : '▼'}
+          </button>
+        </div>
+
+        {isVirtualRoutesAccordionOpen && (
+          <div className="border-t border-purple-500/20 p-2 space-y-2">
+            {filteredVirtualProviderEntries.map(p => {
+              const isEnabled = p.enabled !== false;
+              const chainSummary = getFullVirtualChainSummary(p);
+              return (
+                <div key={`mobile-virtual-${p.provider}`} className={`rounded-lg border border-purple-500/25 bg-background/70 p-3 ${!isEnabled ? 'opacity-60' : ''}`}>
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="font-medium text-sm text-purple-700 dark:text-purple-300 break-words">{p.provider}</div>
+                      <div className="mt-1 text-xs text-foreground font-mono truncate" title={chainSummary}>{chainSummary}</div>
+                    </div>
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-700 dark:text-purple-300 flex-shrink-0">虚拟路由</span>
+                  </div>
+                  <div className="mt-3 pt-2 border-t border-purple-500/15 flex items-center justify-end gap-0.5">
+                    <button onClick={() => openVirtualRouteTestDialog([p])} className="p-1.5 text-blue-600 dark:text-blue-400 hover:bg-blue-500/10 rounded-md transition-colors" title="测试虚拟模型">
+                      <Play className="w-4 h-4" />
+                    </button>
+                    <button onClick={() => handleToggleVirtualModelCard(p.provider, !isEnabled)} className={`p-1.5 rounded-md transition-colors ${isEnabled ? 'text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10' : 'text-muted-foreground hover:bg-muted'}`} title={isEnabled ? '禁用虚拟模型' : '启用虚拟模型'}>
+                      <Power className="w-4 h-4" />
+                    </button>
+                    <button onClick={() => openVirtualModelModal(p.provider)} className="p-1.5 text-muted-foreground hover:text-purple-600 dark:hover:text-purple-300 hover:bg-purple-500/10 rounded-md transition-colors" title="编辑虚拟模型">
+                      <Edit className="w-4 h-4" />
+                    </button>
+                    <button onClick={() => handleDeleteVirtualModel(p.provider)} className="p-1.5 text-red-600 dark:text-red-500 hover:bg-red-500/10 rounded-md transition-colors" title="删除虚拟模型">
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="space-y-6 animate-in fade-in duration-500 font-sans">
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
@@ -1500,14 +2496,27 @@ export default function Channels() {
           <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-foreground">渠道配置</h1>
           <p className="text-muted-foreground mt-1 text-sm sm:text-base">管理上游大模型 API 提供商及流量分发路由</p>
         </div>
-        <button onClick={() => openModal()} className="bg-primary hover:bg-primary/90 text-primary-foreground px-4 py-2 rounded-lg flex items-center gap-2 font-medium transition-colors w-full sm:w-auto justify-center">
-          <Plus className="w-4 h-4" />
-          添加渠道
-        </button>
+        {/* 修改原因：虚拟模型的新建入口需要与普通渠道入口并列展示。
+            修改方式：保留原“添加渠道”按钮，并新增紫色“新建虚拟模型”按钮打开抽屉。
+            目的：用户不再需要到顶部画布内创建虚拟模型，列表顶部即可进入新建流程。 */}
+        <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+          <button onClick={() => openModal()} className="bg-primary hover:bg-primary/90 text-primary-foreground px-4 py-2 rounded-lg flex items-center gap-2 font-medium transition-colors w-full sm:w-auto justify-center">
+            <Plus className="w-4 h-4" />
+            添加渠道
+          </button>
+          <button onClick={() => openVirtualModelModal()} className="border border-purple-500/40 bg-purple-500/10 hover:bg-purple-500/15 text-purple-700 dark:text-purple-300 px-4 py-2 rounded-lg flex items-center gap-2 font-medium transition-colors w-full sm:w-auto justify-center">
+            <Link2 className="w-4 h-4" />
+            新建虚拟模型
+          </button>
+        </div>
       </div>
 
+      {/* 修改原因：虚拟模型路由已改为下方列表顶部手风琴，顶部两栏画布会占用过多屏幕空间。
+          修改方式：删除原画布渲染区，保留状态、保存函数和拖拽编辑能力供抽屉复用。
+          目的：让用户进入页面后先看到渠道列表，并通过虚拟路由手风琴编辑虚拟模型。 */}
+
       {/* ── Filter Bar ── */}
-      {!loading && providers.length > 0 && (
+      {!loading && totalListItemCount > 0 && (
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
           {/* 搜索框 */}
           <div className="relative flex-1 min-w-0">
@@ -1579,9 +2588,9 @@ export default function Channels() {
       {/* 筛选结果统计 */}
       {!loading && hasActiveFilters && (
         <div className="text-xs text-muted-foreground">
-          筛选结果：{filteredProviders.length}/{providers.length} 个渠道
-          {filterKeyword && filteredProviders.length > 0 && (
-            <span className="ml-2 text-primary">含模型名匹配</span>
+          筛选结果：{visibleListItemCount}/{totalListItemCount} 个条目
+          {filterKeyword && visibleListItemCount > 0 && (
+            <span className="ml-2 text-primary">含模型名或链条匹配</span>
           )}
         </div>
       )}
@@ -1590,12 +2599,13 @@ export default function Channels() {
       <div className="md:hidden space-y-4">
         {loading ? (
           <div className="p-8 text-center text-muted-foreground">加载中...</div>
-        ) : filteredProviders.length === 0 ? (
-          <div className="p-12 text-center text-muted-foreground">{providers.length === 0 ? '暂无渠道配置，点击上方按钮添加。' : '没有符合筛选条件的渠道。'}</div>
+        ) : visibleListItemCount === 0 ? (
+          <div className="p-12 text-center text-muted-foreground">{totalListItemCount === 0 ? '暂无渠道配置，点击上方按钮添加。' : '没有符合筛选条件的渠道。'}</div>
         ) : (
           <>
+            {renderMobileVirtualRoutesAccordion()}
             {segments.map((seg, si) => seg.type === 'active' ? (
-              <ProviderCard key={`a-${seg.item.idx}`} p={seg.item.p} idx={seg.item.idx} />
+              <ProviderCard key={`a-${seg.item.idx}-${seg.item.p.provider || si}`} p={seg.item.p} idx={seg.item.idx} />
             ) : (
               <div key={`i-${seg.startIndex}`} className="border border-border rounded-xl overflow-hidden">
                 <button onClick={() => toggleInactiveGroup(seg.startIndex)} className="w-full flex items-center justify-between px-4 py-3 bg-muted/30 hover:bg-muted/50 transition-colors text-sm">
@@ -1617,8 +2627,8 @@ export default function Channels() {
       <div className="hidden md:block bg-card border border-border rounded-xl overflow-hidden">
         {loading ? (
           <div className="p-8 text-center text-muted-foreground">加载中...</div>
-        ) : filteredProviders.length === 0 ? (
-          <div className="p-12 text-center text-muted-foreground">{providers.length === 0 ? '暂无渠道配置，点击右上角添加。' : '没有符合筛选条件的渠道。'}</div>
+        ) : visibleListItemCount === 0 ? (
+          <div className="p-12 text-center text-muted-foreground">{totalListItemCount === 0 ? '暂无渠道配置，点击右上角添加。' : '没有符合筛选条件的渠道。'}</div>
         ) : (
           <table className="w-full text-left border-collapse table-fixed">
             <thead className="bg-muted border-b border-border text-muted-foreground text-sm font-medium">
@@ -1626,13 +2636,14 @@ export default function Channels() {
                 <th className="px-4 py-3 w-[18%]">名称</th>
                 <th className="px-4 py-3 w-[15%]">分组 / 类型</th>
                 <th className="px-4 py-3 w-[8%] text-center">Keys</th>
-                <th className="px-4 py-3 w-[10%]">插件</th>
+                <th className="px-4 py-3 w-[10%]">模型 / 插件</th>
                 <th className="px-4 py-3 w-[10%] text-center">状态</th>
                 <th className="px-4 py-3 w-[10%] text-center">权重</th>
                 <th className="px-4 py-3 w-[29%] text-right">操作</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border text-sm">
+              {renderDesktopVirtualRoutesAccordionRows()}
               {(() => {
                 const rows: any[] = [];
                 segments.forEach((seg) => {
@@ -1659,25 +2670,25 @@ export default function Channels() {
                     );
                   }
                   const { p, idx, inactive: isInactive } = row;
-                const isEnabled = p.enabled !== false;
-                const groups = Array.isArray(p.groups) ? p.groups : p.group ? [p.group] : ['default'];
-                const plugins = p.preferences?.enabled_plugins || [];
-                const weight = p.preferences?.weight ?? p.weight ?? 0;
+                  const isEnabled = p.enabled !== false;
+                  const groups = Array.isArray(p.groups) ? p.groups : p.group ? [p.group] : ['default'];
+                  const plugins = p.preferences?.enabled_plugins || [];
+                  const weight = p.preferences?.weight ?? p.weight ?? 0;
 
-                // Key 统计
-                const apiRaw = Array.isArray(p.api) ? p.api : (typeof p.api === 'string' && p.api.trim() ? [p.api] : []);
-                const totalKeys = apiRaw.length;
-                const configDisabledKeys = apiRaw.filter((k: any) => typeof k === 'string' && k.startsWith('!')).length;
-                const rtStatus = runtimeKeyStatus[p.provider];
-                const rtDisabledCount = rtStatus?.auto_disabled?.length || 0;
-                const enabledKeys = totalKeys - configDisabledKeys;
-                const effectiveEnabled = Math.max(0, enabledKeys - rtDisabledCount);
-                const hasKeyIssue = configDisabledKeys > 0 || rtDisabledCount > 0;
+                  // Key 统计
+                  const apiRaw = Array.isArray(p.api) ? p.api : (typeof p.api === 'string' && p.api.trim() ? [p.api] : []);
+                  const totalKeys = apiRaw.length;
+                  const configDisabledKeys = apiRaw.filter((k: any) => typeof k === 'string' && k.startsWith('!')).length;
+                  const rtStatus = runtimeKeyStatus[p.provider];
+                  const rtDisabledCount = rtStatus?.auto_disabled?.length || 0;
+                  const enabledKeys = totalKeys - configDisabledKeys;
+                  const effectiveEnabled = Math.max(0, enabledKeys - rtDisabledCount);
+                  const hasKeyIssue = configDisabledKeys > 0 || rtDisabledCount > 0;
 
-                // 模型名匹配高亮
-                const matchedModels = getMatchedModels(p);
+                  // 模型名匹配高亮
+                  const matchedModels = getMatchedModels(p);
 
-                return (<>
+                  return (<>
                   <tr key={idx} className={`transition-colors ${isInactive ? 'opacity-50' : ''} ${isEnabled ? 'hover:bg-muted/50' : 'bg-muted/30 opacity-60'}`}>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">
@@ -1831,6 +2842,246 @@ export default function Channels() {
         )}
       </div>
 
+      {/* 修改原因：虚拟模型编辑从顶部内联画布迁移到抽屉，列表卡片只负责折叠展示。
+          修改方式：复用原有渠道模型数据源和原生拖拽逻辑，在 Dialog 中布局左侧数据源和右侧链条编辑器。
+          目的：保留完整编辑能力，同时把主页面空间还给渠道列表。 */}
+      <Dialog.Root open={isVirtualModalOpen} onOpenChange={(open) => { setIsVirtualModalOpen(open); if (!open) setVirtualModelsDirty(false); }}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40 animate-in fade-in duration-200" />
+          <Dialog.Content className="fixed right-0 top-0 h-full w-full xl:w-[1040px] max-w-full bg-background border-l border-border shadow-2xl z-50 flex flex-col animate-in slide-in-from-right duration-300">
+            <div className="p-4 sm:p-5 border-b border-border flex justify-between items-center bg-muted/30 flex-shrink-0">
+              <div className="min-w-0">
+                <Dialog.Title className="text-lg sm:text-xl font-bold text-foreground flex items-center gap-2">
+                  <Link2 className="w-5 h-5 text-purple-500" />
+                  {editingVirtualName ? `编辑虚拟模型: ${editingVirtualName}` : '新建虚拟模型'}
+                </Dialog.Title>
+                <Dialog.Description className="text-xs text-muted-foreground mt-1">
+                  移动端可展开上方渠道面板查看完整渠道列表；桌面端可展开左侧渠道面板拖拽添加。
+                </Dialog.Description>
+              </div>
+              <Dialog.Close className="text-muted-foreground hover:text-foreground"><X className="w-5 h-5" /></Dialog.Close>
+            </div>
+
+            {/* 修改原因：移动端也需要看到完整渠道列表，但默认展开会挤压链条编辑区。
+                修改方式：小屏使用上方可折叠面板，展开时限制 max-height；xl 以上继续使用桌面左右两栏。
+                目的：让手机用户按需查看渠道列表，同时保证链条编辑区不会被完全推走。 */}
+            <div className={`flex-1 min-h-0 grid grid-cols-1 grid-rows-[auto_minmax(0,1fr)] ${isVirtualProviderPanelCollapsed ? 'xl:grid-cols-[76px_1fr]' : 'xl:grid-cols-[300px_1fr]'} xl:grid-rows-[minmax(0,1fr)] xl:divide-x divide-border overflow-hidden`}>
+              <aside className={`min-h-0 bg-muted/10 border-b border-border xl:border-b-0 xl:overflow-y-auto ${isVirtualProviderPanelCollapsed ? 'xl:p-2' : 'xl:p-3'}`}>
+                <div className="xl:hidden">
+                  {/* 修改原因：移动端默认折叠时需要保留一行明确入口，告诉用户渠道面板仍然可用。
+                      修改方式：显示渠道数量和展开箭头，点击后打开同一份完整渠道列表。
+                      目的：不再完全隐藏渠道面板，同时避免默认占用链条编辑空间。 */}
+                  <button
+                    type="button"
+                    onClick={() => setIsVirtualMobileProviderPanelOpen(prev => !prev)}
+                    aria-expanded={isVirtualMobileProviderPanelOpen}
+                    className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left bg-muted/20 hover:bg-muted/40 transition-colors"
+                  >
+                    <span className="text-sm font-medium text-foreground">📦 渠道面板 ({virtualProviderPanelItems.length}个渠道)</span>
+                    <span className="text-xs text-muted-foreground">{isVirtualMobileProviderPanelOpen ? '▲' : '▼'}</span>
+                  </button>
+                  {isVirtualMobileProviderPanelOpen && (
+                    <div className="max-h-[50vh] overflow-y-auto border-t border-border p-3">
+                      <div className="flex items-center justify-between gap-2 mb-2">
+                        <div className="min-w-0">
+                          <h3 className="text-sm font-semibold text-foreground">渠道和模型</h3>
+                          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">已启用渠道，按权重降序，子渠道跟在主渠道后。</p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setIsVirtualMobileProviderPanelOpen(false)}
+                          className="px-2 py-1 rounded-md text-xs text-muted-foreground hover:text-foreground hover:bg-muted transition-colors flex-shrink-0"
+                        >
+                          收起
+                        </button>
+                      </div>
+                      {renderVirtualProviderPanelList()}
+                    </div>
+                  )}
+                </div>
+
+                <div className="hidden xl:block">
+                  <div className={`flex items-center gap-2 mb-2 ${isVirtualProviderPanelCollapsed ? 'justify-center' : 'justify-between'}`}>
+                    {isVirtualProviderPanelCollapsed ? (
+                      <button
+                        type="button"
+                        onClick={() => setIsVirtualProviderPanelCollapsed(false)}
+                        className="w-11 h-10 rounded-lg border border-border bg-background hover:bg-muted/60 text-muted-foreground hover:text-foreground flex items-center justify-center transition-colors"
+                        title="展开渠道面板"
+                      >
+                        <Server className="w-4 h-4" />
+                        <span className="sr-only">展开渠道面板</span>
+                      </button>
+                    ) : (
+                      <>
+                        <div className="min-w-0">
+                          <h3 className="text-sm font-semibold text-foreground">渠道和模型</h3>
+                          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">已启用渠道，按权重降序，子渠道跟在主渠道后。</p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setIsVirtualProviderPanelCollapsed(true)}
+                          className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors flex-shrink-0"
+                          title="收起渠道面板"
+                        >
+                          <ArrowRight className="w-4 h-4" />
+                        </button>
+                      </>
+                    )}
+                  </div>
+
+                  {isVirtualProviderPanelCollapsed ? renderVirtualProviderPanelCollapsedRail() : renderVirtualProviderPanelList()}
+                </div>
+              </aside>
+
+              <section className="min-h-0 flex flex-col overflow-hidden">
+                <div className="p-4 border-b border-border bg-background/60 flex-shrink-0">
+                  <div className="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_auto] gap-3 items-center">
+                    <div>
+                      <label className="text-xs font-medium text-muted-foreground mb-1.5 block">虚拟模型名</label>
+                      <input
+                        type="text"
+                        value={virtualDraftName}
+                        onChange={e => { setVirtualDraftName(e.target.value); setVirtualModelsDirty(true); }}
+                        placeholder="例如 deepseek-chat"
+                        className="w-full bg-background border border-border focus:border-purple-500 px-3 py-2 rounded-lg text-sm font-mono outline-none text-foreground"
+                      />
+                    </div>
+                    <label className="flex items-center justify-between gap-3 px-3 py-2 bg-muted/50 rounded-lg border border-border min-w-[120px] self-end">
+                      <span className="text-sm font-medium text-foreground">启用</span>
+                      <Switch.Root checked={virtualDraftEnabled} onCheckedChange={val => { setVirtualDraftEnabled(val); setVirtualModelsDirty(true); }} className="w-10 h-5 bg-muted rounded-full relative data-[state=checked]:bg-purple-500 transition-colors">
+                        <Switch.Thumb className="block w-4 h-4 bg-white rounded-full shadow-md transition-transform translate-x-0.5 data-[state=checked]:translate-x-[20px]" />
+                      </Switch.Root>
+                    </label>
+                  </div>
+                  {virtualModelsDirty && <div className="mt-3 text-xs text-amber-600 dark:text-amber-400 bg-amber-500/10 px-2 py-1 rounded-lg inline-flex">有未保存更改</div>}
+                </div>
+
+                <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
+                  <div
+                    onDragOver={e => e.preventDefault()}
+                    onDrop={e => handleVirtualEditorDrop(e)}
+                    className="min-h-[260px] border border-dashed border-border rounded-xl bg-muted/10 p-3"
+                  >
+                    {virtualEditorChain.length === 0 ? (
+                      <div className="h-56 flex items-center justify-center text-sm text-muted-foreground text-center">将左侧模型或渠道拖到这里，或使用底部按钮添加节点。</div>
+                    ) : (
+                      <div className="space-y-3">
+                        {virtualEditorChain.map((node, idx) => {
+                          const isChannel = node.type === 'channel';
+                          const provider = isChannel ? getProviderByName(node.value) : null;
+                          const channelModelOptions = provider ? getProviderModelOptions(provider) : [];
+                          const displayVirtualName = virtualDraftName.trim() || editingVirtualName || '当前虚拟模型';
+                          const channelModelLabel = node.model || displayVirtualName;
+                          const matchCount = !isChannel ? getMatchingProviderCount(node.value) : 0;
+                          return (
+                            <div
+                              key={`virtual-editor-${idx}-${node.type}-${node.value}`}
+                              draggable
+                              onDragStart={e => handleChainNodeDragStart(e, '__virtual_editor__', idx)}
+                              onDragOver={e => e.preventDefault()}
+                              onDrop={e => { e.stopPropagation(); handleVirtualEditorDrop(e, idx); }}
+                              className="relative flex gap-3"
+                            >
+                              {idx < virtualEditorChain.length - 1 && <div className="absolute left-[18px] top-10 bottom-[-14px] w-px bg-border" />}
+                              <div className={`relative z-[1] w-9 h-9 rounded-full flex items-center justify-center border ${isChannel ? 'bg-emerald-500/10 border-emerald-500/25 text-emerald-600 dark:text-emerald-400' : 'bg-blue-500/10 border-blue-500/25 text-blue-600 dark:text-blue-400'}`}>
+                                <span className={`w-2.5 h-2.5 rounded-full ${isChannel ? 'bg-emerald-500' : 'bg-blue-500'}`} />
+                              </div>
+                              <div className={`flex-1 min-w-0 border rounded-xl p-3 bg-background ${isChannel ? 'border-emerald-500/20' : 'border-blue-500/20'}`}>
+                                <div className="flex items-start justify-between gap-3 mb-3">
+                                  <div className="min-w-0">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <GripVertical className="w-4 h-4 text-muted-foreground cursor-grab flex-shrink-0" />
+                                      <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${isChannel ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' : 'bg-blue-500/10 text-blue-600 dark:text-blue-400'}`}>{isChannel ? '渠道节点' : '模型节点'}</span>
+                                      <span className="text-xs text-muted-foreground">优先级 {idx + 1}</span>
+                                    </div>
+                                    {isChannel ? (
+                                      <div className="mt-2">
+                                        <div className="font-mono text-sm text-foreground truncate">{node.value ? `${node.value}: ${channelModelLabel}` : '未选择渠道'}</div>
+                                        <div className="text-xs text-muted-foreground mt-0.5">{describeVirtualChannelNode(node, displayVirtualName)}</div>
+                                      </div>
+                                    ) : (
+                                      <div className="mt-2">
+                                        <div className="font-mono text-sm text-foreground truncate">{node.value || '未填写模型名'}</div>
+                                        <div className="text-xs text-muted-foreground mt-0.5">匹配到 {matchCount} 个渠道</div>
+                                      </div>
+                                    )}
+                                  </div>
+                                  <button onClick={() => updateVirtualEditorChainDraft(prev => prev.filter((_, removeIdx) => removeIdx !== idx))} className="p-1.5 text-red-600 dark:text-red-500 hover:bg-red-500/10 rounded-md transition-colors" title="删除节点">
+                                    <X className="w-4 h-4" />
+                                  </button>
+                                </div>
+
+                                {isChannel ? (
+                                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                    <select
+                                      value={node.value}
+                                      onChange={e => updateVirtualEditorNode(idx, { value: e.target.value })}
+                                      className="w-full bg-background border border-border px-3 py-2 rounded-lg text-xs text-foreground outline-none focus:border-purple-500"
+                                    >
+                                      <option value="">选择渠道</option>
+                                      {node.value && !providerNames.includes(node.value) && <option value={node.value}>{node.value}</option>}
+                                      {providerNames.map(providerName => <option key={providerName} value={providerName}>{providerName}</option>)}
+                                    </select>
+                                    <select
+                                      value={node.model || ''}
+                                      onChange={e => updateVirtualEditorNode(idx, { model: e.target.value || undefined })}
+                                      className="w-full bg-background border border-border px-3 py-2 rounded-lg text-xs text-foreground outline-none focus:border-purple-500"
+                                    >
+                                      <option value="">使用虚拟模型名：{displayVirtualName}</option>
+                                      {node.model && !channelModelOptions.some(option => option.displayName === node.model) && <option value={node.model}>{node.model}</option>}
+                                      {channelModelOptions.map(option => <option key={`${option.displayName}-${option.upstreamName}`} value={option.displayName}>{formatProviderModelOption(option)}</option>)}
+                                    </select>
+                                  </div>
+                                ) : (
+                                  <input
+                                    value={node.value}
+                                    onChange={e => updateVirtualEditorNode(idx, { value: e.target.value })}
+                                    placeholder="模型名，例如 deepseek-chat"
+                                    className="w-full bg-background border border-border px-3 py-2 rounded-lg text-xs font-mono text-foreground outline-none focus:border-purple-500"
+                                  />
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2">
+                    <p className="text-xs text-muted-foreground">节点从上到下依次解析。模型节点全局匹配，渠道节点只匹配指定渠道。</p>
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={virtualAddNodeTypes[virtualDraftName.trim() || editingVirtualName || '__new_virtual_model__'] || 'model'}
+                        onChange={e => {
+                          const key = virtualDraftName.trim() || editingVirtualName || '__new_virtual_model__';
+                          setVirtualAddNodeTypes(prev => ({ ...prev, [key]: e.target.value as 'model' | 'channel' }));
+                        }}
+                        className="bg-background border border-border rounded-lg px-2 py-2 text-xs text-foreground"
+                      >
+                        <option value="model">模型节点</option>
+                        <option value="channel">渠道节点</option>
+                      </select>
+                      <button onClick={appendVirtualEditorNodeByType} className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg flex items-center gap-1.5 text-xs font-medium transition-colors">
+                        <Plus className="w-3.5 h-3.5" /> 添加节点
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </section>
+            </div>
+
+            <div className="p-4 bg-muted/30 border-t border-border flex justify-end gap-3 flex-shrink-0">
+              <Dialog.Close className="px-4 py-2 text-sm font-medium text-foreground bg-muted hover:bg-muted/80 rounded-lg">取消</Dialog.Close>
+              <button onClick={handleSaveVirtualEditor} className="px-4 py-2 text-sm font-medium text-white bg-purple-600 hover:bg-purple-700 rounded-lg flex items-center gap-1.5">
+                <CheckCircle2 className="w-4 h-4" /> 保存虚拟模型
+              </button>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+
       {/* Editor Side Sheet - Responsive */}
       <Dialog.Root open={isModalOpen} onOpenChange={(open) => { setIsModalOpen(open); if (!open) setEditingSubChannel(null); }}>
         <Dialog.Portal>
@@ -1889,7 +3140,17 @@ export default function Channels() {
                     </div>
                     <div>
                       <label className="text-sm font-medium text-foreground mb-1.5 block">模型前缀 (可选)</label>
-                      <input type="text" value={formData.model_prefix} onChange={e => updateFormData('model_prefix', e.target.value)} placeholder="例如 azure- 或 aws/" className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono outline-none text-foreground" />
+                      <div className="flex items-center gap-2">
+                        <input type="text" value={formData.model_prefix} onChange={e => updateModelPrefix(e.target.value)} placeholder="例如 azure- 或 aws/" className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono outline-none text-foreground" />
+                        {formData.model_prefix.trim() && (
+                          <label className="flex items-center gap-1.5 text-xs text-muted-foreground whitespace-nowrap cursor-pointer" title="开启后，该渠道的模型去掉前缀后也可被无前缀请求匹配到">
+                            <Switch.Root checked={!!formData.preferences.pool_sharing} onCheckedChange={val => updatePreference('pool_sharing', val)} className="w-9 h-5 bg-muted rounded-full relative data-[state=checked]:bg-emerald-500 transition-colors flex-shrink-0">
+                              <Switch.Thumb className="block w-4 h-4 bg-white rounded-full shadow-md transition-transform translate-x-0.5 data-[state=checked]:translate-x-[18px]" />
+                            </Switch.Root>
+                            共享路由池
+                          </label>
+                        )}
+                      </div>
                     </div>
                     <div className="flex items-center justify-between p-3 bg-muted/50 rounded-lg border border-border">
                       <span className="text-sm font-medium text-foreground">启用该渠道</span>
@@ -2457,6 +3718,8 @@ export default function Channels() {
                     <Network className="w-4 h-4 text-yellow-500" /> 路由与限流
                   </div>
                   <div className="space-y-4">
+
+
                     {/* 权重 + 调度策略 并排 */}
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                       <div>

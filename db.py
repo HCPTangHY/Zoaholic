@@ -376,6 +376,9 @@ class RequestStat(Base):
     prompt_tokens = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)
     total_tokens = Column(Integer, default=0)
+    # Prompt Caching 统计字段：用于保存上游返回的缓存命中和缓存创建 token，默认 0 便于旧日志按无缓存处理。
+    cached_tokens = Column(Integer, default=0, server_default="0")
+    cache_creation_tokens = Column(Integer, default=0, server_default="0")
     prompt_price = Column(Float, default=0.0)
     completion_price = Column(Float, default=0.0)
     timestamp = Column(DateTime(timezone=True), server_default=_SERVER_NOW, index=True)
