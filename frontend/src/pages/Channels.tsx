@@ -36,6 +36,15 @@ import {
   type KeyRuleRetryMode,
 } from '../lib/keyRules';
 
+// ========== DeferredInput ==========
+// 本地 state 暂存输入，blur/Enter 时才写回外部，避免 parse+trim 吞空格
+function DeferredInput({ value, onCommit, ...props }: Omit<React.InputHTMLAttributes<HTMLInputElement>, 'onChange' | 'onBlur' | 'onKeyDown' | 'value'> & { value: string; onCommit: (v: string) => void }) {
+  const [local, setLocal] = useState(value);
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => { if (ref.current !== document.activeElement) setLocal(value); }, [value]);
+  return <input ref={ref} {...props} type="text" value={local} onChange={e => setLocal(e.target.value)} onBlur={() => onCommit(local)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); onCommit(local); (e.target as HTMLInputElement).blur(); } }} />;
+}
+
 // ========== Types ==========
 interface ApiKeyObj {
   key: string;
@@ -3951,8 +3960,8 @@ export default function Channels() {
                                     <option value="keyword">关键词</option>
                                     <option value="default">default</option>
                                   </select>
-                                  {mt === 'status' && <input type="text" inputMode="numeric" value={formatKeyRuleStatusInput(rule.match?.status)} onChange={e => updateRule({ match: { status: parseKeyRuleStatusInput(e.target.value) } })} placeholder="429" className={`${inputClass} w-[68px]`} />}
-                                  {mt === 'keyword' && <input type="text" value={formatKeyRuleKeywordsInput(rule.match?.keyword)} onChange={e => updateRule({ match: { keyword: parseKeyRuleKeywordsInput(e.target.value) } })} placeholder="quota" className={`${inputClass} w-[110px] sm:w-[118px]`} />}
+                                  {mt === 'status' && <DeferredInput inputMode="numeric" value={formatKeyRuleStatusInput(rule.match?.status)} onCommit={v => updateRule({ match: { status: parseKeyRuleStatusInput(v) } })} placeholder="429" className={`${inputClass} w-[68px]`} />}
+                                  {mt === 'keyword' && <DeferredInput value={formatKeyRuleKeywordsInput(rule.match?.keyword)} onCommit={v => updateRule({ match: { keyword: parseKeyRuleKeywordsInput(v) } })} placeholder="quota, rate limit" className={`${inputClass} w-[110px] sm:w-[118px]`} />}
                                   <button type="button" onClick={removeRule} className="ml-auto inline-flex h-6 w-6 items-center justify-center text-red-500/60 hover:text-red-500 sm:hidden" title="删除"><X className="h-3 w-3" /></button>
                                 </div>
                                 <span className="hidden h-5 w-px bg-border sm:block" aria-hidden="true" />
