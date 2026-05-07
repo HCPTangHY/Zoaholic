@@ -51,6 +51,101 @@ def _rebuild_runtime_rate_limits(app) -> None:
         )
 
 
+async def _persist_config(app, sections_to_verify=None):
+    """
+    持久化当前配置，并在需要写回文件时校验指定 section。
+    """
+    # 修改原因：新增单渠道 provider API 与原有全量配置保存都需要同一套落盘、运行时重建和回读校验流程。
+    # 修改方式：把 /v1/api_config/update 原先内联的持久化逻辑集中到内部 helper，并用 sections_to_verify 控制校验范围。
+    # 目的：避免三个 provider 端点复制粘贴持久化代码，确保保存失败时统一返回非 200 响应。
+    if sections_to_verify is None:
+        sections_to_verify = ["providers"]
+    else:
+        sections_to_verify = list(sections_to_verify)
+
+    # 配置持久化策略：
+    # - CONFIG_STORAGE=file（默认）：api.yaml 为权威，前端保存必须写回文件，否则重启会回滚
+    # - CONFIG_STORAGE=auto/db：可写 DB；其中 auto/file 默认也写回 api.yaml
+    config_storage = (os.getenv("CONFIG_STORAGE") or "file").strip().lower()
+
+    save_to_db = config_storage in ("auto", "db")
+    # auto/file：始终写回 api.yaml，保证 yaml 权威；db：默认不写文件（可用 SYNC_CONFIG_TO_FILE 打开）
+    save_to_file = (config_storage in ("file", "auto")) or env_bool("SYNC_CONFIG_TO_FILE", False)
+
+    try:
+        app.state.config, app.state.api_keys_db, app.state.api_list = await update_config(
+            app.state.config,
+            use_config_url=False,
+            skip_model_fetch=True,
+            save_to_file=save_to_file,
+            save_to_db=save_to_db,
+        )
+        try:
+            _rebuild_runtime_rate_limits(app)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid rate_limit configuration: {e}") from e
+        apply_backend_log_preferences((app.state.config or {}).get("preferences") or {})
+
+    except HTTPException:
+        # 修改原因：内部已经构造出的 HTTPException 应保留原始状态码。
+        # 修改方式：在通用异常包装前直接重新抛出。
+        # 目的：避免配置校验类错误被误包装成 500。
+        raise
+    except ValueError as e:
+        # 修改原因：虚拟模型命名冲突和嵌套引用属于用户配置错误。
+        # 修改方式：将 update_config 抛出的 ValueError 转为 400 响应。
+        # 目的：保存配置时给前端明确反馈，而不是表现为服务端持久化失败。
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        # 不允许“假成功”：只要持久化过程有异常，直接返回非 200
+        raise HTTPException(status_code=500, detail=f"Failed to update/persist config: {e}") from e
+
+    # 进一步防止“假成功”：当本次要求写 yaml 时，回读文件校验关键段一致。
+    if save_to_file:
+        try:
+            with open(API_YAML_PATH, "r", encoding="utf-8") as f:
+                file_config = yaml.load(f) or {}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Config write verification failed (cannot read api.yaml): {e}") from e
+
+        # 仅比较“可持久化配置”，忽略运行时字段（例如 providers 下的 _model_dict_cache）
+        runtime_persistable = dump_config_to_json_obj(app.state.config or {})
+        file_persistable = dump_config_to_json_obj(file_config or {})
+
+        runtime_subset = {
+            "providers": runtime_persistable.get("providers", []),
+            "api_keys": runtime_persistable.get("api_keys", []),
+            "preferences": runtime_persistable.get("preferences", {}),
+        }
+        file_subset = {
+            "providers": file_persistable.get("providers", []),
+            "api_keys": file_persistable.get("api_keys", []),
+            "preferences": file_persistable.get("preferences", {}),
+        }
+
+        runtime_encoded = runtime_subset
+        file_encoded = file_subset
+
+        mismatched_sections = [
+            key for key in sections_to_verify
+            if runtime_encoded.get(key) != file_encoded.get(key)
+        ]
+        if mismatched_sections:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Config write verification failed: api.yaml is out of sync. "
+                    f"path={API_YAML_PATH}, verify_sections={sections_to_verify}, mismatched_sections={mismatched_sections}"
+                ),
+            )
+
+    return {
+        "save_to_file": save_to_file,
+        "save_to_db": save_to_db,
+        "api_yaml_path": API_YAML_PATH if save_to_file else None,
+    }
+
+
 @router.get("/v1/generate-api-key", dependencies=[Depends(rate_limit_dependency)])
 async def generate_api_key():
     """
@@ -113,90 +208,114 @@ async def api_config_update(
             detail="No updatable sections provided. Allowed keys: providers, api_keys, preferences.",
         )
 
-    # 配置持久化策略：
-    # - CONFIG_STORAGE=file（默认）：api.yaml 为权威，前端保存必须写回文件，否则重启会回滚
-    # - CONFIG_STORAGE=auto/db：可写 DB；其中 auto/file 默认也写回 api.yaml
-    config_storage = (os.getenv("CONFIG_STORAGE") or "file").strip().lower()
-
-    save_to_db = config_storage in ("auto", "db")
-    # auto/file：始终写回 api.yaml，保证 yaml 权威；db：默认不写文件（可用 SYNC_CONFIG_TO_FILE 打开）
-    save_to_file = (config_storage in ("file", "auto")) or env_bool("SYNC_CONFIG_TO_FILE", False)
-
-    try:
-        app.state.config, app.state.api_keys_db, app.state.api_list = await update_config(
-            app.state.config,
-            use_config_url=False,
-            skip_model_fetch=True,
-            save_to_file=save_to_file,
-            save_to_db=save_to_db,
-        )
-        try:
-            _rebuild_runtime_rate_limits(app)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid rate_limit configuration: {e}") from e
-        apply_backend_log_preferences((app.state.config or {}).get("preferences") or {})
-
-    except HTTPException:
-        # 修改原因：内部已经构造出的 HTTPException 应保留原始状态码。
-        # 修改方式：在通用异常包装前直接重新抛出。
-        # 目的：避免配置校验类错误被误包装成 500。
-        raise
-    except ValueError as e:
-        # 修改原因：虚拟模型命名冲突和嵌套引用属于用户配置错误。
-        # 修改方式：将 update_config 抛出的 ValueError 转为 400 响应。
-        # 目的：保存配置时给前端明确反馈，而不是表现为服务端持久化失败。
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except Exception as e:
-        # 不允许“假成功”：只要持久化过程有异常，直接返回非 200
-        raise HTTPException(status_code=500, detail=f"Failed to update/persist config: {e}") from e
-
-    # 进一步防止“假成功”：当本次要求写 yaml 时，回读文件校验关键段一致。
-    if save_to_file:
-        try:
-            with open(API_YAML_PATH, "r", encoding="utf-8") as f:
-                file_config = yaml.load(f) or {}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Config write verification failed (cannot read api.yaml): {e}") from e
-
-        # 仅比较“可持久化配置”，忽略运行时字段（例如 providers 下的 _model_dict_cache）
-        runtime_persistable = dump_config_to_json_obj(app.state.config or {})
-        file_persistable = dump_config_to_json_obj(file_config or {})
-
-        # 仅校验本次请求涉及到的 section，避免历史遗留差异阻塞无关保存
-        sections_to_verify = [key for key in ("providers", "api_keys", "preferences") if key in config]
-
-        runtime_subset = {
-            "providers": runtime_persistable.get("providers", []),
-            "api_keys": runtime_persistable.get("api_keys", []),
-            "preferences": runtime_persistable.get("preferences", {}),
-        }
-        file_subset = {
-            "providers": file_persistable.get("providers", []),
-            "api_keys": file_persistable.get("api_keys", []),
-            "preferences": file_persistable.get("preferences", {}),
-        }
-
-        runtime_encoded = runtime_subset
-        file_encoded = file_subset
-
-        mismatched_sections = [
-            key for key in sections_to_verify
-            if runtime_encoded.get(key) != file_encoded.get(key)
-        ]
-        if mismatched_sections:
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    f"Config write verification failed: api.yaml is out of sync. "
-                    f"path={API_YAML_PATH}, verify_sections={sections_to_verify}, mismatched_sections={mismatched_sections}"
-                ),
-            )
+    # 修改原因：持久化流程已经抽到 _persist_config，原接口只需要声明本次改动涉及的 section。
+    # 修改方式：按请求中的顶层键生成校验范围，并复用统一 helper 返回的 persisted 信息。
+    # 目的：保持原全量配置接口行为不变，同时让单渠道接口共享同一套保存与校验逻辑。
+    sections_to_verify = [key for key in ("providers", "api_keys", "preferences") if key in config]
+    persisted = await _persist_config(app, sections_to_verify=sections_to_verify)
 
     return JSONResponse(content={
         "message": "API config updated",
-        "persisted": {
-            "save_to_file": save_to_file,
-            "save_to_db": save_to_db,
-            "api_yaml_path": API_YAML_PATH if save_to_file else None,
-        },
+        "persisted": persisted,
     })
+
+
+def _get_providers_config(app):
+    """
+    返回可修改的 providers 配置列表。
+    """
+    # 修改原因：新增 provider 局部接口都要读写 app.state.config["providers"]，分散处理会造成边界行为不一致。
+    # 修改方式：集中确保 config 是字典且 providers 是列表，缺失时初始化为空列表。
+    # 目的：让新增、更新、删除接口使用同一个配置入口，避免重复防御代码。
+    if not isinstance(getattr(app.state, "config", None), dict):
+        app.state.config = {}
+    providers = app.state.config.setdefault("providers", [])
+    if not isinstance(providers, list):
+        raise HTTPException(status_code=500, detail="Invalid providers configuration: providers must be a list.")
+    return providers
+
+
+def _find_provider_index(providers, provider_id: str) -> int:
+    """
+    按 provider 字段查找渠道下标。
+    """
+    # 修改原因：provider_id 的定位规则必须严格按 provider["provider"] == provider_id 执行。
+    # 修改方式：遍历 providers 列表，只匹配字典对象中的 provider 字段。
+    # 目的：保证 PUT 和 DELETE 对同一 provider_id 的定位行为完全一致。
+    for index, provider in enumerate(providers):
+        if isinstance(provider, dict) and provider.get("provider") == provider_id:
+            return index
+    return -1
+
+
+@router.post("/v1/providers", dependencies=[Depends(rate_limit_dependency)])
+async def create_provider(
+    api_index: int = Depends(verify_admin_api_key),
+    provider_data: dict = Body(...)
+):
+    """
+    新增单个渠道。
+    """
+    # 修改原因：前端新增渠道不应再提交完整 providers 数组，否则会覆盖其他浏览器中的并发修改。
+    # 修改方式：校验 provider 字段和重名冲突后，只把当前 provider 追加到配置列表并复用统一持久化流程。
+    # 目的：为新增渠道提供原子化接口，消除全量覆盖风险。
+    provider_name = provider_data.get("provider")
+    if not isinstance(provider_name, str) or not provider_name.strip():
+        raise HTTPException(status_code=400, detail='Provider data must include a non-empty "provider" field.')
+
+    app = get_app()
+    providers = _get_providers_config(app)
+    if _find_provider_index(providers, provider_name) != -1:
+        raise HTTPException(status_code=409, detail=f'Provider "{provider_name}" already exists.')
+
+    providers.append(provider_data)
+    await _persist_config(app)
+    return JSONResponse(
+        status_code=201,
+        content={"message": "Provider created", "provider_id": provider_name},
+    )
+
+
+@router.put("/v1/providers/{provider_id}", dependencies=[Depends(rate_limit_dependency)])
+async def update_provider(
+    provider_id: str,
+    api_index: int = Depends(verify_admin_api_key),
+    provider_data: dict = Body(...)
+):
+    """
+    更新单个渠道。
+    """
+    # 修改原因：编辑已有渠道时只应替换目标 provider，不能让前端用旧列表覆盖整个 providers 数组。
+    # 修改方式：按路径 provider_id 定位原对象，并用请求体整体替换该对象，不做 deep merge。
+    # 目的：允许字段删除和渠道重命名，同时保留其他渠道的最新状态。
+    app = get_app()
+    providers = _get_providers_config(app)
+    provider_index = _find_provider_index(providers, provider_id)
+    if provider_index == -1:
+        raise HTTPException(status_code=404, detail=f'Provider "{provider_id}" not found.')
+
+    providers[provider_index] = provider_data
+    await _persist_config(app)
+    return JSONResponse(content={"message": "Provider updated", "provider_id": provider_id})
+
+
+@router.delete("/v1/providers/{provider_id}", dependencies=[Depends(rate_limit_dependency)])
+async def delete_provider(
+    provider_id: str,
+    api_index: int = Depends(verify_admin_api_key),
+):
+    """
+    删除单个渠道。
+    """
+    # 修改原因：删除渠道时前端不应再上传删除后的完整 providers 数组。
+    # 修改方式：后端按 provider_id 在当前配置中移除目标项，并复用统一持久化流程。
+    # 目的：避免删除操作把其他设备刚保存的渠道修改一并回滚。
+    app = get_app()
+    providers = _get_providers_config(app)
+    provider_index = _find_provider_index(providers, provider_id)
+    if provider_index == -1:
+        raise HTTPException(status_code=404, detail=f'Provider "{provider_id}" not found.')
+
+    providers.pop(provider_index)
+    await _persist_config(app)
+    return JSONResponse(content={"message": "Provider deleted", "provider_id": provider_id})

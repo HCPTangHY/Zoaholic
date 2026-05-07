@@ -189,6 +189,24 @@ function getBalanceLabel(b: BalanceResult): string | null {
   return null;
 }
 
+function sortProvidersByWeight(list: any[]): any[] {
+  // 修改原因：保存后需要从后端重新获取 providers，并继续保持页面原有的权重降序显示。
+  // 修改方式：把原先散落在加载和保存逻辑中的排序规则抽成纯 helper。
+  // 目的：避免刷新、保存和权重更新使用不同排序实现导致列表顺序不一致。
+  return [...list].sort((a, b) => {
+    const weightA = a.preferences?.weight ?? a.weight ?? 0;
+    const weightB = b.preferences?.weight ?? b.weight ?? 0;
+    return weightB - weightA;
+  });
+}
+
+function buildProviderApiPath(providerId: string): string {
+  // 修改原因：provider 名可能包含空格、斜杠或其他需要转义的字符，直接拼 URL 会请求错误路径。
+  // 修改方式：所有单渠道 PUT/DELETE 统一通过 encodeURIComponent 生成路径。
+  // 目的：保证前端调用 /v1/providers/{provider_id} 时按真实渠道名定位。
+  return `/v1/providers/${encodeURIComponent(providerId)}`;
+}
+
 const BALANCE_FILL_COLORS = {
   green: 'linear-gradient(90deg, rgba(16,185,129,0.15) 0%, rgba(16,185,129,0.04) 100%)',
   yellow: 'linear-gradient(90deg, rgba(234,179,8,0.18) 0%, rgba(234,179,8,0.04) 100%)',
@@ -395,6 +413,43 @@ export default function Channels() {
 
   const { token } = useAuthStore();
 
+  const applyApiConfigData = (data: any, options: { syncVirtualModels?: boolean } = {}) => {
+    // 修改原因：初始加载和单渠道保存后的刷新都要把 /v1/api_config 响应写回页面状态，但普通 provider 刷新不应覆盖未保存的虚拟路由草稿。
+    // 修改方式：始终刷新 providers 和价格；只有初始加载显式传 syncVirtualModels 时才同步 virtual_models。
+    // 目的：避免局部保存成功后继续使用本地拼接数组，同时保护用户正在编辑的虚拟模型配置。
+    const rawProviders = data.providers || data.api_config?.providers || [];
+    const sortedProviders = sortProvidersByWeight(Array.isArray(rawProviders) ? rawProviders : []);
+    setProviders(sortedProviders);
+
+    const globalPrefs = data.preferences || data.api_config?.preferences || {};
+    setGlobalModelPrice(globalPrefs.model_price || {});
+    if (!options.syncVirtualModels) return;
+
+    // 修改原因：虚拟模型路由由 /v1/api_config 的全局 preferences 返回。
+    // 修改方式：读取 preferences.virtual_models 并在缺失时回退为空对象。
+    // 目的：页面初始加载后展示已配置的全局虚拟模型路由。
+    const loadedVirtualModels = globalPrefs.virtual_models || {};
+    setVirtualModels(loadedVirtualModels);
+    setVirtualModelsDirty(false);
+    // 修改原因：虚拟模型现在通过渠道列表卡片进入抽屉编辑，旧画布展开状态不再承担主要展示职责。
+    // 修改方式：仍保留已有展开状态初始化，供历史函数和后续兼容逻辑使用。
+    // 目的：减少 UI 重构对既有状态和 CRUD 函数的破坏范围。
+    setExpandedVirtualModels(prev => prev.size > 0 ? prev : new Set(Object.keys(loadedVirtualModels).slice(0, 1)));
+  };
+
+  const refreshProviders = async (options: { syncVirtualModels?: boolean } = {}) => {
+    // 修改原因：主渠道新增、更新、删除都改为单渠道 API，成功后不能再用本地数组推断最终状态。
+    // 修改方式：重新请求 /v1/api_config，并通过 applyApiConfigData 写回后端最新 providers。
+    // 目的：消除多浏览器并发保存时的陈旧状态风险。
+    const res = await apiFetch('/v1/api_config', { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(fmtErr(err, res.status));
+    }
+    const data = await res.json();
+    applyApiConfigData(data, options);
+  };
+
   const fetchInitialData = async () => {
     try {
       const headers = { Authorization: `Bearer ${token}` };
@@ -416,36 +471,13 @@ export default function Channels() {
         setLocalCountdowns(countdowns);
       }).catch(() => {});
 
-      const [configRes, typesRes, pluginsRes, activityRes] = await Promise.all([
-        apiFetch('/v1/api_config', { headers }),
+      const [_providersRefreshed, typesRes, pluginsRes, activityRes] = await Promise.all([
+        refreshProviders({ syncVirtualModels: true }),
         apiFetch('/v1/channels', { headers }),
         apiFetch('/v1/plugins/interceptors', { headers }),
         apiFetch('/v1/stats/provider_activity', { headers }).catch(() => null),
       ]);
 
-      if (configRes.ok) {
-        const data = await configRes.json();
-        const rawProviders = data.providers || data.api_config?.providers || [];
-        // 按权重降序排序
-        const sortedProviders = [...rawProviders].sort((a, b) => {
-          const weightA = a.preferences?.weight ?? a.weight ?? 0;
-          const weightB = b.preferences?.weight ?? b.weight ?? 0;
-          return weightB - weightA;
-        });
-        setProviders(sortedProviders);
-        const globalPrefs = data.preferences || data.api_config?.preferences || {};
-        setGlobalModelPrice(globalPrefs.model_price || {});
-        // 修改原因：虚拟模型路由由 /v1/api_config 的全局 preferences 返回。
-        // 修改方式：读取 preferences.virtual_models 并在缺失时回退为空对象。
-        // 目的：页面加载后立即展示已配置的全局虚拟模型路由。
-        const loadedVirtualModels = globalPrefs.virtual_models || {};
-        setVirtualModels(loadedVirtualModels);
-        setVirtualModelsDirty(false);
-        // 修改原因：虚拟模型现在通过渠道列表卡片进入抽屉编辑，旧画布展开状态不再承担主要展示职责。
-        // 修改方式：仍保留已有展开状态初始化，供历史函数和后续兼容逻辑使用。
-        // 目的：减少本次 UI 重构对既有状态和 CRUD 函数的破坏范围。
-        setExpandedVirtualModels(prev => prev.size > 0 ? prev : new Set(Object.keys(loadedVirtualModels).slice(0, 1)));
-      }
       if (typesRes.ok) {
         const data = await typesRes.json();
         setChannelTypes(data.channels || []);
@@ -957,46 +989,61 @@ export default function Channels() {
 
   const handleDeleteProvider = async (idx: number) => {
     const provider = providers[idx];
-    const name = provider?.provider || `渠道 ${idx + 1}`;
+    const providerId = String(provider?.provider || '').trim();
+    const name = providerId || `渠道 ${idx + 1}`;
+    if (!providerId) {
+      toastError('删除失败：渠道名为空');
+      return;
+    }
     if (!confirm(`确定要删除渠道 "${name}" 吗？此操作不可撤销。`)) return;
 
-    const newProviders = providers.filter((_, i) => i !== idx);
     try {
-      const res = await apiFetch('/v1/api_config/update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ providers: newProviders }),
+      // 修改原因：删除主渠道不能再提交删除后的完整 providers 数组，否则会覆盖其他浏览器的新配置。
+      // 修改方式：调用 DELETE /v1/providers/{provider_id}，成功后统一 refreshProviders 获取后端最新列表。
+      // 目的：让删除操作只影响一个渠道，并保留并发修改。
+      const res = await apiFetch(buildProviderApiPath(providerId), {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {
-        setProviders(newProviders);
+        await refreshProviders();
         toastError(`已删除渠道 "${name}"`);
       } else {
-        toastError('删除失败');
+        const err = await res.json().catch(() => ({}));
+        toastError(fmtErr(err, res.status), '删除失败');
       }
-    } catch {
-      toastError('网络错误');
+    } catch (err: any) {
+      toastError(err?.message || '网络错误');
     }
   };
 
   const handleToggleProvider = async (idx: number) => {
     const provider = providers[idx];
+    const providerId = String(provider?.provider || '').trim();
+    if (!providerId) {
+      toastError('操作失败：渠道名为空');
+      return;
+    }
     const newEnabled = provider.enabled === false ? true : false;
-    const newProviders = [...providers];
-    newProviders[idx] = { ...provider, enabled: newEnabled };
+    const updatedProvider = { ...provider, enabled: newEnabled };
 
     try {
-      const res = await apiFetch('/v1/api_config/update', {
-        method: 'POST',
+      // 修改原因：启用或禁用只改一个 provider，继续全量提交会覆盖其他设备上的渠道改动。
+      // 修改方式：把修改 enabled 后的 provider 对象 PUT 到对应 provider_id，再刷新完整列表。
+      // 目的：保持开关操作的影响范围仅限当前渠道。
+      const res = await apiFetch(buildProviderApiPath(providerId), {
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ providers: newProviders }),
+        body: JSON.stringify(updatedProvider),
       });
       if (res.ok) {
-        setProviders(newProviders);
+        await refreshProviders();
       } else {
-        toastError('操作失败');
+        const err = await res.json().catch(() => ({}));
+        toastError(fmtErr(err, res.status), '操作失败');
       }
-    } catch {
-      toastError('网络错误');
+    } catch (err: any) {
+      toastError(err?.message || '网络错误');
     }
   };
 
@@ -1087,32 +1134,40 @@ export default function Channels() {
     };
   };
 
-  // 排序函数
-  const sortByWeight = (list: any[]) => {
-    return [...list].sort((a, b) => {
-      const weightA = a.preferences?.weight ?? a.weight ?? 0;
-      const weightB = b.preferences?.weight ?? b.weight ?? 0;
-      return weightB - weightA;
-    });
-  };
+  // 修改原因：历史代码多处调用 sortByWeight，本次只把实现统一委托给组件外的纯 helper。
+  // 修改方式：保留原函数名作为局部别名，减少保存子渠道等无关逻辑的改动范围。
+  // 目的：在引入 refreshProviders 的同时保持既有调用点稳定。
+  const sortByWeight = sortProvidersByWeight;
 
   const handleUpdateWeight = async (idx: number, newWeight: number) => {
-    const newProviders = [...providers];
-    if (!newProviders[idx].preferences) newProviders[idx].preferences = {};
-    newProviders[idx].preferences.weight = newWeight;
+    const provider = providers[idx];
+    const providerId = String(provider?.provider || '').trim();
+    if (!providerId) {
+      toastError('权重更新失败：渠道名为空');
+      return;
+    }
+    const updatedProvider = {
+      ...provider,
+      preferences: { ...(provider.preferences || {}), weight: newWeight },
+    };
 
     try {
-      const res = await apiFetch('/v1/api_config/update', {
-        method: 'POST',
+      // 修改原因：权重更新只改变当前 provider.preferences.weight，全量保存会覆盖并发修改。
+      // 修改方式：PUT 单个 provider 后调用 refreshProviders，让后端最新排序结果回到页面。
+      // 目的：保持权重编辑的局部性，同时继续按权重降序展示。
+      const res = await apiFetch(buildProviderApiPath(providerId), {
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ providers: newProviders }),
+        body: JSON.stringify(updatedProvider),
       });
       if (res.ok) {
-        // 更新后重新排序
-        setProviders(sortByWeight(newProviders));
+        await refreshProviders();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        toastError(fmtErr(err, res.status), '权重更新失败');
       }
-    } catch {
-      console.error('Failed to update weight');
+    } catch (err: any) {
+      toastError(err?.message || '权重更新失败');
     }
   };
 
@@ -1850,7 +1905,9 @@ export default function Channels() {
       sub_channels: serializedSubChannels.length > 0 ? serializedSubChannels : undefined,
     };
 
-    let newProviders: any[];
+    let newProviders: any[] | null = null;
+    let providerSavePath = '/v1/providers';
+    let providerSaveMethod: 'POST' | 'PUT' = 'POST';
 
     if (editingSubChannel) {
       // 子渠道模式：保存回 parent.sub_channels
@@ -1888,29 +1945,49 @@ export default function Channels() {
       subs[subIdx] = subObj;
       newProviders = [...providers];
       newProviders[parentIdx] = { ...parent, sub_channels: subs };
-    } else {
-      // 主渠道模式
-      newProviders = [...providers];
-      if (originalIndex !== null) newProviders[originalIndex] = targetProvider;
-      else newProviders.push(targetProvider);
+    } else if (originalIndex !== null) {
+      // 修改原因：编辑主渠道时路径必须使用打开弹窗时对应的原 provider_id，才能支持重命名渠道。
+      // 修改方式：从 originalIndex 读取当前列表中的原渠道名作为 PUT 路径，body 仍保存 targetProvider 的完整对象。
+      // 目的：只替换旧渠道对象，不把整个 providers 数组发回后端。
+      const originalProviderId = String(providers[originalIndex]?.provider || '').trim();
+      if (!originalProviderId) {
+        toastError('保存失败：找不到原渠道名');
+        return;
+      }
+      providerSavePath = buildProviderApiPath(originalProviderId);
+      providerSaveMethod = 'PUT';
     }
 
     try {
-      const res = await apiFetch('/v1/api_config/update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ providers: newProviders }),
-      });
+      // 修改原因：主渠道新增和编辑已经有局部 API，只有子渠道仍保留全量 providers 保存。
+      // 修改方式：子渠道走原 /v1/api_config/update；主渠道新增走 POST /v1/providers，编辑走 PUT /v1/providers/{provider_id}。
+      // 目的：解决主渠道保存时用陈旧 providers 数组覆盖其他设备修改的问题。
+      const res = editingSubChannel
+        ? await apiFetch('/v1/api_config/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ providers: newProviders }),
+        })
+        : await apiFetch(providerSavePath, {
+          method: providerSaveMethod,
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify(targetProvider),
+        });
 
       if (res.ok) {
-        setProviders(sortByWeight(newProviders));
+        if (editingSubChannel && newProviders) {
+          setProviders(sortByWeight(newProviders));
+        } else {
+          await refreshProviders();
+        }
         setIsModalOpen(false);
         setEditingSubChannel(null);
       } else {
-        toastError("保存失败");
+        const err = await res.json().catch(() => ({}));
+        toastError(fmtErr(err, res.status), "保存失败");
       }
-    } catch {
-      toastError("网络错误");
+    } catch (err: any) {
+      toastError(err?.message || "网络错误");
     }
   };
 
