@@ -86,12 +86,11 @@ def get_signature(request_body, model_id, aws_access_key, aws_secret_key, aws_re
     canonical_headers = f'accept:{accept_header}\n' \
                         f'content-type:{content_type}\n' \
                         f'host:{host}\n' \
-                        f'x-amz-bedrock-accept:{accept_header}\n' \
                         f'x-amz-content-sha256:{payload_hash}\n' \
                         f'x-amz-date:{amz_date}\n'
     # 注意：头名称需要按字母顺序排序
 
-    signed_headers = 'accept;content-type;host;x-amz-bedrock-accept;x-amz-content-sha256;x-amz-date' # 按字母顺序排序
+    signed_headers = 'accept;content-type;host;x-amz-content-sha256;x-amz-date' # 按字母顺序排序
 
     canonical_request = f'{method}\n' \
                         f'{canonical_uri}\n' \
@@ -276,7 +275,7 @@ async def get_aws_payload(request, engine, provider, api_key=None):
         aws_ak = parts[0].strip()
         aws_sk = parts[1].strip()
     if aws_ak and aws_sk:
-        ACCEPT_HEADER = "application/vnd.amazon.bedrock.payload+json"
+        ACCEPT_HEADER = "application/json"
         amz_date, payload_hash, authorization_header = await asyncio.to_thread(
             get_signature, payload, original_model, aws_ak, aws_sk, AWS_REGION, HOST, CONTENT_TYPE, ACCEPT_HEADER
         )
@@ -284,7 +283,6 @@ async def get_aws_payload(request, engine, provider, api_key=None):
             'Accept': ACCEPT_HEADER,
             'Content-Type': CONTENT_TYPE,
             'X-Amz-Date': amz_date,
-            'X-Amz-Bedrock-Accept': ACCEPT_HEADER,
             'X-Amz-Content-Sha256': payload_hash,
             'Authorization': authorization_header,
         }
