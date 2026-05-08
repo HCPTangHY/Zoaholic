@@ -276,6 +276,26 @@ async def create_provider(
     )
 
 
+@router.get("/v1/providers/{provider_id}", dependencies=[Depends(rate_limit_dependency)])
+async def get_provider(
+    provider_id: str,
+    api_index: int = Depends(verify_admin_api_key),
+):
+    """
+    获取单个渠道的最新配置。
+    """
+    app = get_app()
+    providers = _get_providers_config(app)
+    provider_index = _find_provider_index(providers, provider_id)
+    if provider_index == -1:
+        raise HTTPException(status_code=404, detail=f'Provider "{provider_id}" not found.')
+
+    from utils import _sanitize_config_for_persistence
+    clean = _sanitize_config_for_persistence({"providers": [providers[provider_index]]})
+    provider_clean = clean["providers"][0] if clean.get("providers") else providers[provider_index]
+    return JSONResponse(content={"provider": jsonable_encoder(provider_clean)})
+
+
 @router.put("/v1/providers/{provider_id}", dependencies=[Depends(rate_limit_dependency)])
 async def update_provider(
     provider_id: str,

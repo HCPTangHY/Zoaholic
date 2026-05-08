@@ -572,7 +572,7 @@ export default function Channels() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isModalOpen]);
 
-  const openModal = (provider: any = null, index: number | null = null) => {
+  const openModal = async (provider: any = null, index: number | null = null) => {
     setOriginalIndex(index);
     setGroupInput('');
     setModelInput('');
@@ -584,6 +584,37 @@ export default function Channels() {
     setFocusedKeyIdx(null);
 
     if (provider) {
+      // 修改原因：编辑主渠道时，页面内存中的 providers 可能已经落后于后端配置。
+      // 修改方式：只有真实主渠道编辑会带 index，此时先 GET 单个 provider；复制渠道的 index 为 null，继续使用本地副本。
+      // 目的：避免用户打开编辑面板后用旧快照填表，保存时覆盖其他设备刚写入的新配置。
+      let freshProvider = provider;
+      if (provider && index !== null) {
+        const providerId = String(provider.provider || '').trim();
+        if (providerId) {
+          try {
+            const res = await apiFetch(buildProviderApiPath(providerId), {
+              method: 'GET',
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            if (res.ok) {
+              const data = await res.json();
+              if (data?.provider) freshProvider = data.provider;
+              else toastWarning('获取渠道最新数据失败，已使用页面缓存继续编辑');
+            } else {
+              toastWarning('获取渠道最新数据失败，已使用页面缓存继续编辑');
+            }
+          } catch {
+            toastWarning('获取渠道最新数据失败，已使用页面缓存继续编辑');
+          }
+        } else {
+          toastWarning('渠道名为空，已使用页面缓存继续编辑');
+        }
+      }
+
+      // 修改原因：后续填表逻辑较长，如果继续直接读 provider 参数，容易遗漏旧快照引用。
+      // 修改方式：统一把最终数据源命名为 activeProvider，GET 成功时它就是后端最新值，失败时是传入的回退值。
+      // 目的：让 API Key、模型、偏好设置和子渠道都从同一个最新快照初始化。
+      const activeProvider = freshProvider;
       const parseApiKey = (keyStr: string) => {
         const trimmed = String(keyStr).trim();
         if (trimmed.startsWith('!')) return { key: trimmed.substring(1), disabled: true };
@@ -591,11 +622,11 @@ export default function Channels() {
       };
 
       let parsedKeys: ApiKeyObj[] = [];
-      if (Array.isArray(provider.api)) parsedKeys = provider.api.map(parseApiKey);
-      else if (typeof provider.api === 'string' && provider.api.trim()) parsedKeys = [parseApiKey(provider.api.trim())];
-      else if (Array.isArray(provider.api_keys)) parsedKeys = provider.api_keys.map(parseApiKey);
+      if (Array.isArray(activeProvider.api)) parsedKeys = activeProvider.api.map(parseApiKey);
+      else if (typeof activeProvider.api === 'string' && activeProvider.api.trim()) parsedKeys = [parseApiKey(activeProvider.api.trim())];
+      else if (Array.isArray(activeProvider.api_keys)) parsedKeys = activeProvider.api_keys.map(parseApiKey);
 
-      const rawModels = Array.isArray(provider.model) ? provider.model : Array.isArray(provider.models) ? provider.models : [];
+      const rawModels = Array.isArray(activeProvider.model) ? activeProvider.model : Array.isArray(activeProvider.models) ? activeProvider.models : [];
       const models: string[] = [];
       const mappings: ModelMapping[] = [];
 
@@ -609,12 +640,12 @@ export default function Channels() {
       });
 
       let groups = ["default"];
-      if (Array.isArray(provider.groups) && provider.groups.length > 0) groups = provider.groups;
-      else if (typeof provider.group === 'string' && provider.group.trim()) groups = [provider.group.trim()];
-      else if (provider.preferences?.group) groups = [provider.preferences.group.trim()];
+      if (Array.isArray(activeProvider.groups) && activeProvider.groups.length > 0) groups = activeProvider.groups;
+      else if (typeof activeProvider.group === 'string' && activeProvider.group.trim()) groups = [activeProvider.group.trim()];
+      else if (activeProvider.preferences?.group) groups = [activeProvider.preferences.group.trim()];
 
-      const pHeaders = provider.preferences?.headers || {};
-      const pOverrides = provider.preferences?.post_body_parameter_overrides || {};
+      const pHeaders = activeProvider.preferences?.headers || {};
+      const pOverrides = activeProvider.preferences?.post_body_parameter_overrides || {};
       const entries: HeaderEntry[] = [];
       Object.entries(pHeaders).forEach(([k, v]) => {
         if (Array.isArray(v)) {
@@ -626,15 +657,15 @@ export default function Channels() {
       setHeaderEntries(entries);
       setOverridesJson(Object.keys(pOverrides).length > 0 ? JSON.stringify(pOverrides, null, 2) : '');
 
-      const pStatusCodeOverrides = provider.preferences?.status_code_overrides || {};
+      const pStatusCodeOverrides = activeProvider.preferences?.status_code_overrides || {};
       setStatusCodeOverridesJson(Object.keys(pStatusCodeOverrides).length > 0 ? JSON.stringify(pStatusCodeOverrides, null, 2) : '');
 
-      const basePreferences = provider.preferences && typeof provider.preferences === 'object'
-        ? provider.preferences
+      const basePreferences = activeProvider.preferences && typeof activeProvider.preferences === 'object'
+        ? activeProvider.preferences
         : {};
 
       // 解析子渠道
-      const rawSubChannels = Array.isArray(provider.sub_channels) ? provider.sub_channels : [];
+      const rawSubChannels = Array.isArray(activeProvider.sub_channels) ? activeProvider.sub_channels : [];
       const subChannels: SubChannelFormData[] = rawSubChannels.map((sub: any) => {
         const subRawModels = Array.isArray(sub.model) ? sub.model : Array.isArray(sub.models) ? sub.models : [];
         const subModels: string[] = [];
@@ -661,19 +692,19 @@ export default function Channels() {
       });
 
       setFormData({
-        provider: provider.provider || provider.name || '',
-        remark: provider.remark || '',
-        engine: provider.engine || '',
-        base_url: provider.base_url || '',
+        provider: activeProvider.provider || activeProvider.name || '',
+        remark: activeProvider.remark || '',
+        engine: activeProvider.engine || '',
+        base_url: activeProvider.base_url || '',
         api_keys: parsedKeys,
-        model_prefix: provider.model_prefix || '',
-        enabled: provider.enabled !== false,
+        model_prefix: activeProvider.model_prefix || '',
+        enabled: activeProvider.enabled !== false,
         groups,
         models,
         mappings,
         preferences: {
           ...basePreferences,
-          weight: basePreferences.weight ?? provider.weight ?? 10,
+          weight: basePreferences.weight ?? activeProvider.weight ?? 10,
           cooldown_period: basePreferences.cooldown_period ?? 3,
           api_key_schedule_algorithm: basePreferences.api_key_schedule_algorithm || 'round_robin',
           proxy: basePreferences.proxy || '',
@@ -1115,24 +1146,57 @@ export default function Channels() {
     } catch { toastError('网络错误'); }
   };
 
-  const openSubChannelEdit = (parentIdx: number, subIdx: number) => {
+  const openSubChannelEdit = async (parentIdx: number, subIdx: number) => {
     const parent = providers[parentIdx];
-    const sub = (parent.sub_channels || [])[subIdx];
-    if (!sub) return;
+    const providerId = String(parent?.provider || '').trim();
+    if (!parent || !providerId) {
+      toastError('编辑失败：主渠道名为空');
+      return;
+    }
+
+    // 修改原因：子渠道编辑保存会把子渠道写回所属主渠道，如果这里继续使用旧 parent，仍可能覆盖其他设备刚改过的主渠道字段。
+    // 修改方式：先按主渠道 provider id 请求最新主渠道，成功后同步替换 providers 中对应项，再从 freshParent 取子渠道填表。
+    // 目的：让子渠道编辑和主渠道编辑一样，以后端最新配置作为表单初始化来源。
+    let freshParent = parent;
+    try {
+      const res = await apiFetch(buildProviderApiPath(providerId), {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.provider) {
+          freshParent = data.provider;
+          setProviders(prev => prev.map((item, idx) => idx === parentIdx ? freshParent : item));
+        } else {
+          toastWarning('获取主渠道最新数据失败，已使用页面缓存继续编辑');
+        }
+      } else {
+        toastWarning('获取主渠道最新数据失败，已使用页面缓存继续编辑');
+      }
+    } catch {
+      toastWarning('获取主渠道最新数据失败，已使用页面缓存继续编辑');
+    }
+
+    const sub = (freshParent.sub_channels || [])[subIdx];
+    if (!sub) {
+      toastError('编辑失败：子渠道不存在或已被删除');
+      return;
+    }
     // 构造一个虚拟 provider 给 openModal，合并主渠道的 key 等
     setEditingSubChannel({ parentIdx, subIdx });
-    openModal({
-      provider: `${parent.provider}:${sub.engine || 'sub'}`,
+    await openModal({
+      provider: `${freshParent.provider}:${sub.engine || 'sub'}`,
       engine: sub.engine || '',
-      base_url: sub.base_url || parent.base_url || '',
-      api: parent.api,
+      base_url: sub.base_url || freshParent.base_url || '',
+      api: freshParent.api,
       model: sub.model || sub.models || [],
-      model_prefix: sub.model_prefix || parent.model_prefix || '',
+      model_prefix: sub.model_prefix || freshParent.model_prefix || '',
       enabled: sub.enabled !== false,
       remark: sub.remark || '',
-      groups: parent.groups || ['default'],
+      groups: freshParent.groups || ['default'],
       preferences: {
-        ...(parent.preferences || {}),
+        ...(freshParent.preferences || {}),
         ...(sub.preferences || {}),
       },
       sub_channels: [], // 子渠道不能再分子渠道
