@@ -1,286 +1,282 @@
-# Zoaholic OAuth 凭据管理方案
+# Zoaholic OAuth 凭据管理技术文档（v1.6.0）
 
 ## 一、概述
 
-为 Zoaholic 新增对订阅式 CLI 工具（Claude Code、OpenAI Codex、Antigravity/Gemini CLI）的原生 OAuth 凭据管理支持。用户通过 OAuth 登录授权后，Zoaholic 自动维护 access_token / refresh_token 生命周期，对外暴露为标准 API 渠道。
+Zoaholic v1.6.0 已实现订阅式 CLI 工具的原生 OAuth 凭据管理。当前内置 OAuth 渠道为 `claude-code`、`codex` 和 `gemini-cli`。用户完成 OAuth 登录或导入 refresh_token 后，运行时凭据保存到 `data/oauth_state.json`，渠道配置文件 `api.yaml` 只保存账号标识符。请求进入 handler 后统一把账号标识符解析为 access_token，再交给对应渠道 adapter 访问上游。
 
-## 二、新增渠道引擎
+该功能的目标是让 OAuth 账号在路由、冷却、统计和管理端中继续表现为普通渠道的 key，同时避免 access_token、refresh_token 写入 `api.yaml` 或日志。
 
-| 引擎 ID | type_name | 透传方言 | 上游默认地址 | 认证方式 |
-|---------|-----------|---------|------------|---------|
-| `claude-code` | `"claude"` | Claude 方言 | `https://api.anthropic.com/v1` | `Authorization: Bearer {access_token}` |
-| `codex` | `"openai"` | OpenAI 方言 | `https://api.openai.com/v1` | `Authorization: Bearer {access_token}` |
-| `antigravity` | `"gemini"` | Gemini 方言 | `https://generativelanguage.googleapis.com/v1beta` | `Authorization: Bearer {access_token}` |
+## 二、内置 OAuth 渠道
 
-每个引擎作为核心渠道（`core/channels/` 目录），不是插件：
-- **复用现有渠道的 request/stream/response adapter**（claude_channel / openai_channel / gemini_channel）
-- 只重写 headers 构建（Bearer 认证）和 passthrough adapter
-- 注册 `type_name` 让对应方言自动匹配透传
+| 引擎 ID | type_name | 透传方言 | 上游默认地址 | Token URL 默认值 | 认证方式 |
+|---|---|---|---|---|---|
+| `claude-code` | `claude` | Claude 方言 | `https://api.anthropic.com` | `https://api.anthropic.com/v1/oauth/token` | `Authorization: Bearer {access_token}` |
+| `codex` | `openai-responses` | OpenAI Responses API 方言 | `https://chatgpt.com/backend-api/codex` | `https://auth.openai.com/oauth/token` | `Authorization: Bearer {access_token}` |
+| `gemini-cli` | `gemini` | Gemini 方言 | `https://cloudcode-pa.googleapis.com` | `https://oauth2.googleapis.com/token` | `Authorization: Bearer {access_token}` |
 
-## 三、数据存储设计
+说明：
 
-### 3.1 api.yaml — 只存占位 ID
+- `codex` 已注册为 `openai-responses`，请求与透传默认走 `/responses`，并强制 `store=false`。
+- 原 `antigravity` 已改为 `gemini-cli`。当前核心渠道注册表中的正式引擎 ID 是 `gemini-cli`。
+- 所有 OAuth 渠道注册时均声明 `is_oauth=True`，前端和余额路由通过该标记选择 OAuth 账号管理逻辑。
+
+## 三、OAuth 常量
+
+### 3.1 Codex
+
+源码位置：`core/channels/codex_channel.py`。
+
+| 项 | 已实现值 |
+|---|---|
+| Auth URL | `https://auth.openai.com/oauth/authorize` |
+| Token URL | `https://auth.openai.com/oauth/token` |
+| client_id | `app_EMoamEEZ73f0CkXaXp7hrann` |
+| redirect_uri | `http://localhost:1455/auth/callback` |
+| scopes | `openid email profile offline_access` |
+| PKCE | S256，授权 URL 中带 `code_challenge` 和 `code_challenge_method=S256` |
+| 登录模式 | `manual` |
+
+Codex 授权 URL 还会携带 `prompt=login`、`id_token_add_organizations=true` 和 `codex_cli_simplified_flow=true`。授权码交换和 refresh 均使用 `application/x-www-form-urlencoded` 表单。id_token 会被不验签解码，用于提取 email 和 ChatGPT account_id。
+
+### 3.2 Claude Code
+
+源码位置：`core/channels/claude_code_channel.py`。
+
+| 项 | 已实现值 |
+|---|---|
+| Auth URL | `https://claude.ai/oauth/authorize` |
+| Token URL | `https://api.anthropic.com/v1/oauth/token` |
+| client_id | `9d1c250a-e61b-44d9-88ed-5944d1962f5e` |
+| redirect_uri | `http://localhost:54545/callback` |
+| scopes | `user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload` |
+| PKCE | S256，授权码交换必须带 `code_verifier` |
+| 登录模式 | `manual` |
+
+Claude Code 的 token exchange 和 refresh 使用 JSON body。请求 adapter 会把普通 Claude adapter 生成的认证头改为 Bearer，并合并 Claude Code 所需的 `anthropic-beta`，其中包含 `oauth-2025-04-20`。当前常量还包含 Claude Code User-Agent 与 gzip magic-byte 兼容处理。
+
+### 3.3 Gemini CLI
+
+源码位置：`core/channels/gemini_cli_channel.py`。
+
+| 项 | 已实现值 |
+|---|---|
+| Auth URL | `https://accounts.google.com/o/oauth2/v2/auth` |
+| Token URL | `https://oauth2.googleapis.com/token` |
+| client_id | 通过 base64 解码得到：`681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com` |
+| client_secret | 通过 base64 解码得到，可由 `GEMINI_CLI_CLIENT_SECRET` 覆盖 |
+| redirect_uri | `http://localhost:8085/oauth2callback` |
+| scopes | `cloud-platform`、`userinfo.email`、`userinfo.profile` |
+| PKCE | 不使用 PKCE，token 请求需要 `client_secret` |
+| 登录模式 | `manual` |
+
+Gemini CLI 使用 Google OAuth installed app 形式。授权码交换后会用 access_token 请求 Google userinfo，尽量以邮箱作为账号标识符。上游请求会转为 Cloud Code Assist `v1internal` 协议，并保留 `project_id` 支持。
+
+## 四、配置与状态文件
+
+### 4.1 api.yaml 只保存账号标识符
 
 ```yaml
-- provider: "CC-Accounts"
+- provider: "Claude-Code-Accounts"
   engine: claude-code
+  base_url: "https://api.anthropic.com"
+  token_url: "https://api.anthropic.com/v1/oauth/token"
   api:
-    - "alice@gmail.com"
-    - "bob@outlook.com"
+    - "alice@example.com"
   model:
     - claude-sonnet-4
-    - claude-opus-4
-  # base_url 不填 = 内置默认
-  # 填了 = 打自定义反代
 
 - provider: "Codex-Pool"
   engine: codex
+  base_url: "https://chatgpt.com/backend-api/codex"
+  token_url: "https://auth.openai.com"
   api:
-    - "dev@company.com"
+    - "dev@example.com"
   model:
-    - gpt-5-codex
-    - codex-mini
+    - gpt-5.3-codex
 
 - provider: "Gemini-CLI"
-  engine: antigravity
+  engine: gemini-cli
+  base_url: "https://cloudcode-pa.googleapis.com"
+  token_url: "https://oauth2.googleapis.com"
   api:
-    - "user@gmail.com"
+    - "user@example.com"
   model:
-    - gemini-3-pro
+    - gemini-2.5-pro
 ```
 
-`api` 列表中的字符串只是标识符（邮箱或自定义 ID），映射到 `data/oauth_state.json` 中的实际凭据。如果标识符在 `oauth_state.json` 中找不到，则当作传统静态 key 原样透传（向后兼容）。
+`api` 列表中的字符串是账号标识符。handler 会先尝试从 OAuthManager 中解析这些标识符；找不到时按普通静态 key 原样透传，以保持向后兼容。
 
-### 3.2 data/oauth_state.json — 运行时凭据
+### 4.2 data/oauth_state.json 保存运行时凭据
 
 ```json
 {
-  "alice@gmail.com": {
-    "type": "claude-code",
+  "dev@example.com": {
+    "type": "codex",
     "access_token": "at_xxx",
     "refresh_token": "rt_xxx",
     "id_token": "eyJ...",
-    "expires_at": 1715200000,
-    "email": "alice@gmail.com",
+    "token_type": "Bearer",
+    "expires_at": 1780000000,
+    "email": "dev@example.com",
+    "account_id": "acc_xxx",
     "status": "active",
-    "last_refresh": "2026-05-08T19:00:00Z",
+    "last_refresh": "2026-05-09T12:00:00Z",
     "error_count": 0,
-    "cooldown_until": null
-  },
-  "dev@company.com": {
-    "type": "codex",
-    "access_token": "at_zzz",
-    "refresh_token": "rt_zzz",
-    "id_token": "eyJ...",
-    "account_id": "org-xxx",
-    "expires_at": 1715200000,
-    "email": "dev@company.com",
-    "status": "active",
-    "last_refresh": "2026-05-08T18:45:00Z",
-    "error_count": 0,
-    "cooldown_until": null
+    "quota_5h": 83.4,
+    "quota_7d": 64.2,
+    "quota_raw": {}
   }
 }
 ```
 
-### 3.3 写入时机
+`/v1/oauth/accounts` 返回账号状态时会把 `access_token` 和 `refresh_token` 替换为 `***`，不会把明文 token 交给前端。
 
-`oauth_state.json` 写入：
-- access_token 刷新成功后
-- 新账号 OAuth 登录完成后
-- 账号状态变更时（cooldown / 恢复）
-- 进程优雅关闭时（SIGTERM）
+## 五、状态持久化与刷新保护
 
-`api.yaml` **永远不动**（不存 token，不触发 uvicorn 热重载）。
+`core/oauth/state.py` 和 `core/oauth/manager.py` 已实现以下保护：
 
-## 四、核心模块
+- 原子写入：同目录创建临时文件，写入 JSON 后执行 `flush`、`fsync`，再用 `os.replace` 替换正式文件。
+- 文件权限：写入后尽量设置为 `0600`。
+- 读取容错：`load_state()` 发现 JSON 损坏或根对象类型错误时，将原文件备份为 `.corrupt.<timestamp>`，并返回空状态让服务继续启动。
+- refresh 成功但落盘失败时，OAuthManager 会把内存状态回滚到旧凭据，避免使用未成功持久化的新 refresh_token。
+- refresh 请求失败时，账号会写入 `status=error`、`last_error`、`last_error_at`，并递增 `error_count`。
+- 连续失败熔断：`error_count >= 5` 且最近 5 分钟内失败过时，`resolve()` 直接返回 `None`，handler 会把该账号视为不可用并尝试其他 key。
+- quota 被动采集使用 30 秒批量落盘，避免普通请求频繁写入 `oauth_state.json`。
 
-### 4.1 目录结构
+## 六、登录流程
 
-```
-core/
-  oauth/
-    __init__.py              # 导出 OAuthManager
-    manager.py               # OAuthManager 主类
-    state.py                 # oauth_state.json 读写
-    providers/
-      __init__.py            # Provider 注册表
-      base.py                # OAuthProvider 抽象基类
-      claude_code.py         # Anthropic OAuth2
-      codex.py               # OpenAI OAuth2
-      antigravity.py         # Google OAuth2
-```
+### 6.1 路由
 
-### 4.2 OAuthProvider 抽象基类
+| 方法 | 路径 | 作用 | 鉴权 |
+|---|---|---|---|
+| GET | `/v1/oauth/authorize?type=...&origin=...` | 生成授权 URL，返回 `auth_url`、`state`、`mode` | admin |
+| POST | `/v1/oauth/exchange` | manual 模式下用用户粘贴的 localhost 回调 URL 中的 code 换 token | admin |
+| GET | `/v1/oauth/callback` | auto 模式下接收 provider 回调并注册账号 | state 校验 |
+| POST | `/v1/oauth/import` | 手动导入 refresh_token 或完整 token 数据 | admin |
+| GET | `/v1/oauth/accounts` | 列出 OAuth 账号状态 | admin |
+| GET | `/v1/oauth/accounts/{key_id}/quota` | 查询单个 OAuth 账号额度 | admin |
+| PUT | `/v1/oauth/accounts/{key_id}/rename` | 重命名账号标识符 | admin |
+| DELETE | `/v1/oauth/accounts/{key_id}` | 删除 OAuth 账号 | admin |
 
-```python
-class OAuthProvider(ABC):
-    """OAuth 提供商抽象"""
+state 保存在进程内 pending flow 中，有效期为 300 秒。callback 不要求 admin header，因为第三方 OAuth provider 的浏览器回跳无法携带管理端 Authorization header；安全边界由 state、过期时间和 pending flow 共同提供。
 
-    @abstractmethod
-    async def refresh_token(self, credential: dict) -> dict:
-        """刷新 access_token。返回更新后的凭据对象。"""
-        ...
+### 6.2 manual 模式
 
-    @abstractmethod
-    def build_auth_url(self, state: str, redirect_uri: str) -> str:
-        """构建 OAuth 授权 URL"""
-        ...
+manual 模式用于 redirect_uri 固定为 localhost 的 provider。当前 Codex、Claude Code 和 Gemini CLI 均声明为 manual。
 
-    @abstractmethod
-    async def exchange_code(self, code: str, redirect_uri: str) -> dict:
-        """授权码换 token"""
-        ...
+流程如下：
 
-    @abstractmethod
-    def get_default_base_url(self) -> str:
-        """返回上游默认地址"""
-        ...
-```
+1. 前端调用 `/v1/oauth/authorize?type={engine}&origin={window.location.origin}`。
+2. 后端按 provider 的 `localhost_redirect_uri` 构建授权 URL，并返回 `mode=manual`。
+3. 用户在弹出的授权页完成登录，provider 跳转到 localhost 回调地址。
+4. 用户复制浏览器中的完整回调 URL，粘贴到前端手动交换弹窗。
+5. 前端解析 code 和 state，调用 `/v1/oauth/exchange`。
+6. 后端换取 token，注册账号，返回 `key_id`。
 
-### 4.3 OAuthManager
+### 6.3 auto 模式
 
-核心职责：
-- `init()` — 启动时加载 `data/oauth_state.json` 到内存
-- `resolve(key_id: str) -> str | None` — key → access_token（含自动刷新）
-- `register(key_id, type, token_data)` — 注册新账号
-- `persist()` — 内存 → `data/oauth_state.json`
+auto 模式已在后端和前端实现，供声明 `redirect_mode="auto"` 的 provider 使用。
 
-### 4.4 Token 解析位置
+流程如下：
 
-**关键设计决定**：`.next()` 继续只返回账号标识符（如 `alice@gmail.com`），**不**返回 access_token。
+1. 前端发起 authorize 时传入 `origin=window.location.origin`。
+2. 后端优先使用 `origin` 构建 `https://zoaholic.example/v1/oauth/callback` 形式的 redirect_uri；没有 origin 时回退到代理头和请求 Host。
+3. provider 回跳 `/v1/oauth/callback` 后，后端完成 token exchange 并渲染成功页。
+4. 成功页通过 `window.opener.postMessage({ type: "oauth_callback_success", key_id, state }, "*")` 通知管理前端。
+5. 前端校验 state 后写入 key 行，并刷新 OAuth 账号列表。
 
-原因：现有的重试、冷却、统计、key 禁用逻辑全是拿 `.next()` 返回值当作「配置中的 key」来操作的。如果返回 access_token，会导致：
-- 日志统计记录令牌明文
-- 冷却对象变成临时 token（下次刷新就对不上）
-- provider_key_index 找不到
-- 自动禁用对象错误
+## 七、token_url 运行时读取
 
-Token 解析在 **handler 层**完成：`process_request` 和 `process_request_passthrough` 中，拿到 key_id 后调 `oauth_manager.resolve(key_id)` 换 access_token，然后传给 channel adapter。日志和冷却系统看到的始终是标识符。
+OAuth token endpoint 不在应用启动时固化。`main.py` 在 lifespan 中调用 `OAuthManager.set_config_ref(lambda: app.state.config or {})`，OAuthManager 调用 provider 的 refresh 或 exchange 方法时注入当前配置。
 
-`OAuthManager` 挂在 `app.state` 上（不是全局单例），在 handler 层通过 request/app 上下文获取。
+各 provider 在每次 token 请求前解析当前配置中的 `token_url`：
 
-## 五、渠道注册
+- Codex：查找 `engine=codex` 的 provider，若填写根地址则补 `/oauth/token`；若已经包含 `/oauth/token` 则原样使用。
+- Gemini CLI：查找 `engine=gemini-cli` 的 provider，支持 provider 顶层 `token_url` 和 `preferences.token_url`；若填写根地址则补 `/token`。
+- Claude Code：使用 `DEFAULT_TOKEN_URL`，同时保留同一套 manager 注入调用路径。
 
-每个 OAuth 渠道注册为独立核心引擎，复用对应的原生渠道 adapter：
+前端渠道编辑面板已增加 Token URL 输入框。该输入框只在 `is_oauth` 渠道显示，保存时随 provider payload 写入，空字符串也会作为显式清空值提交。
 
-```python
-# 以 codex 渠道为例 (core/channels/codex_channel.py)
-from core.channels.openai_channel import (
-    get_gpt_payload,
-    fetch_gpt_response,
-    fetch_gpt_response_stream,
-)
+## 八、渠道注册与请求解析架构
 
-async def get_codex_payload(request, engine, provider, api_key=None):
-    """复用 openai channel 的 payload 构建，替换认证头"""
-    url, headers, payload = await get_gpt_payload(request, "openai", provider, api_key)
-    headers["Authorization"] = f"Bearer {api_key}"
-    return url, headers, payload
+### 8.1 单文件渠道实现
 
-async def get_codex_passthrough_meta(request, engine, provider, api_key=None):
-    """透传 meta：构建 URL + Bearer 头"""
-    from ..utils import resolve_base_url
-    base_url = provider.get('base_url') or "https://api.openai.com/v1"
-    url = resolve_base_url(base_url, '/chat/completions')
-    headers = {
-        "content-type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
-    return url, headers, {}
+每个 OAuth 渠道是一个自包含核心渠道文件：
 
-def register():
-    from .registry import register_channel
-    register_channel(
-        id="codex",
-        type_name="openai",
-        default_base_url="https://api.openai.com/v1",
-        auth_header="Authorization: Bearer {api_key}",
-        description="OpenAI Codex (OAuth subscription)",
-        request_adapter=get_codex_payload,
-        passthrough_adapter=get_codex_passthrough_meta,
-        response_adapter=fetch_gpt_response,
-        stream_adapter=fetch_gpt_response_stream,
-    )
-```
+- `core/channels/codex_channel.py`：Codex OAuth provider、Responses API 渠道 adapter、Codex quota 采集。
+- `core/channels/claude_code_channel.py`：Claude Code OAuth provider、Claude adapter 包装、Claude Code 请求头和 gzip 兼容处理。
+- `core/channels/gemini_cli_channel.py`：Gemini CLI OAuth provider、Google token exchange、Cloud Code Assist 协议适配。
 
-claude-code 和 antigravity 同理，分别复用 claude_channel 和 gemini_channel。
+`core/channels/__init__.py` 导入这些模块并调用各自的 `register()`。注册结果进入渠道注册表，管理端通过 `ChannelDefinition.to_dict()` 读取 `default_base_url`、`default_token_url`、`is_oauth` 和 `source`。
 
-## 六、OAuth 登录流
+### 8.2 OAuth provider 注册
 
-### 6.1 后端路由 (routes/oauth.py)
+`main.py` lifespan 创建 `OAuthManager` 后调用：
 
-```
-GET  /v1/oauth/authorize?type=codex       → 返回 auth_url
-GET  /v1/oauth/callback?code=...&state=... → 换 token，存 state
-POST /v1/oauth/import                      → 手动导入 refresh_token
-GET  /v1/oauth/accounts                    → 列出所有 OAuth 账号
-DELETE /v1/oauth/accounts/{key_id}         → 删除账号
-```
+- `codex_channel.register_oauth_provider(app.state.oauth_manager)`
+- `claude_code_channel.register_oauth_provider(app.state.oauth_manager)`
+- `gemini_cli_channel.register_oauth_provider(app.state.oauth_manager)`
 
-所有端点挂 `verify_admin_api_key` 鉴权。
+这些函数只注册 provider 实例，不再从启动时 providers 参数中固化 token_url。
 
-### 6.2 登录流程
+### 8.3 handler 统一解析 token
 
-1. 前端调 `GET /v1/oauth/authorize?type=codex` → 后端返回授权 URL
-2. 用户浏览器跳转授权页登录 → 回调到 `GET /v1/oauth/callback`
-3. 后端拿到 code → 换 token → 存 state.json → 返回邮箱/ID
-4. 前端把邮箱填进渠道的 api 列表
+`core/handler.py` 中的 `_resolve_oauth_api_key(app, api_key)` 是请求路径的统一入口。
 
-### 6.3 手动导入
+处理顺序为：
 
-支持从 CLIProxyAPI `auths/` 目录或本地配置文件复制 refresh_token：
-```
-POST /v1/oauth/import
-{
-  "key_id": "dev@company.com",
-  "type": "codex",
-  "refresh_token": "rt_xxxx"
-}
-```
+1. 现有轮询逻辑仍然从 provider 的 `api` 列表中取出账号标识符。
+2. handler 先把原始标识符写入 request_info 的 `_used_api_key`，供日志、统计、冷却和 quota wrapper 使用。
+3. `_resolve_oauth_api_key()` 调用 `app.state.oauth_manager.resolve(key_id)`。
+4. resolve 成功时把 access_token 传给 channel adapter；resolve 失败或找不到账号时保留原 key。
 
-## 七、各 Provider 要点
+因此 `.next()`、日志、冷却和统计系统看到的仍是配置中的 key_id，不会看到 access_token。
 
-### 7.1 Claude Code (Anthropic)
-- PKCE 必须，Token Rotation，~1h 有效期
-- 需要 Claude Code 特征 UA/billing（复用 claude_code_compat 插件）
-- `anthropic-beta: oauth-2025-04-20`
+## 九、额度与余额查询
 
-### 7.2 Codex (OpenAI)
-- Auth0 hosted OAuth，PKCE 必须，Token Rotation
-- ~1h 有效期，5h/7d quota window
-- JWT 含 account_id
+### 9.1 Codex quota 采集
 
-### 7.3 Antigravity (Google/Gemini CLI)
-- Google 标准 OAuth2，refresh_token 通常不轮换
-- ~1h 有效期，Antigravity 固定 client_id/secret
+Codex 已实现被动采集和主动查询两条路径。
 
-## 八、安全
+被动采集：
 
-- `oauth_state.json` 文件权限 600，加入 .gitignore
-- OAuth callback 用 state 参数做 CSRF 防护（5 分钟过期）
-- 所有 `/v1/oauth/*` 端点挂 admin 鉴权
-- 日志里只记 key_id（邮箱），不记 access_token
+- `fetch_codex_response()` 和 `fetch_codex_response_stream()` 用 `_QuotaCapturingClient` 包装 Responses API adapter。
+- wrapper 从响应对象读取 headers，优先解析 `x-codex-primary-used-percent`、`x-codex-secondary-used-percent`，并 fallback 到 `x-ratelimit-*`。
+- 解析结果写入 OAuthManager 内存中的 `quota_5h`、`quota_7d` 和 `quota_raw`，随后延迟批量落盘。
 
-## 九、实施顺序
+主动查询：
 
-### Phase 1 — MVP: Codex 单渠道
-1. `core/oauth/` 模块（manager + state + codex provider）
-2. `core/channels/codex_channel.py` 渠道注册
-3. `routes/oauth.py` 手动导入端点
-4. handler 层 token 解析集成
-5. 测试：手动导入 refresh_token → 自动刷新 → 请求通
+- `CodexProvider.fetch_quota()` 发一个轻量 Responses API 请求。
+- 请求使用当前 access_token、当前配置中的 base_url、`stream=true`、`store=false`。
+- 返回时仍从响应 headers 解析 quota。
 
-### Phase 2 — Claude Code + Antigravity
-6. claude_code provider + claude-code 渠道
-7. antigravity provider + antigravity 渠道
+Claude Code 和 Gemini CLI 当前未实现专门 quota 查询，`fetch_quota()` 返回 `None`。
 
-### Phase 3 — 前端 + 登录流
-8. OAuth 登录按钮 + authorize/callback 完整流程
-9. OAuth 账号状态展示
-10. 手动导入弹窗
+### 9.2 前端展示
 
-### Phase 4 — 增强
-11. 配额检测 & 展示
-12. 批量导入
-13. 账号健康度定时检测
+前端账号列表打开时先读取 `/v1/oauth/accounts`。对于 active 且没有 quota 缓存的账号，再异步调用 `/v1/oauth/accounts/{key_id}/quota`。
+
+`QuotaBorderOverlay` 已实现边框进度条：
+
+- 上半边蓝色表示 `quota_5h`。
+- 下半边紫色表示 `quota_7d`。
+- 没有 quota 数据时显示连接状态，不渲染进度边框。
+
+### 9.3 余额路由分流
+
+OAuth 账号额度不走普通 `core.balance` 查询逻辑。
+
+- 账号管理面板按账号调用 `/v1/oauth/accounts/{key_id}/quota`。
+- 渠道编辑面板中的“余额”按钮仍调用 `/v1/channels/balance`，但后端会先读取渠道注册表；若 `channel.is_oauth=True`，则调用 `OAuthManager.fetch_quota()` 并返回百分比结构，不会进入普通 `preferences.balance` 路径。
+
+返回结构兼容普通 BalanceResult，同时保留 `quota_5h`、`quota_7d`、`raw` 和逐账号 `results`。
+
+## 十、安全边界
+
+- `api.yaml` 不保存 OAuth token。
+- `oauth_state.json` 尽量以 `0600` 权限保存。
+- OAuth 账号列表接口隐藏 access_token 和 refresh_token。
+- 请求日志、统计、冷却和自动禁用逻辑使用 key_id，不记录 access_token。
+- OAuth authorize pending flow 使用随机 state，并在 300 秒后过期。
+- callback 只接受 pending flow 中存在且未过期的 state。
+- refresh 连续失败后会短期熔断，避免坏 refresh_token 在请求路径中反复访问上游。
