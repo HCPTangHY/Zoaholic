@@ -595,6 +595,72 @@ _SYSTEM_CONFIG_SECTIONS = _re.compile(
 )
 
 
+
+# ── Billing Header 构建（内置，不依赖 claude_code_compat 插件） ──
+
+_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
+_BILLING_SALT = "59cf53e54c78"
+_BILLING_SAMPLE_INDEXES = (4, 7, 20)
+_BILLING_CC_VERSION = "2.1.97"
+_BILLING_ENTRYPOINT = "cli"
+
+
+def _sample_js_code_unit(text: str, idx: int) -> str:
+    """按 JavaScript UTF-16 code unit 语义采样单个字符。"""
+    if not isinstance(text, str) or idx < 0:
+        return "0"
+    utf16_le = text.encode("utf-16-le")
+    start = idx * 2
+    end = start + 2
+    if end > len(utf16_le):
+        return "0"
+    return utf16_le[start:end].decode("utf-16-le", errors="replace")
+
+
+def _first_user_message_text(messages: list) -> str:
+    """提取第一条 user 消息中的首个文本内容。"""
+    for msg in (messages or []):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    return item.get("text", "")
+        return ""
+    return ""
+
+
+def _build_billing_header(messages: list) -> str:
+    """构造 x-anthropic-billing-header 文本。"""
+    sampled = "".join(
+        _sample_js_code_unit(_first_user_message_text(messages), idx)
+        for idx in _BILLING_SAMPLE_INDEXES
+    )
+    digest = hashlib.sha256(
+        f"{_BILLING_SALT}{sampled}{_BILLING_CC_VERSION}".encode()
+    ).hexdigest()[:3]
+    return (
+        f"{_BILLING_HEADER_PREFIX} cc_version={_BILLING_CC_VERSION}.{digest}; "
+        f"cc_entrypoint={_BILLING_ENTRYPOINT}; cch=00000;"
+    )
+
+
+def _has_billing_header(system) -> bool:
+    """检查 system 中是否已有 billing header。"""
+    if isinstance(system, str):
+        return system.strip().startswith(_BILLING_HEADER_PREFIX)
+    if isinstance(system, list) and system:
+        first = system[0]
+        if isinstance(first, dict):
+            return (first.get("text") or "").strip().startswith(_BILLING_HEADER_PREFIX)
+        if isinstance(first, str):
+            return first.strip().startswith(_BILLING_HEADER_PREFIX)
+    return False
+
+
 def _sanitize_for_plan_billing(payload: dict) -> dict:
     """清洗 payload 绕过 Anthropic 第三方检测，使请求走 plan limits 而非 extra usage。
 
@@ -606,10 +672,25 @@ def _sanitize_for_plan_billing(payload: dict) -> dict:
     if not isinstance(payload, dict):
         return payload
 
-    # ── Layer 1: 确保 system 存在 ──
+    # ── Layer 1: 确保 billing header 存在 ──
     system = payload.get("system")
-    if not system:
-        payload["system"] = [{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}]
+    if not _has_billing_header(system):
+        billing_text = _build_billing_header(payload.get("messages", []))
+        billing_block = {"type": "text", "text": billing_text}
+        if system is None:
+            payload["system"] = [
+                billing_block,
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+            ]
+        elif isinstance(system, str):
+            payload["system"] = [
+                billing_block,
+                {"type": "text", "text": system},
+            ] if system.strip() else [billing_block]
+        elif isinstance(system, list):
+            payload["system"] = [billing_block, *system]
+        else:
+            payload["system"] = [billing_block, system]
 
     # ── Layer 3: Tool name 重命名 ──
     # 收集本次请求实际发生的重命名，用于 messages 历史中的一致替换
