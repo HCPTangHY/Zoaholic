@@ -6,10 +6,8 @@ Claude Code 完整伪装插件。
 2. 注入 Claude Code 请求头，包括完整 anthropic-beta、User-Agent、Session-Id、request-id、Stainless SDK 头和 X-App。
 3. 对 /messages payload 执行 Layer 1 到 Layer 6 的 plan billing 清洗。
 
-限制：
-- 本插件只有请求拦截器，只能修改 headers 和 payload。
-- Layer 7 响应反向映射需要响应拦截或渠道 response adapter 支持，插件无法完成。
-- 因此 Layer 7 的 tool name/property name 响应反向映射仅 claude-code 核心引擎支持。
+Layer 7 响应反向映射通过响应拦截器实现，自动将上游 Claude 返回的
+PascalCase tool name（如 Bash）和重命名后的 property name 还原为客户端原始名。
 
 使用方式：
 preferences:
@@ -30,11 +28,15 @@ import re
 import time
 import uuid
 
+from contextvars import ContextVar
+
 from core.log_config import logger
 from core.plugins import (
     get_plugin_options,
     register_request_interceptor,
     unregister_request_interceptor,
+    register_response_interceptor,
+    unregister_response_interceptor,
 )
 
 
@@ -53,7 +55,12 @@ PLUGIN_INFO = {
 
 EXTENSIONS = [
     "interceptors:claude_code_compat_request",
+    "interceptors:claude_code_compat_response",
 ]
+
+# Layer 7: 请求级反向映射表（ContextVar 在请求生命周期内传递给响应拦截器）
+_reverse_tool_map: ContextVar[dict] = ContextVar("_ccc_reverse_tool_map", default={})
+_reverse_prop_map: ContextVar[dict] = ContextVar("_ccc_reverse_prop_map", default={})
 
 # 修改原因：普通 Claude 渠道挂载插件时，需要与 claude-code 核心 channel 使用同一组默认版本和 billing 参数。
 # 修改方式：将核心 channel 的默认版本、billing salt、采样索引和 header 前缀提升为插件常量。
@@ -597,7 +604,11 @@ def sanitize_payload(payload, headers, billing_salt=DEFAULT_BILLING_SALT, defaul
     sanitize_third_party_strings(payload)
 
     # Layer 3：重命名 tools 和历史消息里的 tool_use/tool_result 名称。
-    rename_tools(payload)
+    renamed = rename_tools(payload)
+
+    # 保存 Layer 3 反向映射到 ContextVar，供 Layer 7 响应拦截器使用
+    if renamed:
+        _reverse_tool_map.set({v: k for k, v in renamed.items()})
 
     # Layer 4：去除 system prompt 配置节标题。
     strip_system_config_sections(payload)
@@ -609,6 +620,9 @@ def sanitize_payload(payload, headers, billing_salt=DEFAULT_BILLING_SALT, defaul
 
     # Layer 6：重命名工具 schema property，并同步 required。
     rename_tool_properties(tools)
+
+    # 保存 Layer 6 反向映射到 ContextVar
+    _reverse_prop_map.set({v: k for k, v in PROP_RENAME_MAP.items()})
 
     return payload
 
@@ -700,6 +714,30 @@ async def claude_code_compat_request_interceptor(request, engine, provider, api_
     return url, headers, payload
 
 
+async def claude_code_compat_response_interceptor(response_chunk, engine, model, is_stream):
+    """Layer 7: 响应反向映射 — 把 CC PascalCase tool name 和 property name 改回客户端原始名。"""
+    if not isinstance(response_chunk, str):
+        return response_chunk
+
+    reverse_tools = _reverse_tool_map.get({})
+    reverse_props = _reverse_prop_map.get({})
+    if not reverse_tools and not reverse_props:
+        return response_chunk
+
+    chunk = response_chunk
+
+    # 反向 tool name（精准匹配 JSON 值位置）
+    for cc_name, orig_name in reverse_tools.items():
+        chunk = chunk.replace(f'"name":"{cc_name}"', f'"name":"{orig_name}"')
+        chunk = chunk.replace(f'"name": "{cc_name}"', f'"name": "{orig_name}"')
+
+    # 反向 property name
+    for renamed, orig in reverse_props.items():
+        chunk = chunk.replace(f'"{renamed}"', f'"{orig}"')
+
+    return chunk
+
+
 def setup(manager):
     """插件初始化。"""
     register_request_interceptor(
@@ -710,8 +748,17 @@ def setup(manager):
         overwrite=True,
         metadata={"description": "Claude Code 完整伪装请求处理"},
     )
+    register_response_interceptor(
+        interceptor_id="claude_code_compat_response",
+        callback=claude_code_compat_response_interceptor,
+        priority=10,
+        plugin_name=PLUGIN_INFO["name"],
+        overwrite=True,
+        metadata={"description": "Claude Code Layer 7 响应反向映射"},
+    )
 
 
 def teardown(manager):
     """插件卸载。"""
     unregister_request_interceptor("claude_code_compat_request")
+    unregister_response_interceptor("claude_code_compat_response")
