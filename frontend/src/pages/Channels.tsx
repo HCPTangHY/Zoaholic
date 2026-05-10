@@ -84,7 +84,7 @@ function KeyLabelOverlay({ label, hasTag, isFocused, children }: { label?: strin
       const keyMask = hasTag
         ? `linear-gradient(to right, transparent 0%, transparent ${labelPct - 10}%, black ${labelPct}%, black ${Math.max(60, labelPct)}%, transparent 100%)`
         : `linear-gradient(to right, transparent 0%, transparent ${labelPct - 10}%, black ${labelPct}%, black 100%)`;
-      const labelMask = `linear-gradient(to right, black 0%, black ${labelPct - 5}%, transparent ${labelPct + 5}%)`;
+      const labelMask = `linear-gradient(to right, black 0%, black ${labelPct + 5}%, transparent ${labelPct + 20}%)`;
 
       setMaskImage(keyInputMaskEl, keyMask);
       setMaskImage(labelSpanEl, labelMask);
