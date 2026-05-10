@@ -510,6 +510,14 @@ class OAuthManager:
         if not include_tokens:
             copied["access_token"] = "***"
             copied["refresh_token"] = "***"
+        # 统一 extra_usage 字段名，让 accounts 接口和 balance 接口返回一致
+        if copied.get("extra_usage_monthly_limit") is not None and "extra_usage_limit" not in copied:
+            copied["extra_usage_limit"] = copied["extra_usage_monthly_limit"]
+        if copied.get("extra_usage_used") is not None and "extra_usage_utilization" not in copied:
+            used = copied.get("extra_usage_used", 0) or 0
+            limit = copied.get("extra_usage_monthly_limit", 0) or 0
+            if limit > 0:
+                copied.setdefault("extra_usage_utilization", round(used / limit * 100, 2))
         return copied
 
     def list_accounts(self, channel_id: str | None = None, include_tokens: bool = False) -> dict:
