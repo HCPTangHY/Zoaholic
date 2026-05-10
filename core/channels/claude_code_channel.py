@@ -398,8 +398,10 @@ class ClaudeCodeProvider(OAuthProvider):
                 from urllib.parse import urlparse
                 host = urlparse(base).netloc.lower()
                 if host and "anthropic.com" not in host:
-                    # base_url 的域名不是 anthropic → 是反代 → 拼 usage 路径
-                    usage_url = base.rstrip("/").rstrip("#") + "/api/oauth/usage"
+                    # base_url 的域名不是 anthropic → 是反代 → 去掉末尾的 /v1 再拼 usage 路径
+                    import re
+                    base_stripped = re.sub(r'/v\d+/?$', '', base.rstrip("/").rstrip("#"))
+                    usage_url = base_stripped + "/api/oauth/usage"
 
         headers = {
             "Authorization": f"Bearer {access_token}",
