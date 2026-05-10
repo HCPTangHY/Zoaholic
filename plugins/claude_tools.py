@@ -214,9 +214,9 @@ def apply_tool_config(payload: Dict[str, Any], tool_type: str) -> None:
     # 注意：type 必须包含版本日期后缀
     tool_mapping = {
         "search": {
-            "type": "web_search_20250305",
+            "type": "web_search_20260209",
             "name": "web_search",
-            "max_uses": 5,  # 限制每次请求最多搜索次数
+            "max_uses": 5,
         },
         "code": {
             "type": "code_execution_20250522",
@@ -242,6 +242,13 @@ def apply_tool_config(payload: Dict[str, Any], tool_type: str) -> None:
         if tool_config["type"] not in existing_types:
             payload["tools"].append(tool_config.copy())
             logger.debug(f"[claude_tools] Added server tool: {tool_config['type']}")
+
+        # web_search_20260209 的 dynamic filtering 依赖 code_execution
+        if tool_type == "search":
+            code_type = tool_mapping["code"]["type"]
+            if code_type not in existing_types:
+                payload["tools"].append(tool_mapping["code"].copy())
+                logger.debug(f"[claude_tools] Auto-added code_execution for dynamic filtering")
 
 
 def update_anthropic_beta_header(headers: Dict[str, Any], features: Set[str]) -> None:
