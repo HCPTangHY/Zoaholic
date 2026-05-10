@@ -295,7 +295,7 @@ def parse_datetime_input(dt_input: str) -> datetime:
 # 修改方式：把轻量列清单拼成显式 SELECT，并在同一个查询中用窗口函数返回 total。
 # 目的：让测试和运行时代码共用同一个 SQL 构造入口，避免列表接口退回 SELECT *。
 def _build_d1_logs_list_sql() -> str:
-    return f"SELECT COUNT(*) OVER() AS total, {LOG_LIST_SQL_COLUMN_CLAUSE} FROM request_stats WHERE 1=1"
+    return f"SELECT {LOG_LIST_SQL_COLUMN_CLAUSE} FROM request_stats WHERE 1=1"
 
 
 # 修改原因：SQLite/PostgreSQL/MySQL 分支同样需要显式列，不能通过 ORM 实体隐式 SELECT *。
@@ -1507,14 +1507,18 @@ async def get_logs(
             sql += " AND success = ?"
             params.append(success_value)
 
+        # 先查 COUNT（轻量，不带大字段）
+        count_sql = sql.replace(f"SELECT {LOG_LIST_SQL_COLUMN_CLAUSE}", "SELECT COUNT(*) AS total", 1)
+        total = int(await d1_client.query_value(count_sql, params, column="total", default=0) or 0)
+        if total == 0:
+            return LogsPage(items=[], total=0, page=page, page_size=page_size, total_pages=0)
+
         offset = (page - 1) * page_size
         sql += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
         rows = await d1_client.query_all(sql, [*params, page_size, offset])
 
         if not rows:
             return LogsPage(items=[], total=0, page=page, page_size=page_size, total_pages=0)
-
-        total = int(rows[0].get("total") or 0)
         total_pages = (total + page_size - 1) // page_size if total > 0 else 0
         now = datetime.now(timezone.utc)
         items = [
@@ -1578,11 +1582,15 @@ async def get_logs(
 
         offset = (page - 1) * page_size
 
-        # 修改原因：SQLAlchemy 分支原来先 COUNT 再 SELECT RequestStat，既双查又隐式 SELECT *。
-        # 修改方式：显式选择轻量列，并用 COUNT(*) OVER() 把 total 附加到每一行结果。
-        # 目的：减少大库日志列表查询的磁盘读取和重复扫描，完整 body 字段只由详情接口读取。
+        # 先查 COUNT（轻量，走索引）
+        count_query = select(func.count()).where(*conditions)
+        total = (await session.execute(count_query)).scalar() or 0
+        if total == 0:
+            return LogsPage(items=[], total=0, page=page, page_size=page_size, total_pages=0)
+
+        # 再查轻量列（不含 body 大字段）
         query = (
-            select(func.count().over().label("total"), *_log_list_sa_columns())
+            select(*_log_list_sa_columns())
             .where(*conditions)
             .order_by(RequestStat.timestamp.desc())
             .offset(offset)
@@ -1594,7 +1602,7 @@ async def get_logs(
     if not rows:
         return LogsPage(items=[], total=0, page=page, page_size=page_size, total_pages=0)
 
-    total = int(rows[0].get("total") or 0)
+    total = total
     total_pages = (total + page_size - 1) // page_size if total > 0 else 0
     now = datetime.now(timezone.utc)
     items = [
