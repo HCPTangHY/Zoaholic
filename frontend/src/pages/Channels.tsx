@@ -4138,21 +4138,7 @@ export default function Channels() {
                           {!isFocused && isPermanent && (
                             <button onClick={async () => { await apiFetch('/v1/channels/key_status/re_enable', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ provider: providerName, key: keyObj.key }) }); refreshKeyStatus(); }} className="text-[11px] px-2 py-0.5 rounded border border-emerald-500/50 bg-emerald-500/20 text-emerald-400 font-medium hover:bg-emerald-500/30 hover:border-emerald-400 cursor-pointer flex-shrink-0 relative z-[2] transition-colors">恢复</button>
                           )}
-                          {/* Label 编辑入口：聚焦时显示 */}
-                          {isFocused && (
-                            <input
-                              type="text"
-                              value={keyObj.label || ''}
-                              onChange={e => {
-                                const newKeys = [...formData.api_keys];
-                                newKeys[idx] = { ...newKeys[idx], label: e.target.value || undefined };
-                                setFormData(prev => prev ? { ...prev, api_keys: newKeys } : prev);
-                              }}
-                              onFocus={() => setFocusedKeyIdx(idx)}
-                              placeholder="备注"
-                              className="w-16 sm:w-20 bg-transparent border-none text-[11px] text-muted-foreground outline-none placeholder:text-muted-foreground/30 relative z-[2]"
-                            />
-                          )}
+
                           <button onClick={() => toggleKeyDisabled(idx)} className={`relative z-[2] ${isGrayed ? 'text-muted-foreground' : 'text-emerald-500'}`} title={keyObj.disabled ? "启用" : "禁用"}>
                             {keyObj.disabled ? <ToggleLeft className="w-5 h-5" /> : <ToggleRight className="w-5 h-5" />}
                           </button>
@@ -4160,6 +4146,24 @@ export default function Channels() {
                             <Play className="w-4 h-4" />
                           </button>
                           <button onClick={() => deleteKey(idx)} className="text-red-500 hover:text-red-400 ml-1 relative z-[2]"><Trash2 className="w-4 h-4" /></button>
+                          {/* Label 编辑：聚焦时在行底部展开 */}
+                          {isFocused && (
+                            <div className="absolute left-0 right-0 -bottom-6 flex items-center gap-1 z-[5]">
+                              <span className="text-[10px] text-muted-foreground/50 pl-8">备注:</span>
+                              <input
+                                type="text"
+                                value={keyObj.label || ''}
+                                onChange={e => {
+                                  const newKeys = [...formData.api_keys];
+                                  newKeys[idx] = { ...newKeys[idx], label: e.target.value || undefined };
+                                  setFormData(prev => prev ? { ...prev, api_keys: newKeys } : prev);
+                                }}
+                                onFocus={() => setFocusedKeyIdx(idx)}
+                                placeholder="点击添加备注"
+                                className="flex-1 bg-background/80 backdrop-blur-sm border border-border/50 rounded px-2 py-0.5 text-[11px] text-amber-600 dark:text-amber-400 font-mono outline-none focus:border-amber-500/50 placeholder:text-muted-foreground/30"
+                              />
+                            </div>
+                          )}
                         </div>
                       );
                     })}
