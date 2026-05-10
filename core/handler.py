@@ -1171,6 +1171,34 @@ class ModelRequestHandler:
         retry_path: List[Dict[str, Any]] = []
         current_retry_count = 0
 
+        # ── 虚拟路由优先级分组索引 ──
+        # matching_providers 已按 _virtual_priority 升序排列（0,0,0,1,1,2...）
+        # 构建 priority_group_ranges: [(start, end, priority), ...]
+        # 用于重试循环中强制在同一 priority group 内走到黑，再降级
+        _is_virtual_route = any(
+            p.get("_virtual_route_provider") and "_virtual_priority" in p
+            for p in matching_providers
+        )
+        _priority_group_ranges: list = []  # [(start_idx, end_idx_exclusive, priority)]
+        if _is_virtual_route:
+            _cur_priority = None
+            _group_start = 0
+            for _i, _p in enumerate(matching_providers):
+                _pp = int(_p.get("_virtual_priority", 0) or 0)
+                if _cur_priority is not None and _pp != _cur_priority:
+                    _priority_group_ranges.append((_group_start, _i, _cur_priority))
+                    _group_start = _i
+                _cur_priority = _pp
+            if _cur_priority is not None:
+                _priority_group_ranges.append((_group_start, len(matching_providers), _cur_priority))
+
+        def _get_priority_group_range(idx: int):
+            """返回 idx 所在 priority group 的 (start, end) 范围"""
+            for start, end, _ in _priority_group_ranges:
+                if start <= idx < end:
+                    return start, end
+            return 0, num_matching_providers
+
         while True:
             if index >= max_attempts:
                 break
@@ -1188,8 +1216,20 @@ class ModelRequestHandler:
                     error_message = "All API keys are rate limited and stop auto retry!"
                     if num_matching_providers == 1:
                         break
-                    else:
-                        continue
+                    # 虚拟路由：检查同 priority group 是否全部耗尽
+                    if _is_virtual_route:
+                        grp_start, grp_end = _get_priority_group_range(current_index)
+                        group_all_exhausted = all(
+                            await provider_api_circular_list[matching_providers[gi]["provider"]].is_all_rate_limited(original_model)
+                            if matching_providers[gi]["provider"] in provider_api_circular_list else True
+                            for gi in range(grp_start, grp_end)
+                        )
+                        if not group_all_exhausted:
+                            # 同组还有可用渠道 → 跳到组内下一个，不降级
+                            continue
+                        # 同组全耗尽 → 跳过整个组，直接到下一个 priority group
+                        index = (grp_end % num_matching_providers) if grp_end < num_matching_providers else grp_end
+                    continue
 
             original_request_model = (original_model, request_data.model)
             
@@ -1525,6 +1565,21 @@ class ModelRequestHandler:
                         # current_retry_count 从 1 开始；最多指数到 2^5，再封顶 5 秒
                         delay = min(5.0, base_delay * (2 ** min(max(current_retry_count - 1, 0), 5)))
                         await asyncio.sleep(delay)
+                    # 虚拟路由：重试时强制留在同一 priority group 内
+                    if _is_virtual_route and _priority_group_ranges:
+                        grp_start, grp_end = _get_priority_group_range(current_index)
+                        next_idx = index % num_matching_providers
+                        if next_idx >= grp_end or next_idx < grp_start:
+                            # 即将越过当前 group → 检查组内是否还有可用 key
+                            group_has_available = False
+                            for gi in range(grp_start, grp_end):
+                                gi_name = matching_providers[gi]["provider"]
+                                if gi_name in provider_api_circular_list:
+                                    if not await provider_api_circular_list[gi_name].is_all_rate_limited(original_model):
+                                        group_has_available = True
+                                        break
+                            if group_has_available:
+                                index = grp_start  # 回到组头继续试
                     continue
 
                 # retry_enabled 但已无重试额度：跳出循环，走统一的“所有重试失败”出口
