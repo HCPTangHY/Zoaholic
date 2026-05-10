@@ -3754,7 +3754,7 @@ export default function Channels() {
                   {virtualModelsDirty && <div className="mt-3 text-xs text-amber-600 dark:text-amber-400 bg-amber-500/10 px-2 py-1 rounded-lg inline-flex">有未保存更改</div>}
                 </div>
 
-                <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
+                <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3" onClick={() => setFocusedKeyIdx(null)}>
                   <div
                     onDragOver={e => e.preventDefault()}
                     onDrop={e => handleVirtualEditorDrop(e)}
