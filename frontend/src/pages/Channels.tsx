@@ -5236,9 +5236,10 @@ export default function Channels() {
                                 <div>
                                   <label className="text-xs font-medium text-muted-foreground mb-1 block">值类型</label>
                                   <select
-                                    value={bal.mapping?.value_type === "'percent'" ? 'percent' : 'amount'}
+                                    value={bal.mapping?.value_type === "'percent'" ? 'percent' : bal.mapping?.value_type === "'quota'" ? 'quota' : 'amount'}
                                     onChange={e => {
-                                      const vt = e.target.value === 'percent' ? "'percent'" : "'amount'";
+                                      const vtMap: Record<string, string> = { percent: "'percent'", quota: "'quota'", amount: "'amount'" };
+                                      const vt = vtMap[e.target.value] || "'amount'";
                                       updatePreference('balance', { ...bal, mapping: { ...(bal.mapping || {}), value_type: vt } });
                                     }}
                                     className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs focus:border-primary outline-none text-foreground"
@@ -5253,6 +5254,9 @@ export default function Channels() {
                                   <div className="space-y-2">
                                     {(bal.mapping?.value_type === "'percent'" ? [
                                       { key: 'percent', label: 'percent', placeholder: 'data.remaining_percent' },
+                                    ] : bal.mapping?.value_type === "'quota'" ? [
+                                      { key: 'available', label: 'available', placeholder: 'balance_infos.0.total_balance' },
+                                      { key: 'currency', label: 'currency (可选)', placeholder: 'balance_infos.0.currency' },
                                     ] : [
                                       { key: 'total', label: 'total', placeholder: 'data.totalQuota' },
                                       { key: 'used', label: 'used', placeholder: 'data.usedQuota' },
