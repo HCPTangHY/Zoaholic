@@ -105,11 +105,13 @@ class LoggingStreamingResponse(Response):
                 self.current_info["process_time"] = process_time
             # sticky_ip: 200 + 0 completion_tokens = 流内报错/空响应，清 session 让下次 round_robin 重新分配
             try:
+
                 if (
                     self.current_info.get("status_code") == 200
                     and self.current_info.get("completion_tokens", 0) == 0
                     and self.current_info.get("success")
                     and self.app
+                    and not self.current_info.get("dialect_id")  # 透传请求不解析 usage，跳过误判
                 ):
                     # 标记为 "假200" — 流建立但无有效输出
                     self.current_info["status_code"] = 502
