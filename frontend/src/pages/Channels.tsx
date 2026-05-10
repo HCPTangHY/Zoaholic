@@ -4083,33 +4083,10 @@ export default function Channels() {
                                 修改方式：把备注移动为输入框内的绝对覆盖层，并让备注与 input 同用 text-sm、leading-5、font-mono，同时改用琥珀色系和右侧透明渐变。
                                 目的：让备注与 Key 文本保持同高同基线，并通过暖色和渐变遮罩自然区分备注与底层 Key。 */}
                             {keyObj.label && !isFocused && (
-                              <div className="absolute inset-y-0 left-0 right-0 flex items-center pointer-events-none z-[3] select-none"
-                                ref={el => {
-                                  if (el) {
-                                    const span = el.querySelector('span');
-                                    const container = el.closest('.flex-1');
-                                    if (span && container) {
-                                      const pct = Math.min(90, (span.scrollWidth / container.clientWidth) * 100);
-                                      const fadeEnd = Math.min(95, pct + 15);
-                                      span.style.maskImage = `linear-gradient(to right, black 0%, black ${pct}%, transparent ${fadeEnd}%)`;
-                                      span.style.webkitMaskImage = `linear-gradient(to right, black 0%, black ${pct}%, transparent ${fadeEnd}%)`;
-                                      const inp = container.querySelector('div');
-                                      if (inp) {
-                                        const keyStart = Math.max(5, pct - 10);
-                                        const keyVisible = Math.min(pct + 5, 80);
-                                        if (hasTag) {
-                                          inp.style.maskImage = `linear-gradient(to right, transparent 0%, transparent ${keyStart}%, black ${keyVisible}%, black 60%, transparent 100%)`;
-                                          inp.style.webkitMaskImage = `linear-gradient(to right, transparent 0%, transparent ${keyStart}%, black ${keyVisible}%, black 60%, transparent 100%)`;
-                                        } else {
-                                          inp.style.maskImage = `linear-gradient(to right, transparent 0%, transparent ${keyStart}%, black ${keyVisible}%, black 100%)`;
-                                          inp.style.webkitMaskImage = `linear-gradient(to right, transparent 0%, transparent ${keyStart}%, black ${keyVisible}%, black 100%)`;
-                                        }
-                                      }
-                                    }
-                                  }
-                                }}
-                              >
-                                <span className="text-sm leading-5 font-mono font-semibold text-amber-600 dark:text-amber-400 whitespace-nowrap">
+                              <div className="absolute inset-y-0 left-0 right-0 flex items-center pointer-events-none z-[3] select-none">
+                                <span className="text-sm leading-5 font-mono font-semibold text-amber-600 dark:text-amber-400 whitespace-nowrap"
+                                  style={{ maskImage: 'linear-gradient(to right, black 0%, black 75%, transparent 95%)', WebkitMaskImage: 'linear-gradient(to right, black 0%, black 75%, transparent 95%)' }}
+                                >
                                   {keyObj.label}
                                 </span>
                               </div>
@@ -4117,9 +4094,9 @@ export default function Channels() {
 
                             <div style={(() => {
                               if (isFocused) return undefined;
-                              // 没 label 时用固定 mask；有 label 时由上面 ref 回调动态设置
                               const hasLabel = !!keyObj.label;
-                              if (hasLabel) return undefined;
+                              if (hasLabel && hasTag) return { maskImage: 'linear-gradient(to right, transparent 0%, transparent 30%, black 40%, black 60%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, transparent 30%, black 40%, black 60%, transparent 100%)' };
+                              if (hasLabel) return { maskImage: 'linear-gradient(to right, transparent 0%, transparent 30%, black 45%, black 100%)', WebkitMaskImage: 'linear-gradient(to right, transparent 0%, transparent 30%, black 45%, black 100%)' };
                               if (hasTag) return { maskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)' };
                               return undefined;
                             })()}>
