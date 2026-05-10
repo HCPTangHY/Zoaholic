@@ -309,6 +309,8 @@ function getBalancePercent(b: BalanceResult): number | null {
   if (!b.supported || b.error) return null;
   if (b.value_type === 'percent' && b.percent != null) return b.percent;
   if (b.total != null && b.total > 0 && b.available != null) return (b.available / b.total) * 100;
+  // 纯额度模式：以 100 为基准，≥100 就是满绿
+  if (b.available != null) return Math.min(b.available, 100);
   return null;
 }
 
@@ -4345,9 +4347,10 @@ export default function Channels() {
                               </span>
                             );
                           })()}
-                          {!isOAuthEngine && !isFocused && balLabel && balColor && (
-                            <span className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] ${TAG_CLASSES[balColor]}`}>{balLabel}</span>
-                          )}
+                          {!isOAuthEngine && !isFocused && balLabel && (() => {
+                            const color = balColor || 'green';
+                            return <span className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] ${TAG_CLASSES[color]}`}>{balLabel}</span>;
+                          })()}
                           {!isFocused && isPermanent && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/15 text-red-500 dark:text-red-400 font-medium flex-shrink-0 relative z-[2]">永久禁用</span>}
                           {!isFocused && isPermanent && (
                             <button onClick={async () => { await apiFetch('/v1/channels/key_status/re_enable', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ provider: providerName, key: keyObj.key }) }); refreshKeyStatus(); }} className="text-[11px] px-2 py-0.5 rounded border border-emerald-500/50 bg-emerald-500/20 text-emerald-400 font-medium hover:bg-emerald-500/30 hover:border-emerald-400 cursor-pointer flex-shrink-0 relative z-[2] transition-colors">恢复</button>
