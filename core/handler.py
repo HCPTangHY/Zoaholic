@@ -265,6 +265,7 @@ async def process_request(
     
     # 记录渠道ID和上游key索引
     current_info["provider_id"] = channel_id
+    current_info["_provider_cfg"] = provider  # stream_guard key_rules 用
     if original_api_key:
         try:
             # 修改原因：OAuth 解析后 api_key 已是 access_token，不能用于 provider.api 索引匹配。
@@ -742,6 +743,7 @@ async def process_request_passthrough(
         current_info["model"] = request.model
 
     current_info["provider_id"] = channel_id
+    current_info["_provider_cfg"] = provider  # stream_guard key_rules 用
     if original_api_key:
         try:
             # 修改原因：OAuth 解析后 api_key 已是 access_token，不能用于 provider.api 索引匹配。
