@@ -390,16 +390,24 @@ class ClaudeCodeProvider(OAuthProvider):
         if not access_token:
             return None
 
+        # 从渠道 base_url 推导 usage 端点（走反代），fallback 到官方直连
+        usage_url = "https://api.anthropic.com/api/oauth/usage"
+        if config and isinstance(config, dict):
+            base = config.get("base_url", "") or ""
+            if base and "anthropic" not in base.lower().split("/")[-1]:
+                # base_url 是反代（如 workers.dev/api.anthropic.com）→ 拼 usage 路径
+                usage_url = base.rstrip("/").rstrip("#") + "/api/oauth/usage"
+
         headers = {
             "Authorization": f"Bearer {access_token}",
             "anthropic-beta": "oauth-2025-04-20",
             "Content-Type": "application/json",
-            "User-Agent": "claude-code/2.1.80",
+            "User-Agent": "claude-code/2.1.97",
         }
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
-                    "https://api.anthropic.com/api/oauth/usage",
+                    usage_url,
                     headers=headers,
                 )
                 if resp.status_code != 200:

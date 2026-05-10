@@ -175,6 +175,23 @@ class OAuthManager:
         normalized = str(channel_id or "").strip()
         return normalized or self.UNMAPPED_CHANNEL
 
+
+    def _find_channel_config(self, channel_id: str) -> dict | None:
+        """从运行时配置中找到指定渠道的 provider dict。"""
+        config = self.get_config()
+        providers = config.get("providers")
+        if not isinstance(providers, list):
+            api_config = config.get("api_config") if isinstance(config.get("api_config"), dict) else {}
+            providers = api_config.get("providers") if isinstance(api_config.get("providers"), list) else []
+        normalized = self._normalize_channel_id(channel_id)
+        for p in providers:
+            if not isinstance(p, dict):
+                continue
+            name = self._normalize_channel_id(str(p.get("provider") or p.get("name") or ""))
+            if name == normalized:
+                return p
+        return None
+
     def _get_channel_accounts(self, channel_id: str | None, create: bool = False) -> dict:
         """获取某个渠道下的账号映射。"""
         # 修改原因：注册、解析、刷新、quota、重命名都需要同一套渠道字典访问规则。
@@ -374,7 +391,9 @@ class OAuthManager:
         provider = self._providers.get(cred.get("type"))
         if not provider or not hasattr(provider, "fetch_quota"):
             return None
-        quota = await self._call_provider_method(provider.fetch_quota, cred)
+        # 找当前渠道的 provider config（含 base_url 等），传给 provider 走反代
+        channel_config = self._find_channel_config(channel_id)
+        quota = await self._call_provider_method(provider.fetch_quota, cred, config=channel_config)
         if isinstance(quota, dict):
             self.update_quota(channel_id, key_id, quota)
             return quota
