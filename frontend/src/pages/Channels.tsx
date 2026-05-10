@@ -1186,7 +1186,13 @@ export default function Channels() {
                   ...(resultForKey?.quota_5h != null ? { quota_5h: resultForKey.quota_5h } : {}),
                   ...(resultForKey?.quota_7d != null ? { quota_7d: resultForKey.quota_7d } : {}),
                   ...(resultForKey?.raw ? { quota_raw: resultForKey.raw } : {}),
-                  _quota_unavailable: !hasQuota,
+                  ...(resultForKey?.extra_usage_enabled ? {
+                    extra_usage_enabled: true,
+                    extra_usage_limit: resultForKey.extra_usage_limit,
+                    extra_usage_used: resultForKey.extra_usage_used,
+                    extra_usage_utilization: resultForKey.extra_usage_utilization,
+                  } : {}),
+                  _quota_unavailable: !hasQuota && !resultForKey?.extra_usage_enabled,
                 },
               };
             });
@@ -4253,6 +4259,17 @@ export default function Channels() {
                           {isOAuthEngine && !isFocused && oauthQuota && (
                             <QuotaBorderOverlay quota5h={oauthQuota.quota_5h} quota7d={oauthQuota.quota_7d} />
                           )}
+                          {/* OAuth extra_usage 余额背景条 */}
+                          {isOAuthEngine && !isFocused && oauthAccount?.extra_usage_enabled && (() => {
+                            const limit = oauthAccount.extra_usage_limit ?? 0;
+                            const used = oauthAccount.extra_usage_used ?? 0;
+                            const pct = limit > 0 ? Math.max(1, ((limit - used) / limit) * 100) : 0;
+                            const color = pct >= 50 ? 'green' : pct >= 20 ? 'yellow' : 'red';
+                            return (
+                              <div className="absolute left-0 top-0 bottom-0 rounded-[7px] z-0 pointer-events-none transition-all duration-500"
+                                   style={{ width: `${pct}%`, background: BALANCE_FILL_COLORS[color] }} />
+                            );
+                          })()}
                           {/* 普通余额背景条 */}
                           {!isOAuthEngine && !isFocused && balColor && balPct != null && (
                             <div className="absolute left-0 top-0 bottom-0 rounded-[7px] z-0 pointer-events-none transition-all duration-500"
@@ -4289,11 +4306,23 @@ export default function Channels() {
                           {isOAuthEngine && !isFocused && oauthQuota && (
                             <QuotaArcs quota5h={oauthQuota.quota_5h} quota7d={oauthQuota.quota_7d} />
                           )}
-                          {isOAuthEngine && !isFocused && oauthAccount && !oauthQuota && (
+                          {isOAuthEngine && !isFocused && oauthAccount && !oauthQuota && !oauthAccount.extra_usage_enabled && (
                             <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-500 relative z-[2]">
                               {oauthAccount.status === 'active' ? '已连接' : oauthAccount.status === 'error' ? '刷新失败' : '冷却中'}
                             </span>
                           )}
+                          {isOAuthEngine && !isFocused && oauthAccount?.extra_usage_enabled && (() => {
+                            const limit = oauthAccount.extra_usage_limit ?? 0;
+                            const used = oauthAccount.extra_usage_used ?? 0;
+                            const remaining = Math.max(0, limit - used);
+                            const pct = limit > 0 ? (remaining / limit) * 100 : 0;
+                            const color = pct >= 50 ? 'green' : pct >= 20 ? 'yellow' : 'red';
+                            return (
+                              <span className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] ${TAG_CLASSES[color]}`}>
+                                ${remaining.toFixed(0)} / ${limit.toFixed(0)}
+                              </span>
+                            );
+                          })()}
                           {!isOAuthEngine && !isFocused && balLabel && balColor && (
                             <span className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] ${TAG_CLASSES[balColor]}`}>{balLabel}</span>
                           )}

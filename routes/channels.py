@@ -698,6 +698,14 @@ def _oauth_quota_to_balance_result(quota: Any, error: Optional[str] = None) -> D
     percent = min(percentages) if percentages else None
     total = 100.0 if percent is not None else None
     used = round(100.0 - percent, 10) if percent is not None else None
+    # extra_usage（如 Claude Code 的额外消费额度）
+    extra = {}
+    if quota.get("extra_usage_enabled"):
+        extra["extra_usage_enabled"] = True
+        extra["extra_usage_limit"] = quota.get("extra_usage_monthly_limit")
+        extra["extra_usage_used"] = quota.get("extra_usage_used")
+        extra["extra_usage_utilization"] = quota.get("extra_usage_utilization")
+
     return {
         "supported": True,
         "value_type": "percent",
@@ -707,6 +715,7 @@ def _oauth_quota_to_balance_result(quota: Any, error: Optional[str] = None) -> D
         "percent": percent,
         "quota_5h": quota_5h,
         "quota_7d": quota_7d,
+        **extra,
         "raw": quota.get("raw") if isinstance(quota.get("raw"), dict) else None,
         "error": None,
     }
