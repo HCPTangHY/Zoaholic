@@ -239,12 +239,18 @@ async def test_channel(
             key = item.strip()
             return key or None
         if isinstance(item, dict):
+            # 支持 {"key": "sk-xxx", "disabled": true} 格式
             key = item.get("key")
             if isinstance(key, str) and key.strip():
                 key = key.strip()
                 if item.get("disabled") and not key.startswith("!"):
                     key = f"!{key}"
                 return key
+            # 支持 {"sk-xxx": "label"} 单键 dict 格式
+            if len(item) == 1:
+                raw_key = next(iter(item.keys()))
+                key = str(raw_key).strip()
+                return key or None
         return None
 
     def _collect_key_candidates(raw_keys: Any) -> list[str]:
@@ -642,7 +648,11 @@ def _normalize_oauth_balance_key_ids(api_value: Any) -> list[str]:
 
     key_ids: list[str] = []
     for item in raw_items:
-        key_id = str(item or "").strip()
+        # dict 格式: {"email@example.com": "label"}
+        if isinstance(item, dict) and len(item) == 1:
+            key_id = str(next(iter(item.keys())) or "").strip()
+        else:
+            key_id = str(item or "").strip()
         if not key_id or key_id.startswith("!"):
             continue
         key_ids.append(key_id)

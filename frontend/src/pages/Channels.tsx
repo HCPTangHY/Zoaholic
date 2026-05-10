@@ -51,6 +51,7 @@ function DeferredInput({ value, onCommit, ...props }: Omit<React.InputHTMLAttrib
 interface ApiKeyObj {
   key: string;
   disabled: boolean;
+  label?: string;
 }
 
 interface ModelMapping {
@@ -862,10 +863,28 @@ export default function Channels() {
       // 修改方式：统一把最终数据源命名为 activeProvider，GET 成功时它就是后端最新值，失败时是传入的回退值。
       // 目的：让 API Key、模型、偏好设置和子渠道都从同一个最新快照初始化。
       const activeProvider = freshProvider;
-      const parseApiKey = (keyStr: string) => {
-        const trimmed = String(keyStr).trim();
+      const parseApiKey = (raw: any): ApiKeyObj => {
+        // dict 格式: {"sk-xxx": "label"}
+        if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+          const entries = Object.entries(raw);
+          if (entries.length === 1) {
+            const [k, v] = entries[0];
+            const trimmed = String(k).trim();
+            const label = v ? String(v).trim() : undefined;
+            if (trimmed.startsWith('!')) return { key: trimmed.substring(1), disabled: true, label };
+            return { key: trimmed, disabled: false, label };
+          }
+        }
+        const trimmed = String(raw).trim();
         if (trimmed.startsWith('!')) return { key: trimmed.substring(1), disabled: true };
         return { key: trimmed, disabled: false };
+      };
+
+
+      const serializeApiKey = (k: ApiKeyObj): string | Record<string, string> => {
+        const raw = k.disabled ? `!${k.key.trim()}` : k.key.trim();
+        if (k.label) return { [raw]: k.label };
+        return raw;
       };
 
       let parsedKeys: ApiKeyObj[] = [];
@@ -2251,9 +2270,14 @@ export default function Channels() {
   const buildProviderSnapshotForTest = (): any => {
     if (!formData) return null;
 
-    const serializedKeys = formData.api_keys
-      .map(k => k.disabled ? `!${k.key.trim()}` : k.key.trim())
-      .filter(Boolean);
+    const serializedKeys: (string | Record<string, string>)[] = formData.api_keys
+      .map(k => {
+        const raw = k.disabled ? `!${k.key.trim()}` : k.key.trim();
+        if (!raw) return null;
+        if (k.label) return { [raw]: k.label } as Record<string, string>;
+        return raw;
+      })
+      .filter((x): x is string | Record<string, string> => x !== null);
     const finalApi = serializedKeys.length === 0 ? "" : serializedKeys.length === 1 ? serializedKeys[0] : serializedKeys;
 
     const finalModels: any[] = [...formData.models];
@@ -2346,9 +2370,14 @@ export default function Channels() {
       return;
     }
 
-    const serializedKeys = formData.api_keys
-      .map(k => k.disabled ? `!${k.key.trim()}` : k.key.trim())
-      .filter(Boolean);
+    const serializedKeys: (string | Record<string, string>)[] = formData.api_keys
+      .map(k => {
+        const raw = k.disabled ? `!${k.key.trim()}` : k.key.trim();
+        if (!raw) return null;
+        if (k.label) return { [raw]: k.label } as Record<string, string>;
+        return raw;
+      })
+      .filter((x): x is string | Record<string, string> => x !== null);
     const finalApi = serializedKeys.length === 0 ? "" : serializedKeys.length === 1 ? serializedKeys[0] : serializedKeys;
 
     const finalModels: any[] = [...formData.models];
@@ -3350,7 +3379,11 @@ export default function Channels() {
                   // Key 统计
                   const apiRaw = Array.isArray(p.api) ? p.api : (typeof p.api === 'string' && p.api.trim() ? [p.api] : []);
                   const totalKeys = apiRaw.length;
-                  const configDisabledKeys = apiRaw.filter((k: any) => typeof k === 'string' && k.startsWith('!')).length;
+                  const configDisabledKeys = apiRaw.filter((k: any) => {
+                    if (typeof k === 'string') return k.startsWith('!');
+                    if (k && typeof k === 'object') { const key = Object.keys(k)[0] || ''; return key.startsWith('!'); }
+                    return false;
+                  }).length;
                   const rtStatus = runtimeKeyStatus[p.provider];
                   const rtDisabledCount = rtStatus?.auto_disabled?.length || 0;
                   const enabledKeys = totalKeys - configDisabledKeys;
@@ -4044,6 +4077,15 @@ export default function Channels() {
                                  style={{ width: `${Math.max(1, balPct)}%`, background: BALANCE_FILL_COLORS[balColor] }} />
                           )}
                           <span className="text-xs text-muted-foreground w-4 text-right relative z-[2]">{idx + 1}</span>
+                          {/* Key Label 渐变叠层 */}
+                          {keyObj.label && !isFocused && (
+                            <span
+                              className="absolute left-8 top-0 bottom-0 flex items-center text-[11px] font-medium text-muted-foreground/60 pointer-events-none z-[1] select-none whitespace-nowrap"
+                              style={{ maskImage: 'linear-gradient(to right, black 0%, black 50%, transparent 100%)', WebkitMaskImage: 'linear-gradient(to right, black 0%, black 50%, transparent 100%)' }}
+                            >
+                              {keyObj.label}
+                            </span>
+                          )}
                           <div className="flex-1 min-w-0 relative z-[2]" style={hasTag && !isFocused ? { WebkitMaskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)', maskImage: 'linear-gradient(to right, black 0%, black 60%, transparent 100%)' } : undefined}>
                             <input
                               type="text"
@@ -4081,6 +4123,21 @@ export default function Channels() {
                           {!isFocused && isPermanent && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/15 text-red-500 dark:text-red-400 font-medium flex-shrink-0 relative z-[2]">永久禁用</span>}
                           {!isFocused && isPermanent && (
                             <button onClick={async () => { await apiFetch('/v1/channels/key_status/re_enable', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ provider: providerName, key: keyObj.key }) }); refreshKeyStatus(); }} className="text-[11px] px-2 py-0.5 rounded border border-emerald-500/50 bg-emerald-500/20 text-emerald-400 font-medium hover:bg-emerald-500/30 hover:border-emerald-400 cursor-pointer flex-shrink-0 relative z-[2] transition-colors">恢复</button>
+                          )}
+                          {/* Label 编辑入口：聚焦时显示 */}
+                          {isFocused && (
+                            <input
+                              type="text"
+                              value={keyObj.label || ''}
+                              onChange={e => {
+                                const newKeys = [...formData.api_keys];
+                                newKeys[idx] = { ...newKeys[idx], label: e.target.value || undefined };
+                                setFormData(prev => prev ? { ...prev, api_keys: newKeys } : prev);
+                              }}
+                              onFocus={e => e.stopPropagation()}
+                              placeholder="备注"
+                              className="w-16 sm:w-20 bg-transparent border-none text-[11px] text-muted-foreground outline-none placeholder:text-muted-foreground/30 relative z-[2]"
+                            />
                           )}
                           <button onClick={() => toggleKeyDisabled(idx)} className={`relative z-[2] ${isGrayed ? 'text-muted-foreground' : 'text-emerald-500'}`} title={keyObj.disabled ? "启用" : "禁用"}>
                             {keyObj.disabled ? <ToggleLeft className="w-5 h-5" /> : <ToggleRight className="w-5 h-5" />}

@@ -223,6 +223,9 @@ async def query_provider_balance(client, provider: Dict[str, Any]) -> Dict[str, 
     api_key = provider.get("api") or provider.get("api_key") or ""
     if isinstance(api_key, list):
         api_key = api_key[0] if api_key else ""
+    # 支持 {"sk-xxx": "label"} 格式 — 取 key
+    if isinstance(api_key, dict) and len(api_key) == 1:
+        api_key = str(next(iter(api_key.keys())))
 
     if auth_mode == "bearer" and api_key:
         headers["Authorization"] = f"Bearer {api_key}"

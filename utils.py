@@ -62,6 +62,43 @@ API_YAML_PATH = os.path.abspath(os.getenv("API_YAML_PATH") or os.path.join(_BASE
 yaml_error_message = None
 
 
+def _rebuild_api_with_labels(provider: dict) -> None:
+    """将运行时 _api_labels 还原到 api 列表中，用于持久化。
+    
+    有 label 的 key 存成 {key: label} dict，没 label 的保持纯字符串。
+    disabled key 保留 ! 前缀。
+    """
+    labels = provider.get("_api_labels")
+    if not labels or not isinstance(labels, dict):
+        return
+    api = provider.get("api")
+    if not api:
+        return
+    
+    raw_list = [api] if isinstance(api, str) else list(api) if isinstance(api, list) else []
+    rebuilt = []
+    for item in raw_list:
+        # 跳过已经是 dict 的（不应该出现在运行时 config，但防御性处理）
+        if isinstance(item, dict):
+            rebuilt.append(item)
+            continue
+        key_str = str(item).strip()
+        # 提取纯 key（去掉 ! 前缀）
+        is_disabled = key_str.startswith("!")
+        clean_key = key_str[1:] if is_disabled else key_str
+        label = labels.get(clean_key)
+        if label:
+            persist_key = f"!{clean_key}" if is_disabled else clean_key
+            rebuilt.append({persist_key: label})
+        else:
+            rebuilt.append(key_str)
+    
+    if len(rebuilt) == 1 and isinstance(rebuilt[0], str):
+        provider["api"] = rebuilt[0]
+    else:
+        provider["api"] = rebuilt
+
+
 def _sanitize_config_for_persistence(config_data: dict) -> dict:
     """清理配置中的运行时字段，返回可持久化的 dict。
 
@@ -72,6 +109,10 @@ def _sanitize_config_for_persistence(config_data: dict) -> dict:
     import copy
 
     processed_data = copy.deepcopy(config_data or {})
+
+    # 持久化前还原 label 到 api 列表
+    for provider in processed_data.get("providers", []) or []:
+        _rebuild_api_with_labels(provider)
 
     # 过滤掉子渠道展开生成的 provider（运行时产物，不持久化）
     processed_data['providers'] = [
@@ -502,19 +543,39 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
             # 解析 API key 列表，支持 ! 前缀标记禁用的 key
             # 格式：正常 key 直接使用，以 ! 开头的 key 表示禁用
             def parse_api_keys(api_list):
-                """解析 API key 列表，返回 (items, disabled_keys)"""
+                """解析 API key 列表，返回 (items, disabled_keys, labels)
+                
+                支持三种元素格式：
+                - str: "sk-xxx" 或 "!sk-xxx"(禁用)
+                - dict: {"sk-xxx": "label"} 或 {"!sk-xxx": "label"}(禁用+label)
+                - int: 自动转 str
+                """
                 items = []
                 disabled_keys = set()
+                labels = {}
                 for key in api_list:
-                    key_str = str(key).strip()
-                    if key_str.startswith('!'):
-                        # 禁用的 key：去掉 ! 前缀，加入禁用集合
-                        clean_key = key_str[1:]
-                        items.append(clean_key)
-                        disabled_keys.add(clean_key)
+                    # dict 格式: {"sk-xxx": "label"}
+                    if isinstance(key, dict) and len(key) == 1:
+                        raw_key, label = next(iter(key.items()))
+                        key_str = str(raw_key).strip()
+                        if key_str.startswith('!'):
+                            clean_key = key_str[1:]
+                            items.append(clean_key)
+                            disabled_keys.add(clean_key)
+                        else:
+                            clean_key = key_str
+                            items.append(clean_key)
+                        if label and str(label).strip():
+                            labels[clean_key] = str(label).strip()
                     else:
-                        items.append(key_str)
-                return items, disabled_keys
+                        key_str = str(key).strip()
+                        if key_str.startswith('!'):
+                            clean_key = key_str[1:]
+                            items.append(clean_key)
+                            disabled_keys.add(clean_key)
+                        else:
+                            items.append(key_str)
+                return items, disabled_keys, labels
             
             # 保存旧实例的自动禁用状态，用于热重载后恢复
             old_circular = provider_api_circular_list.get(provider['provider'])
@@ -526,7 +587,9 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
                 old_auto_cooling = {k: old_circular.cooling_until[k] for k in old_auto_disabled}
 
             if isinstance(provider_api, str):
-                items, disabled_keys = parse_api_keys([provider_api])
+                items, disabled_keys, labels = parse_api_keys([provider_api])
+                if labels:
+                    provider.setdefault('_api_labels', {}).update(labels)
                 provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(
                     items=items,
                     rate_limit=safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"}),
@@ -535,7 +598,9 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
                     disabled_keys=disabled_keys
                 )
             if isinstance(provider_api, list):
-                items, disabled_keys = parse_api_keys(provider_api)
+                items, disabled_keys, labels = parse_api_keys(provider_api)
+                if labels:
+                    provider.setdefault('_api_labels', {}).update(labels)
                 provider_api_circular_list[provider['provider']] = ThreadSafeCircularList(
                     items=items,
                     rate_limit=safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"}),
