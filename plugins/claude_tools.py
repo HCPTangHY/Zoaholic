@@ -301,8 +301,8 @@ async def claude_tools_request_interceptor(
     # 更新模型名（去除后缀）
     payload["model"] = base_model
 
-    # 应用 thinking 配置
-    if "thinking" in features and thinking_budget:
+    # 应用 thinking 配置（尊重用户 overrides —— payload 里已有 thinking 则跳过）
+    if "thinking" in features and thinking_budget and "thinking" not in payload:
         apply_thinking_config(payload, thinking_budget, model=base_model)
 
     # 应用工具配置
