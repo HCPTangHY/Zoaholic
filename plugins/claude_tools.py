@@ -134,29 +134,30 @@ def is_claude_engine(engine: str) -> bool:
     return engine.lower() in claude_engines
 
 
-# Opus 4.7+ 不支持 type: enabled，必须用 adaptive + effort
-_ADAPTIVE_ONLY_MODELS = {"claude-opus-4-7", "claude-mythos-preview"}
-
-
-def _needs_adaptive(model: str) -> bool:
-    """判断模型是否只支持 adaptive thinking"""
+def _needs_legacy_thinking(model: str) -> bool:
+    """判断模型是否只支持旧版 enabled + budget_tokens 格式。
+    
+    Claude 3.x 系列只支持 type: enabled。
+    4.x 及以后全部支持 adaptive，直接用 adaptive + effort。
+    """
     model_lower = model.lower() if model else ""
-    return any(m in model_lower for m in _ADAPTIVE_ONLY_MODELS)
+    return "claude-3" in model_lower
 
 
 def apply_thinking_config(payload: Dict[str, Any], budget_tokens: int, model: str = "") -> None:
     """
     应用 thinking 配置到 payload
 
-    Opus 4.7+: thinking.type = "adaptive" + output_config.effort
-    其他模型: thinking.type = "enabled" + budget_tokens
+    Claude 4.x+: thinking.type = "adaptive" + output_config.effort
+    Claude 3.x: thinking.type = "enabled" + budget_tokens
 
     Args:
         payload: 请求 payload
         budget_tokens: thinking budget tokens
         model: 模型名，用于判断用哪种格式
     """
-    if _needs_adaptive(model):
+    if not _needs_legacy_thinking(model):
+        # Claude 4.x+ 统一用 adaptive + effort
         payload["thinking"] = {"type": "adaptive"}
         if budget_tokens >= 100000:
             effort = "max"
