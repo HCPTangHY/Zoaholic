@@ -297,6 +297,12 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                 "content": [{"type": "text", "text": msg.content}] if isinstance(msg.content, str) else msg.content
             }]})
         elif msg.role != "system":
+            # content 是 list 时，清洗裸字符串元素为 dict
+            if isinstance(content, list):
+                content = [
+                    item if isinstance(item, dict) else {"type": "text", "text": str(item)}
+                    for item in content
+                ]
             messages.append({"role": msg.role, "content": content})
         elif msg.role == "system":
             if system_prompt is None:
