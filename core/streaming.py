@@ -112,8 +112,12 @@ class LoggingStreamingResponse(Response):
                     and self.current_info.get("success")
                     and self.app
                 ):
-                    # 从流内容提取错误信息
+                    # 从流内容提取错误信息（精确解析给日志展示用）
                     stream_error_msg = self._extract_stream_error()
+                    # raw body 给 key_rules 关键词匹配用（不依赖硬编码解析）
+                    raw_body = self.current_info.get("response_body", "") or ""
+                    if isinstance(raw_body, bytes):
+                        raw_body = raw_body.decode("utf-8", errors="replace")
 
                     # 标记为 "假200" — 流建立但无有效输出
                     self.current_info["status_code"] = 502
@@ -127,14 +131,14 @@ class LoggingStreamingResponse(Response):
                     from core.utils import provider_api_circular_list
                     channel_id = self.current_info.get("provider", "")
 
-                    # 尝试用 key_rules 处理流内报错（和 handler.py except 块逻辑一致）
+                    # key_rules 匹配用 raw body（关键词在任何层级 JSON 里都能命中）
                     try:
                         from core.key_rules import resolve_key_rules, match_key_rules
                         provider_cfg = self.current_info.get("_provider_cfg")
                         if provider_cfg and channel_id:
                             _key_rules = resolve_key_rules(provider_cfg.get("preferences") or {})
                             if _key_rules:
-                                _rule = match_key_rules(_key_rules, 502, self.current_info.get("error_message", ""))
+                                _rule = match_key_rules(_key_rules, 502, raw_body)
                                 if _rule:
                                     current_api = self.current_info.get("_used_api_key", "")
                                     clist = provider_api_circular_list.get(channel_id)
