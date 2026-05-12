@@ -5226,7 +5226,7 @@ export default function Channels() {
                                 }}
                                 className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs focus:border-primary outline-none text-foreground"
                               >
-                                <option value="new-api">new-api（/api/status）</option>
+                                <option value="new-api">new-api（/api/usage/token）</option>
                                 <option value="openrouter">OpenRouter</option>
                                 <option value="_custom">自定义</option>
                               </select>
@@ -5239,7 +5239,7 @@ export default function Channels() {
                                     type="text"
                                     value={bal.endpoint || ''}
                                     onChange={e => updatePreference('balance', { ...bal, endpoint: e.target.value })}
-                                    placeholder="/api/status 或 https://example.com/balance"
+                                    placeholder="/api/usage/token 或 https://example.com/balance"
                                     className="w-full bg-background border border-border px-3 py-1.5 rounded-lg text-xs font-mono focus:border-primary outline-none text-foreground"
                                   />
                                   <p className="text-xs text-muted-foreground mt-1">相对路径拼接到域名下，绝对 URL 直接使用</p>
