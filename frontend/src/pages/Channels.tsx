@@ -496,7 +496,7 @@ const QuotaArcs = ({ quota5h, quota7d }: { quota5h?: number; quota7d?: number })
 
 // ── 冷却中 Key 行组件（SVG 边框进度） ──
 function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus, onBlur, onRecover, onToggle, onTest, onDelete }: {
-  idx: number; keyObj: { key: string; disabled: boolean }; remainSec: number; totalDuration: number;
+  idx: number; keyObj: { key: string; disabled: boolean; label?: string }; remainSec: number; totalDuration: number;
   focused: boolean;
   onFocus: () => void; onBlur: () => void;
   onRecover: () => void; onToggle: () => void; onTest: () => void; onDelete: () => void;
@@ -552,6 +552,9 @@ function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus
       {/* 内容 */}
       <div className={`relative flex items-center gap-2 px-3 py-2 rounded-lg border-2 transition-colors ${focused ? 'border-blue-500 bg-muted/50' : 'border-border bg-background dark:bg-card'}`}>
         <span className="text-xs text-muted-foreground w-4 text-right relative z-[2]">{idx + 1}</span>
+        {keyObj.label && !focused && (
+          <span className="text-sm font-mono font-semibold text-amber-600 dark:text-amber-400 truncate max-w-[30%] flex-shrink-0 relative z-[2]">{keyObj.label}</span>
+        )}
         <div className="flex-1 min-w-0 relative z-[2]">
           <input
             type="text" value={keyObj.key || ''} readOnly placeholder="sk-..."
@@ -4275,7 +4278,7 @@ export default function Channels() {
                       const hasTag = !isGrayed && (!!balLabel || isPermanent || (isOAuthEngine && (!!oauthQuota || !!oauthAccount)));
 
                       return (
-                        <div key={idx} className={`relative flex items-center gap-2 px-3 py-2 rounded-lg border transition-colors ${isFocused ? 'border-blue-500' : 'border-border'} ${isGrayed ? 'bg-muted/30 opacity-50' : 'bg-muted/50'}`}>
+                        <div key={idx} className={`relative flex items-center gap-2 px-3 py-2 rounded-lg border transition-colors ${isFocused ? 'border-blue-500' : 'border-border'} ${isGrayed ? (isFocused ? 'bg-muted/30' : 'bg-muted/30 opacity-50') : 'bg-muted/50'}`}>
                           {/* OAuth 额度边框：上半蓝(5h) 下半紫(7d)，叠在普通 border 下方，冷却红条会覆盖在上面 */}
                           {isOAuthEngine && !isFocused && oauthQuota && (
                             <QuotaBorderOverlay quota5h={oauthQuota.quota_5h} quota7d={oauthQuota.quota_7d} />
