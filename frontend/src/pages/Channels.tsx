@@ -495,11 +495,11 @@ const QuotaArcs = ({ quota5h, quota7d }: { quota5h?: number; quota7d?: number })
 };
 
 // ── 冷却中 Key 行组件（SVG 边框进度） ──
-function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus, onBlur, onRecover, onToggle, onTest, onDelete }: {
+function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus, onBlur, onRecover, onToggle, onTest, onDelete, onLabelChange }: {
   idx: number; keyObj: { key: string; disabled: boolean; label?: string }; remainSec: number; totalDuration: number;
   focused: boolean;
   onFocus: () => void; onBlur: () => void;
-  onRecover: () => void; onToggle: () => void; onTest: () => void; onDelete: () => void;
+  onRecover: () => void; onToggle: () => void; onTest: () => void; onDelete: () => void; onLabelChange?: (label: string) => void;
 }) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const [svgViewBox, setSvgViewBox] = useState('');
@@ -576,6 +576,20 @@ function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus
           <button onClick={onTest} disabled={!keyObj.key.trim()} className="text-blue-600 dark:text-blue-400 disabled:opacity-50"><Play className="w-4 h-4" /></button>
           <button onClick={onDelete} className="text-red-500 hover:text-red-400 ml-1"><Trash2 className="w-4 h-4" /></button>
         </div>
+        {/* Label 编辑：聚焦时在行底部展开 */}
+        {focused && onLabelChange && (
+          <div className="absolute left-0 right-0 -bottom-6 flex items-center gap-1 z-[5]">
+            <span className="text-[10px] text-muted-foreground/50 pl-8">备注:</span>
+            <input
+              type="text"
+              value={keyObj.label || ''}
+              onChange={e => onLabelChange(e.target.value)}
+              onFocus={onFocus}
+              placeholder="点击添加备注"
+              className="flex-1 bg-background/80 backdrop-blur-sm border border-border/50 rounded px-2 py-0.5 text-[11px] text-amber-600 dark:text-amber-400 font-mono outline-none focus:border-amber-500/50 placeholder:text-muted-foreground/30"
+            />
+          </div>
+        )}
       </div>
     </div>
   );
@@ -4268,6 +4282,11 @@ export default function Channels() {
                             onToggle={() => toggleKeyDisabled(idx)}
                             onTest={() => openKeyTestDialog(idx)}
                             onDelete={() => deleteKey(idx)}
+                            onLabelChange={(label) => {
+                              const newKeys = [...formData.api_keys];
+                              newKeys[idx] = { ...newKeys[idx], label: label || undefined };
+                              setFormData(prev => prev ? { ...prev, api_keys: newKeys } : prev);
+                            }}
                           />
                         );
                       }
