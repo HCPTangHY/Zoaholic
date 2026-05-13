@@ -54,7 +54,7 @@ BALANCE_TEMPLATES: Dict[str, Dict[str, Any]] = {
         "method": "GET",
         "auth": "bearer",
         "mapping": {
-            "available": "balance_infos.0.total_balance",
+            "available": "balance_infos.0.total_balance+balance_infos.1.total_balance",
             "currency": "balance_infos.0.currency",
             "value_type": "'quota'",
         },
@@ -112,6 +112,18 @@ def extract_value(data: Any, path: Optional[str]) -> Any:
     # 单引号包裹 = 常量
     if path.startswith("'") and path.endswith("'") and len(path) >= 2:
         return path[1:-1]
+
+    # 支持 "+" 分隔的多路径求和，如 "a.0.val+a.1.val"
+    if "+" in path:
+        total = 0.0
+        has_any = False
+        for sub_path in path.split("+"):
+            sub_val = extract_value(data, sub_path.strip())
+            f = _to_float(sub_val)
+            if f is not None:
+                total += f
+                has_any = True
+        return total if has_any else None
 
     # dot notation 遍历
     current = data
