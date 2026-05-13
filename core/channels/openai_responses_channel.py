@@ -436,6 +436,23 @@ async def convert_responses_to_chat_completions(response: dict, model: str) -> d
     reasoning_content = ""
     tool_calls = []
 
+    def append_tool_call(source: dict):
+        # 修改原因：Responses API 非流式可能把 function_call 作为多个顶层 output item 返回，旧转换只看 message.content。
+        # 修改方式：统一从顶层 function_call 和兼容旧 tool_use 两种来源收集工具调用，并按收集顺序写入 index。
+        # 目的：保证并行工具调用转换成 Chat Completions 后仍能逐项区分。
+        arguments = source.get("arguments", "{}")
+        if not isinstance(arguments, str):
+            arguments = json_dumps_text(arguments, ensure_ascii=False)
+        tool_calls.append({
+            "index": len(tool_calls),
+            "id": source.get("call_id") or source.get("id") or f"call_{random_str[:20]}{len(tool_calls):04d}",
+            "type": "function",
+            "function": {
+                "name": source.get("name", ""),
+                "arguments": arguments,
+            }
+        })
+
     # 解析 output
     output = response.get("output", [])
     for item in output:
@@ -456,14 +473,10 @@ async def convert_responses_to_chat_completions(response: dict, model: str) -> d
                 if c_type == "output_text":
                     content_text += c.get("text", "")
                 elif c_type == "tool_use":
-                    tool_calls.append({
-                        "id": c.get("id", f"call_{random_str[:24]}"),
-                        "type": "function",
-                        "function": {
-                            "name": c.get("name", ""),
-                            "arguments": c.get("arguments", "{}")
-                        }
-                    })
+                    append_tool_call(c)
+
+        elif item_type == "function_call":
+            append_tool_call(item)
 
         elif item_type == "image_generation_call":
             # gpt-image-2 等模型的生图结果：结构化 image_url item
@@ -567,6 +580,37 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
         cache_creation_tokens = 0
         has_sent_role = False
         has_sent_content = False  # 追踪是否已发送任何内容
+        # 修改原因：Responses API 的参数 delta 可能在多个工具调用之间并行出现，旧实现没有记录 call_id 到 index 的关系。
+        # 修改方式：维护 call_id、item_id、output_index 到 Chat Completions tool_call_index 的映射，并记录哪些 index 已发过工具头。
+        # 目的：确保每个 function_call_arguments.delta 都追加到正确的工具调用。
+        tc_index = 0
+        current_call_id_to_index: dict = {}
+        current_item_id_to_index: dict = {}
+        current_output_index_to_index: dict = {}
+        sent_tool_header_indexes = set()
+        seen_argument_indexes = set()
+        has_sent_tool_calls = False
+
+        def lookup_tool_call_index(event_data: dict, call_id=None):
+            item_id = event_data.get("item_id")
+            output_index = event_data.get("output_index")
+            if call_id is not None and call_id in current_call_id_to_index:
+                return current_call_id_to_index[call_id]
+            if item_id is not None and item_id in current_item_id_to_index:
+                return current_item_id_to_index[item_id]
+            if output_index is not None and output_index in current_output_index_to_index:
+                return current_output_index_to_index[output_index]
+            return None
+
+        def register_tool_call_index(index: int, event_data: dict, call_id=None):
+            item_id = event_data.get("item_id") or safe_get(event_data, "item", "id", default=None)
+            output_index = event_data.get("output_index")
+            if call_id is not None:
+                current_call_id_to_index[call_id] = index
+            if item_id is not None:
+                current_item_id_to_index[item_id] = index
+            if output_index is not None:
+                current_output_index_to_index[output_index] = index
 
         async for line in aiter_decoded_lines(response.aiter_bytes()):
 
@@ -604,8 +648,30 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                         yield sse_string
                         has_sent_role = True
 
+                    # function call item added
+                    if event_type == "response.output_item.added":
+                        item = data.get("item", {}) or {}
+                        if item.get("type") == "function_call":
+                            call_id = item.get("call_id") or item.get("id") or data.get("call_id") or data.get("item_id") or f"call_{random_str[:20]}{tc_index:04d}"
+                            name = item.get("name") or data.get("name", "")
+                            tool_index = lookup_tool_call_index(data, call_id)
+                            if tool_index is None:
+                                tool_index = tc_index
+                                tc_index += 1
+                            register_tool_call_index(tool_index, data, call_id)
+                            if tool_index not in sent_tool_header_indexes:
+                                mark_content_start()
+                                sse_string = await generate_sse_response(
+                                    timestamp, model, tools_id=call_id, function_call_name=name,
+                                    tool_call_index=tool_index,
+                                )
+                                yield sse_string
+                                sent_tool_header_indexes.add(tool_index)
+                                has_sent_content = True
+                                has_sent_tool_calls = True
+
                     # reasoning delta（新的 reasoning 事件格式）
-                    if event_type == "response.reasoning.delta":
+                    elif event_type == "response.reasoning.delta":
                         delta = data.get("delta", "")
                         if delta:
                             mark_content_start()
@@ -646,22 +712,66 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                     # function call arguments delta
                     elif event_type == "response.function_call_arguments.delta":
                         delta = data.get("delta", "")
+                        call_id = data.get("call_id") or data.get("item_id")
+                        tool_index = lookup_tool_call_index(data, call_id)
+                        if tool_index is None:
+                            # 修改原因：部分兼容网关可能不发送 output_item.added，只在参数 delta 中首次暴露工具调用。
+                            # 修改方式：首次看到未知 call_id/item_id 时立即补发工具头，并分配新的 index。
+                            # 目的：保持“工具头先于参数”的流式顺序，避免客户端拿不到 id/name 容器。
+                            call_id = call_id or f"call_{random_str[:20]}{tc_index:04d}"
+                            tool_index = tc_index
+                            tc_index += 1
+                            register_tool_call_index(tool_index, data, call_id)
+                        if tool_index not in sent_tool_header_indexes:
+                            mark_content_start()
+                            sse_string = await generate_sse_response(
+                                timestamp, model, tools_id=call_id, function_call_name=data.get("name", ""),
+                                tool_call_index=tool_index,
+                            )
+                            yield sse_string
+                            sent_tool_header_indexes.add(tool_index)
+                            has_sent_tool_calls = True
                         if delta:
                             mark_content_start()
                             sse_string = await generate_sse_response(
-                                timestamp, model, function_call_content=delta
+                                timestamp, model, function_call_content=delta,
+                                tool_call_index=tool_index,
                             )
                             yield sse_string
+                            seen_argument_indexes.add(tool_index)
                             has_sent_content = True
+                            has_sent_tool_calls = True
 
                     # function call done
                     elif event_type == "response.function_call_arguments.done":
-                        call_id = data.get("call_id", f"call_{random_str[:24]}")
+                        call_id = data.get("call_id") or data.get("item_id") or f"call_{random_str[:20]}{tc_index:04d}"
                         name = data.get("name", "")
-                        sse_string = await generate_sse_response(
-                            timestamp, model, tools_id=call_id, function_call_name=name
-                        )
-                        yield sse_string
+                        tool_index = lookup_tool_call_index(data, call_id)
+                        if tool_index is None:
+                            tool_index = tc_index
+                            tc_index += 1
+                        register_tool_call_index(tool_index, data, call_id)
+                        if tool_index not in sent_tool_header_indexes:
+                            mark_content_start()
+                            sse_string = await generate_sse_response(
+                                timestamp, model, tools_id=call_id, function_call_name=name,
+                                tool_call_index=tool_index,
+                            )
+                            yield sse_string
+                            sent_tool_header_indexes.add(tool_index)
+                            has_sent_content = True
+                            has_sent_tool_calls = True
+                        arguments = data.get("arguments", "")
+                        if arguments and tool_index not in seen_argument_indexes:
+                            mark_content_start()
+                            sse_string = await generate_sse_response(
+                                timestamp, model, function_call_content=arguments,
+                                tool_call_index=tool_index,
+                            )
+                            yield sse_string
+                            seen_argument_indexes.add(tool_index)
+                            has_sent_content = True
+                            has_sent_tool_calls = True
 
                     # image generation call completed -> inline markdown image
                     elif event_type == "response.output_item.done":
@@ -706,8 +816,12 @@ async def fetch_responses_stream(client, url, headers, payload, model, timeout):
                         
                         # 如果还没发送 stop，在这里发送
                         if has_sent_content:
+                            # 修改原因：Responses 流式工具调用完成时应向下游表达 tool_calls 结束，而不是普通 stop。
+                            # 修改方式：只要本轮发送过工具调用，就把最终 finish_reason 改为 tool_calls。
+                            # 目的：让 OpenAI 兼容客户端按工具调用结束状态继续执行工具。
+                            stop_reason = "tool_calls" if has_sent_tool_calls else "stop"
                             sse_string = await generate_sse_response(
-                                timestamp, model, stop="stop"
+                                timestamp, model, stop=stop_reason
                             )
                             yield sse_string
 

@@ -28,6 +28,7 @@ import json
 import copy
 import asyncio
 from datetime import datetime
+from uuid import uuid4
 from typing import TYPE_CHECKING, Dict, Any, Optional
 
 import httpx
@@ -497,25 +498,41 @@ async def fetch_vertex_express_response(client, url, headers, payload, model, ti
     
     try:
         response_json = response.json()
-        is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature = await gemini_json_process(response_json)
+        # 修改原因：gemini_json_process 现在会返回全部 functionCall，Vertex Express 复用该解析函数时必须同步新返回值。
+        # 修改方式：去掉错误的 await，并接收 function_calls_list 后转换为 OpenAI tool_calls_list。
+        # 目的：避免多个 Gemini 工具调用在 Vertex Express 非流式路径中丢失或共享索引。
+        is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature, function_calls_list = gemini_json_process(response_json)
         
         if blockReason and blockReason != "STOP":
             yield {"error": f"Vertex Blocked: {blockReason}", "status_code": 400, "details": response_json}
             return
 
+        tool_calls_list = []
+        for function_index, function_call in enumerate(function_calls_list):
+            arguments = function_call.get("args")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            tool_calls_list.append({
+                "index": function_index,
+                "id": f"call_{uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": function_call.get("name", ""),
+                    "arguments": arguments,
+                },
+            })
+
         result = await generate_no_stream_response(
-            timestamp, model, 
-            content=content, 
-            tools_id="chatcmpl-vertex" if function_call_name else None, 
-            function_call_name=function_call_name, 
-            function_call_content=function_full_response, 
+            timestamp, model,
+            content=content,
             role="assistant",
-            total_tokens=totalTokenCount, 
-            prompt_tokens=promptTokenCount, 
+            total_tokens=totalTokenCount,
+            prompt_tokens=promptTokenCount,
             completion_tokens=candidatesTokenCount,
             reasoning_content=reasoning_content,
             image_base64=image_base64,
-            thought_signature=thought_signature
+            thought_signature=thought_signature,
+            tool_calls_list=tool_calls_list or None,
         )
         yield result
         

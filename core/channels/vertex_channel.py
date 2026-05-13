@@ -747,7 +747,27 @@ async def fetch_vertex_claude_response(client, url, headers, payload, model, tim
     mark_adapter_metrics_managed()
     
     # Vertex Claude 格式解析与标准 Claude 类似；缓存字段也要按 Claude 口径补入 prompt_tokens。
-    content = safe_get(response_json, "content", 0, "text")
+    content_list = response_json.get("content", [])
+    text_parts = []
+    # 修改原因：Vertex Claude 非流式 content 也可能包含多个 tool_use，不能只读取第一个 text。
+    # 修改方式：遍历全部 content block，文本累积到 content，tool_use 转成带 index 的 tool_calls_list。
+    # 目的：让 Vertex Claude 与标准 Claude 在并行工具调用时保持一致输出。
+    tool_calls_list = []
+    for item in content_list:
+        item_type = item.get("type", "") if isinstance(item, dict) else ""
+        if item_type == "text":
+            text_parts.append(item.get("text", ""))
+        elif item_type == "tool_use":
+            tool_calls_list.append({
+                "index": len(tool_calls_list),
+                "id": item.get("id"),
+                "type": "function",
+                "function": {
+                    "name": item.get("name", ""),
+                    "arguments": json_dumps_text(item.get("input"), ensure_ascii=False),
+                },
+            })
+    content = "".join(text_parts) if text_parts else None
     usage = safe_get(response_json, "usage", default={}) or {}
     cache_usage = extract_cache_usage(usage)
     prompt_tokens = (
@@ -764,7 +784,7 @@ async def fetch_vertex_claude_response(client, url, headers, payload, model, tim
         total_tokens=total_tokens,
         **cache_usage,
     )
-    if content:
+    if content or tool_calls_list:
         mark_content_start()
 
     from ..utils import generate_no_stream_response
@@ -774,7 +794,8 @@ async def fetch_vertex_claude_response(client, url, headers, payload, model, tim
         # Vertex Claude 非流式输出同样需要缓存字段，供下游 OpenAI 或方言转换使用。
         cached_tokens=cache_usage["cached_tokens"],
         cache_creation_tokens=cache_usage["cache_creation_tokens"],
-        return_dict=True
+        return_dict=True,
+        tool_calls_list=tool_calls_list or None,
     )
 
 
@@ -840,14 +861,26 @@ async def fetch_vertex_claude_response_stream(client, url, headers, payload, mod
 
         if need_function_call:
             function_call = json_loads(function_full_response)
-            function_call_name = function_call["name"]
-            function_call_id = function_call["id"]
-            mark_content_start()
-            sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=function_call_id, function_call_name=function_call_name)
-            yield sse_string
-            function_full_response = json_dumps_text(function_call["input"], ensure_ascii=False)
-            sse_string = await generate_sse_response(timestamp, model, content=None, tools_id=function_call_id, function_call_name=None, function_call_content=function_full_response)
-            yield sse_string
+            # 修改原因：Vertex Claude 流式路径独立处理 tool_use，旧输出没有显式传递 tool_call_index。
+            # 修改方式：把解析结果规范为列表后逐项递增 function_index，并在工具头和参数片段中使用同一个 index。
+            # 目的：即使上游返回多个工具调用，也不会把参数合并到 index=0。
+            function_calls = function_call if isinstance(function_call, list) else [function_call]
+            for function_index, function_call in enumerate(function_calls):
+                function_call_name = function_call["name"]
+                function_call_id = function_call["id"]
+                mark_content_start()
+                sse_string = await generate_sse_response(
+                    timestamp, model, content=None, tools_id=function_call_id,
+                    function_call_name=function_call_name, tool_call_index=function_index,
+                )
+                yield sse_string
+                function_full_response = json_dumps_text(function_call["input"], ensure_ascii=False)
+                sse_string = await generate_sse_response(
+                    timestamp, model, content=None, tools_id=function_call_id,
+                    function_call_name=None, function_call_content=function_full_response,
+                    tool_call_index=function_index,
+                )
+                yield sse_string
 
         merge_usage(
             prompt_tokens=promptTokenCount,

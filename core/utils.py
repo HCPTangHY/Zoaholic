@@ -1055,7 +1055,8 @@ async def generate_sse_response(
     stop=None,
     thought_signature=None,
     cached_tokens=0,
-    cache_creation_tokens=0
+    cache_creation_tokens=0,
+    tool_call_index=0
 ):
     """
     生成 OpenAI Chat Completions 格式的 SSE 响应
@@ -1076,6 +1077,7 @@ async def generate_sse_response(
         thought_signature: Gemini 思考签名
         cached_tokens: 上游缓存命中 token 数，用于输出 prompt_tokens_details.cached_tokens
         cache_creation_tokens: 上游缓存创建 token 数，作为内核补充字段供 Claude 方言还原
+        tool_call_index: 当前工具调用在并行 tool_calls 数组中的索引
     """
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
@@ -1097,8 +1099,11 @@ async def generate_sse_response(
         delta_content = {"role": role, "content": ""}
     # 优先级 4：工具调用开始（有 tools_id 和 function_call_name）
     elif tools_id and function_call_name:
+        # 修改原因：非 OAI 渠道的并行工具调用会共享本出口，硬编码 index=0 会把多个工具的参数合并到一起。
+        # 修改方式：由各渠道传入当前工具调用的 tool_call_index，单工具场景继续使用默认值 0。
+        # 目的：让下游按 OpenAI Chat Completions 规范用 index 区分并行工具调用。
         tc = {
-            "index": 0,
+            "index": tool_call_index,
             "id": tools_id,
             "type": "function",
             "function": {"name": function_call_name, "arguments": ""}
@@ -1113,7 +1118,10 @@ async def generate_sse_response(
             args_str = json.dumps(function_call_content, ensure_ascii=False)
         else:
             args_str = str(function_call_content) if function_call_content else ""
-        delta_content = {"tool_calls": [{"index": 0, "function": {"arguments": args_str}}]}
+        # 修改原因：工具参数片段必须沿用对应工具头的 index，否则并行调用会在流式累积时串到同一项。
+        # 修改方式：参数 chunk 使用调用方传入的 tool_call_index，而不是固定写 0。
+        # 目的：保证 stream_convert 和客户端都能把参数累积到正确的 tool call。
+        delta_content = {"tool_calls": [{"index": tool_call_index, "function": {"arguments": args_str}}]}
     # 优先级 6：推理内容
     elif reasoning_content:
         delta_content = {"role": "assistant", "content": "", "reasoning_content": reasoning_content}
@@ -1163,7 +1171,7 @@ async def generate_sse_response(
 
     return sse_response
 
-async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, image_base64=None, thought_signature=None, cached_tokens=0, cache_creation_tokens=0, return_dict: bool = False):
+async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, image_base64=None, thought_signature=None, cached_tokens=0, cache_creation_tokens=0, return_dict: bool = False, tool_calls_list: list[dict] | None = None):
 
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
@@ -1195,7 +1203,46 @@ async def generate_no_stream_response(timestamp, model, content=None, tools_id=N
         "system_fingerprint": "fp_a7d06e42a7"
     }
 
-    if function_call_name:
+    if tool_calls_list:
+        # 修改原因：Claude、Gemini、Responses 等非流式渠道可能一次返回多个工具调用，旧出口只能表达单个调用。
+        # 修改方式：接收调用方已收集好的 tool_calls_list，并为缺失的 index/type/arguments 做最小规范化。
+        # 目的：保持单工具旧参数兼容，同时让并行工具调用在非流式响应中保留独立 index。
+        normalized_tool_calls = []
+        for idx, tool_call in enumerate(tool_calls_list):
+            normalized_tool_call = dict(tool_call)
+            normalized_tool_call.setdefault("index", idx)
+            normalized_tool_call.setdefault("type", "function")
+            function_payload = dict(normalized_tool_call.get("function") or {})
+            if "arguments" in function_payload and not isinstance(function_payload["arguments"], str):
+                function_payload["arguments"] = json_dumps_text(function_payload["arguments"], ensure_ascii=False)
+            function_payload.setdefault("arguments", "")
+            normalized_tool_call["function"] = function_payload
+            normalized_tool_calls.append(normalized_tool_call)
+
+        sample_data = {
+            "id": f"chatcmpl-{random_str}",
+            "object": "chat.completion",
+            "created": timestamp,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": role or "assistant",
+                        "content": None,
+                        "tool_calls": normalized_tool_calls,
+                        "refusal": None
+                    },
+                    "logprobs": None,
+                    "finish_reason": "tool_calls"
+                }
+            ],
+            "usage": None,
+            "service_tier": "default",
+            "system_fingerprint": "fp_4691090a87"
+        }
+
+    elif function_call_name:
         if not tools_id:
             tools_id = f"call_{random_str}"
 

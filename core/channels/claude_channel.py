@@ -456,9 +456,10 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
     # 跳过服务器端工具（server_tool_use, web_search_tool_result）
     content_list = response_json.get("content", [])
     text_parts = []
-    function_call_name = None
-    function_call_content = None
-    tools_id = None
+    # 修改原因：Claude 非流式 content 可能包含多个 tool_use，旧实现只保留最后一个工具调用。
+    # 修改方式：按 content 顺序收集 tool_calls_list，并为每个工具调用写入独立 index。
+    # 目的：让并行工具调用在转换成 Chat Completions 非流式响应时不会被丢失或合并。
+    tool_calls_list = []
 
     thinking_parts = []
 
@@ -479,9 +480,15 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
 
         # 客户端工具调用
         if item_type == "tool_use":
-            function_call_name = item.get("name")
-            function_call_content = item.get("input")
-            tools_id = item.get("id")
+            tool_calls_list.append({
+                "index": len(tool_calls_list),
+                "id": item.get("id"),
+                "type": "function",
+                "function": {
+                    "name": item.get("name", ""),
+                    "arguments": json_dumps_text(item.get("input"), ensure_ascii=False),
+                },
+            })
 
     content = "".join(text_parts) if text_parts else None
     reasoning_content = "".join(thinking_parts) if thinking_parts else None
@@ -503,20 +510,20 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
         total_tokens=total_tokens,
         **cache_usage,
     )
-    if content or reasoning_content or function_call_name:
+    if content or reasoning_content or tool_calls_list:
         mark_content_start()
 
     role = safe_get(response_json, "role")
 
     yield await generate_no_stream_response(
-        timestamp, model, content=content, tools_id=tools_id,
-        function_call_name=function_call_name, function_call_content=function_call_content,
+        timestamp, model, content=content,
         role=role, total_tokens=total_tokens, prompt_tokens=prompt_tokens,
         completion_tokens=output_tokens, reasoning_content=reasoning_content,
         # Claude 非流式缓存字段已统一提取；传给出口函数后才能继续给下游方言使用。
         cached_tokens=cache_usage["cached_tokens"],
         cache_creation_tokens=cache_usage["cache_creation_tokens"],
-        return_dict=True
+        return_dict=True,
+        tool_calls_list=tool_calls_list or None,
     )
 
 
@@ -537,6 +544,11 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
         # 跟踪当前 content_block 类型，用于区分服务器端工具和客户端工具
         current_block_type = None
         current_block_id = None
+        # 修改原因：Claude 流式 tool_use 按顺序出现，但旧转换把所有工具调用 chunk 都写成 index=0。
+        # 修改方式：用 tc_index 分配新工具调用索引，用 current_tc_index 绑定后续 input_json_delta 参数片段。
+        # 目的：确保并行工具调用的参数在 OpenAI 兼容流中保持独立。
+        tc_index = 0
+        current_tc_index = None
         async for line in aiter_decoded_lines(response.aiter_bytes()):
 
                 if line.startswith("data:") and (line := line.lstrip("data: ")):
@@ -593,8 +605,13 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                             function_call_name = content_block.get("name", "")
                             tools_id = content_block.get("id", "")
                             if tools_id and function_call_name:
+                                current_tc_index = tc_index
+                                tc_index += 1
                                 mark_content_start()
-                                sse_string = await generate_sse_response(timestamp, model, None, tools_id, function_call_name, None)
+                                sse_string = await generate_sse_response(
+                                    timestamp, model, None, tools_id, function_call_name, None,
+                                    tool_call_index=current_tc_index,
+                                )
                                 yield sse_string
                             continue
 
@@ -612,7 +629,10 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                             partial_json = delta.get("partial_json", "")
                             if partial_json:
                                 mark_content_start()
-                                sse_string = await generate_sse_response(timestamp, model, None, None, None, partial_json)
+                                sse_string = await generate_sse_response(
+                                    timestamp, model, None, None, None, partial_json,
+                                    tool_call_index=current_tc_index or 0,
+                                )
                                 yield sse_string
                             continue
 
@@ -624,6 +644,15 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                             continue
 
                     if current_block_type == "web_search_tool_result":
+                        continue
+
+                    if event_type == "content_block_stop":
+                        # 修改原因：Claude 后续 content_block_start 可能开启新的工具调用，旧状态不能继续套用。
+                        # 修改方式：在块结束事件里清空当前块类型和当前工具 index。
+                        # 目的：避免服务器端工具或文本块之后的参数片段误用前一个工具调用 index。
+                        current_block_type = None
+                        current_block_id = None
+                        current_tc_index = None
                         continue
 
                     # 正常文本输出
@@ -640,8 +669,13 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                     block_type = safe_get(resp, "content_block", "type", default="")
                     # 只处理客户端工具（tool_use），跳过服务器端工具（server_tool_use）
                     if tools_id and function_call_name and block_type == "tool_use":
+                        current_tc_index = tc_index
+                        tc_index += 1
                         mark_content_start()
-                        sse_string = await generate_sse_response(timestamp, model, None, tools_id, function_call_name, None)
+                        sse_string = await generate_sse_response(
+                            timestamp, model, None, tools_id, function_call_name, None,
+                            tool_call_index=current_tc_index,
+                        )
                         yield sse_string
 
                     # thinking 内容
@@ -655,7 +689,10 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                     function_call_content = safe_get(resp, "delta", "partial_json", default="")
                     if function_call_content and current_block_type != "server_tool_use":
                         mark_content_start()
-                        sse_string = await generate_sse_response(timestamp, model, None, None, None, function_call_content)
+                        sse_string = await generate_sse_response(
+                            timestamp, model, None, None, None, function_call_content,
+                            tool_call_index=current_tc_index or 0,
+                        )
                         yield sse_string
 
     yield "data: [DONE]" + end_of_line
