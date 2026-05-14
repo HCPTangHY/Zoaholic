@@ -15,7 +15,7 @@ from ..utils import (
     safe_get,
     get_model_dict,
     get_base64_image,
-    get_tools_mode,
+    is_tools_disabled,
     generate_sse_response,
     end_of_line,
     generate_chunked_image_md,
@@ -268,12 +268,12 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
             tool_call_id = msg.tool_call_id
 
         if tool_calls:
-            tools_mode = get_tools_mode(provider)
-            if tools_mode != "none":
+            if not is_tools_disabled(provider):
                 tool_calls_list = []
-                # 根据 tools_mode 决定处理多少个工具调用
-                calls_to_process = tool_calls if tools_mode == "parallel" else tool_calls[:1]
-                for tool_call in calls_to_process:
+                # 修改原因：OpenAI 兼容历史中的工具调用必须完整保留。
+                # 修改方式：工具未禁用时直接遍历全部 tool_calls。
+                # 目的：保证后续每个 tool_result 都能匹配到对应 tool_call。
+                for tool_call in tool_calls:
                     tool_calls_list.append({
                         "id": tool_call.id,
                         "type": tool_call.type,
@@ -284,8 +284,10 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
                     })
                 messages.append({"role": msg.role, "tool_calls": tool_calls_list, **extra_fields})
         elif tool_call_id:
-            tools_mode = get_tools_mode(provider)
-            if tools_mode != "none":
+            # 修改原因：禁用工具时不应继续转发 tool_result 历史。
+            # 修改方式：沿用 provider.tools=False 作为唯一禁用判断。
+            # 目的：保留禁用工具逻辑，同时删除工具模式变量。
+            if not is_tools_disabled(provider):
                 messages.append({"role": msg.role, "tool_call_id": tool_call_id, "content": content, **extra_fields})
         else:
             messages.append({"role": msg.role, "content": content, **extra_fields})
@@ -320,8 +322,10 @@ async def get_gpt_payload(request, engine, provider, api_key=None):
             else:
                 payload[field] = value
 
-    tools_mode = get_tools_mode(provider)
-    if tools_mode == "none" or "o1-mini" in original_model or "chatgpt-4o-latest" in original_model or "grok" in original_model:
+    # 修改原因：部分模型或显式禁用工具时不能携带工具字段。
+    # 修改方式：用 provider.tools=False 的禁用判断替代旧工具模式变量。
+    # 目的：保留禁用行为，并避免工具调用历史被模式判断截断。
+    if is_tools_disabled(provider) or "o1-mini" in original_model or "chatgpt-4o-latest" in original_model or "grok" in original_model:
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
 

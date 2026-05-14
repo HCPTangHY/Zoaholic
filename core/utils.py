@@ -231,33 +231,12 @@ class BaseAPI:
             self.chat_url = api_url
             self.embeddings = urlunparse(parsed_url[:2] + (before_v1 + "/v1beta/embeddings",) + ("",) * 3)
 
-def get_tools_mode(provider) -> str:
-    """
-    获取工具调用支持模式
-
-    Args:
-        provider: provider 配置
-
-    Returns:
-        str: 工具模式
-            - "none": 不支持工具调用
-            - "single": 只支持单个工具调用（默认）
-            - "parallel": 支持并行工具调用
-    """
-    tools_config = provider.get("tools")
-
-    if tools_config is False:
-        return "none"
-    elif tools_config == "parallel":
-        return "parallel"
-    elif tools_config is True or tools_config == "single":
-        return "single"
-    elif tools_config is None:
-        # 未配置时默认为 single（向后兼容）
-        return "single"
-    else:
-        # 其他值视为 single
-        return "single"
+def is_tools_disabled(provider) -> bool:
+    """检查 provider 是否禁用了工具调用"""
+    # 修改原因：工具配置现在只保留禁用开关，避免模式判断截断工具调用。
+    # 修改方式：只有 provider.tools 显式为 False 时才返回 True。
+    # 目的：保留禁用工具功能，同时让已经生成的工具调用完整转发。
+    return provider.get("tools") is False
 
 
 def get_engine(provider, endpoint=None, original_model=""):

@@ -22,7 +22,7 @@ from ..utils import (
     safe_get,
     get_model_dict,
     get_base64_image,
-    get_tools_mode,
+    is_tools_disabled,
     generate_sse_response,
     end_of_line,
     parse_json_safely,
@@ -308,11 +308,11 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
             tool_calls = msg.tool_calls
 
         if tool_calls:
-            tools_mode = get_tools_mode(provider)
-            # 根据 tools_mode 决定处理多少个工具调用
-            calls_to_process = tool_calls if tools_mode == "parallel" else tool_calls[:1]
             parts = []
-            for tool_call in calls_to_process:
+            # 修改原因：Vertex Gemini 历史中的工具调用必须完整保留。
+            # 修改方式：直接遍历全部 tool_calls，不再截断。
+            # 目的：避免 functionCall 与后续 functionResponse 不匹配。
+            for tool_call in tool_calls:
                 function_arguments = {
                     "functionCall": {
                         "name": tool_call.function.name,
@@ -460,6 +460,11 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
             if field == "tools":
+                # 修改原因：provider.tools=False 仍需要禁用 Vertex Gemini 工具声明。
+                # 修改方式：遇到工具字段时先检查禁用开关，禁用则跳过声明转换。
+                # 目的：保留禁用工具能力，避免 payload 携带工具声明。
+                if is_tools_disabled(provider):
+                    continue
                 processed_tools = []
                 for tool in value:
                     f_def = copy.deepcopy(tool["function"])
@@ -609,11 +614,11 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
             tool_call_id = msg.tool_call_id
 
         if tool_calls:
-            tools_mode = get_tools_mode(provider)
             tool_calls_list = []
-            # 根据 tools_mode 决定处理多少个工具调用
-            calls_to_process = tool_calls if tools_mode == "parallel" else tool_calls[:1]
-            for tool_call in calls_to_process:
+            # 修改原因：Vertex Claude 历史中的工具调用必须完整保留。
+            # 修改方式：直接遍历全部 tool_calls，不再截断。
+            # 目的：避免 tool_use 与后续 tool_result 数量不一致。
+            for tool_call in tool_calls:
                 tool_calls_list.append({
                     "type": "tool_use",
                     "id": tool_call.id,
@@ -689,8 +694,10 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
         if field not in miss_fields and value is not None:
             payload[field] = value
 
-    tools_mode = get_tools_mode(provider)
-    if request.tools and tools_mode != "none":
+    # 修改原因：provider.tools=False 仍需要禁用 Vertex Claude 工具声明。
+    # 修改方式：仅在工具未禁用时转换 request.tools。
+    # 目的：保留禁用工具能力，同时移除无意义的工具模式变量。
+    if request.tools and not is_tools_disabled(provider):
         tools = []
         for tool in request.tools:
             json_tool = await gpt2claude_tools_json(tool.dict()["function"])
@@ -713,7 +720,10 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
                         "type": "any"
                     }
 
-    if tools_mode == "none":
+    # 修改原因：禁用工具时，payload 中不能残留工具字段。
+    # 修改方式：用统一的禁用判断清理 tools 和 tool_choice。
+    # 目的：延续 provider.tools=False 的禁用语义。
+    if is_tools_disabled(provider):
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
 
