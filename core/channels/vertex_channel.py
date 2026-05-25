@@ -196,6 +196,23 @@ class VertexProvider(OAuthProvider):
         # 目的：让 OAuthManager 可以刷新并保存 Vertex AI 的短期 access_token。
         client_email = credential.get("client_email", "")
         private_key = credential.get("private_key", "")
+        # 自动检测：如果 refresh_token 字段是 service account JSON，解析并提取字段
+        if not client_email or not private_key:
+            raw_token = credential.get("refresh_token", "")
+            if isinstance(raw_token, str) and raw_token.strip().startswith("{"):
+                try:
+                    import json
+                    sa = json.loads(raw_token)
+                    if isinstance(sa, dict) and sa.get("client_email") and sa.get("private_key"):
+                        client_email = sa["client_email"].strip()
+                        private_key = sa["private_key"]
+                        credential["client_email"] = client_email
+                        credential["private_key"] = private_key
+                        if sa.get("project_id"):
+                            credential["project_id"] = sa["project_id"].strip()
+                        credential.pop("refresh_token", None)
+                except (json.JSONDecodeError, KeyError):
+                    pass
         if not client_email or not private_key:
             raise ValueError("Missing client_email or private_key in credential")
         access_token = await get_access_token(client_email, private_key)
@@ -220,7 +237,7 @@ class VertexProvider(OAuthProvider):
         # 修改原因：注册 OAuth provider 时需要提供 Vertex AI 默认 API 根地址。
         # 修改方式：返回 Google Vertex AI 官方 aiplatform 根地址。
         # 目的：让 OAuth 解析后的 provider 与现有渠道默认地址保持一致。
-        return "https://aiplatform.googleapis.com"
+        return "https://aiplatform.googleapis.com/v1beta"
 
 
 def _get_vertex_project_id(provider: dict) -> str:
@@ -294,34 +311,26 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     model_dict = get_model_dict(provider)
     original_model = model_dict[request.model]
 
-    # https://cloud.google.com/vertex-ai/generative-ai/docs/models/gemini/2-0-flash?hl=zh-cn
-    pro_models = ["gemini-2.5"]
-    global_models = ["gemini-2.5-flash-image-preview", "gemini-3-pro"]
-    if any(global_model in original_model for global_model in global_models):
-        location = gemini_preview
-    elif any(pro_model in original_model for pro_model in pro_models):
-        location = gemini2_5_pro_exp
-    else:
-        location = gemini1
+    # 所有模型统一走 global endpoint（Gemini + Claude 均支持）
+    location = gemini_preview  # ThreadSafeCircularList(["global"])
 
-    vertex_base_url = provider.get("base_url", "")
+    vertex_base_url = provider.get("base_url", "https://aiplatform.googleapis.com/v1beta").rstrip('/')
+
     if vertex_base_url.endswith('#'):
         url = vertex_base_url[:-1].rstrip('/')
-    elif "google-vertex-ai" in vertex_base_url or any(global_model in original_model for global_model in global_models):
-        url = vertex_base_url.rstrip('/') + "/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(
+    elif "google-vertex-ai" in vertex_base_url:
+        url = vertex_base_url + "/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(
             LOCATION=await location.next(),
             PROJECT_ID=project_id,
             MODEL_ID=original_model,
             stream=gemini_stream
         )
-    # 修改原因：OAuth access_token 也可能通过 api_key 参数进入，不能被误当作 URL query key。
-    # 修改方式：只有在 api_key 足够长、形态符合旧 API key 判断，且当前没有 Authorization 头时才拼入 query。
-    # 目的：避免 OAuth Bearer token 泄入 URL，同时保留旧 API key 路径。
     elif api_key is not None and len(api_key) > 2 and api_key[2] == "." and "Authorization" not in headers:
-        url = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{original_model}:{gemini_stream}?key={api_key}"
+        url = f"{vertex_base_url}/publishers/google/models/{original_model}:{gemini_stream}?key={api_key}"
         headers.pop("Authorization", None)
     else:
-        url = "https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(
+        url = "{BASE_URL}/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/google/models/{MODEL_ID}:{stream}".format(
+            BASE_URL=vertex_base_url,
             LOCATION=await location.next(),
             PROJECT_ID=project_id,
             MODEL_ID=original_model,
@@ -631,19 +640,13 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
 
     model_dict = get_model_dict(provider)
     original_model = model_dict[request.model]
-    if "claude-3-5-sonnet" in original_model or "claude-3-7-sonnet" in original_model or "4-5@" in original_model:
-        location = c35s
-    elif "claude-3-opus" in original_model:
-        location = c3o
-    elif "claude-sonnet-4" in original_model or "claude-opus-4" in original_model:
-        location = c4
-    elif "claude-3-sonnet" in original_model:
-        location = c3s
-    elif "claude-3-haiku" in original_model:
-        location = c3h
+    # Claude on Vertex 统一走 global endpoint
+    location = gemini_preview  # ThreadSafeCircularList(["global"])
 
+    vertex_base_url = provider.get("base_url", "https://aiplatform.googleapis.com/v1").rstrip('/')
     claude_stream = "streamRawPredict"
-    url = "https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/anthropic/models/{MODEL}:{stream}".format(
+    url = "{BASE_URL}/projects/{PROJECT_ID}/locations/{LOCATION}/publishers/anthropic/models/{MODEL}:{stream}".format(
+        BASE_URL=vertex_base_url,
         LOCATION=await location.next(),
         PROJECT_ID=project_id,
         MODEL=original_model,
@@ -1009,6 +1012,92 @@ export default function render(ctx) {
 """.strip()
 
 
+async def fetch_vertex_gemini_models(client, provider):
+    """获取 Vertex AI Gemini 可用模型列表。"""
+    from ..log_config import logger
+
+    base_url = provider.get('base_url', 'https://aiplatform.googleapis.com/v1beta').rstrip('/')
+
+    # 路由层已经把 OAuth token resolve 到 provider['api'] 里了
+    token = provider.get('api')
+    if isinstance(token, list):
+        token = token[0] if token else None
+    if not token:
+        return []
+
+    # Model Garden 公共目录: /v1beta1/publishers/google/models（不带 project/location）
+    # 从 base_url 提取域名部分
+    import re as _re
+    domain_match = _re.match(r'(https?://[^/]+)', base_url)
+    api_base = domain_match.group(1) if domain_match else 'https://aiplatform.googleapis.com'
+    url = f"{api_base}/v1beta1/publishers/google/models"
+    headers = {'Authorization': f'Bearer {token}'}
+
+    models = []
+    page_token = None
+    for _ in range(10):
+        params = {'pageSize': 100}
+        if page_token:
+            params['pageToken'] = page_token
+        try:
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+        except Exception as e:
+            logger.warning(f'[Vertex] Failed to list Gemini models: {e}')
+            break
+        data = response.json()
+        for m in data.get('publisherModels', data.get('models', [])):
+            name = m.get('name', '')
+            if '/models/' in name:
+                name = name.split('/models/')[-1]
+            name = name.strip()
+            if name and name not in models:
+                models.append(name)
+        page_token = data.get('nextPageToken')
+        if not page_token:
+            break
+    return models
+
+
+async def fetch_vertex_claude_models(client, provider):
+    """获取 Vertex AI Claude 可用模型列表。"""
+    from ..log_config import logger
+
+    base_url = provider.get('base_url', 'https://aiplatform.googleapis.com/v1').rstrip('/')
+
+    # 路由层已经把 OAuth token resolve 到 provider['api'] 里了
+    token = provider.get('api')
+    if isinstance(token, list):
+        token = token[0] if token else None
+    if not token:
+        return []
+
+    # Model Garden 公共目录: /v1beta1/publishers/anthropic/models
+    import re as _re
+    domain_match = _re.match(r'(https?://[^/]+)', base_url)
+    api_base = domain_match.group(1) if domain_match else 'https://aiplatform.googleapis.com'
+    url = f"{api_base}/v1beta1/publishers/anthropic/models"
+    headers = {'Authorization': f'Bearer {token}'}
+
+    try:
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+    except Exception as e:
+        logger.warning(f'[Vertex] Failed to list Claude models: {e}')
+        return []
+
+    data = response.json()
+    models = []
+    for m in data.get('publisherModels', data.get('models', [])):
+        name = m.get('name', '')
+        if '/models/' in name:
+            name = name.split('/models/')[-1]
+        name = name.strip()
+        if name and name not in models:
+            models.append(name)
+    return models
+
+
 def register():
     """注册 Vertex AI 渠道到注册中心"""
     from .registry import register_channel
@@ -1018,18 +1107,19 @@ def register():
     register_channel(
         id="vertex-gemini",
         type_name="vertex-gemini",
-        default_base_url="https://aiplatform.googleapis.com",
+        default_base_url="https://aiplatform.googleapis.com/v1beta",
         auth_header="Authorization: Bearer {access_token}",
         description="Google Vertex AI (Gemini)",
         request_adapter=get_vertex_gemini_payload,
         response_adapter=fetch_vertex_gemini_response,
         stream_adapter=fetch_gemini_response_stream,
-        models_adapter=None,
+        models_adapter=fetch_vertex_gemini_models,
         oauth_provider=VertexProvider(),
         ui_slots={
             "key_hint": _VERTEX_KEY_HINT,
             "base_url_hint": _VERTEX_BASE_URL_HINT,
             "token_url_hint": _VERTEX_TOKEN_URL_HINT,
+            "import_placeholder": '{"type": "service_account", "project_id": "...", ...}',
         },
         source="builtin",
     )
@@ -1038,18 +1128,19 @@ def register():
     register_channel(
         id="vertex-claude",
         type_name="vertex-claude",
-        default_base_url="https://aiplatform.googleapis.com",
+        default_base_url="https://aiplatform.googleapis.com/v1",
         auth_header="Authorization: Bearer {access_token}",
         description="Google Vertex AI (Claude)",
         request_adapter=get_vertex_claude_payload,
         response_adapter=fetch_vertex_claude_response,
         stream_adapter=fetch_vertex_claude_response_stream,
-        models_adapter=None,
+        models_adapter=fetch_vertex_claude_models,
         oauth_provider=VertexProvider(),
         ui_slots={
             "key_hint": _VERTEX_KEY_HINT,
             "base_url_hint": _VERTEX_BASE_URL_HINT,
             "token_url_hint": _VERTEX_TOKEN_URL_HINT,
+            "import_placeholder": '{"type": "service_account", "project_id": "...", ...}',
         },
         source="builtin",
     )
