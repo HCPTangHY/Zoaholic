@@ -54,6 +54,43 @@ PLUGIN_INFO = {
 EXTENSIONS = PLUGIN_EXPORTS
 
 
+# 修改原因：oai_tier 的 tier 标签不能继续由 Channels.tsx 按 bal?.tier 硬编码读取。
+# 修改方式：把 tier 与百分比展示封装成 quota_display 内联 JS，由插件 setup 注册到独立 UI slot 注册表。
+# 目的：让普通 OpenAI Key 的 tier 展示跟随插件生命周期，并为后续 provider 级 slot 解析做准备。
+OAI_TIER_QUOTA_DISPLAY = """
+export default function render(ctx) {
+    const { el, data } = ctx || {};
+    if (!el) return;
+    
+    const tier = data?.tier;
+    const percent = typeof data?.percent === 'number' ? data.percent : null;
+    const available = data?.available;
+    const total = data?.total;
+    
+    // 构建显示内容
+    const parts = [];
+    if (tier) parts.push(tier);
+    if (percent != null) parts.push(`${percent.toFixed(1)}%`);
+    else if (available != null && total != null && total > 0) {
+        parts.push(`${(available / total * 100).toFixed(1)}%`);
+    }
+    
+    if (!parts.length) { el.textContent = ''; return; }
+    
+    const text = parts.join(' ');
+    el.textContent = text;
+    
+    // 颜色
+    const pct = percent ?? (available != null && total != null && total > 0 ? available / total * 100 : null);
+    const colorClass = pct == null ? 'text-blue-400 bg-blue-500/12'
+        : pct >= 50 ? 'text-emerald-500 bg-emerald-500/15'
+        : pct >= 20 ? 'text-amber-600 bg-amber-500/15'
+        : 'text-red-500 bg-red-500/15';
+    el.className = `text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded ${colorClass}`;
+}
+"""
+
+
 # ==================== Tier 缓存 ====================
 
 # key: api_key 前 12 位, value: {"tier": str, "tpm": int, "rpm": int, "updated_at": float}
@@ -63,24 +100,36 @@ _tier_cache: Dict[str, Dict[str, Any]] = {}
 _probe_timestamps: Dict[str, float] = {}
 _PROBE_COOLDOWN = 300  # 5 分钟内不重复探测同一个 key
 
-# TPM → Tier 映射表 (基于 OpenAI 官方文档)
-# https://platform.openai.com/docs/guides/rate-limits
-_TPM_TIER_MAP = [
-    (10_000_000, "Tier 5"),   # 10M+
-    (2_000_000, "Tier 4"),    # 2M+
-    (1_000_000, "Tier 3"),    # 1M+  (实际按模型有差异，这里取主流模型)
-    (450_000, "Tier 2"),      # 450K+
-    (200_000, "Tier 1"),      # 200K+
-    (0, "Free"),
+# TPM → Tier 精确映射表 (来自 keychecker/OpenAI.py)
+# 注意：Tier 5 的 TPM 取决于探测模型 — gpt-5 系列为 40M，其他为 30M
+_OAI_TIERS = {
+    'Tier 1': {'tpm': 500_000, 'rpm': 500},
+    'Tier 2': {'tpm': 1_000_000, 'rpm': 5_000},
+    'Tier 3': {'tpm': 2_000_000, 'rpm': 5_000},
+    'Tier 4': {'tpm': 4_000_000, 'rpm': 10_000},
+    'Tier 5': {'tpm': 40_000_000, 'rpm': 15_000},  # gpt-5 系列; 非 gpt-5 → 30M tpm, 10k rpm
+}
+
+# 探测模型优先级：gpt-5.5 的限制最能反映真实 tier
+_TIER_MODEL_PRIORITY = [
+    "gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5",
+    "o3", "gpt-4.1", "chatgpt-4o-latest", "gpt-4o",
 ]
 
 
-def _tpm_to_tier(tpm: int) -> str:
-    """根据 TPM 上限推断 Tier"""
-    for threshold, tier in _TPM_TIER_MAP:
-        if tpm >= threshold:
-            return tier
-    return "Free"
+def _tpm_to_tier(tpm: int, model_name: str = "") -> str:
+    """根据 TPM 上限精确匹配 Tier（与 keychecker 一致）"""
+    if not isinstance(tpm, int):
+        return "Tier Unknown"
+    import copy
+    fixed_tiers = copy.deepcopy(_OAI_TIERS)
+    # 非 gpt-5 系列的 Tier 5 TPM 是 30M 不是 40M
+    if "gpt-5" not in model_name:
+        fixed_tiers['Tier 5']['tpm'] = 30_000_000
+    for tier_name, tier_data in fixed_tiers.items():
+        if tier_data['tpm'] == tpm:
+            return tier_name
+    return "Tier Unknown"
 
 
 def _cache_key(api_key: str) -> str:
@@ -121,7 +170,7 @@ async def _oai_tier_response_interceptor(response_chunk, engine, model, is_strea
 
         tpm = int(str(tpm_str).replace(",", ""))
         rpm = int(str(rpm_str).replace(",", "")) if rpm_str else None
-        tier = _tpm_to_tier(tpm)
+        tier = _tpm_to_tier(tpm, model or "")
 
         # 修改原因：余额查询阶段拿不到上一次响应头，需要跨请求暂存被动检测结果。
         # 修改方式：用 API Key 前 12 位作为缓存索引，保存 tier、TPM、RPM、模型和更新时间。
@@ -147,26 +196,41 @@ async def _oai_tier_response_interceptor(response_chunk, engine, model, is_strea
 # ==================== Active Probe ====================
 
 async def _probe_tier(api_key: str, base_url: str = "") -> Optional[Dict[str, Any]]:
-    """主动发 max_completion_tokens:0 探测请求，从 400 响应头采集 TPM/RPM（零 token 消耗）"""
+    """主动探测 tier：先查 /models 选最优探测模型，再发请求从响应头采集 TPM/RPM"""
     import httpx
 
     if not base_url:
         base_url = "https://api.openai.com/v1"
-
-    url = f"{base_url.rstrip('/')}/chat/completions"
-    headers = {
+    base = base_url.rstrip('/')
+    auth_headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-    }
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [{"role": "user", "content": ""}],
-        "max_completion_tokens": 0,
     }
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(url, json=payload, headers=headers)
+            # 1. 先拉模型列表，按优先级选探测模型
+            probe_model = "gpt-4o-mini"  # fallback
+            try:
+                models_resp = await client.get(f"{base}/models", headers=auth_headers)
+                if models_resp.status_code == 200:
+                    available = {m["id"] for m in models_resp.json().get("data", [])}
+                    for preferred in _TIER_MODEL_PRIORITY:
+                        if preferred in available:
+                            probe_model = preferred
+                            break
+                # 403 = 无 /models 权限，用 fallback
+            except Exception:
+                pass
+
+            # 2. 发探测请求（keychecker 用 max_tokens for gpt-4 系, max_completion_tokens for others）
+            param = "max_tokens" if "gpt-4" in probe_model else "max_completion_tokens"
+            payload = {
+                "model": probe_model,
+                "messages": [{"role": "user", "content": ""}],
+                param: 0,
+            }
+            resp = await client.post(f"{base}/chat/completions", json=payload, headers=auth_headers)
 
         tpm_str = resp.headers.get("x-ratelimit-limit-tokens")
         rpm_str = resp.headers.get("x-ratelimit-limit-requests")
@@ -176,13 +240,13 @@ async def _probe_tier(api_key: str, base_url: str = "") -> Optional[Dict[str, An
 
         tpm = int(str(tpm_str).replace(",", ""))
         rpm = int(str(rpm_str).replace(",", "")) if rpm_str else None
-        tier = _tpm_to_tier(tpm)
+        tier = _tpm_to_tier(tpm, probe_model)
 
         return {
             "tier": tier,
             "tpm": tpm,
             "rpm": rpm,
-            "model": "gpt-4o-mini (probe)",
+            "model": f"{probe_model} (probe)",
             "updated_at": time.time(),
         }
     except Exception as e:
@@ -235,8 +299,10 @@ async def _oai_tier_balance_enricher(result: dict, engine: str, provider: dict) 
 
 def setup(manager):
     """插件加载"""
-    # 修改原因：Tier 检测分为响应头采集和余额结果补充两个阶段，不能写入 oai_tools 插件。
-    # 修改方式：注册 response_interceptor 采集 OpenAI rate-limit 头，再注册 balance_enricher 输出缓存字段。
+    from core.ui_slots.registry import register_ui_slot
+
+    # 修改原因：Tier 检测分为响应头采集、余额结果补充和前端展示三个阶段，不能写入 oai_tools 插件或 Channels.tsx。
+    # 修改方式：注册 response_interceptor 采集 OpenAI rate-limit 头，注册 balance_enricher 输出缓存字段，并注册 quota_display UI slot。
     # 目的：使 oai_tier 只在渠道启用时工作，并与其他 OpenAI 兼容渠道插件解耦。
     register_response_interceptor(
         interceptor_id="oai_tier_response",
@@ -252,13 +318,32 @@ def setup(manager):
         plugin_name="oai_tier",
         overwrite=True,
     )
+    # 修改原因：前端普通 Key 行不应继续硬编码读取 balanceResults.tier。
+    # 修改方式：注册一个仅匹配 OpenAI API Key 渠道且要求 provider 启用 oai_tier 的 quota_display 贡献。
+    # 目的：让 tier 展示由插件声明，并避免 OAuth 渠道或未启用插件的 provider 误加载该脚本。
+    register_ui_slot(
+        slot_id="oai_tier.quota_display",
+        slot="quota_display",
+        script=OAI_TIER_QUOTA_DISPLAY,
+        source="oai_tier",
+        priority=50,
+        engines=["openai", "openai-responses"],
+        auth_types=["api_key"],
+        enabled_plugin="oai_tier",
+    )
     logger.info("[oai_tier] Plugin loaded")
 
 
 def teardown(manager):
     """插件卸载"""
+    from core.ui_slots.registry import unregister_ui_slot
+
     unregister_response_interceptor("oai_tier_response")
     unregister_balance_enricher("oai_tier_balance")
+    # 修改原因：插件卸载后前端不应继续拿到 oai_tier 的 quota_display 脚本。
+    # 修改方式：按 setup 中使用的固定 slot_id 从独立 UI slot 注册表注销贡献。
+    # 目的：保证插件热重载和停用后不会留下过期 UI slot。
+    unregister_ui_slot("oai_tier.quota_display")
     _tier_cache.clear()
     _probe_timestamps.clear()
     logger.info("[oai_tier] Plugin unloaded")

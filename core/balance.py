@@ -94,12 +94,78 @@ BALANCE_TEMPLATES: Dict[str, Dict[str, Any]] = {
 # ==================== 工具函数 ====================
 
 
+def _safe_eval_expr(expr: str, data: Any) -> Any:
+    """安全执行简单数学表达式，变量引用为 dot notation 路径。
+
+    只允许数字字面量、四则运算(+-*/)、括号、路径引用。
+    用 ast 模块解析，拒绝任何函数调用或其他操作。
+
+    示例:
+        "usage.standard.userTokens / usage.standard.userLimit * 100"
+    """
+    import ast
+    import re
+
+    # 提取所有 dot notation 路径（字母、数字、下划线、点号组成的标识符链）
+    path_pattern = re.compile(r'[a-zA-Z_][a-zA-Z0-9_.]*')
+    paths = path_pattern.findall(expr)
+
+    # 替换路径为实际数值
+    resolved_expr = expr
+    for p in sorted(set(paths), key=len, reverse=True):  # 长路径优先替换
+        val = _extract_dot_path(data, p)
+        f = _to_float(val)
+        if f is None:
+            return None  # 有路径解析不出来就放弃
+        resolved_expr = resolved_expr.replace(p, repr(f))
+
+    # AST 安全校验：只允许数字和运算符
+    try:
+        tree = ast.parse(resolved_expr, mode='eval')
+    except SyntaxError:
+        return None
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp,
+                             ast.Constant, ast.Num,
+                             ast.Add, ast.Sub, ast.Mult, ast.Div,
+                             ast.FloorDiv, ast.Mod, ast.Pow,
+                             ast.USub, ast.UAdd)):
+            continue
+        # 不允许的节点类型
+        return None
+
+    try:
+        result = eval(compile(tree, '<expr>', 'eval'))
+        return result
+    except Exception:
+        return None
+
+
+def _extract_dot_path(data: Any, path: str) -> Any:
+    """纯 dot notation 提取，不处理 eval: 和 + 语法。"""
+    current = data
+    for key in path.split("."):
+        if isinstance(current, dict):
+            current = current.get(key)
+        elif isinstance(current, list):
+            try:
+                current = current[int(key)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+    return current
+
+
 def extract_value(data: Any, path: Optional[str]) -> Any:
     """按 dot notation 从 dict 中提取值。
 
-    - "data.totalQuota"  → data["data"]["totalQuota"]
-    - "'CNY'"            → 常量字符串 "CNY"
-    - None / 空串        → None
+    - "data.totalQuota"        → data["data"]["totalQuota"]
+    - "'CNY'"                  → 常量字符串 "CNY"
+    - "a.0.val+a.1.val"        → 两个路径求和
+    - "eval:a.b / c.d * 100"   → 安全表达式求值
+    - None / 空串              → None
     """
     if path is None:
         return None
@@ -108,6 +174,10 @@ def extract_value(data: Any, path: Optional[str]) -> Any:
     path = path.strip()
     if not path:
         return None
+
+    # eval: 前缀 = 安全表达式求值
+    if path.startswith("eval:"):
+        return _safe_eval_expr(path[5:].strip(), data)
 
     # 单引号包裹 = 常量
     if path.startswith("'") and path.endswith("'") and len(path) >= 2:
@@ -126,19 +196,7 @@ def extract_value(data: Any, path: Optional[str]) -> Any:
         return total if has_any else None
 
     # dot notation 遍历
-    current = data
-    for key in path.split("."):
-        if isinstance(current, dict):
-            current = current.get(key)
-        elif isinstance(current, list):
-            # 支持数字索引，如 "items.0.value"
-            try:
-                current = current[int(key)]
-            except (ValueError, IndexError):
-                return None
-        else:
-            return None
-    return current
+    return _extract_dot_path(data, path)
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -396,6 +454,15 @@ async def query_provider_balance(client, provider: Dict[str, Any]) -> Dict[str, 
             result["used"] = result["total"] - result["available"]
         elif result["used"] is not None and result["available"] is not None and result["total"] is None:
             result["total"] = result["used"] + result["available"]
+
+        # 修改原因：前端机房卡片需要短百分比标签，但百分比口径应由后端统一补齐。
+        # 修改方式：amount 模式在 total 可用且大于 0 时，优先用 available/total 计算剩余额度百分比；没有 available 时用 total-used 兜底。
+        # 目的：让前端直接读取 percent 字段，同时保留 available、used、total 原始明细。
+        if result["total"] is not None and result["total"] > 0:
+            if result["available"] is not None:
+                result["percent"] = round(result["available"] / result["total"] * 100, 2)
+            elif result["used"] is not None:
+                result["percent"] = round((result["total"] - result["used"]) / result["total"] * 100, 2)
 
     result["expires_at"] = extract_value(raw_data, mapping.get("expires_at"))
 

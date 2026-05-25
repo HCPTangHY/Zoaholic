@@ -1,7 +1,11 @@
 from dataclasses import dataclass
+import logging
 from typing import Any, Awaitable, Callable, AsyncIterator, Dict, List, Optional, Tuple
 
 import httpx
+
+
+logger = logging.getLogger(__name__)
 
 
 # Type aliases for better readability
@@ -107,6 +111,17 @@ class ChannelDefinition:
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典，用于 API 响应"""
+        from core.ui_slots.registry import resolve_slots_for_engine
+
+        # 修改原因：ui_slots 已从渠道私有字段扩展为渠道和插件共同贡献，且插件门控 slot 也必须返回给前端判断。
+        # 修改方式：按当前渠道 id 和认证类型解析基础 channel_slots，再由 resolver 为 enabled_plugin 贡献标注 requires_plugin。
+        # 目的：让 /v1/channels 输出完整 resolved slots，同时保留 provider 级插件开关条件供管理端使用。
+        resolved_ui_slots = resolve_slots_for_engine(
+            self.id,
+            auth_type="oauth" if self.is_oauth else "api_key",
+            channel_slots=self.ui_slots,
+        )
+
         return {
             "id": self.id,
             "type_name": self.type_name,
@@ -127,16 +142,50 @@ class ChannelDefinition:
             # 修改方式：把 ChannelDefinition.is_oauth 输出为只读字段。
             # 目的：前端无需继续只依赖硬编码引擎列表即可识别 OAuth 渠道。
             "is_oauth": self.is_oauth,
-            # 修改原因：前端需要按插槽名获取渠道注册的内联 JS 代码，以决定走自定义渲染还是默认组件。
-            # 修改方式：把 ui_slots 字典原样输出，前端按 key 查找并用 Blob URL + import() 加载。
-            # 目的：无需新增 API 端点，渠道元数据接口一次性返回所有插槽脚本。
-            "ui_slots": self.ui_slots,
+            # 修改原因：前端需要拿到渠道基础 slot、全局 UI slot 贡献，以及插件门控 slot 的生效条件。
+            # 修改方式：输出 resolve_slots_for_engine 解析得到的 resolved_ui_slots，而不是原始 self.ui_slots。
+            # 目的：让插件和渠道都能通过同一个渠道元数据接口把插槽脚本及 requires_plugin 条件交给前端。
+            "ui_slots": resolved_ui_slots,
             "source": self.source,
         }
 
 
 # 全局注册表: key 为 channel id(engine), value 为渠道定义
 _REGISTRY: Dict[str, ChannelDefinition] = {}
+
+# 修改原因：OAuthManager 需要在渠道注册时接收 oauth_provider，但 registry 不能直接导入 OAuthManager 以免循环依赖。
+# 修改方式：保存一个运行时注入的注册回调，由 OAuthManager 初始化时安装，渠道注册表只在有 provider 时调用回调。
+# 目的：让内置渠道和插件渠道声明 oauth_provider 后可自动注册，同时保留 main.py 中的兜底扫描逻辑。
+_OAUTH_PROVIDER_REGISTRAR: Optional[Callable[[str, Any], None]] = None
+
+
+def set_oauth_provider_registrar(
+    registrar: Optional[Callable[[str, Any], None]],
+    *,
+    replay_existing: bool = False,
+) -> None:
+    """设置运行时 OAuth provider 注册回调。"""
+    global _OAUTH_PROVIDER_REGISTRAR
+    _OAUTH_PROVIDER_REGISTRAR = registrar
+    # 修改原因：OAuthManager 可能在部分渠道已经注册后才初始化，不能只处理后续新增渠道。
+    # 修改方式：调用方传 replay_existing=True 时遍历当前注册表，并复用统一的安全注册函数。
+    # 目的：保证启动顺序不影响 OAuth provider 自动注册结果。
+    if replay_existing and registrar is not None:
+        for channel_id, channel_def in list(_REGISTRY.items()):
+            _register_oauth_provider_if_possible(channel_id, channel_def.oauth_provider)
+
+
+def _register_oauth_provider_if_possible(channel_id: str, oauth_provider: Any) -> None:
+    """在 OAuthManager 已接入时，把渠道 provider 同步注册过去。"""
+    # 修改原因：普通渠道没有 oauth_provider，且 OAuthManager 初始化前也没有可用回调，这两种情况都应安全跳过。
+    # 修改方式：只有 provider 和 registrar 同时存在时才调用回调，并捕获异常写入日志。
+    # 目的：避免单个渠道 provider 注册失败中断整体渠道注册流程。
+    if oauth_provider is None or _OAUTH_PROVIDER_REGISTRAR is None:
+        return
+    try:
+        _OAUTH_PROVIDER_REGISTRAR(channel_id, oauth_provider)
+    except Exception:
+        logger.exception("Failed to auto-register OAuth provider for channel %s", channel_id)
 
 
 def register_channel(
@@ -229,6 +278,10 @@ def register_channel(
         oauth_provider=oauth_provider,
         source=source,
     )
+    # 修改原因：渠道可能在 OAuthManager 初始化之后由插件或热重载流程注册，不能只依赖启动期扫描。
+    # 修改方式：写入 ChannelDefinition 后立即尝试把 oauth_provider 交给已安装的回调。
+    # 目的：让新注册渠道的 OAuth provider 自动进入 OAuthManager，同时保持无回调时静默兼容。
+    _register_oauth_provider_if_possible(id, oauth_provider)
 
 
 def unregister_channel(id: str) -> bool:

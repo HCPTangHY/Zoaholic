@@ -9,7 +9,7 @@ import {
   Server, X, CheckCircle2, Settings2, Copy, ToggleRight, ToggleLeft,
   Folder, Puzzle, Network, CopyCheck, Power, Files, Play,
   Search, Check, BarChart3, Wallet, XCircle, Link2, GripVertical, ChevronUp, ChevronDown,
-  ClipboardPaste, LogIn, Download
+  ClipboardPaste, LogIn, Download, LayoutList, LayoutGrid
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as Switch from '@radix-ui/react-switch';
@@ -191,7 +191,13 @@ interface ProviderFormData {
   // 因此这里用 Record<string, any>，避免为每个插件都在 Channels 页面硬编码字段。
   preferences: Record<string, any>;
   sub_channels: SubChannelFormData[];
+  // 修改原因：复制 OAuth 渠道保存后需要知道来源 provider 才能复制后端 token state。
+  // 修改方式：在表单态保留一个以下划线开头的临时字段，正式保存 payload 手工组装时不写入该字段。
+  // 目的：让复制流程能调用后端 copy-provider API，同时避免把前端临时标记持久化到 api.yaml。
+  _copiedFrom?: string;
 }
+
+type UiSlotValue = string | { script?: string; requires_plugin?: string };
 
 interface ChannelOption {
   id: string;
@@ -203,10 +209,10 @@ interface ChannelOption {
   // 修改方式：在 ChannelOption 中加入可选 is_oauth 字段，兼容旧后端未返回该字段的情况。
   // 目的：余额按钮和配置面板不再只依赖硬编码 OAuth 引擎集合。
   is_oauth?: boolean;
-  // 修改原因：渠道元数据会返回通用插槽字典，前端需要类型字段承接。
-  // 修改方式：在 ChannelOption 中加入可选 ui_slots 字典字段，key 为插槽名，value 为内联 JS。
-  // 目的：让渠道列表加载后可以按插槽名缓存脚本并交给对应插槽组件动态渲染。
-  ui_slots?: Record<string, string>;
+  // 修改原因：后端会把需要 provider 插件开关的 slot 输出为 {script, requires_plugin}，不再只返回脚本字符串。
+  // 修改方式：把 ui_slots 值类型扩展为 UiSlotValue，导入弹窗仍只把纯字符串 import_placeholder 当文本使用。
+  // 目的：让前端既兼容旧无条件 slot，又能按当前 provider.enabled_plugins 判断插件门控 slot。
+  ui_slots?: Record<string, UiSlotValue>;
   source?: string;
 }
 
@@ -259,11 +265,6 @@ const SCHEDULE_ALGORITHMS = [
   { value: 'sticky_ip', label: 'IP 粘滞 (Sticky IP)' },
 ];
 
-// 修改原因：codex、claude-code 和 antigravity 的凭据来自 OAuth 账号，不应继续按普通 sk-* API Key 处理。
-// 修改方式：集中维护 OAuth 类型引擎集合，并在编辑表单中用当前 engine 派生渲染分支。
-// 目的：让新增 OAuth 引擎时只需要扩展这个集合，Key 管理 UI 自动切换到账号管理模式。
-const OAUTH_ENGINES = new Set(['codex', 'claude-code', 'antigravity', 'gemini-cli']);
-
 function readBooleanPreference(value: any): boolean {
   // 修改原因：后端新增 pool_sharing 布尔开关，旧配置中也可能存在字符串形式的布尔值。
   // 修改方式：统一把 true/1/yes/on 转为 true，其余值按 JavaScript 布尔语义处理。
@@ -284,50 +285,92 @@ function serializeChannelPreferences(preferences: Record<string, any>): Record<s
 }
 
 // ── 余额类型 ──
+interface QuotaGauge {
+  // 修改原因：P2 阶段前端圆环需要消费后端统一 gauges，而不是继续按 OAuth 或普通余额写两套展示字段。
+  // 修改方式：在页面内补齐 QuotaGauge 类型，保留后端可选字段，并额外允许 legacy fallback 写入 displayLabel。
+  // 目的：让 QuotaRings 能直接渲染新 API 字段，也能兼容旧 BalanceResult 计算出的兜底圆环。
+  id: string;
+  label: string;
+  role?: string | null;
+  percent?: number | null;
+  total?: number | null;
+  available?: number | null;
+  used?: number | null;
+  tone?: string | null;
+  resets_at?: string | null;
+  unit?: string | null;
+  display_mode?: 'percent' | 'amount' | 'quota';
+  displayLabel?: string | null;
+}
+
+interface RowQuota {
+  // 修改原因：tier/plan 等标签必须由 quota_display 插槽决定，RowQuota 不应再承载可直接渲染的 badge 列表。
+  // 修改方式：RowQuota 只保留圆环需要的 gauges，BalanceResult 原始字段仍会原样传给 slot 脚本。
+  // 目的：删除通用 badge 展示路径，避免通用前端再次硬编码展示插件或渠道标签。
+  gauges: QuotaGauge[];
+}
+
 interface BalanceResult {
   supported: boolean;
+  status?: string | null;
   value_type?: 'amount' | 'percent' | 'quota';
   total?: number | null;
   used?: number | null;
   available?: number | null;
   percent?: number | null;
-  // 修改原因：OAuth 余额入口会在通用 BalanceResult 外额外返回 5 小时和 7 天 quota。
-  // 修改方式：把两个 OAuth quota 字段和逐账号 results 映射加入可选类型。
-  // 目的：同一个查询函数既能更新普通余额行，也能刷新 OAuth 双弧展示。
-  quota_5h?: number | null;
-  quota_7d?: number | null;
+  currency?: string | null;
+  expires_at?: string | null;
+  // 修改原因：P0 后端会在旧 BalanceResult 旁追加统一额度 UI 字段，前端 P2 需要优先读取 gauges。
+  // 修改方式：在 BalanceResult 中保留 gauges、badges、metrics 和 extensions 的兼容字段，但渲染层不再消费 badges。
+  // 目的：slot 脚本仍能读取后端原始扩展数据，通用前端不再硬编码 tier 或 plan 标签。
+  gauges?: QuotaGauge[];
+  badges?: any[];
+  metrics?: Record<string, any>;
+  extensions?: Record<string, any>;
+  // 修改原因：双额度不再只属于 OAuth，普通 balance 结果也可能返回两个标准 quota 百分比。
+  // 修改方式：把 quota_inner、quota_outer 和逐账号 results 保留在通用 BalanceResult 中。
+  // 目的：让同一条渲染路径同时服务 OAuth 账号和普通 Key 的双弧展示。
+  quota_inner?: number | null;
+  quota_outer?: number | null;
   results?: Record<string, BalanceResult>;
   // 修改原因：oai_tier 会通过 balance_enricher 在普通余额结果中补充被动检测到的 OpenAI Tier 信息。
-  // 修改方式：在通用 BalanceResult 类型中加入 tier、tpm、rpm 和检测元数据字段。
-  // 目的：让非 OAuth Key 行可以类型安全地读取并显示 Tier 标签。
+  // 修改方式：在通用 BalanceResult 类型中保留 tier、tpm、rpm 和检测元数据字段，并只交给 slot 脚本展示。
+  // 目的：兼容旧余额结果，同时避免 Channels.tsx 直接把 Tier 渲染成通用标签。
   tier?: string | null;
   tpm?: number | null;
   rpm?: number | null;
   tier_detected_at?: number | null;
   tier_model?: string | null;
-  // 修改原因：resultForKey 现在显式标注为 BalanceResult，原有 OAuth 额外用量字段也需要在类型中声明。
-  // 修改方式：补齐 extra_usage 相关可选字段，不改变现有 OAuth 渲染逻辑。
-  // 目的：保持前端严格类型检查通过，同时让本次 tier 类型收敛不破坏旧字段读取。
-  extra_usage_enabled?: boolean | null;
-  extra_usage_limit?: number | null;
-  extra_usage_used?: number | null;
-  extra_usage_utilization?: number | null;
   raw?: any;
   error?: string | null;
 }
 
-// 修改原因：OAuth 账号的可视化指标不是普通余额，而是 5 小时和 7 天两个窗口的配额百分比。
-// 修改方式：为页面内的 OAuth 配额读写定义轻量类型，后续由 getOAuthQuota 统一归一化。
-// 目的：让 Key 行渲染可以明确区分普通余额和 OAuth 双弧配额。
+// 修改原因：双弧模板只需要两个标准 quota 百分比和可选原始数据，不应绑定具体渠道字段。
+// 修改方式：保留轻量结构供 OAuth 账号和普通 balance 结果共同归一化使用。
+// 目的：为 RackOAuthRings、QuotaBorderOverlay 和 quota_display 插槽提供统一输入。
 interface OAuthQuota {
-  quota_5h?: number;
-  quota_7d?: number;
+  quota_inner?: number;
+  quota_outer?: number;
   raw?: any;
+}
+
+function formatCompactNumber(n: number): string {
+  // 修改原因：完整列表行需要保留 available/total 原始语义，但大额数字直接显示会挤压输入区域。
+  // 修改方式：按用户指定的 B、M、K 阶梯缩写数字，并统一保留一位小数。
+  // 目的：让列表模式显示 178.8M / 250.0M 这类短文本，而不是改成百分比。
+  if (Math.abs(n) >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+  if (Math.abs(n) >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (Math.abs(n) >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+  return n.toFixed(1);
 }
 
 function getBalancePercent(b: BalanceResult): number | null {
   if (!b.supported || b.error) return null;
   if (b.value_type === 'percent' && b.percent != null) return b.percent;
+  // 修改原因：后端会为 amount 模式补算 percent，圆环进度应优先复用同一个标准字段。
+  // 修改方式：amount 且 percent 已存在时直接返回 percent，旧数据仍保留 available/total 兜底计算。
+  // 目的：让前后端对剩余额度百分比使用一致口径。
+  if (b.value_type === 'amount' && b.percent != null) return b.percent;
   if (b.value_type === 'quota' && b.available != null) return Math.min(b.available, 100);
   if (b.total != null && b.total > 0 && b.available != null) return (b.available / b.total) * 100;
   return null;
@@ -341,33 +384,166 @@ function getBalanceColor(pct: number | null): 'green' | 'yellow' | 'red' | null 
 }
 
 function getBalanceLabel(b: BalanceResult): string | null {
+  // 修改原因：完整 Key 行空间较充足，amount 模式不应被全局改成百分比。
+  // 修改方式：percent 模式仍显示百分比，其余模式保留 available/total 或 available 原始标签，并只压缩大数字。
+  // 目的：让列表模式继续展示 178.8M / 250.0M 这类可读明细。
   if (!b.supported || b.error) return null;
   if (b.value_type === 'percent' && b.percent != null) return `${b.percent.toFixed(1)}%`;
-  if (b.available != null && b.total != null) return `${b.available.toFixed(1)} / ${b.total.toFixed(1)}`;
-  if (b.available != null) return `${b.available.toFixed(1)}`;
+  if (b.available != null && b.total != null) return `${formatCompactNumber(b.available)} / ${formatCompactNumber(b.total)}`;
+  if (b.available != null) {
+    const prefix = getCurrencySymbol((b as any).currency);
+    return `${prefix}${formatCompactNumber(b.available)}`;
+  }
   return null;
 }
 
+function getBalanceCompactLabel(b: BalanceResult): string | null {
+  // 修改原因：机房卡片圆环中心空间有限，amount 模式继续显示 available/total 会发生溢出。
+  // 修改方式：新增紧凑标签函数只供 RackCard 使用，amount 模式优先读后端 percent，并保留旧数据的前端计算兜底。
+  // 目的：把百分比显示限定在机房卡片模式，不影响完整列表行。
+  if (!b.supported || b.error) return null;
+  if (b.value_type === 'percent' && b.percent != null) return `${b.percent.toFixed(1)}%`;
+  if (b.value_type === 'amount' && b.total != null && b.total > 0) {
+    if (b.percent != null) return `${b.percent.toFixed(1)}%`;
+    if (b.available != null) return `${((b.available / b.total) * 100).toFixed(1)}%`;
+    if (b.used != null) return `${(((b.total - b.used) / b.total) * 100).toFixed(1)}%`;
+  }
+  return getBalanceLabel(b);
+}
+
 function normalizeQuotaPct(value: any): number | undefined {
-  // 修改原因：OAuth 余额来源既可能是后端数字，也可能是缓存字符串，直接参与弧线长度计算会产生 NaN。
+  // 修改原因：双额度来源既可能是后端数字，也可能是缓存字符串，直接参与弧线长度计算会产生 NaN。
   // 修改方式：统一把空值转为 undefined，把可解析数字裁剪到 0 到 100。
-  // 目的：保证通用 OAuth 双弧只接收稳定百分比，渠道专属计算由后端或 ui_slots 完成。
+  // 目的：保证通用双弧只接收稳定百分比，渠道专属计算由后端或 ui_slots 完成。
   if (value == null || value === '') return undefined;
   const n = Number(value);
   if (!Number.isFinite(n)) return undefined;
   return Math.max(0, Math.min(100, n));
 }
 
+function getQuotaFromSource(source: any, rawValue?: any): OAuthQuota | null {
+  // 修改原因：后端 OAuthManager 仍可能返回旧 quota_5h/quota_7d 字段，而前端内部字段已经统一为 quota_inner/quota_outer。
+  // 修改方式：读取时兼容旧字段并回退到新字段，只把归一化后的新字段写入前端状态和渲染数据。
+  // 目的：后端无需同步改名，前端的默认双弧和渠道插槽仍只消费 quota_inner/quota_outer。
+  if (!source) return null;
+  const quota_inner = normalizeQuotaPct(source.quota_5h ?? source.quota_inner);
+  const quota_outer = normalizeQuotaPct(source.quota_7d ?? source.quota_outer);
+  const raw = rawValue ?? undefined;
+  if (quota_inner == null && quota_outer == null && raw == null) return null;
+  return { quota_inner, quota_outer, raw };
+}
+
 function getOAuthQuota(account: any): OAuthQuota | null {
-  // 修改原因：Channels.tsx 不应包含 Antigravity 等渠道专属 quota 分组逻辑，否则通用前端会绑定具体 engine。
-  // 修改方式：只读取后端缓存的 quota_5h、quota_7d 并归一化，同时把 raw 原样传给渠道 QUOTA_UI 插槽。
-  // 目的：让 QuotaBorderOverlay 使用统一字段，渠道自己的计算和展示逻辑留在后端 fetch_quota 与 ui_slots 中。
-  if (!account) return null;
-  const quota_5h = normalizeQuotaPct(account.quota_5h);
-  const quota_7d = normalizeQuotaPct(account.quota_7d);
-  const raw = account.quota_raw ?? account.raw ?? undefined;
-  if (quota_5h == null && quota_7d == null && raw == null) return null;
-  return { quota_5h, quota_7d, raw };
+  // 修改原因：OAuth 账号状态会把后端 fetch_quota 的 raw 缓存在 quota_raw 中，但标准额度字段仍与普通 balance 相同。
+  // 修改方式：复用通用双额度读取 helper，并把账号 raw 显式传给渠道插槽。
+  // 目的：OAuth 渠道保留自定义额度展示能力，同时不再维护渠道专属字段猜测。
+  return getQuotaFromSource(account, account?.quota_raw ?? account?.raw);
+}
+
+function normalizeOAuthAccountStateMap(accounts: Record<string, any> | null | undefined): Record<string, any> {
+  // 修改原因：OAuth 状态接口和旧缓存可能继续返回 quota_5h/quota_7d，前端状态需要统一使用 quota_inner/quota_outer。
+  // 修改方式：遍历账号状态并复用 getQuotaFromSource 兼容旧字段，只把归一化后的新字段补回状态副本。
+  // 目的：让初始加载、自动刷新和手动刷新都消费同一套前端字段名。
+  const next: Record<string, any> = {};
+  for (const [keyId, account] of Object.entries(accounts || {})) {
+    const quota = getQuotaFromSource(account, account?.quota_raw ?? account?.raw);
+    next[keyId] = {
+      ...account,
+      ...(quota?.quota_inner != null ? { quota_inner: quota.quota_inner } : {}),
+      ...(quota?.quota_outer != null ? { quota_outer: quota.quota_outer } : {}),
+      ...(quota?.raw != null ? { quota_raw: quota.raw } : {}),
+    };
+  }
+  return next;
+}
+
+function getBalanceQuota(bal: BalanceResult | undefined): OAuthQuota | null {
+  // 修改原因：普通 Key 的 balance 结果如果返回 quota_inner 和 quota_outer，也应进入默认双弧展示。
+  // 修改方式：只从 BalanceResult 顶层标准字段读取双额度，不把普通 raw 响应误判成可渲染 quota。
+  // 目的：让非 OAuth Key 复用 RackOAuthRings 和 QuotaBorderOverlay，同时避免所有普通余额都出现空双弧。
+  if (!bal || !bal.supported || bal.error) return null;
+  return getQuotaFromSource(bal);
+}
+
+function getQuotaPairFromGauges(gauges: QuotaGauge[]): OAuthQuota | null {
+  // 修改原因：QuotaBorderOverlay 和旧 quota_display 插槽仍消费 quota_inner/quota_outer，但 P2 行模型已统一成 gauges。
+  // 修改方式：从前两个 gauge 提取百分比并映射为 inner/outer，超过两个 gauge 时和 QuotaRings 一样只取前两个。
+  // 目的：保留默认双额度边框和已有渠道插槽兼容性，同时不在渲染层重新按 OAuth 分支取值。
+  if (!Array.isArray(gauges) || gauges.length < 2) return null;
+  const quota_inner = normalizeQuotaPct(gauges[0]?.percent);
+  const quota_outer = normalizeQuotaPct(gauges[1]?.percent);
+  if (quota_inner == null && quota_outer == null) return null;
+  return { quota_inner, quota_outer };
+}
+
+function buildRowQuota(bal: BalanceResult | undefined, oauthAccount: any, isOAuthEngine: boolean): RowQuota {
+  // 修改原因：机房卡片和完整 Key 行原先分别判断 OAuth 与普通余额，展示分支会随渠道继续增加。
+  // 修改方式：只构建通用圆环 gauges；tier、plan 和插件标签不再进入 RowQuota，改由 quota_display slot 渲染。
+  // 目的：保留 QuotaRings 的统一入口，同时删除通用 badge 这条前端硬编码展示路径。
+  if (Array.isArray(bal?.gauges) && bal.gauges.length > 0) {
+    return { gauges: bal.gauges };
+  }
+
+  const gauges: QuotaGauge[] = [];
+
+  if (isOAuthEngine) {
+    // 修改原因：getOAuthQuota 会为了插槽保留 raw-only 对象，但 raw-only 不能遮蔽 balance 结果中的旧 quota_inner/quota_outer。
+    // 修改方式：只有账号 quota 含有实际百分比时才优先使用账号数据，否则回退到 balance 旧字段。
+    // 目的：保持 API 未返回 gauges 时，OAuth 行仍能从旧 balance quota 构建双环。
+    const accountQuota = getOAuthQuota(oauthAccount);
+    const balanceQuota = getBalanceQuota(bal);
+    const quota = (accountQuota?.quota_inner != null || accountQuota?.quota_outer != null) ? accountQuota : balanceQuota;
+    if (quota?.quota_inner != null) gauges.push({ id: 'inner', label: 'inner', role: 'short_window', percent: quota.quota_inner });
+    if (quota?.quota_outer != null) gauges.push({ id: 'outer', label: 'outer', role: 'long_window', percent: quota.quota_outer });
+  } else if (bal) {
+    const mode = bal.value_type === 'quota' ? 'quota' : bal.value_type === 'amount' ? 'amount' : 'percent';
+    if (mode === 'quota' && bal.available != null) {
+      gauges.push({
+        id: 'balance', label: '余额', role: 'primary',
+        available: bal.available, unit: (bal as any).currency,
+        display_mode: 'quota',
+      });
+    } else {
+      const pct = getBalancePercent(bal);
+      if (pct != null) {
+        gauges.push({
+          id: 'balance', label: '余额', role: 'primary',
+          percent: pct, tone: getBalanceColor(pct),
+          display_mode: mode,
+          displayLabel: mode === 'amount' ? getBalanceLabel(bal) : null,
+          total: bal.total, available: bal.available, unit: (bal as any).currency,
+        });
+      }
+    }
+  }
+
+  // 修改原因：后端或插件返回的 badges 只应作为原始 slot 数据保留，不能由通用前端直接渲染。
+  // 修改方式：buildRowQuota 不再读取 bal.badges 或 bal.tier，只返回圆环 gauges。
+  // 目的：让 tier/plan 等展示完全由 quota_display 插槽和对应插件开关控制。
+  return { gauges };
+}
+
+function buildRowQuotaSlotData(bal: BalanceResult | undefined, oauthAccount: any, rowQuota: RowQuota): any {
+  // 修改原因：现有渠道 ui_slots 仍读取 data.quota_inner、data.quota_outer、data.raw 或普通 balance 字段，不能在 P2 中突然改为只传 gauges。
+  // 修改方式：普通 balance 优先原样传入；没有 balance 时从账号或 gauges 构造兼容 quota 数据，并把 raw 保留给旧脚本。
+  // 目的：在展示层统一为 RowQuota 的同时，保证 P1 已注册的 quota_display、key_background 等插槽继续工作。
+  if (bal) return bal;
+  const quota = getOAuthQuota(oauthAccount) ?? getQuotaPairFromGauges(rowQuota.gauges);
+  if (!quota) return null;
+  return {
+    ...quota,
+    raw: quota.raw ?? oauthAccount?.quota_raw ?? oauthAccount?.raw,
+  };
+}
+
+function withRackCompactBalanceFallback(gauges: QuotaGauge[], bal: BalanceResult | undefined): QuotaGauge[] {
+  // 修改原因：旧 amount 余额没有 gauges 时，机房卡片圆心不能继续显示完整 available/total 长文本。
+  // 修改方式：只在 legacy balance fallback 的单 gauge 上替换 displayLabel 为 getBalanceCompactLabel，后端新 gauges 不改写。
+  // 目的：保留 P2 统一圆环入口，同时延续机房卡片的紧凑显示策略。
+  if (bal?.gauges?.length || !bal || gauges.length !== 1 || gauges[0]?.id !== 'balance') return gauges;
+  const compactLabel = bal.value_type !== 'percent' ? getBalanceCompactLabel(bal) : null;
+  if (!compactLabel) return gauges;
+  return [{ ...gauges[0], displayLabel: compactLabel }];
 }
 
 function sortProvidersByWeight(list: any[]): any[] {
@@ -456,9 +632,9 @@ function buildBottomHalfPath(x: number, y: number, w: number, h: number, r: numb
   ].join(' ');
 }
 
-// OAuth 额度边框叠加层 — 上半蓝色(5h)、下半紫色(7d)
-function QuotaBorderOverlay({ quota5h, quota7d }: {
-  quota5h?: number | null; quota7d?: number | null;
+// 通用双额度边框叠加层 — 上半蓝色(quota_inner)、下半紫色(quota_outer)
+function QuotaBorderOverlay({ quotaInner, quotaOuter }: {
+  quotaInner?: number | null; quotaOuter?: number | null;
 }) {
   const selfRef = useRef<HTMLDivElement>(null);
   const [svgViewBox, setSvgViewBox] = useState('');
@@ -483,20 +659,20 @@ function QuotaBorderOverlay({ quota5h, quota7d }: {
     return () => ro.disconnect();
   }, []);
 
-  const q5 = quota5h ?? 0;
-  const q7 = quota7d ?? 0;
+  const qInner = quotaInner ?? 0;
+  const qOuter = quotaOuter ?? 0;
   return (
     <div ref={selfRef} className="absolute inset-0 pointer-events-none z-[1]" style={{ overflow: 'visible' }}>
       {svgViewBox && (
         <svg className="absolute inset-0 w-full h-full" viewBox={svgViewBox} style={{ overflow: 'visible' }}>
-          <title>{`5h: ${quota5h ?? '?'}% \u00b7 7d: ${quota7d ?? '?'}%`}</title>
-          {quota5h != null && topPath && (
+          <title>{`inner: ${quotaInner ?? '?'}% \u00b7 outer: ${quotaOuter ?? '?'}%`}</title>
+          {quotaInner != null && topPath && (
             <path d={topPath} pathLength={100} fill="none" stroke="#3b82f6" strokeWidth={2} strokeLinecap="round"
-              style={{ strokeDasharray: `${q5} 100`, strokeDashoffset: 0, transition: 'stroke-dasharray 0.5s ease' }} />
+              style={{ strokeDasharray: `${qInner} 100`, strokeDashoffset: 0, transition: 'stroke-dasharray 0.5s ease' }} />
           )}
-          {quota7d != null && bottomPath && (
+          {quotaOuter != null && bottomPath && (
             <path d={bottomPath} pathLength={100} fill="none" stroke="#8b5cf6" strokeWidth={2} strokeLinecap="round"
-              style={{ strokeDasharray: `${q7} 100`, strokeDashoffset: 0, transition: 'stroke-dasharray 0.5s ease' }} />
+              style={{ strokeDasharray: `${qOuter} 100`, strokeDashoffset: 0, transition: 'stroke-dasharray 0.5s ease' }} />
           )}
         </svg>
       )}
@@ -505,14 +681,14 @@ function QuotaBorderOverlay({ quota5h, quota7d }: {
 }
 
 // 兼容 QuotaArcs 调用点 — 用最小百分比的文字 tag
-const QuotaArcs = ({ quota5h, quota7d }: { quota5h?: number; quota7d?: number }) => {
-  if (quota5h == null && quota7d == null) return null;
-  const pct = Math.min(quota5h ?? 100, quota7d ?? 100);
+const QuotaArcs = ({ quotaInner, quotaOuter }: { quotaInner?: number; quotaOuter?: number }) => {
+  if (quotaInner == null && quotaOuter == null) return null;
+  const pct = Math.min(quotaInner ?? 100, quotaOuter ?? 100);
   const color = pct > 50 ? 'bg-emerald-500/15 text-emerald-500' : pct > 20 ? 'bg-amber-500/15 text-amber-600' : 'bg-red-500/15 text-red-500';
   return (
     <span
       className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] cursor-default ${color}`}
-      title={`5h: ${quota5h ?? '?'}% · 7d: ${quota7d ?? '?'}%`}
+      title={`inner: ${quotaInner ?? '?'}% · outer: ${quotaOuter ?? '?'}%`}
     >
       {Math.round(pct)}%
     </span>
@@ -520,7 +696,7 @@ const QuotaArcs = ({ quota5h, quota7d }: { quota5h?: number; quota7d?: number })
 };
 
 // ── 渠道自定义 UI 插槽 ──
-// 修改原因：前端不能只支持 quota_display，也不能把 CC extra_usage 等渠道专属 UI 写死在 Channels.tsx 中。
+// 修改原因：前端不能只支持 quota_display，也不能把渠道专属余额字段写死在 Channels.tsx 中。
 // 修改方式：把原单一额度插槽泛化为 UiSlot，按 engine + slot 缓存渠道注册的内联 JavaScript，并把插槽上下文交给渠道脚本渲染。
 // 目的：让 Channels.tsx 只提供通用挂载点，余额条、标签、汇总和边框等渠道差异都由 channel.py 的 ui_slots 声明。
 const uiSlotCache: Record<string, ((ctx: any) => void) | null> = {};
@@ -536,15 +712,46 @@ function serializeSlotValue(value: any): string {
   }
 }
 
-function hasUiSlot(engine: string | undefined, slot: string): boolean {
-  // 修改原因：多个挂载点都需要判断某个渠道是否注册了对应插槽，直接散落访问 window.__uiSlots 容易写回专用分支。
-  // 修改方式：提供只按 engine 和 slot 查询的通用 helper，不理解任何渠道字段。
-  // 目的：让插槽存在性判断保持平台化，避免出现按具体 engine 名称分支的硬编码。
-  if (!engine) return false;
-  return Boolean((window as any).__uiSlots?.[engine]?.[slot]);
+function getUiSlotValue(engine: string | undefined, slot: string): UiSlotValue | undefined {
+  // 修改原因：后端 ui_slots 值可能是旧字符串，也可能是带 requires_plugin 条件的对象，读取逻辑不能散落在各挂载点。
+  // 修改方式：集中按 engine 和 slot 从 window.__uiSlots 取原始值，其他 helper 在此基础上判断类型和条件。
+  // 目的：避免每个插槽挂载点都重复理解后端输出格式。
+  if (!engine) return undefined;
+  return (window as any).__uiSlots?.[engine]?.[slot];
 }
 
-const UiSlot = ({ engine, slot, data, context, className, element = 'span', fallbackText }: { engine: string; slot: string; data: any; context?: Record<string, any>; className?: string; element?: 'span' | 'div'; fallbackText?: string }) => {
+function getEnabledPluginName(entry: string): string {
+  // 修改原因：provider.preferences.enabled_plugins 支持 "plugin:options" 格式，requires_plugin 只比较插件名。
+  // 修改方式：取冒号前的名称并去掉空白，和后端 parse_plugin_entry 的匹配口径保持一致。
+  // 目的：让 "oai_tier:xxx" 这类配置也能正确启用 oai_tier 的 UI slot。
+  return String(entry || '').split(':')[0].trim();
+}
+
+function providerHasEnabledPlugin(enabledPlugins: string[] | undefined, pluginName: string | undefined): boolean {
+  // 修改原因：带 requires_plugin 的 slot 必须按当前 provider 的 enabled_plugins 判断，不能只看 engine。
+  // 修改方式：遍历当前 provider 插件列表，按插件名部分匹配 requires_plugin。
+  // 目的：让同一 engine 下不同 provider 可以分别启用或隐藏同一个插件 UI slot。
+  if (!pluginName || !Array.isArray(enabledPlugins)) return false;
+  return enabledPlugins.some((entry) => getEnabledPluginName(entry) === pluginName);
+}
+
+function getUiSlotScript(engine: string | undefined, slot: string, enabledPlugins?: string[]): string | null {
+  const slotValue = getUiSlotValue(engine, slot);
+  if (!slotValue) return null;
+  if (typeof slotValue === 'string') return slotValue;
+  if (typeof slotValue === 'object') {
+    const requiredPlugin = slotValue.requires_plugin;
+    if (requiredPlugin && !providerHasEnabledPlugin(enabledPlugins, requiredPlugin)) return null;
+    return typeof slotValue.script === 'string' ? slotValue.script : null;
+  }
+  return null;
+}
+
+function hasUiSlot(engine: string | undefined, slot: string, enabledPlugins?: string[]): boolean {
+  return getUiSlotScript(engine, slot, enabledPlugins) !== null;
+}
+
+const UiSlot = ({ engine, slot, data, context, className, element = 'span', fallbackText, enabledPlugins }: { engine: string; slot: string; data: any; context?: Record<string, any>; className?: string; element?: 'span' | 'div'; fallbackText?: string; enabledPlugins?: string[] }) => {
   const ref = useRef<HTMLElement | null>(null);
   const [loaded, setLoaded] = useState(false);
   const dataRef = useRef(data);
@@ -553,6 +760,10 @@ const UiSlot = ({ engine, slot, data, context, className, element = 'span', fall
   contextRef.current = context;
   const dataKey = useMemo(() => serializeSlotValue(data), [data]);
   const contextKey = useMemo(() => serializeSlotValue(context), [context]);
+  // 修改原因：enabledPlugins 数组引用可能随表单更新重建，直接放入 effect 依赖会导致无意义重跑。
+  // 修改方式：和 data/context 一样序列化为内容签名，只在插件列表内容变化时重新检查 requires_plugin。
+  // 目的：让插件开关变化能正确影响 UiSlot，同时避免普通输入聚焦造成重复加载。
+  const enabledPluginsKey = useMemo(() => serializeSlotValue(enabledPlugins || []), [enabledPlugins]);
 
   const bindRef = useCallback((node: HTMLElement | null) => {
     ref.current = node;
@@ -569,22 +780,29 @@ const UiSlot = ({ engine, slot, data, context, className, element = 'span', fall
         // 修改方式：按 `${engine}:${slot}` 缓存模块函数，命中时直接复用已加载的 render 函数。
         // 目的：保持列表渲染轻量，同时支持同一渠道注册多个彼此独立的插槽。
         if (fallbackText !== undefined) el.textContent = fallbackText;
+        // 修改原因：后端可能返回 {script, requires_plugin}，且同一个 engine 的不同 provider 插件开关不同。
+        // 修改方式：先按 enabledPlugins 提取可执行脚本，再决定是否使用缓存或动态 import。
+        // 目的：避免未启用插件的 provider 误用已经缓存的同 engine slot 脚本。
+        const slotValue = getUiSlotValue(engine, slot);
+        const jsSrc = getUiSlotScript(engine, slot, enabledPlugins);
+        if (!jsSrc) {
+          if (!slotValue || typeof slotValue === 'string' || !slotValue.requires_plugin) uiSlotCache[cacheKey] = null;
+          setLoaded(true);
+          return;
+        }
         if (cacheKey in uiSlotCache) {
           const fn = uiSlotCache[cacheKey];
-          if (fn) fn({ el, data: dataRef.current, ...(contextRef.current ?? {}) });
+          // 修改原因：新插槽脚本通过 ctx.context?.mode 区分完整行和机房卡片，但旧脚本仍直接读取 ctx.account 等扁平字段。
+          // 修改方式：调用脚本时同时保留扁平展开字段，并额外传入原始 context 对象。
+          // 目的：让 mode 分支生效，同时保持已有渠道和插件脚本兼容。
+          if (fn) fn({ el, data: dataRef.current, ...(contextRef.current ?? {}), context: contextRef.current });
           setLoaded(true);
           return;
         }
 
         // 修改原因：插槽脚本来自渠道元数据，前端只负责按 slot 名加载，不应固定读取 quota_display。
-        // 修改方式：从 window.__uiSlots[engine][slot] 取内联 JS，再通过 Blob URL dynamic import 加载默认导出。
-        // 目的：新增 key_border、key_background、balance_summary、quota_label 时不再修改加载器。
-        const jsSrc = (window as any).__uiSlots?.[engine]?.[slot];
-        if (!jsSrc) {
-          uiSlotCache[cacheKey] = null;
-          setLoaded(true);
-          return;
-        }
+        // 修改方式：从字符串 slot 或对象 slot.script 取内联 JS，再通过 Blob URL dynamic import 加载默认导出。
+        // 目的：新增 key_border、key_background、balance_summary 等插槽时不再修改加载器。
 
         const blob = new Blob([jsSrc], { type: 'application/javascript' });
         const url = URL.createObjectURL(blob);
@@ -592,7 +810,10 @@ const UiSlot = ({ engine, slot, data, context, className, element = 'span', fall
           const mod = await import(/* @vite-ignore */ url);
           const fn = mod.default || mod;
           uiSlotCache[cacheKey] = typeof fn === 'function' ? fn : null;
-          if (uiSlotCache[cacheKey]) uiSlotCache[cacheKey]!({ el, data: dataRef.current, ...(contextRef.current ?? {}) });
+          // 修改原因：首次动态加载插槽脚本时也必须提供 nested context，否则新加载路径和缓存命中路径行为不一致。
+          // 修改方式：与缓存命中分支一样传入 data、展开后的 context 字段，以及完整 context 对象。
+          // 目的：保证 quota_display、key_background 和 key_border 都能稳定读取 ctx.context?.mode。
+          if (uiSlotCache[cacheKey]) uiSlotCache[cacheKey]!({ el, data: dataRef.current, ...(contextRef.current ?? {}), context: contextRef.current });
         } finally {
           URL.revokeObjectURL(url);
         }
@@ -610,7 +831,7 @@ const UiSlot = ({ engine, slot, data, context, className, element = 'span', fall
     };
 
     run();
-  }, [engine, slot, dataKey, contextKey, fallbackText]);
+  }, [engine, slot, dataKey, contextKey, fallbackText, enabledPluginsKey]);
 
   if (element === 'div') {
     return <div ref={bindRef as React.RefCallback<HTMLDivElement>} data-loaded={loaded ? 'true' : 'false'} className={className} />;
@@ -769,61 +990,6 @@ function formatRackKeyLabel(keyObj: ApiKeyObj): string {
   return `${key.slice(0, 6)}…${key.slice(-4)}`;
 }
 
-function formatRackTierText(value: any): string | null {
-  if (value == null) return null;
-  // 如果传入的是对象，尝试取 name 字段
-  if (typeof value === 'object') return formatRackTierText(value?.name);
-  let text = String(value).trim();
-  if (!text) return null;
-  // 剥离常见前缀
-  text = text.replace(/^Google\s*(AI\s*)?/i, '').replace(/^Gemini Code Assist in /i, '').trim() || text;
-  const normalized = text.toLowerCase().replace(/[\s_-]+/g, '');
-  const known: Record<string, string> = {
-    t5: 'T5', tier5: 'T5', tierfive: 'T5',
-    t4: 'T4', tier4: 'T4',
-    t3: 'T3', tier3: 'T3', tierthree: 'T3',
-    t2: 'T2', tier2: 'T2',
-    t1: 'T1', tier1: 'T1',
-    pro: 'Pro', plus: 'Plus', max: 'Max', team: 'Team', enterprise: 'Enterprise', free: 'Free', prolite: 'Prolite',
-  };
-  return known[normalized] || text.charAt(0).toUpperCase() + text.slice(1);
-}
-
-function getRackTierLabel(bal: BalanceResult | undefined, oauthAccount: any, oauthQuota: OAuthQuota | null, isOAuthEngine: boolean): string | null {
-  // 修改原因：普通渠道 tier 来自 balanceResults，OAuth 渠道的订阅标签可能来自账号或 quota raw。
-  // 修改方式：普通渠道优先读取 bal.tier，OAuth 渠道补充读取 subscription_type、plan_type、paidTier 等字段。
-  // 目的：让机房卡片底部药丸覆盖 T5、T3、Pro、Max 等主要来源。
-  const balanceTier = formatRackTierText(bal?.tier);
-  if (!isOAuthEngine) return balanceTier;
-  const raw = oauthQuota?.raw || oauthAccount?.quota_raw || oauthAccount?.raw || {};
-  return balanceTier
-    || formatRackTierText(oauthAccount?.subscription_type)
-    || formatRackTierText(oauthAccount?.subscriptionType)
-    || formatRackTierText(oauthAccount?.tier)
-    || formatRackTierText(oauthAccount?.plan_type)
-    || formatRackTierText(raw?.subscription_type)
-    || formatRackTierText(raw?.subscriptionType)
-    || formatRackTierText(raw?.plan_type)
-    || formatRackTierText(raw?.paidTier?.name || raw?.paidTier)
-    || formatRackTierText(raw?.['x-codex-plan-type']);
-}
-
-function getRackTierClass(tierLabel: string): string {
-  // 修改原因：机房模式底部药丸需要用颜色快速区分常见 tier，不能都显示成同一种弱提示。
-  // 修改方式：按归一化标签映射金色、绿色、紫色、粉色等 Tailwind 类，未知标签使用蓝灰色兜底。
-  // 目的：让 T5、T3、Pro、Max 等标签在密集卡片中仍有辨识度。
-  // 修改原因：原有返回值只适合深色主题，浅色主题下 text-*-200 对比度不足。
-  // 修改方式：每个返回值增加浅色主题文字色和边框强度，并用 dark:text-* 保留深色主题视觉。
-  // 目的：让机房模式 tier 药丸在浅色和深色主题下都清晰可读。
-  const normalized = tierLabel.toLowerCase().replace(/[\s_-]+/g, '');
-  if (normalized.includes('t5') || normalized.includes('tier5')) return 'border-amber-600/40 bg-amber-500/20 text-amber-800 dark:text-amber-200';
-  if (normalized.includes('t3') || normalized.includes('tier3')) return 'border-emerald-600/35 bg-emerald-500/15 text-emerald-800 dark:text-emerald-200';
-  if (normalized.includes('max')) return 'border-pink-600/40 bg-pink-500/20 text-pink-800 dark:text-pink-200';
-  if (normalized.includes('pro')) return 'border-purple-600/40 bg-purple-500/20 text-purple-800 dark:text-purple-200';
-  if (normalized.includes('plus')) return 'border-sky-600/35 bg-sky-500/15 text-sky-800 dark:text-sky-200';
-  return 'border-slate-500/30 bg-slate-500/15 text-slate-700 dark:text-slate-200';
-}
-
 function getRackBalanceTextClass(color: 'green' | 'yellow' | 'red' | null): string {
   // 修改原因：普通 Key 中心百分比仍复用 getBalanceColor 的三档语义，避免卡片文字和旧余额判断脱节。
   // 修改方式：把 green/yellow/red 映射成适合深色卡片的文字颜色。
@@ -909,17 +1075,153 @@ function RackSingleRing({ percent, textClassName, label }: { percent: number | n
 }
 
 function RackOAuthRings({ quota, hideText }: { quota: OAuthQuota | null; hideText?: boolean }) {
-  const quota5h = clampRackPercent(quota?.quota_5h);
-  const quota7d = clampRackPercent(quota?.quota_7d);
+  const quotaInner = clampRackPercent(quota?.quota_inner);
+  const quotaOuter = clampRackPercent(quota?.quota_outer);
   return (
     <div className="relative flex h-12 w-12 items-center justify-center">
       <svg className="h-12 w-12" viewBox="0 0 64 64" aria-hidden="true">
-        <RackRingCircle radius={26} strokeWidth={5} percent={quota5h} color="#60a5fa" trackOpacity={quota5h == null ? 0.42 : 0.74} />
-        <RackRingCircle radius={18} strokeWidth={5} percent={quota7d} color="#a78bfa" trackOpacity={quota7d == null ? 0.35 : 0.68} />
+        <RackRingCircle radius={26} strokeWidth={5} percent={quotaInner} color="#60a5fa" trackOpacity={quotaInner == null ? 0.42 : 0.74} />
+        <RackRingCircle radius={18} strokeWidth={5} percent={quotaOuter} color="#a78bfa" trackOpacity={quotaOuter == null ? 0.35 : 0.68} />
       </svg>
       {!hideText && (
         <span className="absolute inset-0 flex items-center justify-center text-[11px] font-bold font-mono text-sky-700 dark:text-sky-100">
-          {quota5h == null ? '—' : `${Math.round(quota5h)}%`}
+          {quotaInner == null ? '—' : `${Math.round(quotaInner)}%`}
+        </span>
+      )}
+    </div>
+  );
+}
+
+const QUOTA_GAUGE_TONE_STROKES: Record<string, string> = {
+  // 修改原因：QuotaGauge 提供 tone 后，通用圆环需要在不知道具体渠道的情况下应用基础颜色。
+  // 修改方式：将后端约定的 tone 映射为稳定 stroke 色，未指定时继续按余额百分比或双环默认色处理。
+  // 目的：让普通余额、插件和 OAuth quota 都能复用 QuotaRings，而不再在渲染层增加渠道分支。
+  blue: '#60a5fa',
+  green: '#10b981',
+  yellow: '#eab308',
+  red: '#ef4444',
+  gray: '#64748b',
+};
+
+function normalizeQuotaTone(tone?: string | null): string | null {
+  // 修改原因：后端或旧 fallback 可能传入空值、大小写不一致或未登记的 tone。
+  // 修改方式：统一转小写，并只接受 QuotaRings 支持的标准颜色名。
+  // 目的：删除通用 badge 组件后仍让 gauges 的 tone 能安全映射到圆环颜色，不拼接非法样式。
+  const key = String(tone || '').toLowerCase();
+  return key in QUOTA_GAUGE_TONE_STROKES ? key : null;
+}
+
+function getQuotaGaugeStrokeColor(gauge: QuotaGauge | undefined, percent: number | null, fallback: string): string {
+  // 修改原因：单环需要沿用余额渐变，双环需要沿用蓝紫默认色，同时允许后端 tone 覆盖颜色。
+  // 修改方式：先读取标准 tone；没有 tone 且有百分比时使用旧余额渐变，否则使用调用方传入的默认色。
+  // 目的：在保留 RackSingleRing/RackOAuthRings 视觉习惯的同时接入统一 QuotaGauge。
+  const tone = normalizeQuotaTone(gauge?.tone);
+  if (tone && QUOTA_GAUGE_TONE_STROKES[tone]) return QUOTA_GAUGE_TONE_STROKES[tone];
+  if (percent != null && !fallback) return getRackUsageGradientColor(percent);
+  return fallback || (percent == null ? '#334155' : getRackUsageGradientColor(percent));
+}
+
+function getQuotaRingTextClass(gauge: QuotaGauge | undefined, percent: number | null): string {
+  // 修改原因：圆环中心文字也需要随通用 tone 或旧余额百分比分档保持可读颜色。
+  // 修改方式：优先按 tone 映射文字颜色，没有 tone 时复用旧 getBalanceColor 分档。
+  // 目的：让 QuotaRings 替换单环和双环后，文字色不会退回固定样式。
+  const tone = normalizeQuotaTone(gauge?.tone);
+  if (tone === 'blue') return 'text-sky-700 dark:text-sky-100';
+  if (tone === 'green') return 'text-emerald-600 dark:text-emerald-100';
+  if (tone === 'yellow') return 'text-yellow-600 dark:text-yellow-100';
+  if (tone === 'red') return 'text-red-600 dark:text-red-100';
+  if (tone === 'gray') return 'text-muted-foreground';
+  return getRackBalanceTextClass(getBalanceColor(percent));
+}
+
+function getCurrencySymbol(currency: string | null | undefined): string {
+  if (!currency) return '';
+  const map: Record<string, string> = { USD: '$', CNY: '¥', EUR: '€', GBP: '£', JPY: '¥' };
+  return map[currency.toUpperCase()] || `${currency} `;
+}
+
+function formatQuotaAmount(available: number | null | undefined, unit: string | null | undefined): string {
+  if (available == null) return '—';
+  const prefix = getCurrencySymbol(unit);
+  if (available >= 1000) return `${prefix}${formatCompactNumber(available)}`;
+  return `${prefix}${available.toFixed(2)}`;
+}
+
+function getQuotaRingText(gauge: QuotaGauge | undefined, percent: number | null): string {
+  // quota 模式：显示金额
+  if (gauge?.display_mode === 'quota') return formatQuotaAmount(gauge.available, gauge.unit);
+  // amount 模式：优先 displayLabel（紧凑金额），否则百分比
+  if (gauge?.displayLabel) return gauge.displayLabel;
+  return percent == null ? '—' : `${Math.round(percent)}%`;
+}
+
+function QuotaRings({ gauges, hideText }: { gauges: QuotaGauge[]; hideText?: boolean }) {
+  // 修改原因：RackSingleRing 与 RackOAuthRings 的调用点原先按 OAuth 与普通 Key 分支选择，后续 quota 类型会继续增加。
+  // 修改方式：按 gauges 数量决定空态、单环或双环，三项以上沿用前两个 gauge，并在内部复用原有圆环样式参数。
+  // 目的：让机房卡片和完整 Key 行都走同一个圆环渲染路径。
+  const visibleGauges = Array.isArray(gauges) ? gauges.filter(Boolean).slice(0, 2) : [];
+
+  if (visibleGauges.length === 0) {
+    return (
+      <div className="relative flex h-12 w-12 items-center justify-center" title="暂无额度数据">
+        <svg className="h-12 w-12" viewBox="0 0 64 64" aria-hidden="true">
+          <RackRingCircle radius={25} strokeWidth={6} percent={null} color="#334155" trackOpacity={0.45} />
+        </svg>
+        {!hideText && <span className="absolute inset-0 flex items-center justify-center text-[11px] font-bold font-mono text-muted-foreground">—</span>}
+      </div>
+    );
+  }
+
+  if (visibleGauges.length === 1) {
+    const gauge = visibleGauges[0];
+    const mode = gauge.display_mode || (gauge.percent != null ? 'percent' : 'quota');
+    const displayText = getQuotaRingText(gauge, gauge.percent ?? null);
+    const textSize = displayText.length > 5 ? 'text-[8px]' : 'text-[11px]';
+
+    if (mode === 'quota') {
+      // quota 模式：available 对比 100 画弧线 + 金额文字
+      const pct = clampRackPercent(gauge.percent);
+      const stroke = getQuotaGaugeStrokeColor(gauge, pct, '');
+      return (
+        <div className="relative flex h-12 w-12 items-center justify-center" title={`余额: ${displayText}`}>
+          <svg className="h-12 w-12" viewBox="0 0 64 64" aria-hidden="true">
+            <RackRingCircle radius={25} strokeWidth={6} percent={pct} color={stroke} trackOpacity={pct == null ? 0.45 : 0.8} />
+          </svg>
+          {!hideText && <span className={`absolute inset-0 flex items-center justify-center ${textSize} font-bold font-mono ${getQuotaRingTextClass(gauge, pct)}`}>{displayText}</span>}
+        </div>
+      );
+    }
+
+    // percent / amount 模式：正常弧线
+    const pct = clampRackPercent(gauge.percent);
+    const stroke = getQuotaGaugeStrokeColor(gauge, pct, '');
+    return (
+      <div className="relative flex h-12 w-12 items-center justify-center" title={`${gauge.label}: ${pct == null ? '未知' : `${pct.toFixed(1)}%`}`}>
+        <svg className="h-12 w-12" viewBox="0 0 64 64" aria-hidden="true">
+          <RackRingCircle radius={25} strokeWidth={6} percent={pct} color={stroke} trackOpacity={pct == null ? 0.45 : 0.8} />
+        </svg>
+        {!hideText && (
+          <span className={`absolute inset-0 flex items-center justify-center ${textSize} font-bold font-mono ${getQuotaRingTextClass(gauge, pct)}`}>
+            {displayText}
+          </span>
+        )}
+      </div>
+    );
+  }
+
+  const quotaInner = clampRackPercent(visibleGauges[0]?.percent);
+  const quotaOuter = clampRackPercent(visibleGauges[1]?.percent);
+  const innerColor = getQuotaGaugeStrokeColor(visibleGauges[0], quotaInner, '#60a5fa');
+  const outerColor = getQuotaGaugeStrokeColor(visibleGauges[1], quotaOuter, '#a78bfa');
+  return (
+    <div className="relative flex h-12 w-12 items-center justify-center" title={`${visibleGauges[0].label}: ${quotaInner ?? '?'}% · ${visibleGauges[1].label}: ${quotaOuter ?? '?'}%`}>
+      <svg className="h-12 w-12" viewBox="0 0 64 64" aria-hidden="true">
+        <RackRingCircle radius={26} strokeWidth={5} percent={quotaInner} color={innerColor} trackOpacity={quotaInner == null ? 0.42 : 0.74} />
+        <RackRingCircle radius={18} strokeWidth={5} percent={quotaOuter} color={outerColor} trackOpacity={quotaOuter == null ? 0.35 : 0.68} />
+      </svg>
+      {!hideText && (
+        <span className={`absolute inset-0 flex items-center justify-center text-[11px] font-bold font-mono ${getQuotaRingTextClass(visibleGauges[0], quotaInner)}`}>
+          {getQuotaRingText(visibleGauges[0], quotaInner)}
         </span>
       )}
     </div>
@@ -979,11 +1281,15 @@ function RackCoolingBorder({ remainSec, totalDuration }: { remainSec: number; to
   );
 }
 
-function RackCard({ idx, keyObj, providerName, engine, runtimeKeyStatus, localCountdowns, balanceResults, oauthAccounts, isOAuthEngine, onFocus, onImport, onLogin }: {
+function RackCard({ idx, keyObj, providerName, engine, enabledPlugins, runtimeKeyStatus, localCountdowns, balanceResults, oauthAccounts, isOAuthEngine, onFocus, onImport, onLogin }: {
   idx: number;
   keyObj: ApiKeyObj;
   providerName: string;
   engine: string;
+  // 修改原因：机房卡片按 engine 判断 slot 时拿不到 formData，必须由调用处把当前 provider 启用插件列表传入。
+  // 修改方式：在 RackCard props 中增加 enabledPlugins，并传给 hasUiSlot 与 UiSlot。
+  // 目的：让 oai_tier 这类 requires_plugin 的 quota_display 在紧凑卡片中按当前 provider 正确生效。
+  enabledPlugins: string[];
   runtimeKeyStatus: Record<string, { auto_disabled?: { key: string; remaining_seconds: number; duration?: number; reason?: string }[]; cooling?: any[] }>;
   localCountdowns: Record<string, Record<string, { remaining: number; duration: number }>>;
   balanceResults: Record<string, BalanceResult>;
@@ -1009,24 +1315,22 @@ function RackCard({ idx, keyObj, providerName, engine, runtimeKeyStatus, localCo
   const isGrayed = keyObj.disabled || isPermanent;
   const status = isGrayed ? 'disabled' : isCooling ? 'cooling' : 'active';
   const bal = balanceResults[keyObj.key];
-  const balPct = bal ? getBalancePercent(bal) : null;
-  const balColor = getBalanceColor(balPct);
-  const balLabel = bal ? getBalanceLabel(bal) : null;
-  // 如果余额类型不是百分比，圆环中心显示金额而非百分比
-  const ringLabel = (bal && bal.value_type !== 'percent' && balLabel) ? balLabel : null;
   const oauthAccount = oauthAccounts[keyObj.key];
-  const oauthQuota = getOAuthQuota(oauthAccount);
-  const tierLabel = getRackTierLabel(bal, oauthAccount, oauthQuota, isOAuthEngine);
-  const slotData = isOAuthEngine ? oauthQuota : bal;
-  // 修改原因：部分 OAuth 插槽只读取 account 中的订阅或 extra usage 字段，即使 getOAuthQuota 暂时没有数字也应挂载。
-  // 修改方式：把 slotData 和 oauthAccount 合并成插槽可用性判断，实际 data 仍保持与完整行一致传入 quota 或 balance。
-  // 目的：让 key_background、quota_display、quota_label 在机房模式下不因 quota 缺失而失效。
-  const slotPayloadAvailable = slotData || (isOAuthEngine ? oauthAccount : null);
+  // 修改原因：机房卡片不应再按 OAuth 与普通 Key 选择两套圆环数据来源，也不应再渲染通用 badge 标签。
+  // 修改方式：用 buildRowQuota 统一产出 gauges，并为旧 amount fallback 单独压缩圆心显示文本。
+  // 目的：卡片渲染只消费 QuotaRings；tier/plan 等标签交给 quota_display 插槽。
+  const rowQuota = buildRowQuota(bal, oauthAccount, isOAuthEngine);
+  const rackGauges = withRackCompactBalanceFallback(rowQuota.gauges, bal);
+  const rowQuotaHasValues = rowQuota.gauges.length > 0;
+  const slotData = buildRowQuotaSlotData(bal, oauthAccount, rowQuota);
+  // 修改原因：部分渠道插槽只读取账号或 balance 上下文，即使标准 quota 数字暂时没有返回也应挂载。
+  // 修改方式：按 slotData、OAuth 账号和统一 rowQuota 是否有内容综合判断，不再使用 OAuth 展示分支。
+  // 目的：让 key_background、quota_display 在机房模式下不因标准双额度缺失而失效。
+  const slotPayloadAvailable = Boolean(slotData || oauthAccount || rowQuotaHasValues);
   const slotContext = { account: oauthAccount, keyObj, balance: bal };
-  const hasKeyBorderSlot = hasUiSlot(engine, 'key_border');
-  const hasKeyBackgroundSlot = hasUiSlot(engine, 'key_background');
-  const hasQuotaDisplaySlot = hasUiSlot(engine, 'quota_display');
-  const hasQuotaLabelSlot = hasUiSlot(engine, 'quota_label');
+  const hasKeyBorderSlot = hasUiSlot(engine, 'key_border', enabledPlugins);
+  const hasKeyBackgroundSlot = hasUiSlot(engine, 'key_background', enabledPlugins);
+  const hasQuotaDisplaySlot = hasUiSlot(engine, 'quota_display', enabledPlugins);
   const isOAuthEmpty = isOAuthEngine && !keyObj.key.trim();
   const labelText = formatRackKeyLabel(keyObj);
   const title = `${idx + 1}. ${keyObj.label || keyObj.key || '空账号'}${isCooling ? ` · 冷却 ${formatCountdown(remainSec)}` : ''}`;
@@ -1040,7 +1344,6 @@ function RackCard({ idx, keyObj, providerName, engine, runtimeKeyStatus, localCo
   // 修改方式：所有机房卡片统一使用普通边框，冷却进度只由圆环承担。
   // 目的：去掉旧的黄色硬编码冷却边框，保留状态表达但降低干扰。
   const cardBorder = 'border-border';
-  const balanceTextClass = getRackBalanceTextClass(balColor);
   // 修改原因：机房卡片原先复用 muted 半透明背景，浅色主题下与滚动区域层次不够清楚。
   // 修改方式：浅色主题使用 card 表面，深色主题继续使用 muted 半透明表面以维持原暗色观感。
   // 目的：让大量机房卡片在两种主题下都有明确边界和稳定背景。
@@ -1069,32 +1372,32 @@ function RackCard({ idx, keyObj, providerName, engine, runtimeKeyStatus, localCo
       className={`relative h-[92px] overflow-hidden rounded-lg border ${cardSurfaceClass} text-foreground transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 ${cardBorder} ${isGrayed ? 'opacity-50' : 'hover:border-muted-foreground/30'}`}
       style={{ width: 'calc((100% - 5 * 6px) / 6)', isolation: 'isolate' }}
     >
-      {/* 修改原因：key_border 和 key_background 插槽在完整行模式已有挂载点，机房卡片也必须保留同等扩展能力。
-          修改方式：把 key_background 放在卡片背景层，把 key_border 放在外层绝对覆盖层，并透传 quota/account/balance 上下文。
-          目的：保证渠道自定义边框、背景和额度装饰在紧凑视图中不丢失。 */}
+      {/* 修改原因：key_border 和 key_background 插槽在完整行模式已有挂载点，机房卡片也必须保留同等扩展能力；渠道脚本还需要知道当前是小卡片布局。
+          修改方式：把 key_background 放在卡片背景层，把 key_border 放在外层绝对覆盖层，并透传 quota/account/balance 上下文和 mode: 'rack'。
+          目的：保证渠道自定义边框、背景和额度装饰在紧凑视图中不丢失，同时避免完整行样式进入机房卡片。 */}
       {hasKeyBackgroundSlot && slotPayloadAvailable && (
-        <UiSlot engine={engine} slot="key_background" data={slotData} context={slotContext} element="div" className="absolute inset-0 z-0 rounded-xl pointer-events-none" />
+        <UiSlot engine={engine} slot="key_background" data={slotData} context={{ ...slotContext, mode: 'rack' }} element="div" className="absolute inset-0 z-0 rounded-xl pointer-events-none" enabledPlugins={enabledPlugins} />
       )}
       {hasKeyBorderSlot && slotPayloadAvailable && (
-        <UiSlot engine={engine} slot="key_border" data={slotData} context={slotContext} element="div" className="absolute inset-0 z-[3] pointer-events-none" />
+        <UiSlot engine={engine} slot="key_border" data={slotData} context={{ ...slotContext, mode: 'rack' }} element="div" className="absolute inset-0 z-[3] pointer-events-none" enabledPlugins={enabledPlugins} />
       )}
       {isCooling && <RackCoolingBorder remainSec={remainSec} totalDuration={totalDuration} />}
       <span className={`absolute right-1.5 top-1.5 z-[4] h-2 w-2 rounded-full ring-2 ring-card ${statusClass}`} title={status} />
       <div className="relative z-[2] flex h-full flex-col items-center px-1 pb-1.5 pt-2">
         <div className="relative flex h-12 w-12 items-center justify-center">
-          {isOAuthEngine ? (
-            <RackOAuthRings quota={oauthQuota} hideText={hasQuotaDisplaySlot && !!slotPayloadAvailable} />
-          ) : (
-            <RackSingleRing percent={balPct} textClassName={balanceTextClass} label={ringLabel} />
-          )}
-          {/* 修改原因：冷却圆环中心必须显示倒计时，quota_display 再覆盖上去会遮挡剩余秒数。
-              修改方式：quota_display 仍挂载在非冷却卡片的圆环中心，冷却卡片改由 RackCoolingRing 独占中心区域。
-              目的：同时保证普通额度插槽可用，以及冷却状态倒计时清晰可见。 */}
+          {/* 修改原因：机房卡片不能再按 OAuth 与普通 Key 分支选择 RackOAuthRings 或 RackSingleRing。
+              修改方式：统一把 rowQuota.gauges 交给 QuotaRings，由组件内部按数量决定空环、单环或双环。
+              目的：新增 quota 类型时不需要继续修改卡片渲染分支。 */}
+          <QuotaRings gauges={rackGauges} hideText={hasQuotaDisplaySlot && slotPayloadAvailable} />
+          {/* 修改原因：冷却圆环中心必须显示倒计时，quota_display 再覆盖上去会遮挡剩余秒数；OAuth 渠道完整行标签在圆环中心会溢出。
+              修改方式：quota_display 仍挂载在非冷却卡片的圆环中心，并透传 mode: 'rack'，外层容器增加 overflow-hidden 和 max-w-full。
+              目的：同时保证普通额度插槽可用、冷却状态倒计时清晰可见，并限制机房卡片中心文字宽度。 */}
           {hasQuotaDisplaySlot && slotPayloadAvailable && (
-            <div className="absolute inset-0 z-[5] flex items-center justify-center">
-              <UiSlot engine={engine} slot="quota_display" data={slotData} context={slotContext} element="div" className="flex items-center justify-center text-[10px]" />
+            <div className="absolute inset-0 z-[5] flex items-center justify-center overflow-hidden max-w-full">
+              <UiSlot engine={engine} slot="quota_display" data={slotData} context={{ ...slotContext, mode: 'rack' }} element="div" className="flex items-center justify-center text-[10px]" enabledPlugins={enabledPlugins} />
             </div>
           )}
+
           {isOAuthEmpty && (
             <div className={emptyOAuthOverlayClass}>
               <button
@@ -1117,17 +1420,8 @@ function RackCard({ idx, keyObj, providerName, engine, runtimeKeyStatus, localCo
           )}
         </div>
         <div className="mt-auto w-full text-center">
+
           <div className={`truncate text-[10px] font-semibold font-mono ${isCooling ? 'text-red-400 dark:text-red-300 line-through decoration-red-500/40' : 'text-foreground'}`} title={keyObj.label || keyObj.key || labelText}>{labelText}</div>
-          <div className="mt-1 flex min-h-[16px] items-center justify-center gap-1 overflow-hidden">
-            {/* 修改原因：quota_label 插槽在完整行底部显示渠道额外标签，机房卡片底部也需要保留该插槽位置。
-                修改方式：优先在底部标签区挂载 quota_label；没有该插槽时显示通用 tier 药丸。
-                目的：保持渠道专属标签和通用 tier 标签都能在紧凑卡片中展示。 */}
-            {hasQuotaLabelSlot && slotPayloadAvailable ? (
-              <UiSlot engine={engine} slot="quota_label" data={slotData} context={slotContext} className="max-w-full truncate" />
-            ) : (hasQuotaDisplaySlot && slotPayloadAvailable) ? null : tierLabel ? (
-              <span className={`max-w-full truncate rounded-full border px-1.5 py-0.5 text-[9px] font-bold leading-none ${getRackTierClass(tierLabel)}`}>{tierLabel}</span>
-            ) : null}
-          </div>
         </div>
       </div>
       {/* 修改原因：卡片选中后的编辑入口已改为展开完整行，旧的底部小按钮弹层太小且不能编辑 Key。
@@ -1178,6 +1472,7 @@ export default function Channels() {
   const [balanceResults, setBalanceResults] = useState<Record<string, BalanceResult>>({});
   const [balanceLoading, setBalanceLoading] = useState(false);
   const [focusedKeyIdx, setFocusedKeyIdx] = useState<number | null>(null);
+  const [forceListMode, setForceListMode] = useState(false);
 
   // 修改原因：OAuth 类型引擎需要展示已导入账号状态，并允许把 refresh_token 导入为账号标识。
   // 修改方式：新增账号列表、导入弹窗目标下标、待提交 token 和提交中状态。
@@ -1201,10 +1496,18 @@ export default function Channels() {
   // 目的：只在 OAuth 覆盖弹窗打开期间放行 portal 焦点，关闭后恢复编辑抽屉原有的模态行为。
   const isOAuthOverlayOpen = importModalIdx !== null || oauthManualState !== null;
   const selectedChannelType = channelTypes.find(c => c.id === (formData?.engine || ''));
-  // 修改原因：后端已经能返回 is_oauth，但旧部署或加载失败时仍需要保留前端硬编码兜底。
-  // 修改方式：优先读取渠道类型的 is_oauth，缺失时回退到 OAUTH_ENGINES 集合。
-  // 目的：新增 OAuth 引擎只要后端注册标记正确，前端余额和配置区域即可自动适配。
-  const isOAuthEngine = selectedChannelType?.is_oauth ?? OAUTH_ENGINES.has(formData?.engine || '');
+  // 修改原因：OAuth 引擎归属已经由后端渠道元数据声明，前端硬编码集合会与后端注册结果分歧。
+  // 修改方式：只读取 selectedChannelType.is_oauth，字段缺失时按 false 处理。
+  // 目的：让 Channels.tsx 不再猜测 engine 名称，OAuth 管理分支完全跟随后端配置。
+  const isOAuthEngine = selectedChannelType?.is_oauth ?? false;
+  // 修改原因：不同 OAuth 渠道的 refresh_token 样式不同，且 ui_slots 现在可能返回带 requires_plugin 的对象。
+  // 修改方式：从 selectedChannelType.ui_slots.import_placeholder 只读取纯字符串；为空、对象或 export 脚本时使用通用兜底。
+  // 目的：让后端渠道元数据控制占位符，同时避免把内联 JavaScript 或条件对象显示给用户。
+  const rawImportPlaceholderValue = selectedChannelType?.ui_slots?.import_placeholder;
+  const rawImportPlaceholder = typeof rawImportPlaceholderValue === 'string' ? rawImportPlaceholderValue : undefined;
+  const importPlaceholder = rawImportPlaceholder && !rawImportPlaceholder.trimStart().startsWith('export')
+    ? rawImportPlaceholder
+    : 'refresh_token...';
 
   // ── 全局配置（用于价格提示等）──
   const [globalModelPrice, setGlobalModelPrice] = useState<Record<string, string>>({});
@@ -1391,10 +1694,10 @@ export default function Channels() {
       if (typesRes.ok) {
         const data = await typesRes.json();
         const channelList = data.channels || [];
-        // 修改原因：UiSlot 需要按 engine + 插槽名获取渠道内联 JS 脚本。
-        // 修改方式：在渠道列表加载成功后，把各渠道的 ui_slots 缓存到 window.__uiSlots。
-        // 目的：后续插槽组件渲染时可按 engine + slot 名查找并动态加载。
-        const uiSlots: Record<string, Record<string, string>> = {};
+        // 修改原因：UiSlot 需要按 engine + 插槽名获取渠道内联 JS 脚本，且后端可能为插件门控 slot 返回条件对象。
+        // 修改方式：在渠道列表加载成功后，把各渠道的 ui_slots 以 UiSlotValue 类型缓存到 window.__uiSlots。
+        // 目的：后续插槽组件渲染时可按 engine、slot 名和 enabled_plugins 查找并动态加载。
+        const uiSlots: Record<string, Record<string, UiSlotValue>> = {};
         for (const ch of channelList) {
           if (ch.ui_slots) uiSlots[ch.id] = ch.ui_slots;
         }
@@ -1501,7 +1804,10 @@ export default function Channels() {
         return;
       }
       const data = await res.json();
-      setOauthAccounts(data || {});
+      // 修改原因：后端账号状态可能仍带旧 quota_5h/quota_7d 字段，后续 UI 只应读取前端新字段。
+      // 修改方式：写入 state 前统一转换为 quota_inner/quota_outer，保留其余账号状态。
+      // 目的：避免旧后端字段穿透到渲染层造成字段名混用。
+      setOauthAccounts(normalizeOAuthAccountStateMap(data));
     } catch {
       setOauthAccounts({});
     }
@@ -1524,13 +1830,19 @@ export default function Channels() {
     if (!isModalOpen || !isOAuthEngine) return;
     const providerName = (formData?.provider || '').trim();
     if (!providerName) return;
-    const targets = Object.entries(oauthAccounts).filter(([, account]) => (
-      account?.status === 'active'
-      && account.quota_5h == null
-      && account.quota_7d == null
-      && !account._quota_loading
-      && !account._quota_unavailable
-    ));
+    const targets = Object.entries(oauthAccounts).filter(([, account]) => {
+      // 修改原因：账号状态可能来自旧 quota_5h/quota_7d 缓存，判断是否缺少额度也要经过统一映射。
+      // 修改方式：用 getOAuthQuota 读取 quota_inner/quota_outer，而不是直接访问账号上的历史字段。
+      // 目的：避免旧字段导致前端重复触发或漏掉自动配额刷新。
+      const accountQuota = getOAuthQuota(account);
+      return (
+        account?.status === 'active'
+        && accountQuota?.quota_inner == null
+        && accountQuota?.quota_outer == null
+        && !account._quota_loading
+        && !account._quota_unavailable
+      );
+    });
     if (targets.length === 0) return;
 
     // 标记所有目标为 loading
@@ -1572,19 +1884,20 @@ export default function Channels() {
             const { _quota_loading: _unusedLoading, ...accountWithoutLoading } = current;
             const result = perAccount[keyId] || data;
             if (result && typeof result === 'object') {
-              const hasQuota = result.quota_5h != null || result.quota_7d != null;
+              // 修改原因：/balance 结果可能继续使用后端旧 quota_5h/quota_7d 字段，写入账号状态前必须转换。
+              // 修改方式：复用 getQuotaFromSource 得到 quota_inner/quota_outer，再按新字段保存。
+              // 目的：让后续渲染和插槽数据不再依赖旧字段名。
+              const quotaResult = getQuotaFromSource(result);
+              const hasQuota = quotaResult?.quota_inner != null || quotaResult?.quota_outer != null;
               next[keyId] = {
                 ...accountWithoutLoading,
-                ...(result.quota_5h != null ? { quota_5h: result.quota_5h } : {}),
-                ...(result.quota_7d != null ? { quota_7d: result.quota_7d } : {}),
+                ...(quotaResult?.quota_inner != null ? { quota_inner: quotaResult.quota_inner } : {}),
+                ...(quotaResult?.quota_outer != null ? { quota_outer: quotaResult.quota_outer } : {}),
                 ...(result.raw ? { quota_raw: result.raw } : {}),
-                ...(result.extra_usage_enabled ? {
-                  extra_usage_enabled: true,
-                  extra_usage_limit: result.extra_usage_limit,
-                  extra_usage_used: result.extra_usage_used,
-                  extra_usage_utilization: result.extra_usage_utilization,
-                } : {}),
-                _quota_unavailable: !hasQuota && !result.extra_usage_enabled,
+                // 修改原因：渠道专属用量字段应由后端 raw 和 ui_slots 自行解释，通用账号状态不再复制具体字段名。
+                // 修改方式：只按标准 quota_inner/quota_outer 字段判断本次是否拿到默认双弧可用数据。
+                // 目的：避免 Channels.tsx 与某个渠道的私有额度结构继续耦合。
+                _quota_unavailable: !hasQuota,
               };
             } else {
               next[keyId] = { ...accountWithoutLoading, _quota_unavailable: true };
@@ -1772,6 +2085,10 @@ export default function Channels() {
           enabled_plugins: Array.isArray(basePreferences.enabled_plugins) ? basePreferences.enabled_plugins : [],
         },
         sub_channels: subChannels,
+        // 修改原因：复制渠道打开编辑面板时，来源 provider 只存在于传入副本上。
+        // 修改方式：初始化表单时把 _copiedFrom 带入表单态，后续保存成功后用于复制 OAuth state。
+        // 目的：保留复制来源信息，同时不影响普通编辑渠道。
+        _copiedFrom: activeProvider._copiedFrom || undefined,
       });
     } else {
       setHeaderEntries([]);
@@ -1868,7 +2185,11 @@ export default function Channels() {
             // 修改原因：OAuth Key 行不读取普通 balanceResults 标签，而是从 oauthAccounts 中渲染双弧 quota。
             // 修改方式：余额按钮拿到 OAuth quota 后同步写回对应账号状态，保留旧账号字段并清除加载标记。
             // 目的：用户手动点击余额后可以立即看到 OAuth 配额刷新结果。
-            const hasQuota = resultForKey?.quota_5h != null || resultForKey?.quota_7d != null;
+            // 修改原因：手动余额刷新同样可能拿到后端旧 quota_5h/quota_7d 字段，不能直接写入前端状态。
+            // 修改方式：复用 getQuotaFromSource 将结果映射为 quota_inner/quota_outer 后再保存。
+            // 目的：保证按钮刷新和自动刷新使用同一套字段兼容逻辑。
+            const quotaResult = getQuotaFromSource(resultForKey);
+            const hasQuota = quotaResult?.quota_inner != null || quotaResult?.quota_outer != null;
             setOauthAccounts(prev => {
               const current = prev[keyObj.key];
               if (!hasQuota && !current) return prev;
@@ -1878,16 +2199,13 @@ export default function Channels() {
                 [keyObj.key]: {
                   status: accountWithoutLoading.status || 'active',
                   ...accountWithoutLoading,
-                  ...(resultForKey?.quota_5h != null ? { quota_5h: resultForKey.quota_5h } : {}),
-                  ...(resultForKey?.quota_7d != null ? { quota_7d: resultForKey.quota_7d } : {}),
+                  ...(quotaResult?.quota_inner != null ? { quota_inner: quotaResult.quota_inner } : {}),
+                  ...(quotaResult?.quota_outer != null ? { quota_outer: quotaResult.quota_outer } : {}),
                   ...(resultForKey?.raw ? { quota_raw: resultForKey.raw } : {}),
-                  ...(resultForKey?.extra_usage_enabled ? {
-                    extra_usage_enabled: true,
-                    extra_usage_limit: resultForKey.extra_usage_limit,
-                    extra_usage_used: resultForKey.extra_usage_used,
-                    extra_usage_utilization: resultForKey.extra_usage_utilization,
-                  } : {}),
-                  _quota_unavailable: !hasQuota && !resultForKey?.extra_usage_enabled,
+                  // 修改原因：手动余额刷新同样不应复制渠道私有用量字段到通用账号状态。
+                  // 修改方式：只同步标准 quota 字段和 raw，并用标准 quota 是否存在标记默认双弧可用性。
+                  // 目的：让 claude-code 等渠道的额外展示完全通过 key_background 与 quota_display 插槽处理。
+                  _quota_unavailable: !hasQuota,
                 },
               };
             });
@@ -2470,6 +2788,10 @@ export default function Channels() {
     const copy = JSON.parse(JSON.stringify(provider));
     const originalName = copy.provider || 'channel';
     copy.provider = `${originalName}_copy`;
+    // 修改原因：OAuth 渠道复制后还需要复制后端按 provider 分组保存的 token state。
+    // 修改方式：在复制出的表单对象上写入临时 _copiedFrom 字段，保存成功后据此调用后端复制接口。
+    // 目的：只在前端流程中保存来源信息，不把临时字段写入 api.yaml。
+    copy._copiedFrom = originalName;
     openModal(copy, null);
     toastSuccess('已复制渠道配置，请修改后保存');
   };
@@ -3473,6 +3795,26 @@ export default function Channels() {
         });
 
       if (res.ok) {
+        if (!editingSubChannel && providerSaveMethod === 'POST' && formData._copiedFrom && isOAuthEngine) {
+          // 修改原因：复制 OAuth 渠道保存后，api.yaml 已有新渠道账号 key，但 OAuthManager 中还没有目标 provider 的 token state。
+          // 修改方式：创建 provider 成功后调用 /v1/oauth/copy-provider，把来源 provider 下缺失的账号 state 深拷贝到新 provider。
+          // 目的：让复制出的 OAuth 渠道不需要重新登录或重新导入 token 即可正常请求。
+          const copyStateRes = await apiFetch('/v1/oauth/copy-provider', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({
+              source_provider: formData._copiedFrom,
+              target_provider: formData.provider,
+            }),
+          });
+          if (!copyStateRes.ok) {
+            const err = await copyStateRes.json().catch(() => ({}));
+            // 修改原因：provider 创建已经成功，若此处直接 return，用户会停留在无法再次 POST 保存的旧弹窗状态。
+            // 修改方式：仅提示 OAuth state 复制失败，随后继续刷新后端 provider 列表并关闭弹窗。
+            // 目的：让界面反映已保存的新渠道，同时明确告知 token state 复制需要排查。
+            toastError(fmtErr(err, copyStateRes.status), 'OAuth state 复制失败');
+          }
+        }
         // PUT 编辑走单渠道刷新；POST 新增走全量刷新（需要获取后端分配的完整对象）
         const savedProviderId = editingSubChannel
           ? subChannelParentProviderId
@@ -4138,18 +4480,26 @@ export default function Channels() {
       const isFocused = focusedKeyIdx === idx;
       // 修改原因：机房展开行使用 focusedKeyIdx 作为“展开”状态，但完整行原本会在 focused 时隐藏边框、背景和额度插槽。
       // 修改方式：增加 showDecorationsWhileFocused 选项，只有机房展开行开启时才在聚焦状态继续渲染这些插槽。
-      // 目的：让 key_border、key_background、quota_display 和 quota_label 在机房展开行中不被误隐藏。
+      // 目的：让 key_border、key_background 和 quota_display 在机房展开行中不被误隐藏。
       const showRowDecorations = !isFocused || options.showDecorationsWhileFocused;
       const bal = balanceResults[keyObj.key];
       const oauthAccount = oauthAccounts[keyObj.key];
-      const oauthQuota = getOAuthQuota(oauthAccount);
-      // 修改原因：Key 行只应知道通用插槽名，不能在渲染层读取 CC extra_usage 等渠道专属字段。
-      // 修改方式：按当前 engine 查询各插槽是否存在，后续只决定挂载点和默认回退。
-      // 目的：把边框、背景、额外标签和额度标签的渠道差异全部交给 ui_slots 脚本。
-      const hasKeyBorderSlot = hasUiSlot(formData.engine, 'key_border');
-      const hasKeyBackgroundSlot = hasUiSlot(formData.engine, 'key_background');
-      const hasQuotaDisplaySlot = hasUiSlot(formData.engine, 'quota_display');
-      const hasQuotaLabelSlot = hasUiSlot(formData.engine, 'quota_label');
+      // 修改原因：完整 Key 行的额度展示不应再先判断 OAuth 或普通余额，也不应再渲染通用 badge 标签。
+      // 修改方式：统一调用 buildRowQuota 得到 gauges，再从 gauges 派生默认边框需要的 inner/outer 兼容数据。
+      // 目的：QuotaRings、QuotaBorderOverlay 和 UiSlot 共享同一个行模型，tier/plan 展示交给 quota_display。
+      const rowQuota = buildRowQuota(bal, oauthAccount, isOAuthEngine);
+      const rowQuotaPair = getQuotaPairFromGauges(rowQuota.gauges);
+      const rowQuotaHasValues = rowQuota.gauges.length > 0;
+      const slotData = buildRowQuotaSlotData(bal, oauthAccount, rowQuota);
+      const slotPayloadAvailable = Boolean(slotData || oauthAccount || rowQuotaHasValues);
+      const slotContext = { account: oauthAccount, keyObj, balance: bal };
+      const enabledPlugins = formData.preferences.enabled_plugins || [];
+      // 修改原因：Key 行只应知道通用插槽名，不能在渲染层读取渠道专属字段。
+      // 修改方式：按当前 engine 和 provider.enabled_plugins 查询各插槽是否存在，后续只决定挂载点和默认回退。
+      // 目的：把边框、背景和额度标签的渠道差异全部交给 ui_slots 脚本，并正确处理 requires_plugin 条件。
+      const hasKeyBorderSlot = hasUiSlot(formData.engine, 'key_border', enabledPlugins);
+      const hasKeyBackgroundSlot = hasUiSlot(formData.engine, 'key_background', enabledPlugins);
+      const hasQuotaDisplaySlot = hasUiSlot(formData.engine, 'quota_display', enabledPlugins);
 
       if (isCooling) {
         return (
@@ -4177,15 +4527,7 @@ export default function Channels() {
 
       const balPct = bal ? getBalancePercent(bal) : null;
       const balColor = getBalanceColor(balPct);
-      const balLabel = bal ? getBalanceLabel(bal) : null;
-      // 修改原因：普通渠道余额结果现在可能包含 oai_tier 注入的 tier，即使没有可格式化余额也要预留标签空间。
-      // 修改方式：从 balanceResults 读取 tier 并去空白，后续与 balLabel 组合显示。
-      // 目的：让非 OAuth OpenAI 渠道可以在 Key 行显示 Tier 3 | $12.50 这类标签。
-      const tierLabel = typeof bal?.tier === 'string' && bal.tier.trim() ? bal.tier.trim() : null;
-      // 修改原因：右侧标签是否存在现在也可能由渠道插槽或普通渠道 tier 标签决定，不能只按内置余额标签计算遮罩。
-      // 修改方式：把普通 tier 标签以及 quota_display、quota_label 的插槽存在性纳入 hasTag，具体内容仍由各自逻辑渲染。
-      // 目的：保证 Key 备注遮罩在自定义插槽标签或 Tier 标签存在时仍给右侧留出空间。
-      const hasTag = !isGrayed && (!!balLabel || !!tierLabel || isPermanent || (isOAuthEngine && (!!oauthQuota || !!oauthAccount || hasQuotaDisplaySlot || hasQuotaLabelSlot)));
+      const hasTag = !isGrayed && (rowQuotaHasValues || isPermanent || (hasQuotaDisplaySlot && slotPayloadAvailable) || !!oauthAccount || !!bal);
 
       return (
         <div
@@ -4198,22 +4540,24 @@ export default function Channels() {
           }}
           className={`relative flex items-center gap-2 px-3 py-2 rounded-lg border transition-colors ${isFocused ? 'border-blue-500' : 'border-border'} ${isGrayed ? (isFocused ? 'bg-muted/30' : 'bg-muted/30 opacity-50') : 'bg-muted/50'}`}
         >
-          {/* 修改原因：key 行边框可能由渠道自定义，但默认 OAuth 双弧仍是平台通用能力。
-              修改方式：存在 key_border 插槽时挂载 absolute div 并传入 quota/account；不存在时保留 QuotaBorderOverlay。
-              目的：让渠道可以覆盖边框弧，同时不影响未注册插槽的 OAuth 渠道。 */}
-          {isOAuthEngine && showRowDecorations && oauthQuota && (
+          {/* 修改原因：key 行边框可能由渠道自定义，但默认双弧边框已经是平台通用能力；渠道脚本需要知道这里是完整行布局。
+              修改方式：存在 key_border 插槽时挂载 absolute div 并传入当前行上下文和 mode: 'row'；不存在时用 rowQuotaPair 渲染 QuotaBorderOverlay。
+              目的：让 OAuth 和普通 Key 的双 gauge 都能使用同一套默认边框，并保持完整行样式不受机房卡片逻辑影响。 */}
+          {showRowDecorations && rowQuotaPair && (
             hasKeyBorderSlot
-              ? <UiSlot engine={formData.engine} slot="key_border" data={oauthQuota} context={{ account: oauthAccount }} element="div" className="absolute inset-0 pointer-events-none z-[1]" />
-              : <QuotaBorderOverlay quota5h={oauthQuota.quota_5h} quota7d={oauthQuota.quota_7d} />
+              ? <UiSlot engine={formData.engine} slot="key_border" data={slotData} context={{ ...slotContext, mode: 'row' }} element="div" className="absolute inset-0 pointer-events-none z-[1]" enabledPlugins={enabledPlugins} />
+              : <QuotaBorderOverlay quotaInner={rowQuotaPair.quota_inner} quotaOuter={rowQuotaPair.quota_outer} />
           )}
-          {/* 修改原因：OAuth 额外用量背景条属于渠道专属 UI，通用前端不应读取 extra_usage 字段或计算颜色。
-              修改方式：仅在渠道注册 key_background 插槽时挂载覆盖整行的 absolute div，并把 quota/account 透传给脚本。
-              目的：删除 extra_usage 背景条硬编码，让 CC 等渠道在 channel.py 中自行实现背景条。 */}
-          {isOAuthEngine && showRowDecorations && oauthAccount && hasKeyBackgroundSlot && (
-            <UiSlot engine={formData.engine} slot="key_background" data={oauthQuota} context={{ account: oauthAccount }} element="div" className="absolute inset-0 pointer-events-none rounded-[7px] z-0 transition-all duration-500" />
+          {/* 修改原因：背景装饰属于渠道自定义 UI，通用前端不应读取任何渠道私有字段或计算专属颜色；完整行背景条应继续横向填充。
+              修改方式：只要渠道注册 key_background 插槽且当前行有可用上下文，就挂载覆盖整行的 absolute div，并传入 mode: 'row'。
+              目的：让各渠道在自己的 ui_slots 中实现背景条，Channels.tsx 只提供挂载点，同时保留完整行旧布局。 */}
+          {showRowDecorations && slotPayloadAvailable && hasKeyBackgroundSlot && (
+            <UiSlot engine={formData.engine} slot="key_background" data={slotData} context={{ ...slotContext, mode: 'row' }} element="div" className="absolute inset-0 pointer-events-none rounded-[7px] z-0 transition-all duration-500" enabledPlugins={enabledPlugins} />
           )}
-          {/* 普通余额背景条 */}
-          {!isOAuthEngine && !isFocused && balColor && balPct != null && (
+          {/* 修改原因：普通余额背景条是默认回退背景；如果渠道提供 key_background 插槽，应由插槽接管背景表达。
+              修改方式：普通背景条增加 !hasKeyBackgroundSlot 条件，避免两层背景互相覆盖。
+              目的：在保留默认余额条的同时，让自定义背景拥有明确优先级。 */}
+          {!hasKeyBackgroundSlot && !isFocused && balColor && balPct != null && (
             <div className="absolute left-0 top-0 bottom-0 rounded-[7px] z-0 pointer-events-none transition-all duration-500"
                  style={{ width: `${Math.max(1, balPct)}%`, background: BALANCE_FILL_COLORS[balColor] }} />
           )}
@@ -4245,34 +4589,21 @@ export default function Channels() {
               </button>
             </>
           )}
-          {/* 修改原因：quota_display 只是通用插槽之一，加载逻辑已泛化，调用点不应继续依赖旧单一额度插槽。
-              修改方式：存在 quota_display 插槽时挂载 UiSlot，并把当前 OAuth 账号作为 context 传给渠道脚本；否则保留默认 QuotaArcs 百分比标签。
-              目的：兼容 Antigravity、Codex 和 CC 的自定义标签，同时让 CC 能从 account 读取 subscription_type。 */}
-          {isOAuthEngine && showRowDecorations && oauthQuota && (
-            hasQuotaDisplaySlot
-              ? <UiSlot engine={formData.engine} slot="quota_display" data={oauthQuota} context={{ account: oauthAccount }} className="flex-shrink-0 relative z-[2]" />
-              : <QuotaArcs quota5h={oauthQuota.quota_5h} quota7d={oauthQuota.quota_7d} />
+          {/* 修改原因：完整行额度展示需要继续使用渠道的完整标签样式，不能被机房卡片短文本分支影响。
+              修改方式：quota_display 插槽优先，并在上下文中传入 mode: 'row'；没有插槽时才用内置默认。
+              目的：保持完整行 plan、tier、金额和百分比标签的旧展示能力。 */}
+          {showRowDecorations && hasQuotaDisplaySlot && slotPayloadAvailable && (
+            <UiSlot engine={formData.engine} slot="quota_display" data={slotData} context={{ ...slotContext, mode: 'row' }} className="flex-shrink-0 relative z-[2]" enabledPlugins={enabledPlugins} />
           )}
-          {isOAuthEngine && !isFocused && oauthAccount && !oauthQuota && (
+          {showRowDecorations && !isFocused && bal && !hasQuotaDisplaySlot && (
+            <span className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] ${TAG_CLASSES[getBalanceColor(getBalancePercent(bal)) || 'green']}`}>{getBalanceLabel(bal)}</span>
+          )}
+
+          {isOAuthEngine && !isFocused && oauthAccount && !rowQuotaHasValues && !hasQuotaDisplaySlot && (
             <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-500 relative z-[2]">
               {oauthAccount.status === 'active' ? '已连接' : oauthAccount.status === 'error' ? '刷新失败' : '冷却中'}
             </span>
           )}
-          {/* 修改原因：extra_usage 金额标签是渠道专属标签，不应由通用前端计算 remaining/limit。
-              修改方式：存在 quota_label 插槽时挂载 UiSlot 并透传 quota/account；不存在时不渲染任何额外默认标签。
-              目的：让 CC 的 $remaining / $limit 等展示由 claude_code_channel.py 维护。 */}
-          {isOAuthEngine && showRowDecorations && oauthAccount && hasQuotaLabelSlot && (
-            <UiSlot engine={formData.engine} slot="quota_label" data={oauthQuota} context={{ account: oauthAccount }} className="flex-shrink-0 relative z-[2]" />
-          )}
-          {!isOAuthEngine && !isFocused && (balLabel || tierLabel) && (() => {
-            // 修改原因：普通 OpenAI 渠道需要在现有余额标签旁显示 oai_tier 注入的 tier 字段。
-            // 修改方式：优先组合为 “Tier 3 | $12.50”，只有 tier 或只有余额时则单独显示；有余额时沿用余额颜色，只有 tier 时用蓝色弱提示样式。
-            // 目的：不改变 OAuth 插槽和配额展示，只开放普通渠道 Key 行的 Tier 标签显示。
-            const color = balColor || 'green';
-            const label = tierLabel && balLabel ? `${tierLabel} | ${balLabel}` : (tierLabel || balLabel);
-            const tagClass = balLabel ? TAG_CLASSES[color] : 'text-blue-400 bg-blue-500/12';
-            return <span className={`flex-shrink-0 text-[10px] font-semibold font-mono px-1.5 py-0.5 rounded relative z-[2] ${tagClass}`}>{label}</span>;
-          })()}
           {!isFocused && isPermanent && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/15 text-red-500 dark:text-red-400 font-medium flex-shrink-0 relative z-[2]">永久禁用</span>}
           {!isFocused && isPermanent && (
             <button onClick={async () => { await apiFetch('/v1/channels/key_status/re_enable', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ provider: providerName, key: keyObj.key }) }); refreshKeyStatus(); }} className="text-[11px] px-2 py-0.5 rounded border border-emerald-500/50 bg-emerald-500/20 text-emerald-400 font-medium hover:bg-emerald-500/30 hover:border-emerald-400 cursor-pointer flex-shrink-0 relative z-[2] transition-colors">恢复</button>
@@ -5011,12 +5342,12 @@ export default function Channels() {
                       <label className="text-sm font-medium text-foreground mb-1.5 block">API 地址 (Base URL)</label>
                       <input type="text" value={formData.base_url} onChange={e => updateFormData('base_url', e.target.value)} placeholder="留空则使用渠道默认地址，末尾加 # 则不拼接路径后缀" className="w-full bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono outline-none text-foreground" />
                       <span className="text-xs text-muted-foreground mt-1 block">{'末尾加 # 可直接使用完整地址，不拼接路径后缀（如 https://example.com/v1/chat#）'}</span>
-                      {hasUiSlot(formData.engine, 'base_url_hint') && (
+                      {hasUiSlot(formData.engine, 'base_url_hint', formData.preferences.enabled_plugins) && (
                         <>
                           {/* 修改原因：Base URL 的补充说明可能因渠道而异，通用前端不能写死具体渠道提示文案。 */}
                           {/* 修改方式：在 Base URL 输入框下方提供 base_url_hint 挂载点，仅当当前 engine 注册该插槽时渲染 UiSlot。 */}
                           {/* 目的：让渠道自行写入 Base URL 提示，未注册时不显示任何额外 DOM 或空白。 */}
-                          <UiSlot engine={formData.engine} slot="base_url_hint" data={null} element="div" className="text-xs text-muted-foreground mt-1" />
+                          <UiSlot engine={formData.engine} slot="base_url_hint" data={null} element="div" className="text-xs text-muted-foreground mt-1" enabledPlugins={formData.preferences.enabled_plugins || []} />
                         </>
                       )}
                     </div>
@@ -5034,8 +5365,8 @@ export default function Channels() {
                           className="w-full bg-muted border border-border rounded-lg p-2.5 text-sm outline-none focus:border-primary"
                         />
                         <p className="text-[10px] text-muted-foreground">OAuth token exchange 地址，用于换取和刷新 token。不填则使用各 provider 内置默认值。</p>
-                        {hasUiSlot(formData.engine, 'token_url_hint') && (
-                          <UiSlot engine={formData.engine} slot="token_url_hint" data={null} element="div" className="text-xs text-muted-foreground mt-1" />
+                        {hasUiSlot(formData.engine, 'token_url_hint', formData.preferences.enabled_plugins) && (
+                          <UiSlot engine={formData.engine} slot="token_url_hint" data={null} element="div" className="text-xs text-muted-foreground mt-1" enabledPlugins={formData.preferences.enabled_plugins || []} />
                         )}
                       </div>
                     )}
@@ -5132,11 +5463,11 @@ export default function Channels() {
                       >
                         <Wallet className={`w-3 h-3 ${balanceLoading ? 'animate-pulse' : ''}`} /> {balanceLoading ? '查询中...' : (() => {
                           if (isOAuthEngine) {
-                            // 修改原因：OAuth 渠道的余额汇总文本可能来自渠道专属字段，通用前端不应读取 extra_usage 等具体字段。
+                            // 修改原因：OAuth 渠道的余额汇总文本可能来自渠道专属字段，通用前端不应读取具体字段。
                             // 修改方式：存在 balance_summary 插槽时只传入全部 OAuth 账号作为 context，没有插槽时显示平台默认文本。
-                            // 目的：让 CC 等渠道自行汇总余额，Channels.tsx 只保留通用按钮挂载点。
-                            return hasUiSlot(formData.engine, 'balance_summary')
-                              ? <UiSlot engine={formData.engine} slot="balance_summary" data={null} context={{ accounts: oauthAccounts }} className="inline" fallbackText="余额" />
+                            // 目的：让各渠道自行汇总余额，Channels.tsx 只保留通用按钮挂载点。
+                            return hasUiSlot(formData.engine, 'balance_summary', formData.preferences.enabled_plugins)
+                              ? <UiSlot engine={formData.engine} slot="balance_summary" data={null} context={{ accounts: oauthAccounts }} className="inline" fallbackText="余额" enabledPlugins={formData.preferences.enabled_plugins || []} />
                               : '余额';
                           } else {
                             const vals = Object.values(balanceResults).filter((b: any) => b?.supported && !b?.error);
@@ -5171,21 +5502,30 @@ export default function Channels() {
                         <Trash2 className="w-3 h-3" /> 清空
                       </button>
                       <button onClick={addEmptyKey} className="text-primary hover:text-primary/80 flex items-center gap-1"><Plus className="w-3 h-3" /> 添加密钥</button>
+                      {formData.api_keys.length >= 12 && (
+                        <button
+                          onClick={() => { setForceListMode(prev => !prev); setFocusedKeyIdx(null); }}
+                          className="text-muted-foreground hover:text-foreground flex items-center gap-1 transition-colors"
+                          title={forceListMode ? '切换到机房模式' : '切换到完整行模式'}
+                        >
+                          {forceListMode ? <LayoutGrid className="w-3.5 h-3.5" /> : <LayoutList className="w-3.5 h-3.5" />}
+                        </button>
+                      )}
                     </div>
                   </div>
-                  {hasUiSlot(formData.engine, 'key_hint') && (
+                  {hasUiSlot(formData.engine, 'key_hint', formData.preferences.enabled_plugins) && (
                     <>
                       {/* 修改原因：Key 列表附近的充值或使用提示属于渠道专属信息，通用前端不能硬编码具体链接或说明。 */}
                       {/* 修改方式：在 Key 列表标题下方提供 key_hint 挂载点，仅当当前 engine 注册该插槽时渲染 UiSlot。 */}
                       {/* 目的：让渠道自行写入 Key 区域提示，未注册时不显示任何额外 DOM 或空白。 */}
-                      <UiSlot engine={formData.engine} slot="key_hint" data={null} element="div" className="text-xs text-muted-foreground" />
+                      <UiSlot engine={formData.engine} slot="key_hint" data={null} element="div" className="text-xs text-muted-foreground" enabledPlugins={formData.preferences.enabled_plugins || []} />
                     </>
                   )}
                   <div data-key-scroll className="space-y-2 max-h-64 overflow-y-auto pr-1" onClick={e => { if (e.target === e.currentTarget) setFocusedKeyIdx(null); }}>
                     {/* 修改原因：当 Key 数量达到 10 个时，完整行模式会让编辑抽屉过长且难以快速浏览状态。
                         修改方式：在原滚动容器内按数量阈值切换 RackGrid/RackCard；未达到阈值时把原完整行 map 原样保留在 else 分支。
                         目的：让机房模式和完整行模式共用同一份数据、滚动区域与操作回调，同时避免改动现有完整行渲染。 */}
-                    {formData.api_keys.length >= 10 ? (
+                    {formData.api_keys.length >= 12 && !forceListMode ? (
                       <RackGrid onClick={e => { if (e.target === e.currentTarget) setFocusedKeyIdx(null); }}>
                         {formData.api_keys.map((keyObj, idx) => {
                           if (focusedKeyIdx === idx) {
@@ -5206,6 +5546,7 @@ export default function Channels() {
                               keyObj={keyObj}
                               providerName={formData.provider}
                               engine={formData.engine}
+                              enabledPlugins={formData.preferences.enabled_plugins || []}
                               runtimeKeyStatus={runtimeKeyStatus}
                               localCountdowns={localCountdowns}
                               balanceResults={balanceResults}
@@ -5896,12 +6237,12 @@ export default function Channels() {
                       <p className="text-xs text-muted-foreground mt-1">
                         失焦时自动格式化。key 为 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">all</code> 或 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">*</code> 全局生效，模型名精确匹配。dict 递归合并，数组整体覆写，key 加 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">+</code> 前缀追加数组（如 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">+tools</code>）。值为 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">null</code> 删除该字段。
                       </p>
-                      {hasUiSlot(formData.engine, 'override_hint') && (
+                      {hasUiSlot(formData.engine, 'override_hint', formData.preferences.enabled_plugins) && (
                         <>
                           {/* 修改原因：请求体覆写格式可能因渠道协议不同而不同，通用前端不能写死 Antigravity 等渠道的专属提醒。 */}
                           {/* 修改方式：在请求体覆写说明文字下方提供 override_hint 挂载点，仅当当前 engine 注册该插槽时渲染 UiSlot。 */}
                           {/* 目的：让渠道自行写入参数覆写提示，未注册时不显示任何额外 DOM 或空白。 */}
-                          <UiSlot engine={formData.engine} slot="override_hint" data={null} element="div" className="text-xs text-amber-600 dark:text-amber-400 mt-1" />
+                          <UiSlot engine={formData.engine} slot="override_hint" data={null} element="div" className="text-xs text-amber-600 dark:text-amber-400 mt-1" enabledPlugins={formData.preferences.enabled_plugins || []} />
                         </>
                       )}
                     </div>
@@ -6303,11 +6644,11 @@ export default function Channels() {
         <div tabIndex={-1} className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50" onClick={() => setImportModalIdx(null)}>
           <div className="bg-background border border-border rounded-xl p-6 w-[400px] max-w-[90vw] space-y-4" onClick={e => e.stopPropagation()}>
             <h3 className="text-sm font-semibold">导入 Refresh Token</h3>
-            <p className="text-xs text-muted-foreground">从 CLIProxyAPI 配置或本地 OAuth 文件中复制 refresh_token 粘贴到下方</p>
+            <p className="text-xs text-muted-foreground">粘贴 refresh_token 到下方</p>
             <textarea
               value={importToken}
               onChange={e => setImportToken(e.target.value)}
-              placeholder="rt_xxxxxxxx..."
+              placeholder={importPlaceholder}
               className="w-full bg-muted border border-border rounded-lg p-3 text-sm font-mono outline-none focus:border-primary min-h-[80px] resize-none"
               autoFocus
             />
