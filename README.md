@@ -167,7 +167,11 @@ Zoaholic 支持把配置（原 `api.yaml`）持久化到数据库：
 # 后端
 python -m venv .venv
 # 激活虚拟环境后安装依赖
+# 方式一：使用 requirements.txt
 pip install -r requirements.txt
+
+# 方式二：使用 pyproject.toml（推荐）
+pip install .
 
 # 进入前端目录构建 UI
 cd frontend && npm install && npm run build && cd ..
