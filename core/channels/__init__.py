@@ -28,6 +28,10 @@ from . import vertex_channel
 from . import openrouter_channel
 from . import cloudflare_channel
 from . import openai_image_channel
+# 修改原因：fal.ai 是新增的内置生成渠道，需要在 channels 包初始化时加载模块。
+# 修改方式：与 openai_image_channel 一样显式导入 fal_channel。
+# 目的：让注册表能够发现 fal 的 request/response/stream adapters。
+from . import fal_channel
 from . import codex_channel
 from . import claude_code_channel
 # 修改原因：Gemini CLI OAuth 是内置渠道，需要在 channels 包导入时进入注册流程。
@@ -50,6 +54,10 @@ vertex_channel.register()
 openrouter_channel.register()
 cloudflare_channel.register()
 openai_image_channel.register()
+# 修改原因：仅导入 fal_channel 不会写入注册表，必须调用 register。
+# 修改方式：在内置渠道注册序列中追加 fal_channel.register()。
+# 目的：让 core.channels.get_channel("fal") 和管理端渠道列表都能使用 fal 渠道。
+fal_channel.register()
 codex_channel.register()
 claude_code_channel.register()
 # 修改原因：导入模块只加载定义，必须显式调用 register 才会写入渠道注册表。
