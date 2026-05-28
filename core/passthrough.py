@@ -21,7 +21,7 @@ from core.request import get_payload
 from core.response import check_response
 from core.streaming import LoggingStreamingResponse
 from core.utils import get_engine, is_local_api_key, provider_api_circular_list
-from utils import apply_custom_headers, has_header_case_insensitive, safe_get, wait_for_timeout
+from utils import apply_custom_headers, has_header_case_insensitive, safe_get, wait_for_timeout, iter_sse_with_keepalive
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -213,34 +213,23 @@ async def _passthrough_error_wrapper(generator, channel_id, keepalive_interval: 
             yield first
 
         if keepalive_interval:
-            # 修改原因：透传流同样可能在首包前或两次事件之间长时间静默。
-            # 修改方式：复用 wait_for_timeout 的单飞 __anext__ 任务，超时只发 SSE 注释帧，不并发拉取上游。
-            # 目的：不解析/改写透传协议内容的前提下，为下游连接提供稳定空闲字节。
-            if emit_initial_keepalive:
-                yield ": keepalive\n\n"
-            while True:
-                try:
-                    item, status = await wait_for_timeout(gen, timeout=keepalive_interval, wait_task=wait_task)
-                    if status == "timeout":
-                        wait_task = item
-                        yield ": keepalive\n\n"
-                        continue
-                    if status == "reentrant":
-                        wait_task = None
-                        await asyncio.sleep(keepalive_interval)
-                        yield ": keepalive\n\n"
-                        continue
-                    wait_task = None
-                    yield item
-                except asyncio.CancelledError:
-                    if wait_task is not None and not wait_task.done():
-                        wait_task.cancel()
-                    logger.debug(f"provider: {channel_id:<11} passthrough stream cancelled by client")
-                    return
-                except StopAsyncIteration:
-                    if wait_task is not None and not wait_task.done():
-                        wait_task.cancel()
-                    return
+            # 修改原因：透传 keepalive 此前是独立复制的一份 pump，与 utils 中的实现重复，
+            #   keepalive 帧样式与挂起任务清理需要两处同步维护。
+            # 修改方式：改调 utils.iter_sse_with_keepalive 共用同一套保活循环；不传 transform，
+            #   保持透传“不解析/不改写协议内容”的约束，仅注入 SSE 注释帧。上游 EOF 由该函数内部
+            #   转为正常结束，挂起的 __anext__ 任务也在其 finally 中统一清理。
+            # 目的：消除重复实现，统一 keepalive 帧样式与保活语义。
+            try:
+                async for chunk in iter_sse_with_keepalive(
+                    gen,
+                    interval=keepalive_interval,
+                    wait_task=wait_task,
+                    emit_initial=emit_initial_keepalive,
+                ):
+                    yield chunk
+            except asyncio.CancelledError:
+                logger.debug(f"provider: {channel_id:<11} passthrough stream cancelled by client")
+                return
         else:
             async for chunk in gen:
                 yield chunk

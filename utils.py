@@ -1044,6 +1044,79 @@ async def wait_for_timeout(wait_for_thing, timeout = 3, wait_task=None):
     else:
         return first_response_task, "timeout"
 
+
+# SSE keepalive 注释帧。SSE 规范规定以 ":" 开头的行是注释，客户端必须忽略，
+# 因此可安全用于空闲保活，且不会污染 OpenAI/Claude/Gemini 任一方言的事件语义。
+SSE_KEEPALIVE_COMMENT = ": keepalive\n\n"
+
+
+async def iter_sse_with_keepalive(
+    generator,
+    interval,
+    *,
+    wait_task=None,
+    emit_initial=False,
+    transform=None,
+):
+    """统一的 SSE keepalive 注入循环，供普通流式与透传流式共用。
+
+    修改原因：error_handling_wrapper 与 core/passthrough 此前各自复制了一份几乎相同的
+      keepalive pump（wait_for_timeout -> 超时发注释帧 -> 命中则产出 item），keepalive
+      帧样式与重入/取消清理逻辑分散，容易改一处漏一处。
+    修改方式：抽出唯一的 pump 实现，把「是否对 item 做协议转换」通过 transform 注入；
+      其余 keepalive 固有逻辑（单飞 __anext__、超时/重入退避、上游 EOF 收尾、finally
+      清理挂起 wait_task）集中于此。
+    目的：两条路径复用同一套 keepalive 帧与保活语义，并顺带修复生成器被关闭时挂起的
+      wait_task 泄漏。
+
+    职责边界：只处理 keepalive 循环本身；网络错误、done_message、reset_client、
+      stream_end 日志等业务语义不在此处理，相关异常会原样向调用方传播，由各路径自行收尾。
+
+    参数：
+    - generator: 上游异步生成器。
+    - interval: 心跳间隔秒数（即 wait_for_timeout 的 timeout）。
+    - wait_task: 首包阶段已创建、尚未完成的 __anext__ 任务，复用以避免并发拉取上游。
+    - emit_initial: 进入循环前是否立即补发一帧（首包尚未到达时为 True）。
+    - transform: 可选 async 转换器，仅作用于真实 item（不作用于注释帧）；普通流式传入
+      ensure_string 包装，透传流式不传以保持「不解析/不改写协议内容」。
+    """
+    if emit_initial:
+        yield SSE_KEEPALIVE_COMMENT
+    try:
+        while True:
+            try:
+                item, status = await wait_for_timeout(generator, timeout=interval, wait_task=wait_task)
+            except StopAsyncIteration:
+                # 上游 EOF：正常结束循环，交由 finally 统一清理
+                return
+            except RuntimeError as e:
+                # 极端时序仍可能抛重入错误：退避后补一帧，不打断主循环
+                if "asynchronous generator is already running" in str(e):
+                    wait_task = None
+                    await asyncio.sleep(0.2)
+                    yield SSE_KEEPALIVE_COMMENT
+                    continue
+                raise
+            if status == "timeout":
+                # 复用仍在运行的 __anext__ 任务，避免并发创建导致重入
+                wait_task = item
+                yield SSE_KEEPALIVE_COMMENT
+                continue
+            if status == "reentrant":
+                # 重入：按心跳周期退避，避免刷屏
+                wait_task = None
+                await asyncio.sleep(interval)
+                yield SSE_KEEPALIVE_COMMENT
+                continue
+            wait_task = None
+            yield (await transform(item)) if transform is not None else item
+    finally:
+        # 无论因 EOF、异常还是被消费者关闭（GeneratorExit）退出，都取消仍挂起的
+        # 单飞 __anext__ 任务，避免连接资源泄漏。
+        if wait_task is not None and not wait_task.done():
+            wait_task.cancel()
+
+
 async def error_handling_wrapper(
     generator,
     channel_id,
@@ -1079,94 +1152,63 @@ async def error_handling_wrapper(
 
         # 如果需要心跳机制但不使用嵌套生成器方式
         if with_keepalive:
-            # 修改原因：旧实现只在首包超时时进入 keepalive 分支，因此首包成功后 chunk 间静默不会再发心跳。
-            # 修改方式：允许首包成功后也复用同一个等待循环；只有首包尚未到达时才立即补一个心跳。
-            # 目的：覆盖“上游已经开始 stream 但中途长时间不吐字”的真实空闲场景。
-            if first_item is None:
-                yield ": keepalive\n\n"
-            while True:
+            # 修改原因：此前 keepalive pump 在本函数与 core/passthrough 各复制了一份，
+            #   keepalive 帧样式、重入退避和挂起任务清理容易改一处漏一处。
+            # 修改方式：统一改调 iter_sse_with_keepalive，本分支只保留普通流式特有的业务收尾
+            #   （网络错误发 done、reset_client、stream_end 日志）；用 ensure_string 作为 transform
+            #   注入协议转换，首包尚未到达时通过 emit_initial 补发首帧。挂起的 __anext__ 任务由
+            #   iter_sse_with_keepalive 的 finally 统一清理，本分支不再各自 cancel。
+            # 目的：与透传路径共用同一套 keepalive 帧与保活语义，消除重复实现。
+            async def _keepalive_transform(item):
+                return await ensure_string(item, as_sse=stream)
+
+            try:
+                async for chunk in iter_sse_with_keepalive(
+                    generator,
+                    interval=timeout,
+                    wait_task=wait_task,
+                    emit_initial=(first_item is None),
+                    transform=_keepalive_transform,
+                ):
+                    yield chunk
+                _log_stream_end("upstream_eof")
+                stream_end_logged = True
+            except asyncio.CancelledError:
+                logger.debug(f"provider: {channel_id:<11} Stream cancelled by client in main loop")
+                _log_stream_end("client_cancelled", level="debug")
+                stream_end_logged = True
+            except (
+                httpx.ReadError,
+                httpx.RemoteProtocolError,
+                httpx.ReadTimeout,
+                httpx.WriteError,
+                httpx.ProtocolError,
+                h2.exceptions.ProtocolError,
+            ) as e:
+                logger.error(f"provider: {channel_id:<11} Network error in keepalive loop: {e}")
+
                 try:
-                    item, status = await wait_for_timeout(generator, timeout=timeout, wait_task=wait_task)
-                    if status == "timeout":
-                        # 关键：复用仍在运行的 __anext__ 任务，避免并发创建导致重入
-                        wait_task = item
-                        yield ": keepalive\n\n"
-                    elif status == "reentrant":
-                        # 理论上不应频繁出现；出现时按正常心跳周期退避，避免刷屏
-                        wait_task = None
-                        await asyncio.sleep(timeout)
-                        yield ": keepalive\n\n"
-                    else:
-                        yield await ensure_string(item, as_sse=stream)
-                        wait_task = None
-                except asyncio.CancelledError:
-                    logger.debug(f"provider: {channel_id:<11} Stream cancelled by client in main loop")
-                    if wait_task is not None and not wait_task.done():
-                        wait_task.cancel()
-                    _log_stream_end("client_cancelled", level="debug")
-                    stream_end_logged = True
-                    break
-                except StopAsyncIteration:
-                    if wait_task is not None and not wait_task.done():
-                        wait_task.cancel()
-                    _log_stream_end("upstream_eof")
-                    stream_end_logged = True
-                    break
-                except (
-                    httpx.ReadError,
-                    httpx.RemoteProtocolError,
-                    httpx.ReadTimeout,
-                    httpx.WriteError,
-                    httpx.ProtocolError,
-                    h2.exceptions.ProtocolError,
-                ) as e:
-                    logger.error(f"provider: {channel_id:<11} Network error in keepalive loop: {e}")
+                    err_str = str(e)
+                    if request_url and app and ("StreamReset" in err_str or "stream_id" in err_str):
+                        from urllib.parse import urlparse
+                        host = urlparse(request_url).netloc
+                        if host and hasattr(app, "state") and hasattr(app.state, "client_manager"):
+                            asyncio.create_task(app.state.client_manager.reset_client(host))
+                except Exception:
+                    pass
 
-                    try:
-                        err_str = str(e)
-                        if request_url and app and ("StreamReset" in err_str or "stream_id" in err_str):
-                            from urllib.parse import urlparse
-                            host = urlparse(request_url).netloc
-                            if host and hasattr(app, "state") and hasattr(app.state, "client_manager"):
-                                asyncio.create_task(app.state.client_manager.reset_client(host))
-                    except Exception:
-                        pass
-
-                    done = "data: [DONE]\n\n" if done_message is None else done_message
-                    if done:
-                        yield done
-
-                    if wait_task is not None and not wait_task.done():
-                        wait_task.cancel()
-                    _log_stream_end("upstream_network_error", level="warning", detail=type(e).__name__)
-                    stream_end_logged = True
-                    break
-                except RuntimeError as e:
-                    # 兜底保护：极端时序仍可能抛出重入错误，重置等待任务并退避
-                    if "asynchronous generator is already running" in str(e):
-                        wait_task = None
-                        await asyncio.sleep(0.2)
-                        yield ": keepalive\n\n"
-                        continue
-                    logger.error(f"provider: {channel_id:<11} Error in keepalive loop: {e}")
-                    done = "data: [DONE]\n\n" if done_message is None else done_message
-                    if done:
-                        yield done
-                    if wait_task is not None and not wait_task.done():
-                        wait_task.cancel()
-                    _log_stream_end("wrapper_exception", level="error", detail=type(e).__name__)
-                    stream_end_logged = True
-                    break
-                except Exception as e:
-                    logger.error(f"provider: {channel_id:<11} Error in keepalive loop: {e}")
-                    done = "data: [DONE]\n\n" if done_message is None else done_message
-                    if done:
-                        yield done
-                    if wait_task is not None and not wait_task.done():
-                        wait_task.cancel()
-                    _log_stream_end("wrapper_exception", level="error", detail=type(e).__name__)
-                    stream_end_logged = True
-                    break
+                done = "data: [DONE]\n\n" if done_message is None else done_message
+                if done:
+                    yield done
+                _log_stream_end("upstream_network_error", level="warning", detail=type(e).__name__)
+                stream_end_logged = True
+            except Exception as e:
+                logger.error(f"provider: {channel_id:<11} Error in keepalive loop: {e}")
+                done = "data: [DONE]\n\n" if done_message is None else done_message
+                if done:
+                    yield done
+                _log_stream_end("wrapper_exception", level="error", detail=type(e).__name__)
+                stream_end_logged = True
         else:
             # 原始逻辑：不需要心跳
             try:
