@@ -316,6 +316,30 @@ def get_preference(
     return timeout_value
 
 
+def normalize_keepalive_interval(keepalive_interval: Any, timeout_value: Any) -> Optional[int]:
+    """把 keepalive_interval 规范化为可用于 SSE 心跳的正整数秒数。"""
+    # 修改原因：keepalive_interval 来自配置库，可能缺失、为 0/负数、字符串，或大于请求超时。
+    # 修改方式：集中转换和边界检查，只有正整数且小于请求超时时才启用。
+    # 目的：避免无效配置触发热循环/无意义心跳，同时让默认 15 秒心跳稳定生效。
+    try:
+        interval = int(keepalive_interval)
+    except (TypeError, ValueError):
+        return None
+
+    if interval <= 0:
+        return None
+
+    try:
+        timeout = int(timeout_value)
+    except (TypeError, ValueError):
+        timeout = 0
+
+    if timeout > 0 and interval >= timeout:
+        return None
+
+    return interval
+
+
 class ModelRequestHandler:
     """
     模型请求处理器
@@ -698,8 +722,7 @@ class ModelRequestHandler:
                 self.app.state.keepalive_interval, provider_name, 
                 original_request_model, 99999
             )
-            if keepalive_interval > local_timeout_value:
-                keepalive_interval = None
+            keepalive_interval = normalize_keepalive_interval(keepalive_interval, local_timeout_value)
             if is_local_api_key(provider_name):
                 keepalive_interval = None
 

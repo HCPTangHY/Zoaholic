@@ -505,7 +505,7 @@ export default function Settings() {
                 <label className="text-sm font-medium text-foreground mb-1.5 block">Keepalive 心跳间隔 (秒)</label>
                 <input
                   type="number" min="0" max="300"
-                  value={preferences.keepalive_interval?.default ?? 25}
+                  value={preferences.keepalive_interval?.default ?? 15}
                   onChange={e => updatePreference('keepalive_interval', { ...(preferences.keepalive_interval || {}), default: parseInt(e.target.value) })}
                   className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
                 />

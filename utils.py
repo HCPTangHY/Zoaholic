@@ -1079,7 +1079,11 @@ async def error_handling_wrapper(
 
         # 如果需要心跳机制但不使用嵌套生成器方式
         if with_keepalive:
-            yield ": keepalive\n\n"
+            # 修改原因：旧实现只在首包超时时进入 keepalive 分支，因此首包成功后 chunk 间静默不会再发心跳。
+            # 修改方式：允许首包成功后也复用同一个等待循环；只有首包尚未到达时才立即补一个心跳。
+            # 目的：覆盖“上游已经开始 stream 但中途长时间不吐字”的真实空闲场景。
+            if first_item is None:
+                yield ": keepalive\n\n"
             while True:
                 try:
                     item, status = await wait_for_timeout(generator, timeout=timeout, wait_task=wait_task)
@@ -1393,7 +1397,11 @@ async def error_handling_wrapper(
             if (content == "" or content is None) and (tool_calls == "" or tool_calls is None) and (reasoning_content == "" or reasoning_content is None) and b64_json is None:
                 raise StopAsyncIteration
 
-        return new_generator(first_item), first_response_time
+        return new_generator(
+            first_item,
+            with_keepalive=bool(keepalive_interval and stream),
+            timeout=keepalive_interval or 3,
+        ), first_response_time
 
     except StopAsyncIteration:
         # 502 Bad Gateway 是一个更合适的状态码，因为它表明作为代理或网关的服务器从上游服务器收到了无效的响应。

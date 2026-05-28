@@ -45,6 +45,10 @@ from core.stats import (
 from core.plugins import get_plugin_manager
 
 DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 600))
+# 修改原因：SSE 流式响应在上游长时间思考/检索/排队时需要应用层心跳，不能依赖 TCP/Nginx keepalive。
+# 修改方式：为 keepalive_interval 提供可环境变量覆盖的合理默认值，配置文件仍可按全局/渠道/模型覆盖。
+# 目的：默认每 15 秒向下游发送 SSE 注释帧，避免客户端或中间代理因空闲无字节而断开。
+DEFAULT_KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", 15))
 # DEBUG 环境变量支持 true/false/1/0/yes/no
 is_debug = env_bool("DEBUG", False)
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
@@ -60,17 +64,20 @@ logger.info("VERSION: %s", VERSION)
 
 def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT):
     # 存储超时配置
-    preference_dict = {}
+    # 修改原因：旧逻辑在 preferences 为空或未声明某项偏好时，会让 global 默认值变成空 dict，
+    # 后续调用方若传入兜底值就可能覆盖启动期 default_timeout（keepalive 因此默认落到 99999 并被禁用）。
+    # 修改方式：先写入 default_timeout，再叠加配置文件中的全局/模型级覆盖。
+    # 目的：让 model_timeout、keepalive_interval 等偏好都稳定遵守启动期默认值，同时保留现有覆盖语义。
+    preference_dict = {"default": default_timeout}
     preferences = safe_get(all_config, "preferences", default={})
     providers = safe_get(all_config, "providers", default=[])
     if preferences:
         if isinstance(preferences.get(preference_key), int):
             preference_dict["default"] = preferences.get(preference_key)
         else:
-            for model_name, timeout_value in preferences.get(preference_key, {"default": default_timeout}).items():
+            preference_settings = preferences.get(preference_key, {}) or {}
+            for model_name, timeout_value in preference_settings.items():
                 preference_dict[model_name] = timeout_value
-            if "default" not in preferences.get(preference_key, {}):
-                preference_dict["default"] = default_timeout
 
     result = defaultdict(lambda: defaultdict(lambda: default_timeout))
     for provider in providers:
@@ -483,7 +490,7 @@ async def lifespan(app: FastAPI):
                     app.state.admin_api_key = [app.state.api_keys_db[0].get("api")]
 
         app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
-        app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", 99999)
+        app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", DEFAULT_KEEPALIVE_INTERVAL)
         # 初始化 models_list（用于存储从其他 API Key 引用的模型列表）
         app.state.models_list = {}
         # pprint(dict(app.state.provider_timeouts))
