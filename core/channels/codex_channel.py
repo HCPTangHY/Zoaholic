@@ -19,6 +19,7 @@ from core.channels.openai_responses_channel import (
     fetch_responses_response,
     get_responses_payload,
 )
+from core.channels.codex_identity import apply_codex_identity_confuse, restore_codex_identity
 
 
 _oauth_manager = None
@@ -121,6 +122,47 @@ def _get_quota_context_from_request() -> tuple[str, str] | None:
     return str(channel_id), str(key_id)
 
 
+def _get_identity_confuse_auth_id():
+    """从 current_info 获取 OAuth 账号 ID，用作 Codex 身份混淆种子。
+    
+    Codex 只有 OAuth 模式，永久启用混淆。
+    """
+    try:
+        from core.middleware import request_info
+
+        current_info = request_info.get()
+    except Exception:
+        return None
+    if not isinstance(current_info, dict):
+        return None
+
+    return str(current_info.get("_oauth_key_id") or "") or None
+
+
+def _restore_codex_identity_chunk(chunk, state: dict):
+    """按 chunk 类型还原 Codex 身份，兼容当前 adapter 的 str/dict 输出。"""
+    # 修改原因：CPA 处理的是原始 bytes，但 Zoaholic 的 Responses adapter 会把上游流转换为 str SSE，非流式会转换为 dict。
+    # 修改方式：bytes 直接替换，str 经 UTF-8 编码后替换再解码，dict/list 经 JSON 序列化后替换再解析。
+    # 目的：在不重写 Responses adapter 的前提下，对客户端保持身份字段透明。
+    if not state or not state.get("replacements"):
+        return chunk
+    if isinstance(chunk, bytes):
+        return restore_codex_identity(chunk, state)
+    if isinstance(chunk, str):
+        restored = restore_codex_identity(chunk.encode("utf-8"), state)
+        return restored.decode("utf-8")
+    if isinstance(chunk, (dict, list)):
+        try:
+            raw = json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            restored = restore_codex_identity(raw, state)
+            if restored == raw:
+                return chunk
+            return json.loads(restored.decode("utf-8"))
+        except Exception:
+            return chunk
+    return chunk
+
+
 def _store_quota_from_headers(headers) -> None:
     """把响应头中的 quota 数据写入 OAuthManager 内存缓存。"""
     # 修改原因：Codex 普通请求会自然带回 x-ratelimit-*，无需每次打开管理页都主动消耗一次请求额度。
@@ -178,17 +220,33 @@ class _QuotaCapturingClient:
 
 
 async def fetch_codex_response_stream(client, url, headers, payload, model, timeout):
-    """包装 Responses API 流式 adapter，从响应头采集 quota。"""
+    """包装 Responses API 流式 adapter，从响应头采集 quota，并按需做身份混淆还原。"""
+    # 修改原因：Codex 身份混淆必须在真正发送上游请求前完成，而 quota 捕获仍需要复用原有 client wrapper。
+    # 修改方式：读取当前 OAuth 账号和 provider 开关，先混淆 headers/payload，再把响应 chunk 按 state 还原给客户端。
+    # 目的：让上游看到混淆身份，同时保持客户端对请求和响应中的身份标识无感知。
+    state = None
+    auth_id = _get_identity_confuse_auth_id()
+    if auth_id:
+        headers, payload, state = apply_codex_identity_confuse(headers, payload, auth_id)
+
     capturing_client = _QuotaCapturingClient(client)
     async for chunk in fetch_responses_stream(capturing_client, url, headers, payload, model, timeout):
-        yield chunk
+        yield _restore_codex_identity_chunk(chunk, state)
 
 
 async def fetch_codex_response(client, url, headers, payload, model, timeout):
-    """包装 Responses API 非流式 adapter，从响应头采集 quota。"""
+    """包装 Responses API 非流式 adapter，从响应头采集 quota，并按需做身份混淆还原。"""
+    # 修改原因：非流式 Codex 响应也可能在内容或错误中回显混淆身份，需要与流式路径保持一致。
+    # 修改方式：请求发送前应用同一套混淆逻辑，adapter 产出的 dict/bytes/str chunk 再统一还原。
+    # 目的：避免同一功能在流式和非流式请求之间出现可见差异。
+    state = None
+    auth_id = _get_identity_confuse_auth_id()
+    if auth_id:
+        headers, payload, state = apply_codex_identity_confuse(headers, payload, auth_id)
+
     capturing_client = _QuotaCapturingClient(client)
     async for chunk in fetch_responses_response(capturing_client, url, headers, payload, model, timeout):
-        yield chunk
+        yield _restore_codex_identity_chunk(chunk, state)
 
 
 AUTH_URL = "https://auth.openai.com/oauth/authorize"

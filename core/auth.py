@@ -10,6 +10,12 @@ from typing import Optional
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
+from core.ip_blacklist import (
+    get_client_ip_from_request_info,
+    is_global_ip_blocked,
+    is_key_ip_blocked,
+    raise_ip_blocked,
+)
 from core.log_config import logger
 from utils import InMemoryRateLimiter
 
@@ -97,6 +103,12 @@ async def verify_api_key(
     api_list = app.state.api_list
 
     token = await _extract_token(request, credentials)
+    client_ip = get_client_ip_from_request_info()
+    if is_global_ip_blocked(app, client_ip):
+        # 修改原因：全局 IP 黑名单必须优先于 API Key 身份检查执行。
+        # 修改方式：在 token 存在性和 Key 匹配之前读取 middleware 写入的 client_ip 并检查全局缓存。
+        # 目的：被全局禁止的 IP 无论使用哪个 Key 都直接返回 ip_blocked。
+        raise_ip_blocked()
 
     if not token:
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
@@ -149,6 +161,12 @@ async def verify_api_key(
     if api_index is None:
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
 
+    if is_key_ip_blocked(app, api_index, client_ip):
+        # 修改原因：通过身份解析后才能知道当前请求命中的 API Key，Key 级黑名单应在此时检查。
+        # 修改方式：用 api_index 读取 app.state.api_key_ip_blacklists 的对应预解析规则。
+        # 目的：实现“全局黑名单 → 当前 Key 黑名单”的固定检查顺序。
+        raise_ip_blocked()
+
     try:
         from core.byok import store_byok_request_state, update_request_info_auth
 
@@ -184,6 +202,13 @@ async def verify_admin_api_key(
     app = request.app
 
     token = await _extract_token(request, credentials)
+    client_ip = get_client_ip_from_request_info()
+    if is_global_ip_blocked(app, client_ip):
+        # 修改原因：管理接口同样属于请求入口，全局 IP 黑名单应覆盖管理员凭证。
+        # 修改方式：在 JWT 或 admin key 校验前检查全局黑名单。
+        # 目的：被全局禁止的 IP 不能绕过管理接口修改配置。
+        raise_ip_blocked()
+
     if not token:
         raise HTTPException(status_code=403, detail="Invalid or missing credentials")
 
@@ -192,7 +217,18 @@ async def verify_admin_api_key(
         from core.jwt_utils import is_admin_jwt
 
         if is_admin_jwt(token):
+            admin_index = _resolve_admin_api_index(app)
+            if admin_index is not None and is_key_ip_blocked(app, admin_index, client_ip):
+                # 修改原因：admin JWT 会映射到配置中的 admin API Key，仍应遵守该 Key 的 IP 黑名单。
+                # 修改方式：解析出 admin API Key 下标后检查对应 Key 级黑名单。
+                # 目的：保证 JWT 管理入口与普通 API Key 管理入口遵循同一套 IP 访问控制。
+                raise_ip_blocked()
             return token
+    except HTTPException:
+        # 修改原因：JWT 分支中可能抛出 IP 黑名单拦截错误，不能被宽泛异常处理吞掉。
+        # 修改方式：先单独重新抛出 HTTPException，再处理 jwt 模块不可用等普通异常。
+        # 目的：确保 admin JWT 命中 Key 级 IP 黑名单时直接返回 ip_blocked。
+        raise
     except Exception:
         # jwt 模块不可用/异常则继续按 api key 处理
         pass
@@ -218,6 +254,12 @@ async def verify_admin_api_key(
 
     if api_index is None:
         raise HTTPException(status_code=403, detail="Invalid or missing credentials")
+
+    if is_key_ip_blocked(app, api_index, client_ip):
+        # 修改原因：admin API Key 也可以配置 Key 级 IP 黑名单。
+        # 修改方式：普通 admin key 匹配成功后按 api_index 检查预解析黑名单。
+        # 目的：管理端和用户端都遵守同一层级的访问控制规则。
+        raise_ip_blocked()
 
     # 单 key 情况直接视为 admin
     if len(api_list) == 1:

@@ -8,6 +8,7 @@
 from datetime import datetime, timezone
 
 from core.byok import is_byok_provider
+from core.ip_blacklist import normalize_ip_blacklist
 from core.log_config import logger
 from core.utils import ThreadSafeCircularList, get_model_dict, provider_api_circular_list, safe_get
 
@@ -128,6 +129,11 @@ def _expand_sub_channels(providers: list) -> list:
 
 
 async def update_config(config_data, use_config_url=False, skip_model_fetch=False, save_to_file=True, save_to_db: bool = False, changed_providers=None):
+    # 修改原因：IP 黑名单支持精确 IP 和 CIDR，必须在启动和热更新时统一规范并校验。
+    # 修改方式：顶层 ip_blacklist 规范为字符串数组，非法条目直接抛出 ValueError 阻止保存。
+    # 目的：避免请求期才发现格式错误，并为运行时预解析缓存提供稳定输入。
+    config_data['ip_blacklist'] = normalize_ip_blacklist(config_data.get('ip_blacklist'))
+
     # 修改原因：/v1/api_config/update 可以只保存 preferences，此时传入的是已经包含运行时子渠道的 app.state.config。
     # 修改方式：展开子渠道前先移除 _is_sub_channel 运行时 provider，再从主渠道重新展开。
     # 目的：避免多次保存全局设置后，子渠道在运行时 providers 中重复累积。
@@ -141,10 +147,12 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
     for index, provider in enumerate(config_data['providers']):
         _strip_provider_fields(provider)
 
-        if provider.get('project_id'):
-            if "google-vertex-ai" not in provider.get("base_url", ""):
-                provider['base_url'] = 'https://aiplatform.googleapis.com/'
-        if provider.get('cf_account_id'):
+        # 修改原因：用户已填写的 base_url 不应被 project_id 或 cf_account_id 的默认值覆盖。
+        # 修改方式：只有 base_url 为空时才补对应服务的默认地址。
+        # 目的：保留用户自定义网关或代理地址。
+        if provider.get('project_id') and not provider.get('base_url'):
+            provider['base_url'] = 'https://aiplatform.googleapis.com/'
+        if provider.get('cf_account_id') and not provider.get('base_url'):
             provider['base_url'] = 'https://api.cloudflare.com/'
 
         if isinstance(provider['provider'], int):
@@ -152,6 +160,10 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
 
         provider_api = provider.get('api', None)
         provider_is_byok = is_byok_provider(provider)
+        # 修改原因：子渠道共享父渠道 key pool 后会把 provider_api 置空，后续清理逻辑会误认为该渠道没有本地 key。
+        # 修改方式：在每个 provider 循环迭代开始时初始化共享标志，并在共享成功后设置为 True。
+        # 目的：保留共享的父渠道 key pool，同时继续执行后续运行时规范化逻辑。
+        shared_parent_key_pool = False
         if provider_is_byok:
             # 修改原因：BYOK provider 现在用 api: ["*"] 显式标记，"*" 不是可轮换的上游 key。
             # 修改方式：构建 key pool 前移除该 provider 的旧 circular list，并把 provider_api 置空跳过后续创建逻辑。
@@ -171,12 +183,16 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
             parent_circular_list = provider_api_circular_list.get(parent_name) if parent_name else None
             if parent_circular_list:
                 provider_api_circular_list[provider['provider']] = parent_circular_list
-                # 跳过后面的 circular list 创建
+                # 修改原因：共享父渠道 key pool 后 provider_api 会被置空，必须标记该置空不是无 key 状态。
+                # 修改方式：记录 shared_parent_key_pool=True，再跳过后面的 circular list 创建。
+                # 目的：防止清理分支把刚共享的父渠道 key pool 从子渠道映射中移除。
+                shared_parent_key_pool = True
                 provider_api = None
 
         if (
             not provider_is_byok
             and not provider_api
+            and not shared_parent_key_pool
             and (changed_providers is None or provider['provider'] in changed_providers)
         ):
             # 修改原因：热更新时若渠道从静态 key 改成无本地 api，旧 provider_api_circular_list 会残留。
@@ -184,7 +200,10 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
             # 目的：确保无本地 key 的 provider 不会继续使用修改前的本地上游 key，也不会被自动禁用逻辑误处理。
             provider_api_circular_list.pop(provider['provider'], None)
 
-        if provider_api and (changed_providers is None or provider['provider'] in changed_providers):
+        # 修改原因：子渠道已经共享父渠道 key pool 时，不应再为该子渠道创建独立 key pool。
+        # 修改方式：创建分支增加 shared_parent_key_pool 排除条件。
+        # 目的：保持子渠道与父渠道使用同一个 ThreadSafeCircularList 实例。
+        if provider_api and not shared_parent_key_pool and (changed_providers is None or provider['provider'] in changed_providers):
             # 解析 API key 列表，支持 ! 前缀标记禁用的 key
             # 格式：正常 key 直接使用，以 ! 开头的 key 表示禁用
             def parse_api_keys(api_list):
@@ -303,6 +322,11 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
     for index, api_key in enumerate(config_data['api_keys']):
         if "api" in api_key:
             config_data['api_keys'][index]["api"] = str(api_key["api"]).strip()
+
+        # 修改原因：每个 API Key 可独立配置 IP 黑名单，且需要和顶层字段使用同一套校验规则。
+        # 修改方式：把 api_keys[].ip_blacklist 统一规范为字符串数组，非法 IP/CIDR 在保存阶段报错。
+        # 目的：让 Key 级黑名单在热更新后能安全预解析并立即生效。
+        config_data['api_keys'][index]['ip_blacklist'] = normalize_ip_blacklist(api_key.get('ip_blacklist'))
 
         # 兼容 JSON/JSONB：把 created_at 从字符串恢复为 datetime（用于余额/账期逻辑）
         try:

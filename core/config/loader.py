@@ -57,7 +57,12 @@ async def load_config(app=None):
             # 目的：避免大范围修改启动赋值语句，同时让运行时鉴权能读取 BYOK 前缀表。
             if app is not None:
                 from core.byok import build_byok_prefixes
+                from core.ip_blacklist import apply_runtime_ip_blacklists
                 app.state.byok_prefixes = build_byok_prefixes(api_keys_db)
+                # 修改原因：IP 黑名单需要启动后立即进入运行时缓存，而不是等首次保存配置。
+                # 修改方式：加载配置并建立 BYOK 前缀后，同步预解析全局和 Key 级 IP 黑名单。
+                # 目的：服务启动后的首个请求即可按最新 api.yaml 执行 IP 拦截。
+                apply_runtime_ip_blacklists(app, config=config, api_keys_db=api_keys_db)
             return config, api_keys_db, api_list
 
     # 1) 允许从环境变量直接注入配置（适合无文件挂载的 PaaS）
@@ -155,6 +160,11 @@ async def load_config(app=None):
         if not conf_seed or not isinstance(conf_seed, dict):
             if app is not None:
                 app.state.byok_prefixes = []
+                from core.ip_blacklist import apply_runtime_ip_blacklists
+                # 修改原因：无配置启动时也应初始化空黑名单缓存，避免鉴权路径读取缺失属性。
+                # 修改方式：对空 config/app state 执行一次运行时缓存重建。
+                # 目的：让后续首次初始化配置前的健康检查和管理路由保持稳定。
+                apply_runtime_ip_blacklists(app)
             return {}, {}, []
 
     # 4) 规范化配置（不写回文件，避免启动时污染）
@@ -166,7 +176,12 @@ async def load_config(app=None):
         # 修改方式：load_config 持有 app 时基于规范化后的 api_keys_db 单独写 app.state.byok_prefixes。
         # 目的：启动加载配置后，所有鉴权入口都能读取 BYOK 前缀表，同时不破坏旧调用方。
         from core.byok import build_byok_prefixes
+        from core.ip_blacklist import apply_runtime_ip_blacklists
         app.state.byok_prefixes = build_byok_prefixes(api_keys_db)
+        # 修改原因：IP 黑名单是运行时派生状态，不能只保存在 config 字典中。
+        # 修改方式：启动加载配置后预解析顶层和 Key 级黑名单到 app.state。
+        # 目的：请求鉴权时直接使用 set 和 network 列表匹配，无需重复解析配置。
+        apply_runtime_ip_blacklists(app, config=config, api_keys_db=api_keys_db)
 
     # 5) 如果策略允许且数据库可用：把种子配置写入 DB，作为后续“权威配置”
     if config_storage in ("auto", "db"):

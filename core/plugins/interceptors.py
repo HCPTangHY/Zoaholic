@@ -248,20 +248,134 @@ class InterceptorEntry:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+# ==================== 入站拦截器类型定义 ====================
+
+# 入站拦截器回调签名:
+#   async def interceptor(request_data, request, api_key_info, enabled_plugins) -> request_data
+# 参数:
+#   request_data: RequestModel 或其他请求数据对象
+#   request: 原始 FastAPI Request 对象
+#   api_key_info: dict，包含 api_key, api_index, model 等鉴权后的信息
+#   enabled_plugins: 该 key 启用的插件列表
+# 返回:
+#   修改后的 request_data（或原样返回）
+InboundInterceptor = Callable[..., Any]
+
+
 class InterceptorRegistry:
     """
     拦截器注册表
     
-    管理 request、response 拦截器和 balance_enricher 的注册、注销和调用。
+    管理 inbound、request、response 拦截器和 balance_enricher 的注册、注销和调用。
     """
     
     def __init__(self):
+        self._inbound_interceptors: Dict[str, InterceptorEntry] = {}
         self._request_interceptors: Dict[str, InterceptorEntry] = {}
         self._response_interceptors: Dict[str, InterceptorEntry] = {}
         # 修改原因：余额查询结果需要独立的后处理扩展点，不能混入 request/response interceptor。
         # 修改方式：为 balance_enricher 单独维护注册表，仍复用 InterceptorEntry 的优先级、启用状态和插件名字段。
         # 目的：让 oai_tier 等插件可以只补充 balance result，而不影响请求发送或响应内容。
         self._balance_enrichers: Dict[str, InterceptorEntry] = {}
+    
+    # ==================== 入站拦截器 ====================
+    
+    def register_inbound_interceptor(
+        self,
+        interceptor_id: str,
+        callback: InboundInterceptor,
+        priority: int = 100,
+        plugin_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        overwrite: bool = False,
+    ) -> InterceptorEntry:
+        """
+        注册入站拦截器
+        
+        入站拦截器在请求进入 handler 后、分配给上游 provider 之前执行。
+        此时鉴权已完成，模型名已解析，但还没有选择 provider 或进入 channel。
+        
+        Args:
+            interceptor_id: 拦截器唯一标识
+            callback: 拦截器回调函数，签名为:
+                async def interceptor(request_data, request, api_key_info, enabled_plugins)
+                    -> request_data
+            priority: 优先级（数值越小越先执行，默认 100）
+            plugin_name: 所属插件名称
+            metadata: 元数据
+            overwrite: 是否覆盖已存在的拦截器
+        """
+        if interceptor_id in self._inbound_interceptors and not overwrite:
+            raise ValueError(f"Inbound interceptor '{interceptor_id}' already registered")
+        
+        entry = InterceptorEntry(
+            id=interceptor_id,
+            callback=callback,
+            priority=priority,
+            plugin_name=plugin_name,
+            metadata=metadata or {},
+        )
+        self._inbound_interceptors[interceptor_id] = entry
+        logger.debug(f"Registered inbound interceptor: {interceptor_id} (priority={priority})")
+        return entry
+    
+    def unregister_inbound_interceptor(self, interceptor_id: str) -> bool:
+        """注销入站拦截器"""
+        if interceptor_id in self._inbound_interceptors:
+            del self._inbound_interceptors[interceptor_id]
+            logger.debug(f"Unregistered inbound interceptor: {interceptor_id}")
+            return True
+        return False
+    
+    def get_inbound_interceptors(self, enabled_only: bool = True) -> List[InterceptorEntry]:
+        """获取所有入站拦截器（按优先级排序）"""
+        interceptors = list(self._inbound_interceptors.values())
+        if enabled_only:
+            interceptors = [i for i in interceptors if i.enabled]
+        interceptors.sort(key=lambda i: i.priority)
+        return interceptors
+    
+    async def apply_inbound_interceptors(
+        self,
+        request_data: Any,
+        request: Any,
+        api_key_info: Dict[str, Any],
+        enabled_plugins: Optional[List[str]] = None,
+    ) -> Any:
+        """
+        应用所有入站拦截器
+        
+        在 handler.request_model 入口处调用，鉴权完成后、provider 选择前。
+        拦截器可以修改 request_data（如剥字段、注入参数等）。
+        
+        Args:
+            request_data: 请求数据对象（RequestModel 等）
+            request: 原始 FastAPI Request 对象
+            api_key_info: 鉴权后的信息 dict
+            enabled_plugins: 该 key 启用的插件列表
+            
+        Returns:
+            经过所有拦截器处理后的 request_data
+        """
+        interceptors = self.get_inbound_interceptors(enabled_only=True)
+        
+        enabled_plugin_names = None
+        if enabled_plugins is not None:
+            enabled_plugin_names = set(parse_enabled_plugins(enabled_plugins).keys())
+        
+        for interceptor in interceptors:
+            if interceptor.plugin_name:
+                if not enabled_plugin_names or interceptor.plugin_name not in enabled_plugin_names:
+                    continue
+            
+            try:
+                result = await interceptor.callback(request_data, request, api_key_info, enabled_plugins)
+                if result is not None:
+                    request_data = result
+            except Exception as e:
+                logger.error(f"Inbound interceptor '{interceptor.id}' error: {e}")
+        
+        return request_data
     
     # ==================== 请求拦截器 ====================
     
@@ -818,6 +932,37 @@ def reset_interceptor_registry() -> None:
 
 
 # ==================== 便捷函数 ====================
+
+def register_inbound_interceptor(
+    interceptor_id: str,
+    callback: InboundInterceptor,
+    priority: int = 100,
+    plugin_name: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    overwrite: bool = False,
+) -> InterceptorEntry:
+    """注册入站拦截器（便捷函数）"""
+    return get_interceptor_registry().register_inbound_interceptor(
+        interceptor_id, callback, priority, plugin_name, metadata, overwrite
+    )
+
+
+def unregister_inbound_interceptor(interceptor_id: str) -> bool:
+    """注销入站拦截器（便捷函数）"""
+    return get_interceptor_registry().unregister_inbound_interceptor(interceptor_id)
+
+
+async def apply_inbound_interceptors(
+    request_data: Any,
+    request: Any,
+    api_key_info: Dict[str, Any],
+    enabled_plugins: Optional[List[str]] = None,
+) -> Any:
+    """应用所有入站拦截器（便捷函数）"""
+    return await get_interceptor_registry().apply_inbound_interceptors(
+        request_data, request, api_key_info, enabled_plugins
+    )
+
 
 def register_request_interceptor(
     interceptor_id: str,

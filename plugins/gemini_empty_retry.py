@@ -69,6 +69,16 @@ PLUGIN_INFO = {
         "category": "interceptors",
         "tags": ["gemini", "retry", "empty-content"],
         "params_hint": "填写最大重试次数（数字），如 3 或 5。默认 3 次。",
+        "params_schema": [
+            {
+                "key": "retries",
+                "label": "最大重试次数",
+                "type": "number",
+                "min": 1,
+                "max": 10,
+                "default": 3,
+            },
+        ],
     },
 }
 

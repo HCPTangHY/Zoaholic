@@ -116,6 +116,7 @@ export function FullKeyRow({
           newKeys[idx] = { ...newKeys[idx], label: label || undefined };
           setFormData(prev => prev ? { ...prev, api_keys: newKeys } : prev);
         }}
+        alwaysShowRecover={showDecorationsWhileFocused}
       />
     );
   }

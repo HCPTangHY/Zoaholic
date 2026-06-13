@@ -40,6 +40,7 @@ HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-5}"
 MAX_FAILURES="${MAX_FAILURES:-3}"
 STALE_THRESHOLD="${STALE_THRESHOLD:-300}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-30}"
+MEMORY_DIFF_INTERVAL="${MEMORY_DIFF_INTERVAL:-10}"  # 每N次check拉一次memory diff
 AUTO_RESTART="${AUTO_RESTART:-true}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -236,9 +237,15 @@ case "${1:-}" in
         ;;
     --daemon)
         log "INFO" "daemon started: url=${HEALTHZ_URL} interval=${CHECK_INTERVAL}s max_failures=${MAX_FAILURES} stale=${STALE_THRESHOLD}s auto_restart=${AUTO_RESTART}"
+        _mem_diff_counter=0
         while true; do
             rotate_log
             do_check || true
+            _mem_diff_counter=$(( _mem_diff_counter + 1 ))
+            if [ "$_mem_diff_counter" -ge "$MEMORY_DIFF_INTERVAL" ]; then
+                _mem_diff_counter=0
+                "${SCRIPT_DIR}/memory_diff_tracker.sh" 2>/dev/null || true
+            fi
             sleep "$CHECK_INTERVAL"
         done
         ;;

@@ -5,6 +5,7 @@ import html
 import json
 import secrets
 import time
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -151,6 +152,188 @@ def _token_data_from_body(body: dict) -> dict:
     # 修改方式：复制 body 中除 key_id、type、provider、service_account_json 之外的字段。
     # 目的：让手动导入同时支持 refresh_token、access_token、id_token 等凭据字段，同时不污染凭据内容。
     return {k: v for k, v in body.items() if k not in {"key_id", "type", "provider", "service_account_json"}}
+
+
+def _first_non_empty_string(*values) -> str:
+    """返回第一个非空字符串值。"""
+    # 修改原因：CPA 和 sub2api 导出文件中账号标识可能分布在 name、email、user.email、account.email_address 等不同字段。
+    # 修改方式：统一把候选值转成字符串并去掉首尾空白，返回第一个非空结果。
+    # 目的：让批量导入的 key_id 选择规则保持一致，避免每个格式分支重复手写兜底逻辑。
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _utc_iso_from_timestamp(value) -> str | None:
+    """把 unix timestamp 秒转换为 ISO 8601 UTC 字符串。"""
+    # 修改原因：sub2api 的 expires_at 使用 unix timestamp 秒，而 CPA 与管理端更常见的是 RFC3339/ISO 字符串。
+    # 修改方式：接受数字或数字字符串，按 UTC 转为带 Z 后缀的 ISO 8601 字符串；无法解析时返回 None。
+    # 目的：批量导入 sub2api 数据时保存稳定、可读的过期时间字段。
+    if value is None or value == "":
+        return None
+    try:
+        timestamp = float(value)
+        return datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace("+00:00", "Z")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _parse_batch_expiry_epoch(value) -> float | None:
+    """把批量导入凭据中的过期时间解析为 epoch 秒。"""
+    # 修改原因：批量导入的 expires_at 可能是数字、数字字符串或 RFC3339 字符串，路由需要判断无 refresh_token 的 token 是否已过期。
+    # 修改方式：先尝试数字解析，再尝试 ISO/RFC3339 解析，并统一转换成 UTC epoch 秒。
+    # 目的：避免把明显过期且无法刷新的 access_token 注册进 OAuthManager。
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        pass
+    try:
+        normalized = text.replace("Z", "+00:00") if text.endswith("Z") else text
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _batch_token_is_expired(token_data: dict) -> bool:
+    """判断批量导入的凭据是否已经过期。"""
+    # 修改原因：refresh 不可用时注册过期 access_token 会让后续请求立即失败，且错误不如导入时反馈清楚。
+    # 修改方式：读取 expires_at，缺失时兼容 Gemini 的 expiry 字段，解析成功后与当前时间比较。
+    # 目的：把无可刷新能力的过期凭据标记为 skipped，而不是写入不可用账号。
+    expiry_value = token_data.get("expires_at")
+    if expiry_value is None:
+        expiry_value = token_data.get("expiry")
+    expiry_epoch = _parse_batch_expiry_epoch(expiry_value)
+    return expiry_epoch is not None and expiry_epoch <= time.time()
+
+
+def _unknown_batch_import_item(item=None) -> dict:
+    """生成未知格式的 normalize 结果。"""
+    # 修改原因：批量导入需要逐条返回结果，遇到无法识别或非对象元素时也不能让整批解析失败。
+    # 修改方式：保留 dict 中已有凭据字段；非 dict 使用空 token_data，并把账号标识兜底为 unknown。
+    # 目的：让调用方可以在 results 中看到跳过原因，同时保留兼容未知导出结构的余地。
+    token_data = dict(item) if isinstance(item, dict) else {}
+    key_id = _first_non_empty_string(
+        token_data.get("key_id"),
+        token_data.get("email"),
+        token_data.get("name"),
+    ) or "unknown"
+    return {"key_id": key_id, "token_data": token_data, "source_format": "unknown"}
+
+
+def _normalize_sub2api_account(account) -> dict:
+    """把 sub2api 单个账号转换为统一导入结构。"""
+    # 修改原因：sub2api 把 OAuth 凭据放在 accounts[].credentials 中，账号标识放在 name 或 credentials.email 中。
+    # 修改方式：复制 credentials 作为 token_data，并把 unix 秒 expires_at 转成 ISO 8601 字符串。
+    # 目的：让 sub2api 导出可以直接批量导入，而不要求管理员手工拆分每个账号。
+    if not isinstance(account, dict):
+        return {"key_id": "unknown", "token_data": {}, "source_format": "sub2api"}
+    credentials = account.get("credentials")
+    token_data = dict(credentials) if isinstance(credentials, dict) else {}
+    expires_at = _utc_iso_from_timestamp(token_data.get("expires_at"))
+    if expires_at:
+        token_data["expires_at"] = expires_at
+    key_id = _first_non_empty_string(
+        account.get("name"),
+        token_data.get("email"),
+        token_data.get("chatgpt_account_id"),
+        token_data.get("account_id"),
+    ) or "unknown"
+    return {"key_id": key_id, "token_data": token_data, "source_format": "sub2api"}
+
+
+def _normalize_cpa_import_item(item) -> dict:
+    """把 CPA 单文件凭据转换为统一导入结构。"""
+    # 修改原因：CPA 的 Codex、Claude 和 Gemini 导出字段不同，但后续注册逻辑只需要统一的 key_id 与 token_data。
+    # 修改方式：按格式特征识别子类型，保留原始字段，同时补齐 email、account_id、organization_id、expires_at 等本地常用字段。
+    # 目的：让 CPA 单文件和多文件合并数据复用同一条批量导入处理路径。
+    if not isinstance(item, dict):
+        return _unknown_batch_import_item(item)
+
+    token_data = dict(item)
+
+    if "expiry" in item:
+        key_id = _first_non_empty_string(item.get("email")) or "unknown"
+        if item.get("expiry"):
+            token_data["expires_at"] = item.get("expiry")
+        return {"key_id": key_id, "token_data": token_data, "source_format": "cpa_gemini"}
+
+    account = item.get("account") if isinstance(item.get("account"), dict) else {}
+    organization = item.get("organization") if isinstance(item.get("organization"), dict) else {}
+    if account or organization or "expires_in" in item:
+        key_id = _first_non_empty_string(
+            account.get("email_address"),
+            item.get("email"),
+            organization.get("uuid"),
+            account.get("uuid"),
+        ) or "unknown"
+        email = _first_non_empty_string(account.get("email_address"), item.get("email"))
+        if email:
+            token_data["email"] = email
+        account_uuid = _first_non_empty_string(account.get("uuid"))
+        if account_uuid:
+            token_data["account_id"] = account_uuid
+        org_uuid = _first_non_empty_string(organization.get("uuid"))
+        if org_uuid:
+            token_data["organization_id"] = org_uuid
+        org_name = _first_non_empty_string(organization.get("name"))
+        if org_name:
+            token_data["organization_name"] = org_name
+        try:
+            expires_in = float(item.get("expires_in") or 0)
+        except (TypeError, ValueError):
+            expires_in = 0
+        if expires_in > 0:
+            expires_at = time.time() + expires_in
+            token_data["expires_at"] = expires_at
+            token_data["expired"] = _utc_iso_from_timestamp(expires_at)
+        return {"key_id": key_id, "token_data": token_data, "source_format": "cpa_claude"}
+
+    user = item.get("user") if isinstance(item.get("user"), dict) else {}
+    if user or "expires_at" in item:
+        key_id = _first_non_empty_string(user.get("email"), item.get("email"), user.get("id")) or "unknown"
+        email = _first_non_empty_string(user.get("email"), item.get("email"))
+        if email:
+            token_data["email"] = email
+        account_id = _first_non_empty_string(user.get("id"), item.get("account_id"))
+        if account_id:
+            token_data["account_id"] = account_id
+        return {"key_id": key_id, "token_data": token_data, "source_format": "cpa_codex"}
+
+    if item.get("token_type") and item.get("email"):
+        key_id = _first_non_empty_string(item.get("email")) or "unknown"
+        return {"key_id": key_id, "token_data": token_data, "source_format": "cpa_gemini"}
+
+    return _unknown_batch_import_item(item)
+
+
+def _normalize_batch_import_data(data) -> list[dict]:
+    """把 sub2api 或 CPA 导出数据统一转换为批量导入账号列表。"""
+    # 修改原因：/v1/oauth/batch_import 需要自动识别 sub2api、CPA 单文件和 CPA 多文件合并三种输入格式。
+    # 修改方式：sub2api 识别 accounts 数组，CPA 多文件识别顶层数组，CPA 单文件识别顶层 access_token；其他结构保留为 unknown。
+    # 目的：让后续批量注册逻辑只处理统一的 key_id、token_data、source_format 三元结构。
+    if isinstance(data, dict) and isinstance(data.get("accounts"), list):
+        return [_normalize_sub2api_account(account) for account in data.get("accounts", [])]
+    if isinstance(data, list):
+        return [_normalize_cpa_import_item(item) for item in data]
+    if isinstance(data, dict) and "access_token" in data:
+        return [_normalize_cpa_import_item(data)]
+    if isinstance(data, dict):
+        return [_unknown_batch_import_item(data)]
+    return [{"key_id": "unknown", "token_data": {}, "source_format": "unknown"}]
 
 
 def _key_exists_in_provider(app, channel_id: str, key_id: str) -> bool:
@@ -517,6 +700,86 @@ async def import_account(request: Request):
             return {"message": "Account imported", "key_id": key_id, "already_exists": already_exists}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@router.post("/v1/oauth/batch_import", dependencies=[Depends(verify_admin_api_key)])
+async def batch_import(request: Request):
+    """批量导入 OAuth 账号，兼容 sub2api 和 CPA 导出格式。"""
+    # 修改原因：现有 /v1/oauth/import 只能导入单个账号，CPA/sub2api 迁移时需要手动拆分大量凭据。
+    # 修改方式：新增批量端点，先自动 normalize 三种导出格式，再逐条刷新、注册和记录结果。
+    # 目的：让管理员可以一次导入多账号，同时单个账号失败不会中断整批处理。
+    body = await request.json()
+    channel_id = _require_provider_name(body.get("provider"))
+    if not channel_id:
+        return JSONResponse({"error": "provider is required"}, status_code=400)
+    type_name = str(body.get("type") or "").strip()
+    if not type_name:
+        return JSONResponse({"error": "type is required"}, status_code=400)
+    if "data" not in body:
+        return JSONResponse({"error": "data is required"}, status_code=400)
+
+    try:
+        normalized_items = _normalize_batch_import_data(body.get("data"))
+    except Exception as exc:
+        return JSONResponse({"error": f"Failed to parse batch import data: {exc}"}, status_code=400)
+
+    oauth_mgr = request.app.state.oauth_manager
+    oauth_provider = oauth_mgr._providers.get(type_name)
+    results = []
+    success = 0
+    failed = 0
+    skipped = 0
+
+    for item in normalized_items:
+        # 修改原因：批量导入中的任一条数据都可能缺字段或刷新失败，不能影响其他账号继续导入。
+        # 修改方式：每个账号独立 try/except，逐条生成 status、already_exists 或 error。
+        # 目的：返回完整的导入报告，方便前端或管理员定位具体失败账号。
+        key_id = _first_non_empty_string(item.get("key_id")) or "unknown"
+        token_data = item.get("token_data") if isinstance(item.get("token_data"), dict) else {}
+        token_data = dict(token_data)
+
+        try:
+            if token_data.get("refresh_token") and oauth_provider:
+                # 修改原因：CPA/sub2api 导出中的 access_token 可能已经临近过期，refresh_token 可用时应先刷新再落库。
+                # 修改方式：优先走 OAuthManager.refresh_provider 以继承运行时配置注入；旧 manager 或测试替身缺失该方法时回退到 provider.refresh_token。
+                # 目的：保存更新后的 access_token 和可能轮换后的 refresh_token，减少导入后首次请求失败概率。
+                if hasattr(oauth_mgr, "refresh_provider"):
+                    token_data = await oauth_mgr.refresh_provider(type_name, token_data)
+                else:
+                    token_data = await oauth_provider.refresh_token(token_data)
+
+            if not token_data.get("access_token"):
+                skipped += 1
+                results.append({"key_id": key_id, "status": "skipped", "error": "missing access_token"})
+                continue
+
+            if not token_data.get("refresh_token") and _batch_token_is_expired(token_data):
+                skipped += 1
+                results.append({"key_id": key_id, "status": "skipped", "error": "token expired"})
+                continue
+
+            if token_data.get("refresh_token") and not oauth_provider and _batch_token_is_expired(token_data):
+                skipped += 1
+                results.append({"key_id": key_id, "status": "skipped", "error": "token expired and refresh unavailable"})
+                continue
+
+            email = _first_non_empty_string(token_data.get("email"))
+            final_key_id = email or key_id
+            already_exists = _key_exists_in_provider(request.app, channel_id, final_key_id)
+            await oauth_mgr.register(channel_id, final_key_id, type_name, token_data)
+            success += 1
+            results.append({"key_id": final_key_id, "status": "success", "already_exists": already_exists})
+        except Exception as exc:
+            failed += 1
+            results.append({"key_id": key_id, "status": "failed", "error": str(exc)})
+
+    return {
+        "total": len(normalized_items),
+        "success": success,
+        "failed": failed,
+        "skipped": skipped,
+        "results": results,
+    }
 
 
 @router.get("/v1/oauth/accounts", dependencies=[Depends(verify_admin_api_key)])

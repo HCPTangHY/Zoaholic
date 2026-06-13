@@ -1,6 +1,6 @@
 [project]
 name = "Zoaholic"
-version = "1.7.3"
+version = "1.7.4"
 description = "A LLM API gateway with multi-dialect support base on Uni-API"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,6 +23,7 @@ dependencies = [
     "uvicorn>=0.35.0",
     "watchfiles>=1.1.0",
     "orjson>=3.10.0",
+    "pyyaml>=6.0",
 ]
 
 [build-system]

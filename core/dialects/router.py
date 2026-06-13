@@ -114,6 +114,19 @@ def _create_dialect_verify_api_key(dialect_id: str):
         app = request.app
         api_list = app.state.api_list
 
+        from core.ip_blacklist import (
+            get_client_ip_from_request_info,
+            is_global_ip_blocked,
+            is_key_ip_blocked,
+            raise_ip_blocked,
+        )
+        client_ip = get_client_ip_from_request_info()
+        if is_global_ip_blocked(app, client_ip):
+            # 修改原因：方言端点跳过 StatsMiddleware 的标准认证，但仍必须先执行全局 IP 黑名单。
+            # 修改方式：在方言 token 提取和 API Key 匹配前读取 request_info.client_ip 检查全局缓存。
+            # 目的：保证 Gemini/Claude 等方言入口也遵守“全局黑名单优先”。
+            raise_ip_blocked()
+
         dialect = get_dialect(dialect_id)
         token: str | None = None
 
@@ -179,6 +192,12 @@ def _create_dialect_verify_api_key(dialect_id: str):
         if api_index is None:
             from fastapi import HTTPException
             raise HTTPException(status_code=403, detail="Invalid or missing API Key")
+
+        if is_key_ip_blocked(app, api_index, client_ip):
+            # 修改原因：方言入口解析出 API Key 下标后，也要执行当前 Key 的 IP 黑名单。
+            # 修改方式：用 api_index 读取 app.state.api_key_ip_blacklists 对应规则。
+            # 目的：保持方言入口与 /v1 标准入口的访问控制顺序一致。
+            raise_ip_blocked()
 
         # 更新 request_info 和 request.state 中的 API key 信息，确保统计记录模板 key 而非 BYOK 真实 key。
         try:

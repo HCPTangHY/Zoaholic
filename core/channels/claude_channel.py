@@ -586,6 +586,32 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
                 if line.startswith("data:") and (line := line.lstrip("data: ")):
                     resp: dict = json_loads(line)
 
+                    # 流内错误事件检测（overloaded、429、赛博安全等）
+                    event_type_early = resp.get("type", "")
+                    if event_type_early == "error" or (event_type_early not in (
+                        "message_start", "message_delta", "message_stop",
+                        "content_block_start", "content_block_delta", "content_block_stop",
+                        "ping",
+                    ) and "error" in resp):
+                        err_obj = resp.get("error", {})
+                        if isinstance(err_obj, dict):
+                            err_msg = err_obj.get("message", str(resp))
+                            err_type = err_obj.get("type", "upstream_error")
+                        else:
+                            err_msg = str(err_obj or resp)
+                            err_type = "upstream_error"
+                        oai_err = json_dumps_text({
+                            "error": {
+                                "message": err_msg,
+                                "type": err_type,
+                                "param": None,
+                                "code": err_type,
+                            }
+                        }, ensure_ascii=False)
+                        yield f"data: {oai_err}" + end_of_line
+                        logger.warning(f"[claude_stream] Upstream error event: {err_type}: {err_msg[:200]}")
+                        break
+
                     if not input_tokens and not cached_tokens and not cache_creation_tokens:
                         msg_usage = safe_get(resp, "message", "usage", default={})
                         if msg_usage:

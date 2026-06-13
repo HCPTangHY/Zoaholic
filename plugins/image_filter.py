@@ -44,6 +44,26 @@ PLUGIN_INFO = {
         "category": "interceptors",
         "tags": ["filter", "image", "multimodal", "text-only"],
         "params_hint": "留空 = 过滤并插入 [图片已过滤] 提示 | quiet = 静默过滤 | 其他文本 = 自定义占位提示",
+        "params_schema": [
+            {
+                "key": "mode",
+                "label": "过滤模式",
+                "type": "select",
+                "options": [
+                    {"value": "", "label": "插入 [图片已过滤] 提示（默认）"},
+                    {"value": "quiet", "label": "静默过滤（不插入提示）"},
+                ],
+                "default": "",
+            },
+            {
+                "key": "placeholder",
+                "label": "自定义占位文本",
+                "type": "text",
+                "placeholder": "留空使用默认提示",
+                "default": "",
+                "visible_when": {"mode": ""},
+            },
+        ],
     },
 }
 

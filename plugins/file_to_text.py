@@ -45,6 +45,19 @@ PLUGIN_INFO = {
         "category": "interceptors",
         "tags": ["filter", "file", "text", "convert"],
         "params_hint": "留空 = 转为代码块 + 文件名 | quiet = 转为纯文本 | remove = 直接移除文件",
+        "params_schema": [
+            {
+                "key": "mode",
+                "label": "转换模式",
+                "type": "select",
+                "options": [
+                    {"value": "", "label": "代码块 + 文件名（默认）"},
+                    {"value": "quiet", "label": "纯文本（无格式）"},
+                    {"value": "remove", "label": "直接移除文件"},
+                ],
+                "default": "",
+            },
+        ],
     },
 }
 

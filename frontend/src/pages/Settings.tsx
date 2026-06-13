@@ -3,7 +3,7 @@ import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
 import { toastSuccess, toastError, toastWarning } from '../components/Toast';
 import {
-  Save, RefreshCw, AlertCircle, Zap, Shield,
+  Save, RefreshCw, AlertCircle, Zap, Shield, Ban,
   Timer, Database, Blocks, Plus, Trash2, Link, DollarSign
 } from 'lucide-react';
 
@@ -67,6 +67,7 @@ export default function Settings() {
   const [preferences, setPreferences] = useState<Preferences>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [globalIpBlacklistText, setGlobalIpBlacklistText] = useState('');
 
   // 数据库清理状态
   const [cleanupAction, setCleanupAction] = useState<CleanupAction>('clear_fields');
@@ -106,6 +107,13 @@ export default function Settings() {
             ];
           }
           setPreferences(loadedPreferences);
+          const apiConfig = data.api_config || data;
+          const rawBl = apiConfig.ip_blacklist;
+          setGlobalIpBlacklistText(
+            Array.isArray(rawBl) ? rawBl.filter(Boolean).join('\n')
+            : typeof rawBl === 'string' ? rawBl.trim()
+            : ''
+          );
         }
       } catch (err) {
         console.error('Failed to load settings:', err);
@@ -277,21 +285,24 @@ export default function Settings() {
         const parts = String(priceStr || '').split(',').map(s => s.trim());
         const inp = parts[0] || '0';
         const out = parts[1] || '0';
-        if (isNaN(Number(inp)) || isNaN(Number(out))) {
+        const cached = parts[2] || '';
+        if (isNaN(Number(inp)) || isNaN(Number(out)) || (cached && isNaN(Number(cached)))) {
           toastWarning(`模型价格「${trimmed}」的价格值无效，请填写数字`);
           return;
         }
-        validEntries.push([trimmed, `${inp},${out}`]);
+        validEntries.push([trimmed, cached ? `${inp},${out},${cached}` : `${inp},${out}`]);
       }
       cleanedPreferences.model_price = validEntries.length > 0 ? Object.fromEntries(validEntries) : null;
     }
+
+    const ipEntries = [...new Set(globalIpBlacklistText.split(/[\n,]+/).map(s => s.trim()).filter(Boolean))];
 
     setSaving(true);
     try {
       const res = await apiFetch('/v1/api_config/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ preferences: cleanedPreferences })
+        body: JSON.stringify({ preferences: cleanedPreferences, ip_blacklist: ipEntries })
       });
       if (res.ok) {
         toastSuccess('配置已保存成功');
@@ -417,18 +428,20 @@ export default function Settings() {
               </div>
             ) : (
               <div className="space-y-2">
-                <div className="grid grid-cols-[1fr_5.5rem_5.5rem_2rem] gap-2 text-[11px] text-muted-foreground font-medium px-1">
+                <div className="grid grid-cols-[1fr_5rem_5rem_5rem_2rem] gap-2 text-[11px] text-muted-foreground font-medium px-1">
                   <span>模型名 / 前缀</span>
                   <span className="text-center">输入 $/M</span>
                   <span className="text-center">输出 $/M</span>
+                  <span className="text-center">缓存 $/M</span>
                   <span></span>
                 </div>
                 {Object.entries(preferences.model_price || {}).map(([prefix, priceStr], idx) => {
                   const parts = String(priceStr || '').split(',').map(s => s.trim());
                   const inputPrice = parts[0] || '';
                   const outputPrice = parts[1] || '';
+                  const cachedPrice = parts[2] || '';
                   return (
-                    <div key={idx} className="grid grid-cols-[1fr_5.5rem_5.5rem_2rem] gap-2 items-center">
+                    <div key={idx} className="grid grid-cols-[1fr_5rem_5rem_5rem_2rem] gap-2 items-center">
                       <input
                         type="text"
                         value={prefix}
@@ -446,7 +459,8 @@ export default function Settings() {
                         onChange={e => {
                           const mp = { ...(preferences.model_price || {}) };
                           const entries = Object.entries(mp);
-                          entries[idx] = [prefix, `${e.target.value},${outputPrice}`];
+                          const newVal = cachedPrice ? `${e.target.value},${outputPrice},${cachedPrice}` : `${e.target.value},${outputPrice}`;
+                          entries[idx] = [prefix, newVal];
                           updatePreference('model_price', Object.fromEntries(entries));
                         }}
                         placeholder="0.3"
@@ -458,10 +472,25 @@ export default function Settings() {
                         onChange={e => {
                           const mp = { ...(preferences.model_price || {}) };
                           const entries = Object.entries(mp);
-                          entries[idx] = [prefix, `${inputPrice},${e.target.value}`];
+                          const newVal = cachedPrice ? `${inputPrice},${e.target.value},${cachedPrice}` : `${inputPrice},${e.target.value}`;
+                          entries[idx] = [prefix, newVal];
                           updatePreference('model_price', Object.fromEntries(entries));
                         }}
                         placeholder="1.0"
+                        className="bg-background border border-border px-2 py-1.5 rounded-lg text-sm font-mono text-center text-foreground focus:border-primary outline-none"
+                      />
+                      <input
+                        type="text"
+                        value={cachedPrice}
+                        onChange={e => {
+                          const mp = { ...(preferences.model_price || {}) };
+                          const entries = Object.entries(mp);
+                          const val = e.target.value;
+                          const newVal = val ? `${inputPrice},${outputPrice},${val}` : `${inputPrice},${outputPrice}`;
+                          entries[idx] = [prefix, newVal];
+                          updatePreference('model_price', Object.fromEntries(entries));
+                        }}
+                        placeholder="自动"
                         className="bg-background border border-border px-2 py-1.5 rounded-lg text-sm font-mono text-center text-foreground focus:border-primary outline-none"
                       />
                       <button
@@ -602,6 +631,23 @@ export default function Settings() {
                 </p>
               </div>
             )}
+          </div>
+        </section>
+
+        {/* 全局 IP 黑名单 */}
+        <section className="bg-card border border-border rounded-xl overflow-hidden">
+          <div className="p-4 border-b border-border bg-muted/30 flex items-center gap-2 font-medium text-foreground">
+            <Ban className="w-5 h-5 text-red-500" /> IP 黑名单
+          </div>
+          <div className="p-6 space-y-3">
+            <p className="text-sm text-muted-foreground">全局 IP 黑名单对所有请求生效，包括 API 和管理接口。每行填写一个精确 IP 或 CIDR 网段。</p>
+            <textarea
+              value={globalIpBlacklistText}
+              onChange={e => setGlobalIpBlacklistText(e.target.value)}
+              placeholder={'例如：\n1.2.3.4\n10.0.0.0/8'}
+              className="w-full min-h-[120px] bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
+            />
+            <p className="text-xs text-muted-foreground">点击页面顶部「保存配置」按钮后生效。各 API Key 还可在 Key 管理页独立配置 Key 级黑名单。</p>
           </div>
         </section>
 

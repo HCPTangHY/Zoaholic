@@ -81,7 +81,7 @@ async def fetch_prices(force: bool = False) -> bool:
             return False
 
 
-def lookup_price(model_name: str) -> Optional[tuple[float, float]]:
+def lookup_price(model_name: str) -> Optional[tuple[float, float, float]]:
     """
     查找模型价格。
     
@@ -91,24 +91,35 @@ def lookup_price(model_name: str) -> Optional[tuple[float, float]]:
     3. 去掉日期后缀重试（如 gpt-4o-2024-08-06 → gpt-4o）
     
     Returns:
-        (prompt_price, completion_price) 单位 $/M tokens，或 None
+        (prompt_price, completion_price, cached_price) 单位 $/M tokens，或 None
     """
     if not _price_cache:
         return None
 
     normalized = _normalize_model_id(model_name)
 
+    def _price_tuple(item: dict) -> tuple[float, float, float]:
+        """
+        修改原因：统计写入需要知道缓存输入价，才能在不改数据库结构的前提下折算 prompt_price。
+        修改方式：把外部价格库的 input_cached 作为第三段返回；没有缓存价时回退到 input。
+        目的：保持原有输入、输出价格行为不变，同时让调用方可以按 cached_tokens 计算等效输入价。
+        """
+        input_price = item.get("input", 0) or 0
+        output_price = item.get("output", 0) or 0
+        cached_price = item.get("input_cached") or input_price
+        return input_price, output_price, cached_price
+
     # 1. 精确匹配
     item = _price_cache.get(normalized)
     if item:
-        return item.get("input", 0) or 0, item.get("output", 0) or 0
+        return _price_tuple(item)
 
     # 2. 前缀匹配（取最长的 key）
     candidates = [(k, v) for k, v in _price_cache.items() if normalized.startswith(k)]
     if candidates:
         candidates.sort(key=lambda x: len(x[0]), reverse=True)
         item = candidates[0][1]
-        return item.get("input", 0) or 0, item.get("output", 0) or 0
+        return _price_tuple(item)
 
     # 3. 去掉日期后缀（-2024-08-06, -20240806, -0125 等）
     import re
@@ -116,13 +127,13 @@ def lookup_price(model_name: str) -> Optional[tuple[float, float]]:
     if stripped != normalized:
         item = _price_cache.get(stripped)
         if item:
-            return item.get("input", 0) or 0, item.get("output", 0) or 0
+            return _price_tuple(item)
     # 也试短日期后缀 (-0125)
     stripped2 = re.sub(r'-\d{4}$', '', normalized)
     if stripped2 != normalized and stripped2 != stripped:
         item = _price_cache.get(stripped2)
         if item:
-            return item.get("input", 0) or 0, item.get("output", 0) or 0
+            return _price_tuple(item)
 
     return None
 

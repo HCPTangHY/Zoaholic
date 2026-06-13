@@ -250,6 +250,21 @@ async def error_handling_wrapper(
                 except Exception:
                     pass
 
+                # 发送 OAI 格式 error event，让客户端知道流异常结束
+                try:
+                    import json as _json
+                    err_payload = _json.dumps({
+                        "error": {
+                            "message": f"Upstream network error: {type(e).__name__}",
+                            "type": "upstream_network_error",
+                            "param": None,
+                            "code": "upstream_network_error",
+                        }
+                    })
+                    yield f"data: {err_payload}\n\n"
+                except Exception:
+                    pass
+
                 done = "data: [DONE]\n\n" if done_message is None else done_message
                 if done:
                     yield done

@@ -393,6 +393,12 @@ async def process_request_passthrough(
         request, engine, provider, api_key, url, headers, payload, enabled_plugins
     )
 
+    # 非生成子端点（如 count_tokens）：剥掉生成专属字段，防止 overrides 塞回的字段触发上游 400
+    if url.rstrip('/').endswith('/count_tokens') and isinstance(payload, dict):
+        for _f in ('max_tokens', 'stream', 'stop_sequences', 'temperature',
+                    'top_p', 'top_k', 'metadata', 'context_management'):
+            payload.pop(_f, None)
+
     if is_debug:
         pass
 

@@ -2,7 +2,10 @@ import gc
 import os
 import json
 import asyncio
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib  # Python < 3.11 fallback
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -32,7 +35,7 @@ from core.handler import (
     set_debug_mode as set_handler_debug_mode,
 )
 from core.middleware import StatsMiddleware, request_info, get_api_key
-from core.error_response import openai_error_response
+from core.error_response import create_error_response, openai_error_response
 
 from utils import safe_get, load_config
 
@@ -90,6 +93,156 @@ def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT)
     # print("result", json.dumps(result, indent=4))
 
     return result
+
+# ---- 数据库压缩闸门 ----
+_db_ready = asyncio.Event()
+_db_ready.set()  # 初始状态：放行
+_last_compact_date = None  # 每天最多压缩一次
+
+
+async def _maybe_compact_db(app):
+    """凌晨低峰期自动执行 VACUUM INTO 压缩数据库。"""
+    global _last_compact_date
+    import os
+
+    try:
+        prefs = {}
+        if hasattr(app, 'state') and hasattr(app.state, 'config'):
+            prefs = (app.state.config or {}).get('preferences', {})
+
+        tz_name = str(prefs.get('log_retention_timezone') or '').strip()
+        if tz_name:
+            try:
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo(tz_name)
+            except Exception:
+                tz = datetime.now().astimezone().tzinfo
+        else:
+            tz = datetime.now().astimezone().tzinfo
+        now_local = datetime.now(tz)
+        current_hour = now_local.hour
+        today = now_local.date()
+
+        # 每天最多跑一次
+        if _last_compact_date == today:
+            return
+
+        compact_start = int(prefs.get('db_compact_hour_start', 3))
+        compact_end = int(prefs.get('db_compact_hour_end', 5))
+        compact_threshold_mb = int(prefs.get('db_compact_threshold_mb', 1024))
+
+        # 时间窗口检查（支持跨午夜）
+        if compact_start <= compact_end:
+            in_window = compact_start <= current_hour < compact_end
+        else:
+            in_window = current_hour >= compact_start or current_hour < compact_end
+
+        if not in_window:
+            return
+
+        # 文件大小检查
+        db_path = os.path.join(os.environ.get('DATA_DIR', 'data'), 'stats.db')
+        if not os.path.exists(db_path):
+            return
+        db_size_mb = os.path.getsize(db_path) / (1024 * 1024)
+        if db_size_mb <= compact_threshold_mb:
+            return
+
+        compact_path = db_path + '.compact'
+        old_path = db_path + '.old'
+
+        logger.info(f'[db_compact] 触发压缩: {db_size_mb:.0f}MB > {compact_threshold_mb}MB, '
+                    f'时间 {now_local.strftime("%H:%M")} (窗口 {compact_start}:00-{compact_end}:00)')
+
+        # Step 1: 关闭闸门，挂起新请求
+        _db_ready.clear()
+        logger.info('[db_compact] 已挂起新请求')
+
+        # Step 2: 等待 stats buffer 消费完
+        try:
+            from core.stats import _stats_buffer
+            for _ in range(100):  # 最多等 10 秒
+                if len(_stats_buffer) == 0:
+                    break
+                await asyncio.sleep(0.1)
+        except ImportError:
+            pass
+
+        # Step 3: VACUUM INTO
+        import sqlite3
+        def do_vacuum_into():
+            if os.path.exists(compact_path):
+                os.remove(compact_path)
+            conn = sqlite3.connect(db_path)
+            conn.execute(f"VACUUM INTO '{compact_path}'")
+            conn.close()
+
+        await asyncio.to_thread(do_vacuum_into)
+        compact_size_mb = os.path.getsize(compact_path) / (1024 * 1024)
+        logger.info(f'[db_compact] VACUUM INTO 完成: {db_size_mb:.0f}MB -> {compact_size_mb:.0f}MB')
+
+        # Step 4: 关闭数据库连接
+        try:
+            from db import close_db
+            await close_db()
+        except ImportError:
+            pass
+
+        # Step 5: 替换文件
+        def do_replace():
+            for suffix in ['', '-wal', '-shm']:
+                src = db_path + suffix
+                dst = old_path + suffix
+                if os.path.exists(src):
+                    os.rename(src, dst)
+            os.rename(compact_path, db_path)
+
+        await asyncio.to_thread(do_replace)
+
+        # Step 6: 重新打开数据库连接
+        try:
+            from db import init_db
+            await init_db()
+        except ImportError:
+            pass
+
+        # Step 7: 清理旧文件
+        def do_cleanup_old():
+            for suffix in ['', '-wal', '-shm']:
+                f = old_path + suffix
+                if os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
+
+        await asyncio.to_thread(do_cleanup_old)
+
+        _last_compact_date = today
+        logger.info(f'[db_compact] 压缩完成，节省 {db_size_mb - compact_size_mb:.0f}MB')
+
+    except Exception as e:
+        logger.error(f'[db_compact] 压缩失败: {e}')
+        # 尝试恢复
+        try:
+            db_path = os.path.join(os.environ.get('DATA_DIR', 'data'), 'stats.db')
+            old_path = db_path + '.old'
+            compact_path = db_path + '.compact'
+            if os.path.exists(old_path) and not os.path.exists(db_path):
+                os.rename(old_path, db_path)
+                for suffix in ['-wal', '-shm']:
+                    if os.path.exists(old_path + suffix):
+                        os.rename(old_path + suffix, db_path + suffix)
+                logger.info('[db_compact] 已恢复旧数据库')
+            if os.path.exists(compact_path):
+                os.remove(compact_path)
+        except Exception as re:
+            logger.error(f'[db_compact] 恢复也失败了: {re}')
+    finally:
+        # 无论成功失败都打开闸门
+        _db_ready.set()
+        logger.info('[db_compact] 已恢复接受请求')
+
 
 async def cleanup_expired_raw_data():
     """
@@ -171,9 +324,10 @@ async def cleanup_expired_raw_data():
 
                 if result.rowcount > 0:
                     logger.info(f"Cleaned up expired raw data from {result.rowcount} log entries")
-                    # SQLite DELETE/UPDATE 不释放磁盘空间，需要 VACUUM 回收 freelist。
-                    # 只在 SQLite 且确实清理了数据时执行，避免 PostgreSQL/MySQL 上不必要的开销。
-                    # VACUUM 必须在事务外执行，用独立的 raw connection + autocommit。
+                    # SQLite DELETE/UPDATE 不释放磁盘空间，需要回收 freelist。
+                    # auto_vacuum=INCREMENTAL 模式下用 incremental_vacuum 逐步回收，
+                    # 不需要独占锁，不阻塞 WAL checkpoint，不会导致 database locked。
+                    # full VACUUM 需要独占锁 + checkpoint WAL，2G+ 库会卡住十几秒并导致 WAL 膨胀。
                     if (DB_TYPE or "sqlite").lower() == "sqlite":
                         try:
                             import aiosqlite
@@ -187,10 +341,15 @@ async def cleanup_expired_raw_data():
                             if not db_path:
                                 db_path = "data/stats.db"
                             async with aiosqlite.connect(db_path) as vacuum_conn:
-                                await vacuum_conn.execute("VACUUM")
-                                logger.info("SQLite VACUUM completed after raw data cleanup")
+                                # 每次回收最多 2000 页（约 8MB），轻量不阻塞
+                                await vacuum_conn.execute("PRAGMA incremental_vacuum(2000)")
+                                logger.info("SQLite incremental_vacuum completed after raw data cleanup")
                         except Exception as ve:
-                            logger.warning(f"SQLite VACUUM failed (non-critical): {ve}")
+                            logger.warning(f"SQLite incremental_vacuum failed (non-critical): {ve}")
+
+                # ---- 数据库自动压缩 (VACUUM INTO) ----
+                if (DB_TYPE or "sqlite").lower() == "sqlite":
+                    await _maybe_compact_db(app)
                     
         except asyncio.CancelledError:
             logger.info("Raw data cleanup task cancelled")
@@ -797,6 +956,15 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     if exc.status_code == 404:
         token = await get_api_key(request)
         logger.error(f"404 Error: {exc.detail} api_key: {token}")
+    if isinstance(exc.detail, dict) and exc.detail.get("type") == "ip_blocked":
+        # 修改原因：IP 黑名单命中需要返回需求指定的 error.type，而默认 403 会变成 permission_denied_error。
+        # 修改方式：当依赖鉴权抛出的 detail 带有 type=ip_blocked 时，显式传入 error_type。
+        # 目的：让中间件路径和 FastAPI Depends 路径都返回 {"error":{"message":"Access denied","type":"ip_blocked"}}。
+        return create_error_response(
+            message=str(exc.detail.get("message") or "Access denied"),
+            status_code=exc.status_code,
+            error_type="ip_blocked",
+        )
     return openai_error_response(message=str(exc.detail), status_code=exc.status_code)
 
 
@@ -854,6 +1022,9 @@ model_handler: Optional[ModelRequestHandler] = None
 # SPA 前端路由 fallback - 所有未匹配的前端路由都返回 index.html
 from fastapi.responses import FileResponse
 
+# 修改原因：Key Analytics 是前端独立路由，直接刷新页面时也应返回 SPA index.html。
+# 修改方式：把 /key-analytics 加入服务端 fallback 白名单。
+# 目的：避免浏览器刷新新增页面时落到静态文件 404。
 SPA_ROUTES = ["/channels", "/playground", "/admin", "/settings", "/logs", "/login"]
 
 # 缓存控制头：index.html 不缓存，静态资源（带 hash）长期缓存

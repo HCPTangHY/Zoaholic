@@ -430,6 +430,60 @@ async def reload_plugin(name: str, _: int = Depends(verify_admin_api_key)):
         )
 
 
+@router.post("/reload_all", dependencies=[Depends(rate_limit_dependency)])
+async def reload_all_plugins(_: int = Depends(verify_admin_api_key)):
+    """
+    强制重新加载所有插件（先全部注销再重新扫描加载）
+    """
+    manager = get_plugin_manager()
+    interceptor_registry = get_interceptor_registry()
+
+    # 1. 注销所有已注册的插件拦截器
+    existing_plugins = list(manager.loader.plugins.keys())
+    for name in existing_plugins:
+        try:
+            interceptor_registry.unregister_plugin_interceptors(name)
+        except Exception:
+            pass
+
+    # 2. 卸载所有插件
+    for name in existing_plugins:
+        try:
+            manager.loader.unload_plugin(name)
+        except Exception:
+            pass
+
+    # 3. 清空插件注册表
+    manager.loader._plugins.clear()
+
+    # 4. 重新扫描并加载
+    result = manager.loader.load_all()
+
+    # 5. 激活所有已启用的插件
+    loaded = []
+    failed = []
+    for source, plugins in result.items():
+        for info in plugins:
+            if info.enabled:
+                try:
+                    manager._activate_plugin(info)
+                    loaded.append(info.name)
+                except Exception as e:
+                    failed.append({"name": info.name, "error": str(e)})
+                    logger.error(f"Failed to activate plugin {info.name}: {e}")
+            else:
+                loaded.append(info.name)
+
+    logger.info(f"[plugins] reload_all: {len(loaded)} loaded, {len(failed)} failed")
+
+    return JSONResponse(content={
+        "success": True,
+        "loaded": loaded,
+        "failed": failed,
+        "message": f"Reloaded {len(loaded)} plugins, {len(failed)} failed",
+    })
+
+
 @router.delete("/{name}", dependencies=[Depends(rate_limit_dependency)])
 async def uninstall_plugin(name: str, _: int = Depends(verify_admin_api_key)):
     """

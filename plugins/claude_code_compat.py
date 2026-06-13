@@ -50,6 +50,26 @@ PLUGIN_INFO = {
         "category": "interceptor",
         "tags": ["claude", "anthropic", "claude-code", "auth", "bearer", "billing", "sanitize"],
         "params_hint": "格式：2.1.97 或 2.1.97,cli 或 2.1.97,cli,59cf53e54c78。留空使用默认值。",
+        "params_schema": [
+            {
+                "key": "version",
+                "label": "CC 版本号",
+                "type": "text",
+                "placeholder": "如 2.1.128",
+                "default": "",
+            },
+            {
+                "key": "client",
+                "label": "客户端类型",
+                "type": "select",
+                "options": [
+                    {"value": "", "label": "默认"},
+                    {"value": "cli", "label": "CLI"},
+                    {"value": "vscode", "label": "VSCode"},
+                ],
+                "default": "",
+            },
+        ],
     },
 }
 
@@ -116,7 +136,7 @@ TOOL_RENAME_MAP = {
     "task": "Task",
     "webfetch": "WebFetch",
     "web_fetch": "WebFetch",
-    "web_search": "WebSearch",
+
     "todowrite": "TodoWrite",
     "todoread": "TodoRead",
     "question": "Question",
@@ -180,8 +200,9 @@ CC_TOOL_STUBS = [
         "description": "Find files by pattern",
         "input_schema": {
             "type": "object",
-            "properties": {"pattern": {"type": "string"}},
+            "properties": {"pattern": {"type": "string", "description": "File glob pattern"}},
             "required": ["pattern"],
+            "additionalProperties": False,
         },
     },
     {
@@ -189,32 +210,36 @@ CC_TOOL_STUBS = [
         "description": "Search file contents",
         "input_schema": {
             "type": "object",
-            "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}},
+            "properties": {
+                "pattern": {"type": "string", "description": "Search pattern"},
+                "path": {"type": "string", "description": "Directory path"},
+            },
             "required": ["pattern"],
+            "additionalProperties": False,
         },
     },
-    {
-        "name": "Agent",
-        "description": "Launch a subagent",
-        "input_schema": {
-            "type": "object",
-            "properties": {"prompt": {"type": "string"}},
-            "required": ["prompt"],
-        },
-    },
+
     {
         "name": "NotebookEdit",
         "description": "Edit notebook cells",
         "input_schema": {
             "type": "object",
-            "properties": {"notebook_path": {"type": "string"}, "cell_index": {"type": "integer"}},
+            "properties": {
+                "notebook_path": {"type": "string", "description": "Path to notebook"},
+                "cell_index": {"type": "integer", "description": "Cell index"},
+            },
             "required": ["notebook_path"],
+            "additionalProperties": False,
         },
     },
     {
         "name": "TodoRead",
         "description": "Read task list",
-        "input_schema": {"type": "object", "properties": {}},
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
     },
 ]
 
@@ -688,9 +713,38 @@ def is_message_request(url, payload):
     return url_lower.endswith("/messages") or "/messages?" in url_lower or "/messages/" in url_lower
 
 
+def _is_native_claude_code(request, headers):
+    """检测请求是否来自原生 Claude Code 客户端。优先读客户端原始 UA。"""
+    # 先从客户端原始请求头读
+    client_ua = ""
+    if request is not None and hasattr(request, "headers"):
+        client_ua = str(request.headers.get("user-agent") or "")
+    # fallback 到上游构建的 headers
+    if not client_ua:
+        client_ua = str(get_header_case_insensitive(headers, "User-Agent") or "")
+    return "claude-code/" in client_ua or "claude-cli/" in client_ua
+
+
 async def claude_code_compat_request_interceptor(request, engine, provider, api_key, url, headers, payload):
-    """Claude Code 完整伪装请求拦截器。"""
+    """Claude Code 完整伪装请求拦截器。原生 CC 请求直接放行。"""
     if not is_claude_request(engine, url, headers):
+        return url, headers, payload
+
+    _native = _is_native_claude_code(request, headers)
+    if _native:
+        logger.debug("[claude_code_compat] native CC detected, key transform + header completion only")
+        # 原生 CC 跳过伪装/桩注入/payload清洗，但补全关键 header：
+        # 1. x-api-key → Bearer 转换
+        header_api_key = pop_header_case_insensitive(headers, "x-api-key")
+        credential = api_key if api_key not in (None, "") else header_api_key
+        if credential:
+            set_header_case_insensitive(headers, "Authorization", f"Bearer {credential}")
+        # 2. anthropic-beta 合并补全（保留用户原始 flags + 补充缺失的）
+        merge_anthropic_beta(headers)
+        # 3. anthropic-version 补全（用户没带就补）
+        if get_header_case_insensitive(headers, "anthropic-version") is None:
+            headers["anthropic-version"] = "2023-06-01"
+        # 4. User-Agent — 原生 CC 自带，不覆盖
         return url, headers, payload
 
     config = resolve_plugin_config(provider)

@@ -585,6 +585,38 @@ if not DISABLE_DATABASE:
         _legacy_async_session = sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
 
 
+async def close_db():
+    """关闭数据库引擎连接（用于 db compact 替换文件前）。"""
+    global db_engine, _legacy_async_session
+    if db_engine is not None:
+        await db_engine.dispose()
+        logger.info("Database engine disposed")
+
+
+async def init_db():
+    """重新初始化数据库引擎（用于 db compact 替换文件后）。"""
+    global db_engine, _legacy_async_session
+    if DISABLE_DATABASE or DB_TYPE != "sqlite":
+        return
+    db_path = os.getenv("DB_PATH", "./data/stats.db")
+    is_debug = env_bool("DEBUG", False)
+    db_engine = create_async_engine("sqlite+aiosqlite:///" + db_path, echo=is_debug)
+
+    @event.listens_for(db_engine.sync_engine, "connect")
+    def set_sqlite_pragma_on_reconnect(dbapi_connection, connection_record):
+        cursor = None
+        try:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA busy_timeout = 30000;")
+        finally:
+            if cursor:
+                cursor.close()
+
+    _legacy_async_session = sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+    logger.info("Database engine re-initialized")
+
+
 @asynccontextmanager
 async def async_session_scope():
     """统一数据库会话入口。

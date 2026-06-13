@@ -633,6 +633,25 @@ class ModelRequestHandler:
             tmp_retry_count = total_slots * 2
             return tmp_retry_count
 
+        # ── 入站拦截器：鉴权完成、provider 选择前 ──
+        try:
+            from core.plugins.interceptors import apply_inbound_interceptors
+            _inbound_api_key_info = {
+                "api_key": self.app.state.api_list[api_index] if not override_providers else None,
+                "api_index": api_index,
+                "model": request_model_name,
+                "role": role,
+            }
+            _inbound_enabled_plugins = safe_get(
+                config, 'api_keys', api_index, 'preferences', 'enabled_plugins',
+                default=None
+            ) if not override_providers else None
+            request_data = await apply_inbound_interceptors(
+                request_data, None, _inbound_api_key_info, _inbound_enabled_plugins
+            )
+        except Exception as _inbound_err:
+            logger.warning(f"Inbound interceptors error: {_inbound_err}")
+
         retry_count = _calc_retry_count(matching_providers)
         max_attempts = min(num_matching_providers + retry_count, 500)  # 绝对上限防死循环
 

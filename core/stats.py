@@ -342,6 +342,22 @@ async def create_tables():
     async with db_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+        # SQLite: 启用 incremental auto_vacuum，DELETE/UPDATE 后自动回收磁盘空间
+        db_type = (DB_TYPE or "sqlite").lower()
+        if db_type == "sqlite":
+            current_av = (await conn.execute(text("PRAGMA auto_vacuum"))).scalar()
+            if current_av != 2:
+                await conn.execute(text("PRAGMA auto_vacuum = INCREMENTAL"))
+                # auto_vacuum 切换需要 VACUUM 生效
+                raw_conn = await conn.get_raw_connection()
+                raw = raw_conn.dbapi_connection
+                if hasattr(raw, '_connection'):
+                    # aiosqlite wraps the real connection
+                    await raw._connection.execute("VACUUM")
+                else:
+                    raw.execute("VACUUM")
+                logger.info("SQLite auto_vacuum set to INCREMENTAL")
+
         # 检查并添加缺失的列 - 扩展此简易迁移以支持 SQLite / PostgreSQL / TiDB(MySQL)
         db_type = (DB_TYPE or "sqlite").lower()
         if db_type in ["sqlite", "postgres", "mysql", "d1"]:
@@ -420,19 +436,23 @@ async def create_tables():
 # ============== 成本计算 ==============
 
 def _parse_price_str(price_str) -> tuple:
-    """解析 '输入,输出' 格式的价格字符串"""
+    """解析 '输入,输出,缓存输入' 格式的价格字符串。"""
+    # 修改原因：缓存命中 token 需要使用单独价格，但现有数据库只保存 prompt_price 与 completion_price。
+    # 修改方式：配置价格支持第三段 cached_price；缺省第三段时回退到 prompt_price，保持旧配置兼容。
+    # 目的：让统计写入阶段能够把缓存折扣折算进 prompt_price，而不改数据库结构和查询公式。
     parts = [p.strip() for p in str(price_str).split(",")]
     try:
         prompt_price = float(parts[0]) if len(parts) > 0 and parts[0] != "" else 0.0
         completion_price = float(parts[1]) if len(parts) > 1 and parts[1] != "" else 0.0
+        cached_price = float(parts[2]) if len(parts) > 2 and parts[2] != "" else prompt_price
     except (ValueError, TypeError):
         return None
-    return prompt_price, completion_price
+    return prompt_price, completion_price, cached_price
 
 
 def _match_model_price(model_price_dict: dict, model_name: str, *, use_default: bool = True):
     """
-    在一个 model_price 字典中，按前缀匹配模型名，返回 (prompt_price, completion_price) 或 None。
+    在一个 model_price 字典中，按前缀匹配模型名，返回 (prompt_price, completion_price, cached_price) 或 None。
 
     匹配规则：遍历字典 key，如果 model_name 以该 key 开头则命中；
     多个前缀同时匹配时，取最长的那个（最精确匹配）。
@@ -455,12 +475,12 @@ def _match_model_price(model_price_dict: dict, model_name: str, *, use_default: 
 
 def get_current_model_prices(app, model_name: str, provider_name: str = None):
     """
-    根据配置返回指定模型的 prompt_price 和 completion_price（单位：$/M tokens）。
+    根据配置返回指定模型的 prompt_price、completion_price 和 cached_price（单位：$/M tokens）。
 
     查找优先级：
     1. 渠道级 provider.preferences.model_price（前缀匹配）
     2. 全局 preferences.model_price（前缀匹配）
-    3. 都未配置 → 返回 (0, 0)，即不计费
+    3. 都未配置 → 返回 (0, 0, 0)，即不计费
 
     Args:
         app: FastAPI 应用实例
@@ -468,7 +488,7 @@ def get_current_model_prices(app, model_name: str, provider_name: str = None):
         provider_name: 渠道名称（可选）
 
     Returns:
-        (prompt_price, completion_price) 元组
+        (prompt_price, completion_price, cached_price) 元组
     """
     from utils import safe_get
     try:
@@ -517,9 +537,9 @@ def get_current_model_prices(app, model_name: str, provider_name: str = None):
                 return result
 
         # 6. 都未配置，不计费
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     except Exception:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
 
 async def compute_total_cost_from_db(filter_api_key: Optional[str] = None, start_dt_obj: Optional[datetime] = None) -> float:
@@ -628,6 +648,34 @@ async def _query_token_usage_d1(
 # ============== 统计写入 ==============
 
 
+def _unpack_model_prices(price_result) -> tuple[float, float, float]:
+    """
+    修改原因：价格接口新增 cached_price，但部分注入的 get_model_prices_func 可能仍返回旧的二元组。
+    修改方式：统一把二元组补齐为三元组，第三段缺省时使用 prompt_price。
+    目的：让 enqueue_stats 和 update_stats 共用兼容逻辑，避免不同写入路径出现解包错误。
+    """
+    if len(price_result) == 3:
+        return price_result
+    prompt_price, completion_price = price_result
+    return prompt_price, completion_price, prompt_price
+
+
+def _apply_cached_prompt_price(current_info: dict, prompt_price: float, cached_price: float) -> None:
+    """
+    修改原因：数据库没有单独的 cached_price 字段，不能通过表结构保存缓存输入价。
+    修改方式：按 cached_tokens 对 prompt_price 做加权折算，再覆盖 current_info["prompt_price"]。
+    目的：沿用现有成本公式，同时让缓存命中 token 按缓存价格计费。
+    """
+    cached_tokens = current_info.get("cached_tokens", 0) or 0
+    prompt_tokens = current_info.get("prompt_tokens", 0) or 0
+    if cached_tokens > 0 and prompt_tokens > 0 and cached_price != prompt_price:
+        # clamp: 防止异常情况 cached_tokens > prompt_tokens
+        billable_cached = min(cached_tokens, prompt_tokens)
+        non_cached = prompt_tokens - billable_cached
+        effective = (non_cached * prompt_price + billable_cached * cached_price) / prompt_tokens
+        current_info["prompt_price"] = round(effective, 10)
+
+
 def enqueue_stats(current_info: dict, app=None, get_model_prices_func=None) -> None:
     """将请求统计放入 buffer，由常驻 consumer 批量写入。"""
     # 修改原因：请求路径不能再直接等待 SQLite 写入，否则会在 db_semaphore 前堆积协程并阻塞事件循环。
@@ -639,14 +687,16 @@ def enqueue_stats(current_info: dict, app=None, get_model_prices_func=None) -> N
     try:
         if current_info.get("success") and current_info.get("model"):
             if get_model_prices_func:
-                prompt_price, completion_price = get_model_prices_func(current_info["model"])
+                price_result = get_model_prices_func(current_info["model"])
             elif app:
-                prompt_price, completion_price = get_current_model_prices(
+                price_result = get_current_model_prices(
                     app, current_info["model"], provider_name=current_info.get("provider"))
             else:
-                prompt_price, completion_price = 0.0, 0.0
+                price_result = 0.0, 0.0, 0.0
+            prompt_price, completion_price, cached_price = _unpack_model_prices(price_result)
             current_info["prompt_price"] = prompt_price
             current_info["completion_price"] = completion_price
+            _apply_cached_prompt_price(current_info, prompt_price, cached_price)
     except Exception:
         pass
 
@@ -806,7 +856,7 @@ async def update_stats(current_info: dict, app=None, get_model_prices_func=None)
     Args:
         current_info: 包含请求信息的字典
         app: FastAPI 应用实例（用于获取模型价格）
-        get_model_prices_func: 获取模型价格的函数，签名为 (model_name) -> (prompt_price, completion_price)
+        get_model_prices_func: 获取模型价格的函数，签名为 (model_name) -> (prompt_price, completion_price[, cached_price])
     """
     if DISABLE_DATABASE:
         return
@@ -815,14 +865,16 @@ async def update_stats(current_info: dict, app=None, get_model_prices_func=None)
     try:
         if current_info.get("success") and current_info.get("model"):
             if get_model_prices_func:
-                prompt_price, completion_price = get_model_prices_func(current_info["model"])
+                price_result = get_model_prices_func(current_info["model"])
             elif app:
-                prompt_price, completion_price = get_current_model_prices(
+                price_result = get_current_model_prices(
                     app, current_info["model"], provider_name=current_info.get("provider"))
             else:
-                prompt_price, completion_price = 0.0, 0.0
+                price_result = 0.0, 0.0, 0.0
+            prompt_price, completion_price, cached_price = _unpack_model_prices(price_result)
             current_info["prompt_price"] = prompt_price
             current_info["completion_price"] = completion_price
+            _apply_cached_prompt_price(current_info, prompt_price, cached_price)
     except Exception:
         pass
 

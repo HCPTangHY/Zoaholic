@@ -129,9 +129,10 @@ class LoggingStreamingResponse(Response):
                         and app
                     ):
                         # 从流内容提取错误信息（精确解析给日志展示用）
-                        stream_error_msg = self._extract_stream_error()
+                        # 优先用 upstream_response_body（上游原始返回体），fallback 到 response_body（转换后）
+                        stream_error_msg = self._extract_stream_error(prefer_upstream=True)
                         # raw body 给 key_rules 关键词匹配用（不依赖硬编码解析）
-                        raw_body = current_info.get("response_body", "") or ""
+                        raw_body = current_info.get("upstream_response_body", "") or current_info.get("response_body", "") or ""
                         if isinstance(raw_body, bytes):
                             raw_body = raw_body.decode("utf-8", errors="replace")
 
@@ -192,13 +193,21 @@ class LoggingStreamingResponse(Response):
                 self.current_info = None
                 self.body_iterator = None
 
-    def _extract_stream_error(self) -> str:
-        """从 current_info 的 response_body 中提取错误信息。
+    def _extract_stream_error(self, prefer_upstream: bool = False) -> str:
+        """从 current_info 的响应体中提取错误信息。
         
         尝试解析 SSE error event 和 JSON error 对象。
         返回错误消息字符串，没找到则返回空字符串。
+        
+        Args:
+            prefer_upstream: 优先从 upstream_response_body（上游原始返回体）提取，
+                           fallback 到 response_body（转换后的返回体）。
         """
-        body = (self.current_info or {}).get("response_body", "")
+        ci = self.current_info or {}
+        if prefer_upstream:
+            body = ci.get("upstream_response_body", "") or ci.get("response_body", "")
+        else:
+            body = ci.get("response_body", "")
         if not body:
             return ""
         if isinstance(body, bytes):

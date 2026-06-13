@@ -85,7 +85,12 @@ async def _persist_config(app, sections_to_verify=None, changed_providers=None):
         # 修改方式：热更新配置后基于最新 api_keys_db 重建 app.state.byok_prefixes。
         # 目的：管理端保存 BYOK 通配符 key 后，标准和方言鉴权立即生效。
         from core.byok import build_byok_prefixes
+        from core.ip_blacklist import apply_runtime_ip_blacklists
         app.state.byok_prefixes = build_byok_prefixes(app.state.api_keys_db)
+        # 修改原因：update_config 返回的是规范化配置，IP 黑名单的运行时缓存也要随管理端保存同步刷新。
+        # 修改方式：在 BYOK 前缀重建之后预解析顶层和 Key 级 ip_blacklist 到 app.state。
+        # 目的：管理员保存配置后无需重启即可立即拦截被禁 IP。
+        apply_runtime_ip_blacklists(app)
         try:
             _rebuild_runtime_rate_limits(app)
         except ValueError as e:
@@ -122,11 +127,16 @@ async def _persist_config(app, sections_to_verify=None, changed_providers=None):
             "providers": runtime_persistable.get("providers", []),
             "api_keys": runtime_persistable.get("api_keys", []),
             "preferences": runtime_persistable.get("preferences", {}),
+            # 修改原因：全局 IP 黑名单存放在 api.yaml 顶层，不在 preferences 中。
+            # 修改方式：写回校验子集显式加入 ip_blacklist 字段。
+            # 目的：保存全局黑名单时也能发现 api.yaml 未同步的问题。
+            "ip_blacklist": runtime_persistable.get("ip_blacklist", []),
         }
         file_subset = {
             "providers": file_persistable.get("providers", []),
             "api_keys": file_persistable.get("api_keys", []),
             "preferences": file_persistable.get("preferences", {}),
+            "ip_blacklist": file_persistable.get("ip_blacklist", []),
         }
 
         runtime_encoded = runtime_subset
@@ -189,13 +199,20 @@ async def api_config_update(
     app = get_app()
     updated = False
 
-    # 支持同时更新 providers、api_keys 和 preferences 段，保持与 /v1/api_config 返回结构一致
+    # 支持同时更新 providers、api_keys、preferences 和顶层 ip_blacklist 段，保持与 /v1/api_config 返回结构一致
     if "providers" in config:
         app.state.config["providers"] = config["providers"]
         updated = True
 
     if "api_keys" in config:
         app.state.config["api_keys"] = config["api_keys"]
+        updated = True
+
+    if "ip_blacklist" in config:
+        # 修改原因：全局 IP 黑名单按需求存放在 api.yaml 顶层，而不是 preferences 内。
+        # 修改方式：允许 /v1/api_config/update 直接更新顶层 ip_blacklist，后续由 update_config 校验并规范化。
+        # 目的：前端保存全局黑名单后能持久化到 api.yaml 顶层并热更新。
+        app.state.config["ip_blacklist"] = config["ip_blacklist"]
         updated = True
 
     # 更新全局 preferences（包括 SCHEDULING_ALGORITHM 等设置）
@@ -211,13 +228,13 @@ async def api_config_update(
     if not updated:
         raise HTTPException(
             status_code=400,
-            detail="No updatable sections provided. Allowed keys: providers, api_keys, preferences.",
+            detail="No updatable sections provided. Allowed keys: providers, api_keys, preferences, ip_blacklist.",
         )
 
     # 修改原因：持久化流程已经抽到 _persist_config，原接口只需要声明本次改动涉及的 section。
     # 修改方式：按请求中的顶层键生成校验范围，并复用统一 helper 返回的 persisted 信息。
     # 目的：保持原全量配置接口行为不变，同时让单渠道接口共享同一套保存与校验逻辑。
-    sections_to_verify = [key for key in ("providers", "api_keys", "preferences") if key in config]
+    sections_to_verify = [key for key in ("providers", "api_keys", "preferences", "ip_blacklist") if key in config]
     persisted = await _persist_config(app, sections_to_verify=sections_to_verify)
 
     return JSONResponse(content={

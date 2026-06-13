@@ -77,3 +77,39 @@ async def debug_memory_diff():
     sorted_diff = dict(sorted(diff.items(), key=lambda x: -abs(x[1]["diff"]))[:20])
     _baseline = current
     return {"rss_mb": _get_rss_mb(), "top20_growth": sorted_diff}
+
+import tracemalloc as _tm
+
+@router.get("/debug/memory/tracemalloc/start")
+async def tm_start():
+    if _tm.is_tracing():
+        return {"status": "already tracing"}
+    _tm.start(10)
+    return {"status": "started", "rss_mb": _get_rss_mb()}
+
+@router.get("/debug/memory/tracemalloc/top")
+async def tm_top():
+    if not _tm.is_tracing():
+        return {"error": "not tracing, call /debug/memory/tracemalloc/start first"}
+    snapshot = _tm.take_snapshot()
+    stats = snapshot.statistics("lineno")
+    top = []
+    for s in stats[:30]:
+        top.append({
+            "file": str(s.traceback),
+            "size_mb": round(s.size / 1048576, 2),
+            "count": s.count,
+        })
+    current, peak = _tm.get_traced_memory()
+    return {
+        "rss_mb": _get_rss_mb(),
+        "traced_current_mb": round(current / 1048576, 2),
+        "traced_peak_mb": round(peak / 1048576, 2),
+        "top30": top,
+    }
+
+@router.get("/debug/memory/tracemalloc/stop")
+async def tm_stop():
+    if _tm.is_tracing():
+        _tm.stop()
+    return {"status": "stopped"}

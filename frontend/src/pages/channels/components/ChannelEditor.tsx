@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { type KeyboardEvent } from 'react';
+import { type KeyboardEvent, useState, useRef, useEffect } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as Switch from '@radix-ui/react-switch';
 import {
@@ -7,10 +7,11 @@ import {
   Server, X, CheckCircle2, Settings2, Copy, ToggleRight, ToggleLeft,
   Folder, Puzzle, Network, CopyCheck, Power, Play,
   Check, Wallet, Link2, GripVertical, ChevronUp, ChevronDown,
-  ClipboardPaste, LogIn, Download, LayoutList, LayoutGrid
+  ClipboardPaste, LogIn, Download, LayoutList, LayoutGrid, MoreHorizontal, Package, FileUp
 } from 'lucide-react';
 import { InterceptorSheet } from '../../../components/InterceptorSheet';
 import { ProviderLogo } from '../../../components/ProviderLogos';
+import { PipelineView } from './PipelineView';
 import {
   formatKeyRuleKeywordsInput,
   formatKeyRuleStatusInput,
@@ -56,6 +57,27 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
     setForceListMode, runtimeKeyStatus, localCountdowns, globalModelPrice, token, importPlaceholder, setImportModalIdx, setImportToken,
     setOauthManualState, setManualUrl, refreshKeyStatus,
   } = state;
+
+  const [keyMoreMenuOpen, setKeyMoreMenuOpen] = useState(false);
+  const [batchImportOpen, setBatchImportOpen] = useState(false);
+  const [batchPasteOpen, setBatchPasteOpen] = useState(false);
+  const [batchJsonText, setBatchJsonText] = useState('');
+  const [batchPasteText, setBatchPasteText] = useState('');
+  const [batchPasteSep, setBatchPasteSep] = useState('newline');
+  const [customSep, setCustomSep] = useState('');
+  const [batchImportResult, setBatchImportResult] = useState<any>(null);
+  const [batchImportLoading, setBatchImportLoading] = useState(false);
+  const [batchImportError, setBatchImportError] = useState('');
+  const keyMoreMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!keyMoreMenuOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (keyMoreMenuRef.current && !keyMoreMenuRef.current.contains(e.target as Node)) setKeyMoreMenuOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [keyMoreMenuOpen]);
+
   return (
     <>
       {/* Editor Side Sheet - Responsive */}
@@ -219,7 +241,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                       </span>
                     </div>
                     <div className="flex items-center gap-3 text-xs text-muted-foreground">
-                      <span>共 <span className="font-mono text-foreground">{formData.api_keys.filter(k => !k.disabled).length}</span>/{formData.api_keys.length} 个可用 Key</span>
+                      <span>共 <span className="font-mono text-foreground">{formData.api_keys.filter(k => !k.disabled && k.key.trim()).length}</span>/{formData.api_keys.filter(k => k.key.trim()).length} 个可用 Key</span>
                       <button
                         onClick={() => openKeyTestDialog(null, {
                           engine: formData.engine || 'openai',
@@ -242,15 +264,15 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                     <span className="flex items-center gap-2">
                       <Settings2 className="w-4 h-4 text-emerald-500" /> API Keys
                       {formData.api_keys.length > 0 && (() => {
-                        const cfgEnabled = formData.api_keys.filter(k => !k.disabled).length;
+                        const cfgEnabled = formData.api_keys.filter(k => !k.disabled && k.key.trim()).length;
                         const rtCount = runtimeKeyStatus[formData.provider]?.auto_disabled?.length || 0;
                         const eff = Math.max(0, cfgEnabled - rtCount);
                         const issue = formData.api_keys.some(k => k.disabled) || rtCount > 0;
-                        return <span className={`text-xs font-normal font-mono px-1.5 py-0.5 rounded ${issue ? 'bg-orange-500/10 text-orange-600 dark:text-orange-400' : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-500'}`}>{eff}/{formData.api_keys.length}</span>;
+                        return <span className={`text-xs font-normal font-mono px-1.5 py-0.5 rounded ${issue ? 'bg-orange-500/10 text-orange-600 dark:text-orange-400' : 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-500'}`}>{eff}/{formData.api_keys.filter(k => k.key.trim()).length}</span>;
                       })()}
                     </span>
                     <div className="flex items-center gap-2 text-xs">
-                      <button onClick={copyAllKeys} className="text-muted-foreground hover:text-foreground flex items-center gap-1"><Copy className="w-3 h-3" /> 复制全部</button>
+                      <button onClick={addEmptyKey} className="text-primary hover:text-primary/80 flex items-center gap-1"><Plus className="w-3 h-3" /> 添加密钥</button>
                       <button
                         onClick={() => queryAllBalances()}
                         disabled={balanceLoading}
@@ -289,15 +311,22 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                       >
                         <Play className="w-3 h-3" /> 多key测试
                       </button>
-                      <button
-                        onClick={clearAllKeys}
-                        disabled={formData.api_keys.length === 0}
-                        className="text-red-600 dark:text-red-500 hover:text-red-700 dark:hover:text-red-400 flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
-                        title="一键清空该渠道的全部密钥"
-                      >
-                        <Trash2 className="w-3 h-3" /> 清空
-                      </button>
-                      <button onClick={addEmptyKey} className="text-primary hover:text-primary/80 flex items-center gap-1"><Plus className="w-3 h-3" /> 添加密钥</button>
+                      <div ref={keyMoreMenuRef} className="relative">
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); setKeyMoreMenuOpen(prev => !prev); }}
+                          className="text-muted-foreground hover:text-foreground rounded p-0.5"
+                          title="更多操作"
+                        >
+                          <MoreHorizontal className="w-3.5 h-3.5" />
+                        </button>
+                        {keyMoreMenuOpen && (
+                          <div className="absolute right-0 top-full z-20 mt-1 min-w-[120px] bg-card border border-border rounded-lg shadow-lg p-1">
+                            <button type="button" onClick={() => { copyAllKeys(); setKeyMoreMenuOpen(false); }} className="w-full px-3 py-1.5 hover:bg-muted rounded text-xs flex items-center gap-2 text-left text-foreground"><Copy className="w-3 h-3" /> 复制全部</button>
+                            <button type="button" onClick={() => { clearAllKeys(); setKeyMoreMenuOpen(false); }} disabled={formData.api_keys.length === 0} className="w-full px-3 py-1.5 hover:bg-muted rounded text-xs flex items-center gap-2 text-left text-red-600 dark:text-red-500 disabled:opacity-50"><Trash2 className="w-3 h-3" /> 清空</button>
+                          </div>
+                        )}
+                      </div>
                       {formData.api_keys.length >= 12 && (
                         <button
                           onClick={() => { setForceListMode(prev => !prev); setFocusedKeyIdx(null); }}
@@ -378,6 +407,17 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                             />
                           );
                         })}
+                        <div
+                          className="relative h-[92px] overflow-hidden rounded-lg border border-dashed border-border/60 bg-card/50 text-foreground transition-all duration-200 hover:border-primary/40 flex flex-col items-center justify-center gap-1.5"
+                          style={{ width: 'calc((100% - 5 * 6px) / 6)' }}
+                        >
+                          <button type="button" onClick={addEmptyKey} className="flex items-center gap-1 rounded px-2 py-1 text-[10px] text-primary hover:bg-muted"><Plus className="w-3 h-3" /> 添加</button>
+                          {isOAuthEngine ? (
+                            <button type="button" onClick={() => { setBatchImportOpen(true); setBatchPasteOpen(false); }} className="flex items-center gap-1 rounded px-2 py-1 text-[10px] text-muted-foreground hover:bg-muted hover:text-primary"><Package className="w-3 h-3" /> 导入</button>
+                          ) : (
+                            <button type="button" onClick={() => { setBatchPasteOpen(true); setBatchImportOpen(false); }} className="flex items-center gap-1 rounded px-2 py-1 text-[10px] text-muted-foreground hover:bg-muted hover:text-primary"><ClipboardPaste className="w-3 h-3" /> 粘贴</button>
+                          )}
+                        </div>
                       </RackGrid>
                     ) : (
                       <>
@@ -410,11 +450,254 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                         ))}
                       </>
                     )}
-                    {/* 修改原因：BYOK provider 现在必须在密钥列表中显式填写 "*"，空列表不再表示 BYOK。 */}
-                    {/* 修改方式：把空状态提示改为提醒管理员新增 "*" 作为 BYOK 标记。 */}
-                    {/* 目的：避免管理员误以为空密钥仍会启用 BYOK 模式。 */}
-                    {formData.api_keys.length === 0 && <div className="text-center p-4 text-sm text-muted-foreground italic">暂无密钥。请新增并填写 * 表示 BYOK 模式；空密钥不会启用 BYOK</div>}
+                    {formData.api_keys.length > 0 && (formData.api_keys.length < 12 || forceListMode) && (
+                      <div className="flex justify-center gap-3 pt-2 text-xs">
+                        <button type="button" onClick={addEmptyKey} className="text-primary hover:text-primary/80 flex items-center gap-1"><Plus className="w-3 h-3" /> 添加密钥</button>
+                        {isOAuthEngine ? (
+                          <button type="button" onClick={() => { setBatchImportOpen(true); setBatchPasteOpen(false); }} className="text-muted-foreground hover:text-primary flex items-center gap-1"><Package className="w-3 h-3" /> 批量导入</button>
+                        ) : (
+                          <button type="button" onClick={() => { setBatchPasteOpen(true); setBatchImportOpen(false); }} className="text-muted-foreground hover:text-primary flex items-center gap-1"><ClipboardPaste className="w-3 h-3" /> 批量粘贴</button>
+                        )}
+                      </div>
+                    )}
+                    {formData.api_keys.length === 0 && (
+                      <div className="text-center p-6 space-y-2">
+                        <p className="text-sm text-muted-foreground italic">暂无密钥</p>
+                        <div className="flex justify-center gap-3 text-xs">
+                          <button type="button" onClick={addEmptyKey} className="text-primary hover:text-primary/80 flex items-center gap-1"><Plus className="w-3.5 h-3.5" /> 添加密钥</button>
+                          {isOAuthEngine ? (
+                            <button type="button" onClick={() => { setBatchImportOpen(true); setBatchPasteOpen(false); }} className="text-muted-foreground hover:text-primary flex items-center gap-1"><Package className="w-3.5 h-3.5" /> 批量导入</button>
+                          ) : (
+                            <button type="button" onClick={() => { setBatchPasteOpen(true); setBatchImportOpen(false); }} className="text-muted-foreground hover:text-primary flex items-center gap-1"><ClipboardPaste className="w-3.5 h-3.5" /> 批量粘贴</button>
+                          )}
+                          <button type="button" onClick={() => setFormData(prev => prev ? ({...prev, api_keys: [...prev.api_keys, {key: '*', disabled: false}]}) : prev)} className="text-muted-foreground hover:text-foreground flex items-center gap-1">* BYOK</button>
+                        </div>
+                      </div>
+                    )}
                   </div>
+
+                  {/* OAuth 批量导入面板 */}
+                  {batchImportOpen && isOAuthEngine && (
+                    <div className="mt-3 space-y-3 rounded-lg border border-border bg-muted/30 p-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-medium text-foreground">批量导入 OAuth 凭证</span>
+                        <button type="button" onClick={() => { setBatchImportOpen(false); setBatchImportResult(null); setBatchImportError(''); setBatchJsonText(''); }} className="text-muted-foreground hover:text-foreground"><X className="w-4 h-4" /></button>
+                      </div>
+                      <p className="text-xs text-muted-foreground">支持 sub2api 导出 JSON（含 accounts 数组）、CPA 单文件、CPA 多文件数组。也可上传 .json 或 .zip 文件。</p>
+                      <div className="flex gap-2">
+                        <label className="cursor-pointer text-xs text-primary hover:text-primary/80 flex items-center gap-1 border border-border rounded px-2 py-1">
+                          <FileUp className="w-3 h-3" /> 上传文件
+                          <input type="file" accept=".json,.zip" className="hidden" onChange={async (e) => {
+                            const file = e.target.files?.[0];
+                            if (!file) return;
+                            if (file.name.endsWith('.zip')) {
+                              try {
+                                const JSZip = (await import('jszip')).default;
+                                const zip = await JSZip.loadAsync(file);
+                                const jsons: any[] = [];
+                                for (const [name, entry] of Object.entries(zip.files)) {
+                                  if (!name.endsWith('.json') || (entry as any).dir) continue;
+                                  const text = await (entry as any).async('text');
+                                  try { jsons.push(JSON.parse(text)); } catch {}
+                                }
+                                setBatchJsonText(JSON.stringify(jsons, null, 2));
+                              } catch { setBatchImportError('ZIP 解析失败'); }
+                            } else {
+                              const text = await file.text();
+                              setBatchJsonText(text);
+                            }
+                            e.target.value = '';
+                          }} />
+                        </label>
+                      </div>
+                      <textarea
+                        value={batchJsonText}
+                        onChange={e => { setBatchJsonText(e.target.value); setBatchImportResult(null); setBatchImportError(''); }}
+                        placeholder='{"accounts": [...]} 或 [{...}, {...}] 或单个 {"access_token": ...}'
+                        className="w-full h-32 bg-background border border-border rounded-lg px-3 py-2 text-xs font-mono outline-none text-foreground resize-y"
+                      />
+                      {batchJsonText && (() => {
+                        try {
+                          const d = JSON.parse(batchJsonText);
+                          // normalize to preview items
+                          type PreviewItem = { email: string; format: string; hasRefresh: boolean; expiresAt: string; expired: boolean; hasToken: boolean };
+                          const items: PreviewItem[] = [];
+                          const parseOne = (obj: any): PreviewItem => {
+                            if (obj?.credentials) {
+                              // sub2api
+                              const c = obj.credentials;
+                              const exp = c.expires_at ? (typeof c.expires_at === 'number' ? new Date(c.expires_at * 1000).toLocaleString() : String(c.expires_at)) : '-';
+                              const expTs = typeof c.expires_at === 'number' ? c.expires_at * 1000 : (c.expires_at ? Date.parse(c.expires_at) : NaN);
+                              return { email: obj.name || c.email || '未知', format: 'sub2api', hasRefresh: !!c.refresh_token, expiresAt: exp, expired: !isNaN(expTs) && expTs < Date.now(), hasToken: !!c.access_token };
+                            }
+                            // CPA formats
+                            const email = obj?.user?.email || obj?.account?.email_address || obj?.email || '未知';
+                            let fmt = 'unknown';
+                            if (obj?.user?.email) fmt = 'CPA-codex';
+                            else if (obj?.account?.email_address) fmt = 'CPA-claude';
+                            else if (obj?.email && obj?.expiry) fmt = 'CPA-gemini';
+                            else if (obj?.access_token) fmt = 'CPA';
+                            const exp = obj?.expires_at || obj?.expiry || (obj?.expires_in ? `${obj.expires_in}s` : '-');
+                            const expStr = typeof exp === 'number' ? new Date(exp * 1000).toLocaleString() : String(exp);
+                            const expTs = typeof exp === 'number' ? exp * 1000 : (typeof exp === 'string' && exp !== '-' ? Date.parse(exp) : NaN);
+                            return { email, format: fmt, hasRefresh: !!obj?.refresh_token, expiresAt: expStr, expired: !isNaN(expTs) && expTs < Date.now(), hasToken: !!obj?.access_token };
+                          };
+                          if (d?.accounts) { d.accounts.forEach((a: any) => items.push(parseOne(a))); }
+                          else if (Array.isArray(d)) { d.forEach((a: any) => items.push(parseOne(a))); }
+                          else if (d?.access_token) { items.push(parseOne(d)); }
+                          if (items.length === 0) return <p className="text-xs text-amber-600">⚠ 无法识别格式</p>;
+                          const fmtLabel = d?.accounts ? 'sub2api' : Array.isArray(d) ? 'CPA 多文件' : 'CPA 单文件';
+                          return (
+                            <div className="space-y-2">
+                              <p className="text-xs text-emerald-600">✓ {fmtLabel}，共 {items.length} 个账号
+                                {(() => {
+                                  const expired = items.filter(i => i.expired).length;
+                                  const noToken = items.filter(i => !i.hasToken).length;
+                                  const noRefresh = items.filter(i => !i.hasRefresh && !i.expired && i.hasToken).length;
+                                  const valid = items.length - expired - noToken;
+                                  return <span className="ml-2">
+                                    {valid > 0 && <span className="text-emerald-600">{valid} 可用</span>}
+                                    {expired > 0 && <span className="text-red-500 ml-1">{expired} 已过期</span>}
+                                    {noToken > 0 && <span className="text-red-500 ml-1">{noToken} 缺token</span>}
+                                    {noRefresh > 0 && <span className="text-amber-600 ml-1">{noRefresh} 无refresh</span>}
+                                  </span>;
+                                })()}
+                              </p>
+                              <div className="max-h-40 overflow-y-auto text-xs border border-border rounded">
+                                <table className="w-full">
+                                  <thead className="bg-muted/50 sticky top-0"><tr>
+                                    <th className="px-2 py-1 text-left font-medium">#</th>
+                                    <th className="px-2 py-1 text-left font-medium">邮箱/标识</th>
+                                    <th className="px-2 py-1 text-left font-medium">格式</th>
+                                    <th className="px-2 py-1 text-left font-medium">refresh</th>
+                                    <th className="px-2 py-1 text-left font-medium">过期时间</th>
+                                    <th className="px-2 py-1 text-left font-medium">状态</th>
+                                  </tr></thead>
+                                  <tbody>{items.map((it, i) => (
+                                    <tr key={i} className="border-t border-border/50">
+                                      <td className="px-2 py-1 text-muted-foreground">{i+1}</td>
+                                      <td className="px-2 py-1 font-mono truncate max-w-[180px]">{it.email}</td>
+                                      <td className="px-2 py-1">{it.format}</td>
+                                      <td className="px-2 py-1">{it.hasRefresh ? <span className="text-emerald-600">✓</span> : <span className="text-red-500">✗</span>}</td>
+                                      <td className="px-2 py-1 text-muted-foreground">{it.expiresAt}</td>
+                                      <td className="px-2 py-1">{!it.hasToken ? <span className="text-red-500">缺token</span> : it.expired ? <span className="text-red-500">已过期</span> : it.hasRefresh ? <span className="text-emerald-600">可刷新</span> : <span className="text-amber-600">无refresh</span>}</td>
+                                    </tr>
+                                  ))}</tbody>
+                                </table>
+                              </div>
+                            </div>
+                          );
+                        } catch { return <p className="text-xs text-red-500">JSON 格式错误</p>; }
+                      })()}
+                      {batchImportError && <p className="text-xs text-red-500">{batchImportError}</p>}
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          disabled={!batchJsonText.trim() || batchImportLoading}
+                          onClick={async () => {
+                            setBatchImportLoading(true); setBatchImportError(''); setBatchImportResult(null);
+                            try {
+                              const data = JSON.parse(batchJsonText);
+                              const res = await apiFetch('/v1/oauth/batch_import', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                                body: JSON.stringify({ provider: formData.provider, type: formData.engine, data }),
+                              });
+                              const json = await res.json();
+                              if (!res.ok) { setBatchImportError(json?.error || '导入失败'); } else { setBatchImportResult(json); refreshOAuthAccounts?.(); }
+                            } catch (err: any) { setBatchImportError(err.message || '请求失败'); }
+                            setBatchImportLoading(false);
+                          }}
+                          className="bg-primary text-primary-foreground px-3 py-1.5 rounded text-xs font-medium disabled:opacity-50"
+                        >{batchImportLoading ? '导入中...' : '开始导入'}</button>
+                      </div>
+                      {batchImportResult && (
+                        <div className="space-y-2">
+                          <p className="text-xs font-medium">结果：✅ {batchImportResult.success} 成功 {batchImportResult.failed > 0 ? `❌ ${batchImportResult.failed} 失败` : ''} {batchImportResult.skipped > 0 ? `⚠️ ${batchImportResult.skipped} 跳过` : ''}</p>
+                          <div className="max-h-40 overflow-y-auto text-xs space-y-1">
+                            {batchImportResult.results?.map((r: any, i: number) => (
+                              <div key={i} className={`flex items-center gap-2 px-2 py-1 rounded ${r.status === 'success' ? 'bg-emerald-500/10' : r.status === 'failed' ? 'bg-red-500/10' : 'bg-amber-500/10'}`}>
+                                <span>{r.status === 'success' ? '✅' : r.status === 'failed' ? '❌' : '⚠️'}</span>
+                                <span className="font-mono truncate flex-1">{r.key_id}</span>
+                                {r.already_exists && <span className="text-amber-600 text-[10px]">已存在</span>}
+                                {r.error && <span className="text-red-500 text-[10px] truncate max-w-[200px]">{r.error}</span>}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* 普通 Key 批量粘贴面板 */}
+                  {batchPasteOpen && !isOAuthEngine && (
+                    <div className="mt-3 space-y-3 rounded-lg border border-border bg-muted/30 p-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-medium text-foreground">批量粘贴 API Key</span>
+                        <button type="button" onClick={() => { setBatchPasteOpen(false); setBatchPasteText(''); }} className="text-muted-foreground hover:text-foreground"><X className="w-4 h-4" /></button>
+                      </div>
+                      <textarea
+                        value={batchPasteText}
+                        onChange={e => setBatchPasteText(e.target.value)}
+                        placeholder="每行一个 Key，或选择其他分隔符"
+                        className="w-full h-28 bg-background border border-border rounded-lg px-3 py-2 text-xs font-mono outline-none text-foreground resize-y"
+                      />
+                      <div className="flex items-center gap-3 text-xs flex-wrap">
+                        <span className="text-muted-foreground">分隔符：</span>
+                        {[['newline','换行'],['comma','逗号'],['semicolon','分号'],['space','空格'],['custom','自定义']].map(([v,l]) => (
+                          <label key={v} className="flex items-center gap-1 cursor-pointer">
+                            <input type="radio" name="sep" value={v} checked={batchPasteSep===v} onChange={() => setBatchPasteSep(v)} className="w-3 h-3" />{l}
+                          </label>
+                        ))}
+                        {batchPasteSep === 'custom' && (
+                          <input
+                            type="text"
+                            value={customSep}
+                            onChange={e => setCustomSep(e.target.value)}
+                            placeholder="输入分隔符"
+                            className="w-16 bg-background border border-border rounded px-1.5 py-0.5 text-xs font-mono outline-none text-foreground"
+                          />
+                        )}
+                      </div>
+                      {batchPasteText && (() => {
+                        const sepMap: Record<string,RegExp> = { newline: /\n/, comma: /,/, semicolon: /;/, space: /\s+/ };
+                        const sep = batchPasteSep === 'custom' && customSep ? new RegExp(customSep.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g') : (sepMap[batchPasteSep] || /\n/);
+                        const rawKeys = batchPasteText.split(sep).map(s => s.trim()).filter(Boolean);
+                        const keys = [...new Set(rawKeys)];
+                        const existingKeys = new Set(formData.api_keys.map(k => k.key));
+                        const newKeys = keys.filter(k => !existingKeys.has(k));
+                        const emptyCount = batchPasteText.split(sep).filter(s => !s.trim()).length;
+                        const dupCount = rawKeys.length - keys.length;
+                        const existCount = keys.length - newKeys.length;
+                        return (
+                          <div className="space-y-1">
+                            <div className="flex items-center justify-between">
+                              <div className="text-xs text-muted-foreground space-x-2">
+                                <span>解析 <span className="font-mono text-foreground">{rawKeys.length}</span> 条</span>
+                                {dupCount > 0 && <span className="text-amber-600">重复 {dupCount}</span>}
+                                {emptyCount > 0 && <span className="text-muted-foreground/60">空行 {emptyCount}</span>}
+                                {existCount > 0 && <span className="text-amber-600">已存在 {existCount}</span>}
+                                <span className="text-emerald-600">有效 <span className="font-mono">{newKeys.length}</span></span>
+                              </div>
+                            <button
+                              type="button"
+                              disabled={newKeys.length === 0}
+                              onClick={() => {
+                                setFormData(prev => prev ? ({
+                                  ...prev,
+                                  api_keys: [...prev.api_keys, ...newKeys.map(k => ({ key: k, disabled: false }))],
+                                }) : prev);
+                                setBatchPasteOpen(false); setBatchPasteText('');
+                              }}
+                              className="bg-primary text-primary-foreground px-3 py-1.5 rounded text-xs font-medium disabled:opacity-50"
+                            >添加 {newKeys.length} 个</button>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  )}
+
                   {isOAuthEngine && (
                     <div className="mt-2 flex justify-end">
                       {/* 修改原因：OAuth 凭据需要一个管理员显式导出入口，用于迁移或备份当前渠道。 */}
@@ -962,32 +1245,26 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                     <Settings2 className="w-4 h-4 text-muted-foreground" /> 高级设置
                   </div>
                   <div className="space-y-4">
-                    <div>
-                      <div className="flex items-center justify-between mb-1.5">
-                        <label className="text-sm font-medium text-foreground flex items-center gap-1.5"><Puzzle className="w-3.5 h-3.5 text-emerald-500" /> 拦截器插件</label>
-                        <span className="text-xs text-muted-foreground hidden sm:inline">格式: plugin_name[:config]</span>
-                      </div>
-                      <div className="bg-muted/50 border border-border rounded-lg p-3">
-                        <div className="flex flex-wrap gap-2 mb-3">
-                          {(!formData.preferences.enabled_plugins || formData.preferences.enabled_plugins.length === 0) ? (
-                            <span className="text-sm text-muted-foreground italic">未启用任何插件</span>
-                          ) : (
-                            (formData.preferences.enabled_plugins as string[]).map((p: string, idx: number) => {
-                              const [name, opts] = p.split(':');
-                              return (
-                                <span key={idx} className="bg-emerald-500/10 border border-emerald-500/20 text-emerald-600 dark:text-emerald-500 px-2 py-1 rounded text-xs font-mono flex items-center gap-1">
-                                  <Puzzle className="w-3 h-3" />
-                                  {name} {opts && <span className="opacity-60">({opts})</span>}
-                                </span>
-                              );
-                            })
-                          )}
-                        </div>
-                        <button onClick={() => setShowPluginSheet(true)} className="text-xs bg-muted text-foreground hover:bg-muted/80 px-3 py-1.5 rounded-md flex items-center gap-1.5 transition-colors">
-                          <Settings2 className="w-3 h-3" /> 配置插件 ({formData.preferences.enabled_plugins?.length || 0})
-                        </button>
-                      </div>
-                    </div>
+                    {/* 请求处理流水线 — 可视化 Pipeline */}
+                    <PipelineView
+                      formData={formData}
+                      allPlugins={allPlugins}
+                      overridesJson={overridesJson}
+                      setOverridesJson={setOverridesJson}
+                      headerEntries={headerEntries}
+                      setHeaderEntries={setHeaderEntries}
+                      onOpenPluginSheet={() => setShowPluginSheet(true)}
+                      onPluginsChange={(plugins) => {
+                        // 修改原因：PipelineView 现在支持 inline 增删插件和编辑参数，需要直接写回当前渠道表单。
+                        // 修改方式：仅更新 preferences.enabled_plugins，保留其他 preferences 字段不变。
+                        // 目的：让常用插件操作无需打开 InterceptorSheet，也不影响插件表单的完整配置能力。
+                        setFormData(prev => {
+                          if (!prev) return prev;
+                          return { ...prev, preferences: { ...prev.preferences, enabled_plugins: plugins } };
+                        });
+                      }}
+                      formatJsonOnBlur={formatJsonOnBlur}
+                    />
 
                     <div className="flex gap-3 items-end">
                       <div className="flex-1 min-w-0">
@@ -1037,65 +1314,6 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                       <label className="text-sm font-medium text-foreground mb-1.5 block">系统提示词 (System Prompt)</label>
                       <textarea value={formData.preferences.system_prompt || ''} onChange={e => updatePreference('system_prompt', e.target.value)} rows={3} className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground" />
                     </div>
-                    <div>
-                      <label className="text-sm font-medium text-foreground mb-1.5 block">自定义请求头</label>
-                      <div className="space-y-2">
-                        {headerEntries.map((entry, idx) => (
-                          <div key={idx} className="flex gap-2 items-center">
-                            <input
-                              value={entry.key}
-                              onChange={e => {
-                                const next = [...headerEntries];
-                                next[idx] = { ...next[idx], key: e.target.value };
-                                setHeaderEntries(next);
-                              }}
-                              placeholder="Header-Name"
-                              className="flex-1 bg-background border border-border px-3 py-1.5 rounded-lg text-sm font-mono text-foreground"
-                            />
-                            <input
-                              value={entry.value}
-                              onChange={e => {
-                                const next = [...headerEntries];
-                                next[idx] = { ...next[idx], value: e.target.value };
-                                setHeaderEntries(next);
-                              }}
-                              placeholder="Value"
-                              className="flex-1 bg-background border border-border px-3 py-1.5 rounded-lg text-sm font-mono text-foreground"
-                            />
-                            <button onClick={() => setHeaderEntries(headerEntries.filter((_, i) => i !== idx))} className="text-muted-foreground hover:text-destructive transition-colors">
-                              <X className="w-4 h-4" />
-                            </button>
-                          </div>
-                        ))}
-                        <button onClick={() => setHeaderEntries([...headerEntries, { key: '', value: '' }])} className="text-xs text-primary hover:text-primary/80 flex items-center gap-1">
-                          <Plus className="w-3 h-3" /> 添加请求头
-                        </button>
-                      </div>
-                      <p className="text-xs text-muted-foreground mt-1">支持同名 Header，每条单独发送</p>
-                    </div>
-                    <div>
-                      <label className="text-sm font-medium text-foreground mb-1.5 block">请求体覆写 (JSON)</label>
-                      <textarea
-                        value={overridesJson}
-                        onChange={e => setOverridesJson(e.target.value)}
-                        onBlur={() => formatJsonOnBlur(overridesJson, setOverridesJson, '请求体覆写')}
-                        rows={3}
-                        placeholder='{"all": {"temperature": 0.1}}'
-                        className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm font-mono focus:border-primary outline-none text-foreground"
-                      />
-                      <p className="text-xs text-muted-foreground mt-1">
-                        失焦时自动格式化。key 为 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">all</code> 或 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">*</code> 全局生效，模型名精确匹配。dict 递归合并，数组整体覆写，key 加 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">+</code> 前缀追加数组（如 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">+tools</code>）。值为 <code className="px-1 py-0.5 bg-muted rounded text-[11px]">null</code> 删除该字段。
-                      </p>
-                      {hasUiSlot(formData.engine, 'override_hint', formData.preferences.enabled_plugins) && (
-                        <>
-                          {/* 修改原因：请求体覆写格式可能因渠道协议不同而不同，通用前端不能写死 Antigravity 等渠道的专属提醒。 */}
-                          {/* 修改方式：在请求体覆写说明文字下方提供 override_hint 挂载点，仅当当前 engine 注册该插槽时渲染 UiSlot。 */}
-                          {/* 目的：让渠道自行写入参数覆写提示，未注册时不显示任何额外 DOM 或空白。 */}
-                          <UiSlot engine={formData.engine} slot="override_hint" data={null} element="div" className="text-xs text-amber-600 dark:text-amber-400 mt-1" enabledPlugins={formData.preferences.enabled_plugins || []} />
-                        </>
-                      )}
-                    </div>
-
                     <div className="flex items-center justify-between p-3 bg-muted/50 rounded-lg border border-border">
                       <span className="text-sm text-foreground">启用 Tools (函数调用)</span>
                       <Switch.Root checked={formData.preferences.tools} onCheckedChange={val => updatePreference('tools', val)} className="w-11 h-6 bg-muted rounded-full data-[state=checked]:bg-primary">

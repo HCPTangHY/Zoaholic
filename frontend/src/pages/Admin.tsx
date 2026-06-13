@@ -1,13 +1,14 @@
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
-import { toastSuccess, toastError, toastWarning, fmtErr } from '../components/Toast';
+import { toastSuccess, toastError, toastWarning } from '../components/Toast';
 import {
   Key, Plus, RefreshCw, Copy, Trash2, Edit, Save, X, Search,
   Folder, CheckCircle2, AlertCircle, AlertTriangle,
-  Wand2, Wallet, Brain, Download, Check, Ban
+  Wand2, Wallet, Brain, Download, Check, Ban, BarChart3
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
+import { KeyAnalyticsSheet } from '../components/KeyAnalyticsSheet';
 
 // ========== Types ==========
 interface ApiKeyData {
@@ -17,6 +18,7 @@ interface ApiKeyData {
   groups?: string[];
   group?: string;
   model?: string[];
+  ip_blacklist?: string[];
   preferences?: {
     credits?: number;
     created_at?: string;
@@ -40,6 +42,12 @@ export default function Admin() {
   const [keys, setKeys] = useState<ApiKeyData[]>([]);
   const [keyStates, setKeyStates] = useState<Record<string, ApiKeyState>>({});
   const [loading, setLoading] = useState(true);
+  const [analyticsKey, setAnalyticsKey] = useState<{api: string; name?: string} | null>(null);
+  // 修改原因：Key Analytics 需要与 Channel Analytics 一样由列表按钮打开侧滑 Sheet，而不是用 analyticsKey 是否为空隐式控制。
+  // 修改方式：增加独立 open 状态，关闭 Sheet 时再清空当前 Key。
+  // 目的：让打开、关闭和切换 Key 的状态更清晰，避免后续增加关闭动画或复用组件时互相影响。
+  const [analyticsOpen, setAnalyticsOpen] = useState(false);
+
 
   // Edit Sheet
   const [isSheetOpen, setIsSheetOpen] = useState(false);
@@ -56,6 +64,7 @@ export default function Admin() {
   const [formModelRateLimits, setFormModelRateLimits] = useState<{model: string; rate: string}[]>([]);
   const [formExcludedChannels, setFormExcludedChannels] = useState<string[]>([]);
   const [formExcludedModels, setFormExcludedModels] = useState<string[]>([]);
+  const [formIpBlacklistText, setFormIpBlacklistText] = useState('');
 
   // Input states
   const [groupInput, setGroupInput] = useState('');
@@ -76,6 +85,34 @@ export default function Admin() {
   const [fetchingModels, setFetchingModels] = useState(false);
 
   // ========== Data Loading ==========
+  const parseIpBlacklistText = (text: string): string[] => {
+    // 修改原因：IP 黑名单输入使用 textarea，每行一个规则，同时需要兼容用户粘贴逗号分隔内容。
+    // 修改方式：按换行和逗号拆分，去除空白并去重后保存为字符串数组。
+    // 目的：让前端提交结构与 api.yaml 中的 ip_blacklist 数组一致。
+    return [...new Set(text.split(/[\n,]+/).map(s => s.trim()).filter(Boolean))];
+  };
+
+  const formatIpBlacklistText = (items: unknown): string => {
+    // 修改原因：后端返回的 ip_blacklist 可能来自旧配置字符串或新配置数组。
+    // 修改方式：数组按行展示，字符串原样展示，其他值视为空。
+    // 目的：编辑时清晰展示一行一个 IP/CIDR，并保留旧配置兼容性。
+    if (Array.isArray(items)) return items.map(item => String(item).trim()).filter(Boolean).join('\n');
+    if (typeof items === 'string') return items.trim();
+    return '';
+  };
+
+  const validateIpBlacklistEntries = (entries: string[]): boolean => {
+    // 修改原因：浏览器端无法完整复用 Python ipaddress，过严校验会误伤 IPv6 压缩格式。
+    // 修改方式：仅拦截空白、逗号和明显缺少 IP 主体的条目，严格校验交给后端 update_config。
+    // 目的：避免前端拒绝合法 IPv6，同时仍减少一部分明显误输入。
+    const invalid = entries.find(entry => /\s|,/.test(entry) || entry.startsWith('/') || entry.endsWith('/'));
+    if (invalid) {
+      toastWarning(`IP 黑名单条目格式不正确：${invalid}`);
+      return false;
+    }
+    return true;
+  };
+
   const fetchData = async () => {
     if (!token) return;
     setLoading(true);
@@ -88,7 +125,9 @@ export default function Admin() {
 
       if (configRes.ok) {
         const config = await configRes.json();
-        setKeys(config.api_config?.api_keys || config.api_keys || []);
+        const apiConfig = config.api_config || config;
+        setKeys(apiConfig.api_keys || []);
+
       }
       if (statesRes.ok) {
         const states = await statesRes.json();
@@ -155,6 +194,7 @@ export default function Admin() {
       setFormExcludedChannels(Array.isArray(ec) ? [...ec] : (typeof ec === 'string' && ec.trim() ? ec.split(',').map((s: string) => s.trim()).filter(Boolean) : []));
       const em = source.preferences?.excluded_models;
       setFormExcludedModels(Array.isArray(em) ? [...em] : (typeof em === 'string' && em.trim() ? em.split(',').map((s: string) => s.trim()).filter(Boolean) : []));
+      setFormIpBlacklistText(formatIpBlacklistText(source.ip_blacklist));
     } else {
       setFormApi('');
       setFormName('');
@@ -166,6 +206,7 @@ export default function Admin() {
       setFormModelRateLimits([]);
       setFormExcludedChannels([]);
       setFormExcludedModels([]);
+      setFormIpBlacklistText('');
     }
 
     setIsSheetOpen(true);
@@ -305,6 +346,9 @@ export default function Admin() {
       return;
     }
 
+    const keyIpBlacklist = parseIpBlacklistText(formIpBlacklistText);
+    if (!validateIpBlacklistEntries(keyIpBlacklist)) return;
+
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const target: any = { api: formApi.trim() };
 
@@ -312,6 +356,10 @@ export default function Admin() {
     if (formRole.trim()) target.role = formRole.trim();
     target.groups = formGroups.length > 0 ? formGroups : ['default'];
     if (formModels.length > 0) target.model = formModels;
+    // 修改原因：Key 级 IP 黑名单需要保存在 api_keys 条目的顶层字段，而不是 preferences 中。
+    // 修改方式：textarea 解析为数组后赋给 target.ip_blacklist，空数组也保留，方便清空旧配置。
+    // 目的：让每个 API Key 独立的 IP 黑名单随 API Key 保存一起持久化并热更新。
+    target.ip_blacklist = keyIpBlacklist;
 
     // Preferences
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -360,6 +408,8 @@ export default function Admin() {
       // 清理 undefined 键
       if (target.preferences.excluded_channels === undefined) delete target.preferences.excluded_channels;
       if (target.preferences.excluded_models === undefined) delete target.preferences.excluded_models;
+      if (Object.keys(target.preferences).length === 0) delete target.preferences;
+      target.ip_blacklist = keyIpBlacklist;
       newKeys[editingIndex] = target;
     } else {
       newKeys.push(target);
@@ -382,6 +432,8 @@ export default function Admin() {
       toastError('网络错误');
     }
   };
+
+
 
   // ========== Delete ==========
   const handleDelete = async (index: number) => {
@@ -487,6 +539,22 @@ export default function Admin() {
     navigator.clipboard.writeText(text);
   };
 
+  const openKeyAnalytics = (keyObj: ApiKeyData) => {
+    // 修改原因：分析入口需要从当前 Key 行传入完整 Key 和可读名称，Sheet 内部再计算 key_hash。
+    // 修改方式：优先使用顶层 name，兼容 preferences.name，然后显式打开侧滑 Sheet。
+    // 目的：保持 Admin 列表操作区只负责选择 Key，具体分析请求由 KeyAnalyticsSheet 负责。
+    setAnalyticsKey({ api: keyObj.api, name: keyObj.name || keyObj.preferences?.name });
+    setAnalyticsOpen(true);
+  };
+
+  const handleAnalyticsOpenChange = (open: boolean) => {
+    // 修改原因：Radix Dialog 关闭时只会回传 open=false，需要同步清理已选 Key。
+    // 修改方式：先更新 open 状态，关闭时再把 analyticsKey 置空。
+    // 目的：防止下次打开前短暂显示上一次 Key 的标题或数据。
+    setAnalyticsOpen(open);
+    if (!open) setAnalyticsKey(null);
+  };
+
   return (
     <div className="space-y-6 animate-in fade-in duration-500 font-sans">
       {/* Header */}
@@ -551,6 +619,7 @@ export default function Admin() {
                 </div>
                 <div className="flex items-center justify-end gap-1 pt-3 border-t border-border">
                   <button onClick={() => openCreditsDialog(keyObj.api)} className="p-1.5 text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10 rounded-md" title="充值"><Wallet className="w-4 h-4" /></button>
+                  <button onClick={() => openKeyAnalytics(keyObj)} className="p-1.5 text-primary hover:bg-primary/10 rounded-md" title="用量分析"><BarChart3 className="w-4 h-4" /></button>
                   <button onClick={() => openSheet(null, keyObj)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="复制"><Copy className="w-4 h-4" /></button>
                   <button onClick={() => openSheet(idx)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="编辑"><Edit className="w-4 h-4" /></button>
                   <button onClick={() => handleDelete(idx)} className="p-1.5 text-red-600 dark:text-red-500 hover:bg-red-500/10 rounded-md" title="删除"><Trash2 className="w-4 h-4" /></button>
@@ -647,6 +716,9 @@ export default function Admin() {
                       <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                         <button onClick={() => openCreditsDialog(keyObj.api)} className="p-1.5 text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10 rounded-md" title="充值额度">
                           <Wallet className="w-4 h-4" />
+                        </button>
+                        <button onClick={() => openKeyAnalytics(keyObj)} className="p-1.5 text-primary hover:bg-primary/10 rounded-md" title="用量分析">
+                          <BarChart3 className="w-4 h-4" />
                         </button>
                         <button onClick={() => openSheet(null, keyObj)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="复制配置">
                           <Copy className="w-4 h-4" />
@@ -834,6 +906,20 @@ export default function Admin() {
               <section className="space-y-4">
                 <div className="text-sm font-semibold text-foreground border-b border-border pb-2 flex items-center gap-2">
                   <Ban className="w-4 h-4 text-red-500" /> 访问控制
+                </div>
+
+                <div className="space-y-3">
+                  <label className="text-sm font-medium text-foreground mb-1.5 block">IP 黑名单</label>
+                  {/* 修改原因：每个 API Key 需要独立维护 IP 黑名单，且字段存放在 api_keys 条目顶层。 */}
+                  {/* 修改方式：在访问控制区域增加 textarea，一行一个 IP/CIDR，保存时解析到 target.ip_blacklist。 */}
+                  {/* 目的：当前 Key 命中黑名单时在鉴权层直接返回 ip_blocked。 */}
+                  <textarea
+                    value={formIpBlacklistText}
+                    onChange={e => setFormIpBlacklistText(e.target.value)}
+                    placeholder={'例如：\n1.2.3.4\n5.6.7.0/24'}
+                    className="w-full min-h-[96px] bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
+                  />
+                  <p className="text-xs text-muted-foreground">仅影响当前 API Key。全局黑名单会先于 Key 级黑名单检查。</p>
                 </div>
 
                 <div className="space-y-3">
@@ -1120,6 +1206,14 @@ export default function Admin() {
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
+
+      {/* Key Analytics Sheet */}
+      <KeyAnalyticsSheet
+        open={analyticsOpen}
+        onOpenChange={handleAnalyticsOpenChange}
+        apiKeyValue={analyticsKey?.api || ''}
+        apiKeyName={analyticsKey?.name}
+      />
     </div>
   );
 }

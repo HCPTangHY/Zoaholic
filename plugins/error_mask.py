@@ -37,6 +37,15 @@ PLUGIN_INFO = {
         "category": "interceptors",
         "tags": ["error", "mask", "security"],
         "params_hint": "可通过 error_mask:自定义提示语 设置替换文本，默认为 'The upstream service returned an error. Please try again later.'",
+        "params_schema": [
+            {
+                "key": "message",
+                "label": "替换提示语",
+                "type": "text",
+                "placeholder": "留空使用默认提示",
+                "default": "",
+            },
+        ],
     },
 }
 

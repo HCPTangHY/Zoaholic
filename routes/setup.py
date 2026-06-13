@@ -262,7 +262,12 @@ async def setup_init(payload: SetupInitRequest = Body(...)):
             # 修改方式：基于最新 api_keys_db 单独重建 app.state.byok_prefixes。
             # 目的：首次配置或修复后无需重启即可使用 BYOK 通配符身份。
             from core.byok import build_byok_prefixes
+            from core.ip_blacklist import apply_runtime_ip_blacklists
             app.state.byok_prefixes = build_byok_prefixes(app.state.api_keys_db)
+            # 修改原因：setup 修复配置也会调用 update_config，可能同时写入或清空 IP 黑名单。
+            # 修改方式：修复后重建运行时黑名单缓存。
+            # 目的：首次修复或补 key 后运行时状态与配置文件保持一致。
+            apply_runtime_ip_blacklists(app)
 
         # 更新内存标记
         app.state.needs_setup = False
@@ -301,7 +306,12 @@ async def setup_init(payload: SetupInitRequest = Body(...)):
     # 修改方式：基于最新 api_keys_db 单独重建 app.state.byok_prefixes。
     # 目的：保持 setup 初始化路径和常规配置加载路径一致。
     from core.byok import build_byok_prefixes
+    from core.ip_blacklist import apply_runtime_ip_blacklists
     app.state.byok_prefixes = build_byok_prefixes(app.state.api_keys_db)
+    # 修改原因：首次初始化后也需要建立空 IP 黑名单缓存，避免鉴权读取缺失属性。
+    # 修改方式：基于最新最小配置重建运行时黑名单。
+    # 目的：让 setup 初始化路径与普通启动和管理端热更新路径一致。
+    apply_runtime_ip_blacklists(app)
 
     app.state.needs_setup = False
     app.state.admin_api_key = [admin_api_key]

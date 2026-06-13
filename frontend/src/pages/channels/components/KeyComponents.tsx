@@ -210,11 +210,12 @@ export const UiSlot = ({ engine, slot, data, context, className, element = 'span
 };
 
 // ── 冷却中 Key 行组件（SVG 边框进度） ──
-export function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus, onBlur, onRecover, onToggle, onTest, onDelete, onLabelChange }: {
+export function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, onFocus, onBlur, onRecover, onToggle, onTest, onDelete, onLabelChange, alwaysShowRecover }: {
   idx: number; keyObj: { key: string; disabled: boolean; label?: string }; remainSec: number; totalDuration: number;
   focused: boolean;
   onFocus: () => void; onBlur: () => void;
   onRecover: () => void; onToggle: () => void; onTest: () => void; onDelete: () => void; onLabelChange?: (label: string) => void;
+  alwaysShowRecover?: boolean;
 }) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const [svgViewBox, setSvgViewBox] = useState('');
@@ -283,7 +284,7 @@ export function CoolingKeyRow({ idx, keyObj, remainSec, totalDuration, focused, 
             </span>
           )}
         </div>
-        {!focused && (
+        {(!focused || alwaysShowRecover) && (
           <button onClick={onRecover} className="text-[11px] px-2 py-0.5 rounded border border-emerald-500/50 bg-emerald-500/20 text-emerald-400 font-medium hover:bg-emerald-500/30 hover:border-emerald-400 cursor-pointer flex-shrink-0 relative z-[2] transition-colors">恢复</button>
         )}
         <div className="actions flex items-center gap-1 flex-shrink-0 relative z-[2]">

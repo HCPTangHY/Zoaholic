@@ -52,6 +52,11 @@ async def get_openrouter_payload(request, engine, provider, api_key=None):
     }
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'
+    # 修改原因：OpenRouter 要求普通请求和透传请求都携带站点标识请求头。
+    # 修改方式：在非透传请求构建阶段补齐与 get_openrouter_passthrough_meta 一致的请求头。
+    # 目的：让从 OpenAI 通用渠道移除 URL 检测后，OpenRouter 渠道仍完整注入自身专属 header。
+    headers['HTTP-Referer'] = "https://github.com/HCPTangHY/Zoaholic"
+    headers['X-Title'] = "Zoaholic"
     
     from ..utils import resolve_base_url
     url = resolve_base_url(provider.get("base_url", "https://openrouter.ai/api/v1"), "/chat/completions")

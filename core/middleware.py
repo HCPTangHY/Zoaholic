@@ -30,6 +30,7 @@ from core.metrics import on_request_start, on_request_end
 from core.stats import enqueue_stats
 from core.utils import truncate_for_logging
 from core.error_response import openai_error_response
+from core.ip_blacklist import ip_blocked_error_response, is_global_ip_blocked, is_key_ip_blocked
 from core.byok import (
     get_byok_prefixes,
     reset_byok_context,
@@ -187,6 +188,27 @@ class StatsMiddleware:
         # 获取路径
         path = scope.get("path", "")
         method = scope.get("method", "GET")
+        headers = scope.get("headers", [])
+        client_ip = self._get_client_ip(scope, headers)
+
+        # 获取 app 实例
+        app = scope.get("app")
+        if app and is_global_ip_blocked(app, client_ip):
+            # 修改原因：全局 IP 黑名单按需求应对所有 HTTP 请求生效，不能只覆盖 /v1 标准鉴权路径。
+            # 修改方式：在 OPTIONS、非 /v1 路径和方言判断之前读取客户端 IP 并检查全局黑名单缓存。
+            # 目的：被禁 IP 访问前端、管理接口、方言端点或普通 /v1 端点时都直接返回 ip_blocked。
+            response = ip_blocked_error_response()
+            await response(scope, receive, send)
+            return
+
+        # 数据库压缩期间挂起请求（不返回错误，等压缩完自动放行）
+        try:
+            from main import _db_ready
+            if not _db_ready.is_set():
+                
+                await asyncio.wait_for(_db_ready.wait(), timeout=30)
+        except (ImportError, asyncio.TimeoutError):
+            pass
 
         # OPTIONS 直接放行
         if method == "OPTIONS":
@@ -202,14 +224,11 @@ class StatsMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # 获取 app 实例
-        app = scope.get("app")
         if not app:
             await self.app(scope, receive, send)
             return
 
         start_time = time()
-        headers = scope.get("headers", [])
         # 修改原因：标准鉴权和方言鉴权都可能在请求上下文中写入 BYOK 真实 key。
         # 修改方式：请求开始时建立空 BYOK ContextVar，并在请求结束或早退时恢复。
         # 目的：确保真实上游 key 只在本次请求内可见，不会残留到后续协程上下文。
@@ -268,6 +287,15 @@ class StatsMiddleware:
                     token = byok_template_key
 
             if api_index is not None:
+                if is_key_ip_blocked(app, api_index, client_ip):
+                    # 修改原因：标准 /v1 鉴权解析出当前 API Key 后，必须继续检查该 Key 自己的 IP 黑名单。
+                    # 修改方式：用 api_index 匹配 app.state.api_key_ip_blacklists 中的预解析规则，命中即返回指定 403。
+                    # 目的：实现“全局黑名单 → 当前 Key 黑名单”的顺序，并避免进入余额、审查或上游请求流程。
+                    response = ip_blocked_error_response()
+                    await response(scope, receive, send)
+                    reset_byok_context(byok_context_tokens)
+                    return
+
                 store_byok_scope_state(
                     scope,
                     byok_real_key=byok_real_key,
@@ -304,9 +332,6 @@ class StatsMiddleware:
                 await response(scope, receive, send)
                 reset_byok_context(byok_context_tokens)
                 return
-
-        # 获取 client IP
-        client_ip = self._get_client_ip(scope, headers)
 
         # 获取用户key相关信息
         api_key_name = safe_get(config, "api_keys", api_index, "name", default=None)
