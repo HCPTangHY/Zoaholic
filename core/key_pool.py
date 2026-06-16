@@ -341,7 +341,7 @@ class ThreadSafeCircularList:
         if self.is_key_disabled(item):
             return True
         # 检查是否在冷却中
-        if now < self.cooling_until[item]:
+        if now < self.cooling_until.get(item, 0):
             return True
 
         # 获取适用的速率限制
@@ -451,6 +451,12 @@ class ThreadSafeCircularList:
                                 self._sticky_sessions.pop(k, None)
                     return item
 
+                # 修改原因：遍历全部 key 时不释放事件循环会在高并发下造成级联阻塞 30 秒以上，
+                # 触发 watchdog 写 thread dump 后 PM2 重启。
+                # 修改方式：每次限流 key 判定后显式让出事件循环。
+                # 目的：避免持锁遍历导致的级联阻塞和进程重启。
+                await asyncio.sleep(0)
+
                 # 如果已经检查了所有的 API key 都被限制
                 if self.index == start_index:
                     logger.warning("All API keys are rate limited!")
@@ -497,17 +503,24 @@ class ThreadSafeCircularList:
         if len(self.items) == 0:
             return False
 
+        # 快照 items，避免长时间持锁导致事件循环阻塞
         async with self.lock:
-            for item in self.items:
-                # 跳过禁用的 key
-                if self.is_key_disabled(item):
-                    continue
-                if not await self.is_rate_limited(item, model, is_check=True):
-                    return False
+            items_snapshot = list(self.items)
 
-            # 如果遍历完所有items都被限制，返回True
-            # logger.debug(f"Check result: all items are rate limited!")
-            return True
+        for item in items_snapshot:
+            # 跳过禁用的 key
+            if self.is_key_disabled(item):
+                continue
+            if not await self.is_rate_limited(item, model, is_check=True):
+                return False
+            # 修改原因：is_all_rate_limited 同样遍历全部 key 调用 is_rate_limited，
+            # 事件循环在此过程中不释放，与 next() 产生相同的阻塞问题。
+            # 修改方式：每个 key 检查后让出事件循环。
+            # 目的：与 next() 的修复保持一致，避免级联阻塞。
+            await asyncio.sleep(0)
+
+        # 如果遍历完所有items都被限制，返回True
+        return True
     
     def get_enabled_items_count(self) -> int:
         """返回启用的项目数量。

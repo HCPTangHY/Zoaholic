@@ -715,6 +715,11 @@ class ModelRequestHandler:
                     # 虚拟路由：检查同 priority group 是否全部耗尽
                     if _is_virtual_route:
                         grp_start, grp_end = _get_priority_group_range(current_index)
+                        # 修改原因：matching_providers 在分组构建后可能因运行时过滤发生变化，
+                        # grp_end 可能越界导致 IndexError。
+                        # 修改方式：以 min(grp_end, len(matching_providers)) 做运行时边界保护。
+                        # 目的：避免虚拟路由分组检查因索引越界返回 500。
+                        grp_end = min(grp_end, len(matching_providers))
                         group_all_exhausted = True
                         for gi in range(grp_start, grp_end):
                             gi_provider = matching_providers[gi]
@@ -1115,6 +1120,10 @@ class ModelRequestHandler:
                     # 虚拟路由：重试时强制留在同一 priority group 内
                     if _is_virtual_route and _priority_group_ranges:
                         grp_start, grp_end = _get_priority_group_range(current_index)
+                        # 修改原因：与限流耗尽检查相同的越界风险。
+                        # 修改方式：grp_end 做运行时边界保护。
+                        # 目的：避免虚拟路由重试阶段因索引越界返回 500。
+                        grp_end = min(grp_end, len(matching_providers))
                         next_idx = index % num_matching_providers
                         if next_idx >= grp_end or next_idx < grp_start:
                             # 即将越过当前 group → 检查组内是否还有可用 key
