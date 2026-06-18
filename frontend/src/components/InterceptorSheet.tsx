@@ -17,8 +17,13 @@ interface PluginOption {
   version: string;
   description: string;
   enabled: boolean;
+  inbound_interceptors?: unknown[];
+  channel_inbound_interceptors?: unknown[];
   request_interceptors: unknown[];
   response_interceptors: unknown[];
+  channel_outbound_interceptors?: unknown[];
+  key_outbound_interceptors?: unknown[];
+  balance_enrichers?: unknown[];
   metadata?: {
     params_hint?: string;
     params_schema?: ParamSchema[];
@@ -38,21 +43,37 @@ interface InterceptorSheetProps {
   allPlugins: PluginOption[];
   enabledPlugins: string[]; // ["pluginA:config", "pluginB"]
   providerPreferences: Record<string, unknown>;
+  title?: string;
+  description?: string;
+  returnLabel?: string;
   onUpdate: (payload: { enabled_plugins: string[]; preferences_patch: Record<string, unknown>; preferences_delete: string[] }) => void;
 }
 
-type InterceptorTab = 'all' | 'request' | 'response';
+type InterceptorTab = 'all' | 'channel_inbound' | 'request' | 'response' | 'channel_outbound' | 'key_outbound';
 
 // 修改原因：插件数量增多后，需要按请求或响应拦截方向快速缩小列表。
-// 修改方式：用固定配置驱动小型 pill Tab，避免改变 InterceptorSheetProps。
-// 目的：让筛选能力只停留在组件内部，不影响保存数据结构。
+// 修改方式：用固定配置驱动小型 pill Tab，加入新增的渠道入站、渠道出站和 Key 出站阶段。
+// 目的：让完整配置面板也能按新阶段筛选插件。
 const INTERCEPTOR_TABS: Array<{ value: InterceptorTab; label: string }> = [
   { value: 'all', label: '全部' },
+  { value: 'channel_inbound', label: '渠道入站' },
   { value: 'request', label: '请求拦截' },
   { value: 'response', label: '响应拦截' },
+  { value: 'channel_outbound', label: '渠道出站' },
+  { value: 'key_outbound', label: 'Key 出站' },
 ];
 
-export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugins, providerPreferences, onUpdate }: InterceptorSheetProps) {
+export function InterceptorSheet({
+  open,
+  onOpenChange,
+  allPlugins,
+  enabledPlugins,
+  providerPreferences,
+  title = '插件配置',
+  description = '勾选要在本渠道启用的插件拦截器。可为每个插件配置参数（格式：plugin:options）。',
+  returnLabel = '返回编辑',
+  onUpdate,
+}: InterceptorSheetProps) {
   // 自行获取插件列表，防止父组件传入的 allPlugins 因 403 等原因为空
   const [localPlugins, setLocalPlugins] = useState<PluginOption[]>(allPlugins);
 
@@ -83,11 +104,17 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
   // 目的：让后续排序和渲染都基于用户当前看到的插件集合。
   const filteredPlugins = useMemo(() => {
     return effectivePlugins.filter(plugin => {
-      const hasRequest = plugin.request_interceptors.length > 0;
-      const hasResponse = plugin.response_interceptors.length > 0;
+      const hasChannelInbound = (plugin.channel_inbound_interceptors?.length ?? 0) > 0;
+      const hasRequest = (plugin.request_interceptors?.length ?? 0) > 0;
+      const hasResponse = (plugin.response_interceptors?.length ?? 0) > 0;
+      const hasChannelOutbound = (plugin.channel_outbound_interceptors?.length ?? 0) > 0;
+      const hasKeyOutbound = (plugin.key_outbound_interceptors?.length ?? 0) > 0;
 
+      if (activeTab === 'channel_inbound' && !hasChannelInbound) return false;
       if (activeTab === 'request' && !hasRequest) return false;
       if (activeTab === 'response' && !hasResponse) return false;
+      if (activeTab === 'channel_outbound' && !hasChannelOutbound) return false;
+      if (activeTab === 'key_outbound' && !hasKeyOutbound) return false;
       if (!normalizedSearch) return true;
 
       return (
@@ -285,8 +312,11 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
     const isSelected = selected.has(plugin.plugin_name);
     const isExpanded = expanded.has(plugin.plugin_name);
     const options = selected.get(plugin.plugin_name) || '';
-    const hasRequest = plugin.request_interceptors.length > 0;
-    const hasResponse = plugin.response_interceptors.length > 0;
+    const hasChannelInbound = (plugin.channel_inbound_interceptors?.length ?? 0) > 0;
+    const hasRequest = (plugin.request_interceptors?.length ?? 0) > 0;
+    const hasResponse = (plugin.response_interceptors?.length ?? 0) > 0;
+    const hasChannelOutbound = (plugin.channel_outbound_interceptors?.length ?? 0) > 0;
+    const hasKeyOutbound = (plugin.key_outbound_interceptors?.length ?? 0) > 0;
     const hasProviderConfig = Boolean(plugin.metadata?.provider_config?.key);
     const paramsSchema = Array.isArray(plugin.metadata?.params_schema) ? plugin.metadata.params_schema : [];
 
@@ -319,11 +349,14 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
                     有渠道配置
                   </span>
                 )}
-                {/* 修改原因：只含单一方向拦截器的插件需要在列表中快速识别类型。
-                    修改方式：仅请求插件显示蓝色“请求”，仅响应插件显示紫色“响应”，双向插件不额外标记。
-                    目的：避免全功能插件产生冗余标签，同时突出单向插件。 */}
-                {hasRequest && !hasResponse && <span className="text-xs bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded">请求</span>}
-                {hasResponse && !hasRequest && <span className="text-xs bg-purple-500/10 text-purple-400 px-1.5 py-0.5 rounded">响应</span>}
+                {/* 修改原因：新增三个拦截器阶段后，插件能力标签不能只显示“请求/响应”。
+                    修改方式：按实际阶段显示小标签，多阶段插件显示多个标签。
+                    目的：让管理员在完整配置面板中能直接看出插件运行时机。 */}
+                {hasChannelInbound && <span className="text-xs bg-emerald-500/10 text-emerald-500 px-1.5 py-0.5 rounded">渠道入站</span>}
+                {hasRequest && <span className="text-xs bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded">请求</span>}
+                {hasResponse && <span className="text-xs bg-purple-500/10 text-purple-400 px-1.5 py-0.5 rounded">响应</span>}
+                {hasChannelOutbound && <span className="text-xs bg-cyan-500/10 text-cyan-500 px-1.5 py-0.5 rounded">渠道出站</span>}
+                {hasKeyOutbound && <span className="text-xs bg-amber-500/10 text-amber-500 px-1.5 py-0.5 rounded">Key 出站</span>}
               </div>
               <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{plugin.description}</p>
             </div>
@@ -439,11 +472,11 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
               className="text-muted-foreground hover:text-foreground flex items-center gap-1.5 text-sm font-medium px-2 py-1 rounded-md hover:bg-muted transition-colors"
             >
               <ArrowLeft className="w-4 h-4" />
-              返回编辑
+              {returnLabel}
             </button>
             <h3 className="text-lg font-semibold text-foreground flex items-center gap-2">
               <Puzzle className="w-5 h-5 text-emerald-500" />
-              插件配置
+              {title}
             </h3>
           </div>
           <button onClick={() => onOpenChange(false)} className="text-muted-foreground hover:text-foreground p-1 rounded-full hover:bg-muted transition-colors">
@@ -454,7 +487,7 @@ export function InterceptorSheet({ open, onOpenChange, allPlugins, enabledPlugin
         {/* Body */}
         <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4">
           <p className="text-sm text-muted-foreground">
-            勾选要在本渠道启用的插件拦截器。可为每个插件配置参数（格式：plugin:options）。
+            {description}
           </p>
 
           {/* Toolbar */}
