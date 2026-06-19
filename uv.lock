@@ -967,7 +967,7 @@ wheels = [
 
 [[package]]
 name = "zoaholic"
-version = "1.7.4"
+version = "1.7.5"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },
