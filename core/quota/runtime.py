@@ -36,6 +36,9 @@ class _SlidingCounter:
         cutoff = now - period
         return sum(1 for t in self._q if t > cutoff)
 
+    def clear(self):
+        self._q.clear()
+
     def cleanup(self, now: float, max_period: float):
         if math.isinf(max_period):
             return
@@ -62,6 +65,10 @@ class _SlidingAccumulator:
             return self._perm
         cutoff = now - period
         return sum(a for t, a in self._q if t > cutoff)
+
+    def clear(self):
+        self._q.clear()
+        self._perm = 0.0
 
     def cleanup(self, now: float, max_period: float):
         if math.isinf(max_period):
@@ -97,6 +104,10 @@ class _FixedWindow:
             self.start = now
         self.val += amount
 
+    def clear(self):
+        self.val = 0
+        self.start = 0
+
     def resets_at(self, period: float) -> Optional[float]:
         if math.isinf(period) or self.start == 0:
             return None
@@ -128,6 +139,10 @@ class _FixedUniqueWindow:
     def add(self, now: float, period: float, ip: str):
         self._ensure_window(now, period)
         self.seen.add(ip)
+
+    def clear(self):
+        self.seen.clear()
+        self.start = 0
 
     def resets_at(self, period: float) -> Optional[float]:
         if math.isinf(period) or self.start == 0:
@@ -176,6 +191,23 @@ class ScopedStore:
         ids = {scope_id for (scope_id, metric_name) in self._sliding.keys() if metric_name == metric}
         ids.update(scope_id for (scope_id, metric_name) in self._fixed.keys() if metric_name == metric)
         return ids
+
+    def reset_scope_metric(self, scope_predicate, metric_name: str) -> int:
+        """重置指定 scope_id 与 metric 的所有滑动和固定计数器。"""
+
+        affected = 0
+        for key, counter in list(self._sliding.items()):
+            scope_id, stored_metric = key
+            if stored_metric == metric_name and scope_predicate(scope_id):
+                counter.clear()
+                affected += 1
+        for key, windows in list(self._fixed.items()):
+            scope_id, stored_metric = key
+            if stored_metric == metric_name and scope_predicate(scope_id):
+                for window in windows.values():
+                    window.clear()
+                affected += len(windows) or 1
+        return affected
 
     def cleanup(self, now: float, max_periods: Dict[str, float]):
         """清理普通滑动窗口。"""
@@ -307,6 +339,33 @@ class QuotaCounter:
                 scope_id = self._scope_id_for_rule(rule, normalized_model, '', for_status=True)
                 out[status_key] = self._status_for_scope(scope_id or 'key', rule.metric, limit, now)
         return out
+
+    def reset_status(self, status_key: str) -> dict:
+        """按状态 key 手动清零一条正交配额。"""
+
+        # 修改原因：管理端需要对每个 Scope × Metric 状态提供手动重置按钮。
+        # 修改方式：沿用 get_status 输出的 status_key，定位到底层 scope_id 与 metric 计数器后清零。
+        # 目的：避免通过保存配置或重启服务来间接重置额度，同时保持 Key、Per-IP、模型三个作用域统一。
+        scope, metric, qualifier = _parse_status_key(status_key)
+        affected = 0
+        if metric == Metric.UNIQUE_IP:
+            affected = self._reset_unique_ip()
+        elif scope == Scope.KEY:
+            affected = self._store.reset_scope_metric(lambda scope_id: scope_id == 'key', metric.value)
+        elif scope == Scope.IP:
+            affected = self._store.reset_scope_metric(lambda scope_id: scope_id.startswith('ip:') and scope_id != 'ip:', metric.value)
+        elif scope == Scope.MODEL:
+            affected = self._reset_model_metric(qualifier, metric)
+        else:
+            raise ValueError(f"Unsupported quota scope: {scope}")
+
+        return {
+            'status_key': status_key,
+            'scope': scope.value,
+            'metric': metric.value,
+            'qualifier': qualifier,
+            'affected': affected,
+        }
 
     # ── 检查 ──
 
@@ -465,6 +524,23 @@ class QuotaCounter:
             return None
         return self._ip_fixed_window(limit.period).resets_at(limit.period)
 
+    def _reset_unique_ip(self) -> int:
+        affected = len(self._ip_seen) + len(self._ip_fixed)
+        self._ip_seen.clear()
+        for window in self._ip_fixed.values():
+            window.clear()
+        return affected
+
+    def _reset_model_metric(self, qualifier: str, metric: Metric) -> int:
+        metric_name = metric.value
+        known_scope_ids = self._store.scope_ids_for_metric(metric_name)
+        matched = {
+            scope_id for scope_id in known_scope_ids
+            if scope_id.startswith('model:') and _model_match(qualifier, scope_id.split(':', 1)[1])
+        }
+        matched.add(f"model:{qualifier}")
+        return self._store.reset_scope_metric(lambda scope_id: scope_id in matched, metric_name)
+
     def _ip_fixed_window(self, period: float) -> _FixedUniqueWindow:
         if period not in self._ip_fixed:
             self._ip_fixed[period] = _FixedUniqueWindow()
@@ -567,6 +643,14 @@ class QuotaRegistry:
         counter = self._counters.get(api_key)
         return counter.get_status(model) if counter else {}
 
+    def reset_key_status(self, api_key: str, status_key: str) -> dict:
+        counter = self._counters.get(api_key)
+        if not counter:
+            raise KeyError(api_key)
+        result = counter.reset_status(status_key)
+        result['api_key'] = api_key
+        return result
+
     def has_quota(self, api_key: str) -> bool:
         return api_key in self._counters
 
@@ -574,6 +658,22 @@ class QuotaRegistry:
 # ──────────────────────────────────────────────
 # 工具函数
 # ──────────────────────────────────────────────
+
+def _parse_status_key(status_key: str) -> Tuple[Scope, Metric, str]:
+    raw = str(status_key or '').strip()
+    parts = raw.split(':', 2)
+    if len(parts) != 3:
+        raise ValueError(f"Invalid quota status key: {status_key!r}")
+    scope_raw, metric_raw, qualifier = parts
+    try:
+        scope = Scope(scope_raw)
+        metric = Metric(metric_raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid quota status key: {status_key!r}") from exc
+    if not qualifier:
+        qualifier = 'default'
+    return scope, metric, qualifier
+
 
 def _model_match(qualifier: str, model: str) -> bool:
     """模型匹配：精确 → 包含 → default 通配。"""

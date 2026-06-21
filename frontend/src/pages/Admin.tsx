@@ -322,6 +322,7 @@ export default function Admin() {
   const [activeKeyNode, setActiveKeyNode] = useState<string | null>(null);
   const [openAddMenu, setOpenAddMenu] = useState<string | null>(null);
   const [showPluginSheet, setShowPluginSheet] = useState(false);
+  const [resettingQuotaKey, setResettingQuotaKey] = useState<string | null>(null);
 
   // Input states
   const [groupInput, setGroupInput] = useState('');
@@ -407,6 +408,14 @@ export default function Admin() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const refreshQuotaStates = async () => {
+    if (!token) return;
+    const res = await apiFetch('/v1/api_keys_states', { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) return;
+    const data = await res.json();
+    setQuotaStates(data.quota_states || {});
   };
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -575,13 +584,7 @@ export default function Admin() {
 
     setIsSheetOpen(true);
     // 打开面板时刷新 quota 状态
-    const { token } = useAuthStore.getState();
-    if (token) {
-      apiFetch('/v1/api_keys_states', { headers: { Authorization: `Bearer ${token}` } })
-        .then(r => r.ok ? r.json() : null)
-        .then(data => { if (data) setQuotaStates(data.quota_states || {}); })
-        .catch(() => {});
-    }
+    refreshQuotaStates().catch(() => {});
   };
 
   // ========== Generate Key ==========
@@ -1040,8 +1043,41 @@ export default function Admin() {
     return resetAt ? `刷新: ${resetAt}` : '刷新: 首次使用后计算';
   };
 
-  const renderQuotaStatusBlock = (status: any, metric: QuotaMetricValue) => {
+  const handleResetQuotaStatus = async (statusKey: string, label: string) => {
+    if (!token || !formApi.trim()) return;
+    const title = label || statusKey;
+    if (!confirm(`确定要重置「${title}」的运行时额度吗？\n\n这只会清零当前内存中的 quota 计数，不会删除配置，也不会删除历史日志。`)) return;
+    const resetId = `${formApi}:${statusKey}`;
+    setResettingQuotaKey(resetId);
+    try {
+      const res = await apiFetch('/v1/api_keys/quota/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ api_key: formApi.trim(), status_key: statusKey }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toastError(data.detail || '重置额度失败');
+        return;
+      }
+      setQuotaStates(prev => ({ ...prev, [formApi.trim()]: data.quota_state || {} }));
+      toastSuccess('额度已重置');
+    } catch (error) {
+      console.error('Failed to reset quota status:', error);
+      toastError('重置额度失败');
+    } finally {
+      setResettingQuotaKey(null);
+    }
+  };
+
+  const renderQuotaStatusBlock = (
+    status: any,
+    metric: QuotaMetricValue,
+    resetTarget?: { statusKey: string; label: string },
+  ) => {
     if (!status) return null;
+    const resetId = resetTarget ? `${formApi}:${resetTarget.statusKey}` : '';
+    const isResetting = Boolean(resetTarget && resettingQuotaKey === resetId);
     return (
       <div className="space-y-1">
         <div className="flex items-center gap-2 w-full">
@@ -1055,9 +1091,21 @@ export default function Admin() {
             {metric === 'cost' ? `$${Number(status.remaining).toFixed(2)}/$${Number(status.limit).toFixed(2)}` : `${fmtQuotaNumber(status.remaining)}/${fmtQuotaNumber(status.limit)}`}
           </span>
         </div>
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-muted-foreground">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-muted-foreground">
           {getQuotaWindowText(status) && <span>{getQuotaWindowText(status)}</span>}
           {getQuotaResetText(status) && <span>{getQuotaResetText(status)}</span>}
+          {resetTarget && (
+            <button
+              type="button"
+              disabled={isResetting}
+              onClick={() => handleResetQuotaStatus(resetTarget.statusKey, resetTarget.label)}
+              className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground hover:border-primary/50 hover:text-primary disabled:opacity-50"
+              title="清零这条运行时额度"
+            >
+              <RefreshCw className={`w-3 h-3 ${isResetting ? 'animate-spin' : ''}`} />
+              重置
+            </button>
+          )}
         </div>
       </div>
     );
@@ -1217,6 +1265,8 @@ export default function Admin() {
             <p className="text-xs text-muted-foreground italic">暂无规则</p>
           ) : scopedRules.map(({ rule, entryIndex, parsed }) => {
             const status = getQuotaRuleStatus(rule.key);
+            const statusKey = getQuotaStatusKeyFromConfig(rule.key);
+            const metricLabel = QUOTA_METRIC_LABELS[parsed.metric] || parsed.metric;
             return (
               <div key={entryIndex} className="rounded-lg border border-border bg-muted/20 p-2 space-y-1.5">
                 <div className="grid grid-cols-2 gap-2 items-center">
@@ -1253,7 +1303,7 @@ export default function Admin() {
                     </button>
                   </div>
                 </div>
-                {renderQuotaStatusBlock(status, parsed.metric)}
+                {renderQuotaStatusBlock(status, parsed.metric, { statusKey, label: `${title} ${metricLabel}` })}
               </div>
             );
           })}
@@ -1282,6 +1332,8 @@ export default function Admin() {
             <p className="text-xs text-muted-foreground italic">暂无规则</p>
           ) : formModelLimits.map((rule, index) => {
             const status = getModelLimitStatus(rule.key);
+            const modelKey = rule.key.trim();
+            const statusKey = modelKey ? `model:request:${modelKey}` : '';
             return (
               <div key={index} className="rounded-lg border border-border bg-muted/20 p-2 space-y-2">
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
@@ -1314,7 +1366,7 @@ export default function Admin() {
                     <X className="w-3.5 h-3.5" />
                   </button>
                 </div>
-                {renderQuotaStatusBlock(status, 'request')}
+                {statusKey && renderQuotaStatusBlock(status, 'request', { statusKey, label: `模型限速 ${modelKey}` })}
               </div>
             );
           })}
