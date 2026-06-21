@@ -94,6 +94,49 @@ PLUGIN_INFO = {
 }
 ```
 
+如果插件需要在管理端显示参数表单，应在 `PLUGIN_INFO["metadata"]` 中声明 UI 信息：
+
+```python
+PARAMS_SCHEMA = [
+    {
+        "key": "mode",
+        "label": "处理模式",
+        "type": "select",      # text / textarea / number / toggle / select / multi-select
+        "default": "strip",
+        "options": [
+            {"value": "allow", "label": "允许"},
+            {"value": "strip", "label": "剥离"},
+        ],
+        "serialize": "key_value",
+    },
+    {
+        "key": "keywords",
+        "label": "关键词",
+        "type": "textarea",
+        "placeholder": "一行一个关键词",
+        "serialize": "key_value",
+    },
+]
+
+PLUGIN_INFO = {
+    "name": "my_plugin",
+    "version": "1.0.0",
+    "description": "示例插件",
+    "metadata": {
+        "category": "interceptors",
+        "params_hint": "mode=strip,keywords=...",
+        "params_schema": PARAMS_SCHEMA,
+    },
+}
+```
+
+UI 声明规则：
+
+- `params_hint` 是简短说明，显示给管理员查看。
+- `params_schema` 是前端参数表单的字段定义。
+- `serialize: "key_value"` 表示保存为 `key=value` 参数。多个参数会由前端按插件条目格式写入 `enabled_plugins`。
+- 如果同一插件注册了拦截器，建议把 `params_hint` 和 `params_schema` 同时写入拦截器的 `metadata`。这样 `/v1/plugins/interceptors` 可以直接把参数表单带给渠道面板和 Key 面板。
+
 ### `EXTENSIONS`（可选）
 
 声明插件提供的扩展：
@@ -209,7 +252,16 @@ register_channel(
 
 ### 请求/响应拦截器（推荐）
 
-这是最简单的插件扩展方式，允许在请求发送前和响应返回后进行拦截和处理：
+插件可以通过拦截器修改请求和响应。当前拦截器分为以下阶段：
+
+- **Key 入站**：`register_inbound_interceptor`。鉴权完成后、选择 provider 前执行。配置来自 `api_keys[].preferences.enabled_plugins`。
+- **渠道入站**：`register_channel_inbound_interceptor`。provider 已选定、channel adapter 转换请求体前执行。配置来自 `provider.preferences.enabled_plugins`。
+- **请求拦截**：`register_request_interceptor`。请求体已转换为上游协议、发送到上游前执行。配置来自 `provider.preferences.enabled_plugins`。
+- **响应拦截**：`register_response_interceptor`。上游返回后执行。配置来自 `provider.preferences.enabled_plugins`。
+- **渠道出站**：`register_channel_outbound_interceptor`。响应拦截器和 Key Rules 后、Key 出站前执行。配置来自 `provider.preferences.enabled_plugins`。
+- **Key 出站**：`register_key_outbound_interceptor`。渠道出站之后、最终返回客户端前执行。配置来自 `api_keys[].preferences.enabled_plugins`。
+
+请求拦截和响应拦截是最常用的渠道级阶段：
 
 ```python
 from core.plugins import (
@@ -285,10 +337,19 @@ def teardown(manager):
 
 #### 拦截器执行顺序
 
-1. **请求拦截器**：在 `get_payload()` 构建完请求后、发送前调用。
-2. **响应拦截器**：在渠道返回响应后、返回给客户端前调用。
+一次请求中的主要顺序如下：
 
-拦截器按 `priority` 排序执行，数值越小越先执行。
+1. **Key 入站**：下游 API Key 鉴权完成后执行，可检查请求来源、系统提示词、工具声明等。
+2. **渠道入站**：provider 选定后执行，可做渠道级请求对象清洗。
+3. **请求拦截**：channel adapter 生成上游请求后执行，可改 URL、headers、payload。
+4. **上游请求**：向真实 provider 发送请求。
+5. **响应拦截**：上游响应返回后执行，可改响应 chunk 或完整响应。
+6. **Key Rules**：按渠道配置处理错误、冷却和重试。
+7. **渠道出站**：渠道级最终响应处理。
+8. **Key 出站**：下游 API Key 级最终响应处理。
+9. **返回客户端**。
+
+每个阶段内部按 `priority` 排序执行，数值越小越先执行。
 
 #### 按渠道控制拦截器
 
@@ -331,6 +392,97 @@ register_request_interceptor(
 ```
 
 适用场景：渠道内置的全局逻辑，例如 AWS 的 SigV4 签名、Bedrock `cache_control` 清除等。通常在渠道的 `register()` 函数中注册，并在回调内通过 `engine` 参数判断是否为目标引擎。
+
+#### Key 入站、渠道出站和 Key 出站示例
+
+Key 入站适合做下游 API Key 级别的访问控制。`key_guard` 就使用这个阶段检查 User-Agent、请求头、系统提示词和工具声明：
+
+```python
+from core.plugins import register_inbound_interceptor, unregister_inbound_interceptor
+
+PARAMS_SCHEMA = [
+    {"key": "allowed_ua", "label": "UA 白名单", "type": "textarea", "serialize": "key_value"},
+]
+
+async def my_key_inbound(request_data, request, api_key_info, enabled_plugins):
+    # enabled_plugins 来自 api_keys[].preferences.enabled_plugins
+    # api_key_info 中包含 api_key、api_index、model 等鉴权结果
+    return request_data
+
+register_inbound_interceptor(
+    "my_key_inbound",
+    my_key_inbound,
+    priority=30,
+    plugin_name="my_plugin",
+    metadata={
+        "description": "Key 入站检查示例",
+        "params_hint": "allowed_ua=TauriTavern",
+        "params_schema": PARAMS_SCHEMA,
+    },
+)
+```
+
+渠道出站适合做 provider 级别的最终响应处理。它和渠道配置绑定：
+
+```python
+from core.plugins import register_channel_outbound_interceptor, unregister_channel_outbound_interceptor
+
+async def my_channel_outbound(response_chunk, engine, model, provider, is_stream, enabled_plugins):
+    # enabled_plugins 来自 provider.preferences.enabled_plugins
+    # provider 是当前选中的上游渠道配置
+    return response_chunk
+
+register_channel_outbound_interceptor(
+    "my_channel_outbound",
+    my_channel_outbound,
+    priority=100,
+    plugin_name="my_plugin",
+    metadata={"description": "渠道出站处理示例"},
+)
+```
+
+Key 出站适合做下游 API Key 级别的最终响应处理。它和 Key 配置绑定：
+
+```python
+from core.plugins import register_key_outbound_interceptor, unregister_key_outbound_interceptor
+
+async def my_key_outbound(response_chunk, engine, model, api_key_info, is_stream, enabled_plugins):
+    # enabled_plugins 来自 api_keys[].preferences.enabled_plugins
+    # api_key_info 是当前下游 API Key 的信息
+    return response_chunk
+
+register_key_outbound_interceptor(
+    "my_key_outbound",
+    my_key_outbound,
+    priority=100,
+    plugin_name="my_plugin",
+    metadata={"description": "Key 出站处理示例"},
+)
+```
+
+卸载插件时需要注销已注册的拦截器：
+
+```python
+def teardown(manager):
+    unregister_inbound_interceptor("my_key_inbound")
+    unregister_channel_outbound_interceptor("my_channel_outbound")
+    unregister_key_outbound_interceptor("my_key_outbound")
+```
+
+#### 前端识别拦截器阶段
+
+前端通过 `/v1/plugins/interceptors` 读取插件能力。接口会返回以下阶段字段：
+
+- `inbound_interceptors`：Key 入站。
+- `channel_inbound_interceptors`：渠道入站。
+- `request_interceptors`：请求拦截。
+- `response_interceptors`：响应拦截。
+- `channel_outbound_interceptors`：渠道出站。
+- `key_outbound_interceptors`：Key 出站。
+
+注册拦截器时，系统会自动在条目 `metadata.stage` 中写入对应阶段。插件也可以显式写入同名 `stage`，但一般不需要手动写。渠道面板和 Key 面板会根据这些字段决定插件显示在哪个位置。
+
+插件参数表单来自 `metadata.params_schema`。如果插件只在 `PLUGIN_INFO["metadata"]` 中声明，插件列表接口也会返回该声明。为了兼容旧前端，建议在每个拦截器注册时也把 `params_schema` 放入拦截器 `metadata`。
 
 #### 拦截器管理 API
 
