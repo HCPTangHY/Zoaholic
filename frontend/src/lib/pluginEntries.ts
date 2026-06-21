@@ -19,8 +19,36 @@ function stringifyParamValue(value: unknown): string {
   if (value === undefined || value === null) return '';
   if (typeof value === 'boolean') return value ? 'true' : 'false';
   if (Array.isArray(value)) return value.map(item => String(item)).join('\n');
+  if (typeof value === 'object') {
+    return Object.entries(value as Record<string, unknown>)
+      .map(([key, item]) => `${key}: ${Array.isArray(item) ? item.map(part => String(part)).join('|') : String(item ?? '')}`)
+      .join('\n');
+  }
   return String(value);
 }
+
+const KEY_GUARD_PARAM_KEYS = [
+  'allowed_ua',
+  'ua',
+  'header_allow',
+  'header_deny',
+  'system_allow',
+  'system_deny',
+  'tools_policy',
+  'tool_allow',
+  'allowed_tools',
+  'tool_deny',
+  'denied_tools',
+  'tool_choice_policy',
+  'strip_tools',
+  'tools',
+  'reject_status',
+  'reject_message',
+];
+
+const KEY_GUARD_LIST_KEYS = new Set(['allowed_ua', 'ua', 'system_allow', 'system_deny', 'tool_allow', 'allowed_tools', 'tool_deny', 'denied_tools']);
+const KEY_GUARD_BOOL_KEYS = new Set(['strip_tools', 'tools']);
+const KEY_GUARD_NUMBER_KEYS = new Set(['reject_status']);
 
 function singleKeyObject(value: Record<string, unknown>): { name: string; params: unknown } | null {
   const keys = Object.keys(value);
@@ -36,14 +64,31 @@ export function paramsObjectToOptions(pluginName: string, params: unknown): stri
 
   if (pluginName === 'key_guard') {
     const parts: string[] = [];
-    const allowedUa = obj.allowed_ua ?? obj.ua;
-    if (allowedUa !== undefined && allowedUa !== null) {
-      parts.push(`allowed_ua=${stringifyParamValue(allowedUa)}`);
-    }
-    const stripTools = obj.strip_tools ?? obj.tools;
-    if (stripTools !== undefined && stripTools !== null) {
-      parts.push(`strip_tools=${stringifyParamValue(stripTools)}`);
-    }
+    const used = new Set<string>();
+    const appendParam = (key: string, value: unknown) => {
+      if (value === undefined || value === null) return;
+      const text = stringifyParamValue(value);
+      if (text) parts.push(`${key}=${text}`);
+      used.add(key);
+    };
+
+    appendParam('allowed_ua', obj.allowed_ua ?? obj.ua);
+    appendParam('header_allow', obj.header_allow);
+    appendParam('header_deny', obj.header_deny);
+    appendParam('system_allow', obj.system_allow);
+    appendParam('system_deny', obj.system_deny);
+    appendParam('tools_policy', obj.tools_policy);
+    appendParam('tool_allow', obj.tool_allow ?? obj.allowed_tools);
+    appendParam('tool_deny', obj.tool_deny ?? obj.denied_tools);
+    appendParam('tool_choice_policy', obj.tool_choice_policy);
+    appendParam('strip_tools', obj.strip_tools ?? obj.tools);
+    appendParam('reject_status', obj.reject_status);
+    appendParam('reject_message', obj.reject_message);
+
+    Object.entries(obj).forEach(([key, value]) => {
+      if (used.has(key) || KEY_GUARD_PARAM_KEYS.includes(key)) return;
+      appendParam(key, value);
+    });
     return parts.join(',');
   }
 
@@ -89,41 +134,53 @@ export function parseEnabledPluginValue(value: EnabledPluginValue): ParsedEnable
   return { name: '', opts: undefined, hasOpts: false };
 }
 
-function parseKeyValueOptions(options: string): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const rawPart of options.split(',')) {
-    const part = rawPart.trim();
-    if (!part) continue;
-    const idx = part.indexOf('=');
-    if (idx <= 0) continue;
-    const key = part.slice(0, idx).trim();
-    const value = part.slice(idx + 1);
-    if (key) result[key] = value;
-  }
-  return result;
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function parseKeyGuardOptions(options: string): Record<string, string> {
-  // 修改原因：key_guard 的 allowed_ua 来自 textarea，值里理论上可以出现逗号，不能用通用逗号切分。
-  // 修改方式：只识别固定字段边界 allowed_ua=、ua=、strip_tools=、tools=，避免把 allowed_ua 内容按逗号拆碎。
-  // 目的：前端内部转换也尽量不依赖用户内容不会出现逗号。
+  // 修改原因：key_guard 参数已经扩展到多个 textarea/select/toggle，值里可能出现逗号。
+  // 修改方式：按已知 key 的边界解析 key=value，而不是直接用逗号切分。
+  // 目的：保存结构化 params 时保留所有反滥用规则字段。
   const result: Record<string, string> = {};
-  const readTextField = (key: string, aliases: string[]) => {
-    for (const alias of aliases) {
-      const prefix = `${alias}=`;
-      const start = options.indexOf(prefix);
-      if (start < 0) continue;
-      const valueStart = start + prefix.length;
-      const boundaryCandidates = ['allowed_ua=', 'ua=', 'strip_tools=', 'tools=']
-        .map(candidate => options.indexOf(`,${candidate}`, valueStart))
-        .filter(index => index >= 0);
-      const end = boundaryCandidates.length > 0 ? Math.min(...boundaryCandidates) : options.length;
-      result[key] = options.slice(valueStart, end);
-      return;
+  const matches: Array<{ key: string; boundaryStart: number; valueStart: number }> = [];
+
+  for (const key of KEY_GUARD_PARAM_KEYS) {
+    const re = new RegExp(`(^|,)${escapeRegExp(key)}=`, 'g');
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(options)) !== null) {
+      const prefix = match[1] || '';
+      const keyStart = match.index + prefix.length;
+      matches.push({ key, boundaryStart: match.index, valueStart: keyStart + key.length + 1 });
     }
-  };
-  readTextField('allowed_ua', ['allowed_ua', 'ua']);
-  readTextField('strip_tools', ['strip_tools', 'tools']);
+  }
+
+  matches.sort((a, b) => a.boundaryStart - b.boundaryStart);
+  matches.forEach((match, index) => {
+    const canonicalKey = match.key === 'ua' ? 'allowed_ua'
+      : match.key === 'tools' ? 'strip_tools'
+      : match.key === 'allowed_tools' ? 'tool_allow'
+      : match.key === 'denied_tools' ? 'tool_deny'
+      : match.key;
+    const valueEnd = index + 1 < matches.length ? matches[index + 1].boundaryStart : options.length;
+    result[canonicalKey] = options.slice(match.valueStart, valueEnd).trim();
+  });
+
+  for (const rawPart of options.split(',')) {
+    const token = rawPart.trim();
+    if (!token || token.includes('=')) continue;
+    if (token.startsWith('ua:')) {
+      const current = result.allowed_ua ? `${result.allowed_ua}\n` : '';
+      result.allowed_ua = `${current}${token.slice(3).trim()}`.trim();
+    } else if (token === 'no_tools') {
+      result.strip_tools = 'false';
+    } else if (token === 'strip_tools') {
+      result.strip_tools = 'true';
+    } else if (['allow', 'strip', 'deny', 'require'].includes(token)) {
+      result.tools_policy = token;
+    }
+  }
+
   return result;
 }
 
@@ -147,10 +204,26 @@ export function buildEnabledPluginValue(name: string, opts: string): EnabledPlug
   if (pluginName === 'key_guard') {
     const parsed = parseKeyGuardOptions(trimmedOpts);
     const params: Record<string, unknown> = {};
-    const allowedUa = parsed.allowed_ua ?? parsed.ua;
-    if (allowedUa) params.allowed_ua = splitLines(allowedUa);
-    const stripTools = parsed.strip_tools ?? parsed.tools;
-    if (stripTools !== undefined) params.strip_tools = parseBooleanText(stripTools);
+
+    Object.entries(parsed).forEach(([key, value]) => {
+      const text = String(value ?? '').trim();
+      if (!text) return;
+      if (KEY_GUARD_LIST_KEYS.has(key)) {
+        const canonicalKey = key === 'ua' ? 'allowed_ua'
+          : key === 'allowed_tools' ? 'tool_allow'
+          : key === 'denied_tools' ? 'tool_deny'
+          : key;
+        params[canonicalKey] = splitLines(text);
+      } else if (KEY_GUARD_BOOL_KEYS.has(key)) {
+        params[key === 'tools' ? 'strip_tools' : key] = parseBooleanText(text);
+      } else if (KEY_GUARD_NUMBER_KEYS.has(key)) {
+        const numeric = Number(text);
+        if (Number.isFinite(numeric)) params[key] = numeric;
+      } else {
+        params[key] = text;
+      }
+    });
+
     return Object.keys(params).length > 0 ? { name: pluginName, params } : pluginName;
   }
 

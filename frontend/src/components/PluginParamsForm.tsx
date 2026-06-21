@@ -62,6 +62,33 @@ function shouldSerializeAsKeyValue(currentOptions: string, schema: ParamSchema[]
   return schema.length === 1 && KEY_VALUE_DEFAULT_KEYS.has(schema[0].key);
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseKeyValueOptionsBySchema(options: string, schema: ParamSchema[]): Record<string, string> {
+  const result: Record<string, string> = {};
+  const keys = schema.map(param => param.key).filter(Boolean);
+  const matches: Array<{ key: string; boundaryStart: number; valueStart: number }> = [];
+
+  for (const key of keys) {
+    const re = new RegExp(`(^|,)${escapeRegExp(key)}=`, 'g');
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(options)) !== null) {
+      const prefix = match[1] || '';
+      const keyStart = match.index + prefix.length;
+      matches.push({ key, boundaryStart: match.index, valueStart: keyStart + key.length + 1 });
+    }
+  }
+
+  matches.sort((a, b) => a.boundaryStart - b.boundaryStart);
+  matches.forEach((match, index) => {
+    const valueEnd = index + 1 < matches.length ? matches[index + 1].boundaryStart : options.length;
+    result[match.key] = options.slice(match.valueStart, valueEnd).trim();
+  });
+  return result;
+}
+
 function valueWithDefaults(values: Record<string, string>, schema: ParamSchema[]): Record<string, string> {
   const result: Record<string, string> = {};
   for (const param of schema) {
@@ -90,13 +117,7 @@ export function parsePluginOptions(options: string, schemaInput: ParamSchema[]):
       return result;
     }
 
-    for (const part of trimmed.split(',')) {
-      const idx = part.indexOf('=');
-      if (idx <= 0) continue;
-      const key = part.slice(0, idx).trim();
-      if (schema.some(param => param.key === key)) result[key] = part.slice(idx + 1).trim();
-    }
-    return result;
+    return parseKeyValueOptionsBySchema(trimmed, schema);
   }
 
   if (schema.some(param => param.key === 'allowed_ua') && schema.some(param => param.key === 'strip_tools')) {
