@@ -7,12 +7,19 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import math
+import os
 from collections import defaultdict, deque
 from time import time
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 from .parser import Limit, Metric, Rule, Scope, WindowType
+
+logger = logging.getLogger('Zoaholic')
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_SNAPSHOT_PATH = os.path.join(_PROJECT_ROOT, 'data', 'runtime_quota_snapshot.json')
 
 
 # ──────────────────────────────────────────────
@@ -246,6 +253,7 @@ class QuotaCounter:
         self._ip_seen: Dict[str, float] = {}
         self._ip_fixed: Dict[float, _FixedUniqueWindow] = {}
         self._ops = 0
+        self._snapshot_dirty = False
 
     # ── 公开 API ──
 
@@ -359,6 +367,7 @@ class QuotaCounter:
         else:
             raise ValueError(f"Unsupported quota scope: {scope}")
 
+        self._snapshot_dirty = True
         return {
             'status_key': status_key,
             'scope': scope.value,
@@ -416,7 +425,11 @@ class QuotaCounter:
                     if key in fixed_done:
                         continue
                     increment = 1 if metric == Metric.REQUEST else amount
-                    self._store.get_fixed_window(scope_id, metric_name, limit.period).increment(now, limit.period, increment)
+                    window = self._store.get_fixed_window(scope_id, metric_name, limit.period)
+                    old_start = window.start
+                    window.increment(now, limit.period, increment)
+                    if window.start != old_start:
+                        self._snapshot_dirty = True
                     fixed_done.add(key)
 
     def _record_unique_ip(self, client_ip: str, now: float):
@@ -426,7 +439,11 @@ class QuotaCounter:
         for rule in self._by_metric.get(Metric.UNIQUE_IP, []):
             for limit in rule.limits:
                 if limit.window == WindowType.FIXED:
-                    self._ip_fixed_window(limit.period).add(now, limit.period, client_ip)
+                    window = self._ip_fixed_window(limit.period)
+                    old_start = window.start
+                    window.add(now, limit.period, client_ip)
+                    if window.start != old_start:
+                        self._snapshot_dirty = True
 
     # ── 读取 ──
 
@@ -546,6 +563,57 @@ class QuotaCounter:
             self._ip_fixed[period] = _FixedUniqueWindow()
         return self._ip_fixed[period]
 
+    # ── 快照 ──
+
+    def _snapshot(self) -> dict:
+        """导出固定窗口状态。"""
+        snap: dict = {'fixed': [], 'ip_fixed': []}
+        for (scope_id, metric_name), windows in self._store._fixed.items():
+            for period, window in windows.items():
+                if window.start > 0:
+                    snap['fixed'].append({
+                        's': scope_id, 'm': metric_name, 'p': period,
+                        'v': window.val, 't': window.start,
+                    })
+        for period, uw in self._ip_fixed.items():
+            if uw.start > 0:
+                snap['ip_fixed'].append({
+                    'p': period, 'ips': sorted(uw.seen), 't': uw.start,
+                })
+        return snap
+
+    def _restore_snapshot(self, snap: dict):
+        """从快照恢复固定窗口状态（跳过已过期窗口）。"""
+        now = time()
+        restored = 0
+        for entry in snap.get('fixed', []):
+            scope_id = entry.get('s', '')
+            metric = entry.get('m', '')
+            period = entry.get('p', 0)
+            val = entry.get('v', 0)
+            start = entry.get('t', 0)
+            if not scope_id or not metric or period <= 0 or start <= 0:
+                continue
+            if not math.isinf(period) and now >= start + period:
+                continue
+            window = self._store.get_fixed_window(scope_id, metric, period)
+            window.val = val
+            window.start = start
+            restored += 1
+        for entry in snap.get('ip_fixed', []):
+            period = entry.get('p', 0)
+            ips = entry.get('ips', [])
+            start = entry.get('t', 0)
+            if period <= 0 or start <= 0:
+                continue
+            if not math.isinf(period) and now >= start + period:
+                continue
+            uw = self._ip_fixed_window(period)
+            uw.seen = set(ips)
+            uw.start = start
+            restored += 1
+        return restored
+
     # ── 清理 ──
 
     def _cleanup(self, now: float):
@@ -582,6 +650,8 @@ class QuotaRegistry:
         from .compat import merge_legacy_to_quota
         from .parser import parse_config as _parse
 
+        pre_snapshot = self._capture_snapshot()
+
         self._counters.clear()
         self._global = None
 
@@ -603,18 +673,25 @@ class QuotaRegistry:
                 if rules:
                     self._counters[api] = QuotaCounter(rules)
 
+        snapshot = pre_snapshot if pre_snapshot.get('c') or pre_snapshot.get('g') else self._read_snapshot_file()
+        self._apply_snapshot(snapshot)
+        self._save_snapshot()
+
     def check(self, api_key: str, model: str = 'default', client_ip: str = '') -> Optional[str]:
         """请求前检查。None = 放行，str = 拒绝原因（含计数记录）。"""
 
         if self._global:
             reason = self._global.check_request(model, client_ip)
             if reason:
+                self._check_and_save()
                 return f"[global] {reason}"
         counter = self._counters.get(api_key)
         if counter:
             reason = counter.check_request(model, client_ip)
             if reason:
+                self._check_and_save()
                 return reason
+        self._check_and_save()
         return None
 
     def is_exhausted(self, api_key: str, model: str = 'default') -> bool:
@@ -635,6 +712,7 @@ class QuotaRegistry:
             counter.record_usage(model, cost, tokens, tokens_in=tokens_in, tokens_out=tokens_out, client_ip=client_ip)
         if self._global:
             self._global.record_usage(model, cost, tokens, tokens_in=tokens_in, tokens_out=tokens_out, client_ip=client_ip)
+        self._check_and_save()
 
     def get_counter(self, api_key: str) -> Optional[QuotaCounter]:
         return self._counters.get(api_key)
@@ -649,10 +727,68 @@ class QuotaRegistry:
             raise KeyError(api_key)
         result = counter.reset_status(status_key)
         result['api_key'] = api_key
+        self._save_snapshot()
         return result
 
     def has_quota(self, api_key: str) -> bool:
         return api_key in self._counters
+
+    # ── 快照持久化 ──
+
+    def _capture_snapshot(self) -> dict:
+        data: dict = {'v': 1, 't': time(), 'c': {}}
+        for api_key, counter in self._counters.items():
+            snap = counter._snapshot()
+            if snap.get('fixed') or snap.get('ip_fixed'):
+                data['c'][api_key] = snap
+        if self._global:
+            snap = self._global._snapshot()
+            if snap.get('fixed') or snap.get('ip_fixed'):
+                data['g'] = snap
+        return data
+
+    def _apply_snapshot(self, data: dict):
+        if not data or data.get('v') != 1:
+            return
+        total = 0
+        for api_key, snap in data.get('c', {}).items():
+            counter = self._counters.get(api_key)
+            if counter:
+                total += counter._restore_snapshot(snap)
+        if self._global and data.get('g'):
+            total += self._global._restore_snapshot(data['g'])
+        if total > 0:
+            logger.info(f"Restored {total} fixed quota windows from snapshot")
+
+    def _save_snapshot(self):
+        data = self._capture_snapshot()
+        try:
+            os.makedirs(os.path.dirname(_SNAPSHOT_PATH), exist_ok=True)
+            tmp = _SNAPSHOT_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, separators=(',', ':'))
+            os.replace(tmp, _SNAPSHOT_PATH)
+        except Exception as e:
+            logger.warning(f"Failed to save quota snapshot: {e}")
+
+    def _read_snapshot_file(self) -> dict:
+        try:
+            with open(_SNAPSHOT_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+
+    def _check_and_save(self):
+        dirty = False
+        for counter in self._counters.values():
+            if counter._snapshot_dirty:
+                counter._snapshot_dirty = False
+                dirty = True
+        if self._global and self._global._snapshot_dirty:
+            self._global._snapshot_dirty = False
+            dirty = True
+        if dirty:
+            self._save_snapshot()
 
 
 # ──────────────────────────────────────────────
