@@ -1011,6 +1011,58 @@ export default function Admin() {
   // 目的：用可视分组表达 Scope × Metric 正交模型，同时继续输出原有 preferences.quota 对象。
   const fmtQuotaNumber = (n: number) => n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` : `${Math.round(n)}`;
 
+  const formatQuotaResetTime = (value: unknown) => {
+    const timestamp = Number(value);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return '';
+    const date = new Date(timestamp > 1e12 ? timestamp : timestamp * 1000);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleString('zh-CN', {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    });
+  };
+
+  const getQuotaWindowText = (status: any) => {
+    if (!status) return '';
+    if (String(status.period) === 'inf') return '永久额度';
+    if (status.window === 'fixed') return '固定窗口';
+    if (status.window === 'sliding') return '滑动窗口';
+    return '';
+  };
+
+  const getQuotaResetText = (status: any) => {
+    if (!status || status.window !== 'fixed' || String(status.period) === 'inf') return '';
+    const resetAt = formatQuotaResetTime(status.reset_at);
+    return resetAt ? `刷新: ${resetAt}` : '刷新: 首次使用后计算';
+  };
+
+  const renderQuotaStatusBlock = (status: any, metric: QuotaMetricValue) => {
+    if (!status) return null;
+    return (
+      <div className="space-y-1">
+        <div className="flex items-center gap-2 w-full">
+          <div className="h-1.5 flex-1 bg-muted rounded-full overflow-hidden">
+            <div
+              className={`h-full rounded-full transition-all ${(status.limit > 0 && status.remaining / status.limit < 0.1) ? 'bg-red-500' : (status.limit > 0 && status.remaining / status.limit < 0.3) ? 'bg-yellow-500' : 'bg-emerald-500'}`}
+              style={{ width: `${status.limit > 0 ? Math.max(1, (status.remaining / status.limit) * 100) : 100}%` }}
+            />
+          </div>
+          <span className="text-[10px] text-muted-foreground font-mono whitespace-nowrap">
+            {metric === 'cost' ? `$${Number(status.remaining).toFixed(2)}/$${Number(status.limit).toFixed(2)}` : `${fmtQuotaNumber(status.remaining)}/${fmtQuotaNumber(status.limit)}`}
+          </span>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-muted-foreground">
+          {getQuotaWindowText(status) && <span>{getQuotaWindowText(status)}</span>}
+          {getQuotaResetText(status) && <span>{getQuotaResetText(status)}</span>}
+        </div>
+      </div>
+    );
+  };
+
   const getQuotaRuleStatus = (configKey: string) => {
     const editStates = formApi ? (quotaStates[formApi] || {}) : {};
     const parsed = parseQuotaConfigKey(configKey);
@@ -1019,6 +1071,18 @@ export default function Admin() {
     return Object.entries(editStates).find(([statusKey]) => {
       const status = parseQuotaStatusKey(statusKey);
       return status.scope === parsed.scope && status.metric === parsed.metric && status.qualifier === (parsed.scope === 'ip' ? 'default' : parsed.qualifier);
+    })?.[1] as any;
+  };
+
+  const getModelLimitStatus = (modelKey: string) => {
+    const model = modelKey.trim();
+    if (!model) return null;
+    const editStates = formApi ? (quotaStates[formApi] || {}) : {};
+    const exactKey = `model:request:${model}`;
+    if ((editStates as any)[exactKey]) return (editStates as any)[exactKey];
+    return Object.entries(editStates).find(([statusKey]) => {
+      const status = parseQuotaStatusKey(statusKey);
+      return status.scope === 'model' && status.metric === 'request' && status.qualifier === model;
     })?.[1] as any;
   };
 
@@ -1189,19 +1253,7 @@ export default function Admin() {
                     </button>
                   </div>
                 </div>
-                {status && (
-                  <div className="flex items-center gap-2 w-full">
-                    <div className="h-1.5 flex-1 bg-muted rounded-full overflow-hidden">
-                      <div
-                        className={`h-full rounded-full transition-all ${(status.limit > 0 && status.remaining / status.limit < 0.1) ? 'bg-red-500' : (status.limit > 0 && status.remaining / status.limit < 0.3) ? 'bg-yellow-500' : 'bg-emerald-500'}`}
-                        style={{ width: `${status.limit > 0 ? Math.max(1, (status.remaining / status.limit) * 100) : 100}%` }}
-                      />
-                    </div>
-                    <span className="text-[10px] text-muted-foreground font-mono whitespace-nowrap">
-                      {parsed.metric === 'cost' ? `$${Number(status.remaining).toFixed(2)}/$${Number(status.limit).toFixed(2)}` : `${fmtQuotaNumber(status.remaining)}/${fmtQuotaNumber(status.limit)}`}
-                    </span>
-                  </div>
-                )}
+                {renderQuotaStatusBlock(status, parsed.metric)}
               </div>
             );
           })}
@@ -1228,38 +1280,44 @@ export default function Admin() {
         <div className="space-y-2">
           {formModelLimits.length === 0 ? (
             <p className="text-xs text-muted-foreground italic">暂无规则</p>
-          ) : formModelLimits.map((rule, index) => (
-            <div key={index} className="flex flex-col gap-2 rounded-lg border border-border bg-muted/20 p-2 sm:flex-row sm:items-center">
-              <input
-                value={rule.key}
-                onChange={event => {
-                  const next = [...formModelLimits];
-                  next[index] = { ...next[index], key: event.target.value };
-                  setFormModelLimits(next);
-                }}
-                placeholder="模型名，如 claude-opus-4"
-                className="flex-1 bg-background border border-border px-2 py-1.5 rounded-lg text-xs font-mono text-foreground"
-              />
-              <input
-                value={rule.value}
-                onChange={event => {
-                  const next = [...formModelLimits];
-                  next[index] = { ...next[index], value: event.target.value };
-                  setFormModelLimits(next);
-                }}
-                placeholder="10/5h:fixed"
-                className="w-full sm:w-36 bg-background border border-border px-2 py-1.5 rounded-lg text-xs font-mono text-foreground"
-              />
-              <button
-                type="button"
-                onClick={() => setFormModelLimits(formModelLimits.filter((_, i) => i !== index))}
-                className="self-end sm:self-auto text-muted-foreground hover:text-destructive transition-colors"
-                title="删除模型限速"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          ))}
+          ) : formModelLimits.map((rule, index) => {
+            const status = getModelLimitStatus(rule.key);
+            return (
+              <div key={index} className="rounded-lg border border-border bg-muted/20 p-2 space-y-2">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <input
+                    value={rule.key}
+                    onChange={event => {
+                      const next = [...formModelLimits];
+                      next[index] = { ...next[index], key: event.target.value };
+                      setFormModelLimits(next);
+                    }}
+                    placeholder="模型名，如 claude-opus-4"
+                    className="flex-1 bg-background border border-border px-2 py-1.5 rounded-lg text-xs font-mono text-foreground"
+                  />
+                  <input
+                    value={rule.value}
+                    onChange={event => {
+                      const next = [...formModelLimits];
+                      next[index] = { ...next[index], value: event.target.value };
+                      setFormModelLimits(next);
+                    }}
+                    placeholder="10/5h:fixed"
+                    className="w-full sm:w-36 bg-background border border-border px-2 py-1.5 rounded-lg text-xs font-mono text-foreground"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setFormModelLimits(formModelLimits.filter((_, i) => i !== index))}
+                    className="self-end sm:self-auto text-muted-foreground hover:text-destructive transition-colors"
+                    title="删除模型限速"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+                {renderQuotaStatusBlock(status, 'request')}
+              </div>
+            );
+          })}
         </div>
         <button
           type="button"

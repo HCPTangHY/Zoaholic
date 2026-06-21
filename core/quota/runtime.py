@@ -129,6 +129,11 @@ class _FixedUniqueWindow:
         self._ensure_window(now, period)
         self.seen.add(ip)
 
+    def resets_at(self, period: float) -> Optional[float]:
+        if math.isinf(period) or self.start == 0:
+            return None
+        return self.start + period
+
 
 class ScopedStore:
     """统一计数器存储。key = (scope_id, metric_name)。"""
@@ -290,7 +295,8 @@ class QuotaCounter:
                 status_key = f"{rule.scope.value}:{rule.metric.value}:{rule.qualifier}"
                 if rule.metric == Metric.UNIQUE_IP:
                     current = self._unique_ip_count(limit, now)
-                    out[status_key] = _status(current, limit)
+                    reset_at = self._unique_ip_reset_at(limit, now)
+                    out[status_key] = _status(current, limit, reset_at=reset_at, now=now)
                     continue
                 if rule.scope == Scope.IP:
                     out[status_key] = self._aggregate_ip_status(rule.metric, limit, now)
@@ -299,8 +305,7 @@ class QuotaCounter:
                     out[status_key] = self._aggregate_model_status(rule.qualifier, limit, now)
                     continue
                 scope_id = self._scope_id_for_rule(rule, normalized_model, '', for_status=True)
-                current = self._read_metric(scope_id or 'key', rule.metric, limit, now)
-                out[status_key] = _status(current, limit)
+                out[status_key] = self._status_for_scope(scope_id or 'key', rule.metric, limit, now)
         return out
 
     # ── 检查 ──
@@ -389,15 +394,30 @@ class QuotaCounter:
             return self._store.get_or_create_accumulator(scope_id, metric_name).total(now, limit.period)
         return 0
 
+    def _status_for_scope(self, scope_id: str, metric: Metric, limit: Limit, now: float) -> dict:
+        metric_name = metric.value
+        current = self._read_metric(scope_id, metric, limit, now)
+        reset_at = None
+        if limit.window == WindowType.FIXED:
+            reset_at = self._store.get_fixed_window(scope_id, metric_name, limit.period).resets_at(limit.period)
+        return _status(current, limit, reset_at=reset_at, now=now)
+
     def _aggregate_ip_status(self, metric: Metric, limit: Limit, now: float) -> dict:
         # 修改原因：ip scope 的真实计数分散在 ip:{client_ip} 多个 scope_id 下，API 不能为每个 IP 生成动态顶层 key。
         # 修改方式：状态聚合为同一 key（如 ip:cost:default），current 使用最接近触发限制的单个 IP 最大值，并附加 subjects 数量。
         # 目的：前端可以稳定展示 per-IP 规则，同时仍能看到当前最紧张的 IP 使用量。
         metric_name = metric.value
         scope_ids = sorted(sid for sid in self._store.scope_ids_for_metric(metric_name) if sid.startswith('ip:') and sid != 'ip:')
-        values = [self._read_metric(scope_id, metric, limit, now) for scope_id in scope_ids]
-        current = max(values) if values else 0
-        data = _status(current, limit)
+        best_current = 0
+        best_reset_at = None
+        for scope_id in scope_ids:
+            current = self._read_metric(scope_id, metric, limit, now)
+            if current >= best_current:
+                best_current = current
+                best_reset_at = None
+                if limit.window == WindowType.FIXED:
+                    best_reset_at = self._store.get_fixed_window(scope_id, metric_name, limit.period).resets_at(limit.period)
+        data = _status(best_current, limit, reset_at=best_reset_at, now=now)
         data['aggregate'] = 'max'
         data['subjects'] = len(scope_ids)
         return data
@@ -408,13 +428,21 @@ class QuotaCounter:
             sid for sid in self._store.scope_ids_for_metric(metric_name)
             if sid.startswith('model:') and _model_match(qualifier, sid.split(':', 1)[1])
         )
+        active_scope_ids = set(self._store.scope_ids_for_metric(metric_name))
         if not scope_ids:
             scope_ids = [f"model:{qualifier}"]
-        values = [self._read_metric(scope_id, Metric.REQUEST, limit, now) for scope_id in scope_ids]
-        current = max(values) if values else 0
-        data = _status(current, limit)
+        best_current = 0
+        best_reset_at = None
+        for scope_id in scope_ids:
+            current = self._read_metric(scope_id, Metric.REQUEST, limit, now)
+            if current >= best_current:
+                best_current = current
+                best_reset_at = None
+                if limit.window == WindowType.FIXED:
+                    best_reset_at = self._store.get_fixed_window(scope_id, metric_name, limit.period).resets_at(limit.period)
+        data = _status(best_current, limit, reset_at=best_reset_at, now=now)
         data['aggregate'] = 'max'
-        data['subjects'] = len([sid for sid in scope_ids if sid in self._store.scope_ids_for_metric(metric_name)])
+        data['subjects'] = len([sid for sid in scope_ids if sid in active_scope_ids])
         return data
 
     def _unique_ip_count(self, limit: Limit, now: float) -> int:
@@ -431,6 +459,11 @@ class QuotaCounter:
         if math.isinf(limit.period):
             return client_ip in self._ip_seen
         return self._ip_seen.get(client_ip, 0) > now - limit.period
+
+    def _unique_ip_reset_at(self, limit: Limit, now: float) -> Optional[float]:
+        if limit.window != WindowType.FIXED:
+            return None
+        return self._ip_fixed_window(limit.period).resets_at(limit.period)
 
     def _ip_fixed_window(self, period: float) -> _FixedUniqueWindow:
         if period not in self._ip_fixed:
@@ -578,10 +611,10 @@ def _period_str(period: float) -> str:
     return f"{int(period)}s"
 
 
-def _status(current: float, limit: Limit) -> dict:
+def _status(current: float, limit: Limit, reset_at: Optional[float] = None, now: Optional[float] = None) -> dict:
     display_current = current if isinstance(current, int) else round(current, 4)
     remaining = max(0, limit.value - current)
-    return {
+    data = {
         'current': display_current,
         'limit': limit.value,
         'period': limit.period if not math.isinf(limit.period) else 'inf',
@@ -589,6 +622,12 @@ def _status(current: float, limit: Limit) -> dict:
         'remaining': remaining if isinstance(remaining, int) else round(remaining, 4),
         'label': f"{_format_limit_value(limit.value)}/{_period_str(limit.period)}",
     }
+    if reset_at is not None:
+        base_now = time() if now is None else now
+        if reset_at > base_now:
+            data['reset_at'] = round(reset_at, 3)
+            data['reset_in'] = round(reset_at - base_now, 3)
+    return data
 
 
 def _format_limit_value(value: float) -> str:
