@@ -1579,17 +1579,20 @@ class InterceptedClient:
         return False
 
     async def _intercept(self, url: str, headers: Optional[Dict] = None) -> Tuple[str, Dict]:
-        """对 url 和 headers 应用请求拦截器"""
+        """对 url 和 headers 应用请求拦截器，并追加自定义请求头"""
         if self._client is None:
             raise RuntimeError("InterceptedClient is closed")
         headers = dict(headers or {})
-        if not self._enabled_plugins:
-            return url, headers
-        url, headers, _ = await apply_request_interceptors(
-            None, self._engine, self._provider, self._api_key,
-            str(url), headers, {},
-            self._enabled_plugins,
-        )
+        if self._enabled_plugins:
+            url, headers, _ = await apply_request_interceptors(
+                None, self._engine, self._provider, self._api_key,
+                str(url), headers, {},
+                self._enabled_plugins,
+            )
+        # 自定义请求头：与 core/request.py 保持一致
+        from core.http_headers import apply_custom_headers
+        from utils import safe_get
+        apply_custom_headers(headers, safe_get(self._provider, "preferences", "headers", default={}))
         return url, headers
 
     async def get(self, url, *, headers=None, **kwargs):

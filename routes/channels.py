@@ -572,7 +572,8 @@ async def fetch_channel_models(
                     # 修改方式：保存包装器实例，并在 finally 中调用 close；业务代码仍使用 client 变量。
                     # 目的：让 models 查询完成或异常中断后都释放包装器持有的请求级对象。
                     enabled_plugins = safe_get(provider, "preferences", "enabled_plugins", default=None)
-                    if enabled_plugins:
+                    custom_headers = safe_get(provider, "preferences", "headers", default=None)
+                    if enabled_plugins or custom_headers:
                         from core.plugins.interceptors import InterceptedClient
                         intercepted_client = InterceptedClient(client, engine, provider, enabled_plugins)
                         client = intercepted_client
