@@ -5,9 +5,11 @@
 """
 
 import asyncio
+import json
 
 from core.channels.gemini_channel import gemini_json_process
 from core.channels.openai_responses_channel import convert_responses_to_chat_completions
+from core.dialects.claude import ClaudeStreamRenderer
 from core.json_utils import json_loads
 from core.stream_convert import assemble_stream_to_json
 from core.utils import generate_no_stream_response, generate_sse_response
@@ -18,6 +20,50 @@ def _parse_sse_payload(sse_text: str) -> dict:
     # 修改方式：剥离 data 前缀后使用项目统一 JSON loader 解析。
     # 目的：确保测试断言的是下游实际收到的 tool_calls.index。
     return json_loads(sse_text.removeprefix("data: ").strip())
+
+
+def test_claude_stream_renderer_processes_all_tool_call_entries_in_one_chunk():
+    # 修改原因：GLM-5.2 可能在同一个 OpenAI SSE chunk 中输出两个 tool_calls 条目：
+    # 第一条只有 name/id，第二条只有 arguments。旧的 Claude 渲染器只读取 tool_calls[0]，
+    # 因而丢失参数。
+    # 修改方式：构造同 index 的两条工具片段，检查 OAI→Claude 流式渲染同时输出 tool_use
+    # 和 input_json_delta。
+    # 目的：防止 Anthropic 客户端收到 input={} 且没有后续参数增量。
+    renderer = ClaudeStreamRenderer()
+    chunk = "data: " + json.dumps({
+        "id": "chatcmpl-test",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "glm-5.2",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "KillShell", "arguments": ""},
+                    },
+                    {
+                        "index": 0,
+                        "id": None,
+                        "type": "function",
+                        "function": {"name": None, "arguments": '{"shell_id":"ca4f69"}'},
+                    },
+                ],
+            },
+            "finish_reason": None,
+        }],
+    }, ensure_ascii=False) + "\n\n"
+
+    rendered = asyncio.run(renderer(chunk))
+
+    assert '"type":"tool_use"' in rendered
+    assert '"name":"KillShell"' in rendered
+    assert '"type":"input_json_delta"' in rendered
+    assert '"partial_json":"{\\"shell_id\\":\\"ca4f69\\"}"' in rendered
+
 
 
 def test_generate_sse_response_preserves_tool_call_index_for_header_and_arguments():

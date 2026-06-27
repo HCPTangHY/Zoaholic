@@ -538,40 +538,46 @@ class ClaudeStreamRenderer:
         # 3. 工具调用
         tool_calls = delta.get("tool_calls") or []
         if tool_calls:
-            tc = tool_calls[0]
-            tc_index = tc.get("index", 0)
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                tc_index = tc.get("index", 0)
+                fn = tc.get("function") or {}
+                if not isinstance(fn, dict):
+                    continue
 
-            if tc.get("function", {}).get("name"):
-                # 新工具调用 → 新的 content_block
-                result += self._transition_to_block(
-                    "tool_use",
-                    id=tc.get("id", ""),
-                    name=tc["function"]["name"],
-                )
-                self._tool_block_indices[tc_index] = self._block_index
+                if fn.get("name"):
+                    # 新工具调用 → 新的 content_block
+                    result += self._transition_to_block(
+                        "tool_use",
+                        id=tc.get("id", ""),
+                        name=fn["name"],
+                    )
+                    self._tool_block_indices[tc_index] = self._block_index
 
-                if tc["function"].get("arguments"):
+                    if fn.get("arguments"):
+                        event = {
+                            "type": "content_block_delta",
+                            "index": self._block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": fn["arguments"],
+                            },
+                        }
+                        result += f"event: content_block_delta\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
+                elif fn.get("arguments"):
+                    # arguments 续传。部分 OpenAI 兼容上游会在同一个 SSE
+                    # chunk 里先给 name/id，再用第二个 tool_calls 条目给参数。
+                    idx = self._tool_block_indices.get(tc_index, self._block_index)
                     event = {
                         "type": "content_block_delta",
-                        "index": self._block_index,
+                        "index": idx,
                         "delta": {
                             "type": "input_json_delta",
-                            "partial_json": tc["function"]["arguments"],
+                            "partial_json": fn["arguments"],
                         },
                     }
                     result += f"event: content_block_delta\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
-            elif tc.get("function", {}).get("arguments"):
-                # arguments 续传
-                idx = self._tool_block_indices.get(tc_index, self._block_index)
-                event = {
-                    "type": "content_block_delta",
-                    "index": idx,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": tc["function"]["arguments"],
-                    },
-                }
-                result += f"event: content_block_delta\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
             return result
 
         # 4. 完成
