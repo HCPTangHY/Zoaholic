@@ -145,7 +145,8 @@ function PluginCard({ name, opts, hasOpts, description, paramsSchema, paramsHint
   onOptsChange: (opts: string) => void;
 }) {
   const schema = Array.isArray(paramsSchema) ? paramsSchema : [];
-  const shouldShowParams = schema.length > 0 || hasOpts;
+  // ponytail: 旧插件无 params_schema 时仍需显示文本输入框，PluginParamsForm 已有 schema=[] 回退逻辑
+  const shouldShowParams = true;
 
   return (
     <div className="bg-card border border-border rounded-md px-3 py-2">
