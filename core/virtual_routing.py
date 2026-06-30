@@ -260,14 +260,6 @@ def validate_virtual_models_config(config: Dict[str, Any]) -> None:
         if not isinstance(chain, list):
             raise ValueError(f"virtual model '{name}' chain must be a list")
 
-        for node in chain:
-            if not isinstance(node, dict):
-                continue
-            node_type = str(node.get("type") or "model").strip().lower()
-            node_value = str(node.get("value") or "").strip()
-            node_model = str(node.get("model") or "").strip()
-            # 自引用不算嵌套：同名虚拟模型 chain 里引用自己的名字，实际是引用真实模型
-            if node_type == "model" and node_value in virtual_names and node_value != name:
-                raise ValueError(f"virtual model '{name}' contains nested virtual model '{node_value}'")
-            if node_type == "channel" and node_model and node_model in virtual_names and node_model != name:
-                raise ValueError(f"virtual model '{name}' contains nested virtual model '{node_model}'")
+        # ponytail: 不再校验嵌套虚拟模型。
+        # resolve_virtual_model 的 chain 解析只查真实 provider 的 model dict，
+        # 不会递归调用 resolve_virtual_model，因此不存在运行时递归风险。
