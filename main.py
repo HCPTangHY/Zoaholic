@@ -759,6 +759,7 @@ async def lifespan(app: FastAPI):
         # 修改方式：启动时扫描 registry 中所有声明了 oauth_provider 的渠道，并统一注册到 OAuthManager。
         # 目的：消除 Codex、Claude Code、Gemini CLI 等渠道硬编码，让内置渠道和插件渠道共享注册路径。
         _register_oauth_providers_from_registry(app.state.oauth_manager)
+        app.state.oauth_manager.start_proactive_refresh()
 
 
     if app and not hasattr(app.state, "channel_manager"):

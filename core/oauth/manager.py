@@ -18,6 +18,11 @@ class OAuthManager:
 
     UNMAPPED_CHANNEL = "_unmapped"
 
+    # 主动刷新参数
+    PROACTIVE_INTERVAL = 30       # 轮询间隔（秒）
+    PROACTIVE_MARGIN = 600        # 过期前多少秒开始刷新（10 分钟）
+    PROACTIVE_CONCURRENCY = 8     # 同时刷新上限
+
     def __init__(self, state_path: str = STATE_PATH):
         # 修改原因：OAuth 凭据需要按渠道隔离，同一邮箱可能同时存在于多个 provider name 下。
         # 修改方式：manager 的 _state 统一改为 {channel_id: {key_id: credential}}，锁也改为 channel:key 维度。
@@ -38,6 +43,8 @@ class OAuthManager:
         self._quota_persisted_generation = 0
         self._quota_persist_handle = None
         self._quota_flush_delay = 30
+        self._proactive_task: asyncio.Task | None = None
+        self._proactive_semaphore = asyncio.Semaphore(self.PROACTIVE_CONCURRENCY)
         # 修改原因：渠道注册表现在支持在 register_channel 时声明 oauth_provider，manager 初始化后应立即接入该机制。
         # 修改方式：安装一个 registry 回调，并要求重放已有渠道，处理 manager 创建前已经完成的渠道注册。
         # 目的：让 OAuth provider 注册从 main.py 硬编码扫描迁移到渠道注册表自动同步，同时保留旧兜底逻辑。
@@ -786,3 +793,92 @@ class OAuthManager:
         if lock_key not in self._locks:
             self._locks[lock_key] = asyncio.Lock()
         return self._locks[lock_key]
+
+    # ==================== Proactive refresh ====================
+
+    def start_proactive_refresh(self) -> None:
+        """启动后台主动刷新任务。在 lifespan 中调用。"""
+        if self._proactive_task is not None and not self._proactive_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._proactive_task = loop.create_task(self._proactive_refresh_loop())
+        logger.info("[proactive_refresh] background task started (interval=%ds, margin=%ds, concurrency=%d)",
+                    self.PROACTIVE_INTERVAL, self.PROACTIVE_MARGIN, self.PROACTIVE_CONCURRENCY)
+
+    def stop_proactive_refresh(self) -> None:
+        """停止后台主动刷新任务。"""
+        if self._proactive_task is not None:
+            self._proactive_task.cancel()
+            self._proactive_task = None
+            logger.info("[proactive_refresh] background task stopped")
+
+    async def _proactive_refresh_loop(self) -> None:
+        """后台循环：定期扫描所有 OAuth 账号，主动刷新即将过期的 token。"""
+        import time as _time
+
+        while True:
+            try:
+                await asyncio.sleep(self.PROACTIVE_INTERVAL)
+            except asyncio.CancelledError:
+                return
+
+            now = _time.time()
+            tasks: list[tuple[str, str, dict]] = []
+
+            for channel_id, accounts in list(self._state.items()):
+                if not isinstance(accounts, dict):
+                    continue
+                for key_id, cred in list(accounts.items()):
+                    if not isinstance(cred, dict):
+                        continue
+                    # 跳过没有 refresh_token 的账号
+                    if not cred.get("refresh_token"):
+                        continue
+                    # 跳过已处于熔断状态的账号
+                    if self._is_refresh_circuit_open(cred):
+                        continue
+                    # 跳过 status 不是 active 的账号（error / disabled 等）
+                    status = cred.get("status", "active")
+                    if status not in ("active", None):
+                        continue
+                    # 检查是否在过期边界内
+                    expires_at = cred.get("expires_at", 0)
+                    if not isinstance(expires_at, (int, float)):
+                        try:
+                            expires_at = float(expires_at)
+                        except (TypeError, ValueError):
+                            continue
+                    if now > expires_at - self.PROACTIVE_MARGIN:
+                        tasks.append((channel_id, key_id, cred))
+
+            if not tasks:
+                continue
+
+            refreshed = 0
+            failed = 0
+
+            async def _do_refresh(ch_id: str, k_id: str):
+                nonlocal refreshed, failed
+                async with self._proactive_semaphore:
+                    try:
+                        token = await self.resolve(ch_id, k_id)
+                        if token:
+                            refreshed += 1
+                        else:
+                            failed += 1
+                    except Exception as e:
+                        failed += 1
+                        logger.debug("[proactive_refresh] %s:%s error: %s", ch_id, k_id, e)
+
+            batch = [_do_refresh(ch, k) for ch, k, _ in tasks]
+            try:
+                await asyncio.gather(*batch, return_exceptions=True)
+            except asyncio.CancelledError:
+                return
+
+            if refreshed or failed:
+                logger.info("[proactive_refresh] cycle done: %d refreshed, %d failed (of %d candidates)",
+                            refreshed, failed, len(tasks))
