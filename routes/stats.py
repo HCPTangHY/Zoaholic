@@ -296,6 +296,32 @@ class KeyAnalyticsModelTrendEntry(BaseModel):
     timestamp: str
     model: str
     request_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost: float = 0.0
+
+
+class KeyAnalyticsIpTrendEntry(BaseModel):
+    timestamp: str
+    request_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost: float = 0.0
+
+
+class KeyAnalyticsIpDetailResponse(BaseModel):
+    key_hash: str
+    ip: str
+    request_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost: float = 0.0
+    last_used: Optional[str] = None
+    model_distribution: List[KeyAnalyticsModelDistributionItem]
+    trend: List[KeyAnalyticsIpTrendEntry]
+    granularity: Literal["hour", "day"]
+    start_datetime: Optional[str] = None
+    end_datetime: Optional[str] = None
 
 
 class KeyAnalyticsRecentErrorItem(BaseModel):
@@ -638,6 +664,51 @@ def _key_analytics_sa_cost_expr():
         func.coalesce(RequestStat.prompt_tokens, 0) * func.coalesce(RequestStat.prompt_price, 0.0)
         + func.coalesce(RequestStat.completion_tokens, 0) * func.coalesce(RequestStat.completion_price, 0.0)
     ) / 1000000.0
+
+
+async def _resolve_key_analytics_target(
+    key_hash: str,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> tuple[str, Optional[str], Optional[str]]:
+    """在所选时间范围内把安全哈希解析为数据库保存的 API Key。"""
+    normalized_hash = (key_hash or "").strip().lower()
+    if not normalized_hash:
+        raise HTTPException(status_code=400, detail="key_hash is required.")
+
+    if (DB_TYPE or "sqlite").lower() == "d1":
+        from db import d1_client
+        if d1_client is None:
+            raise HTTPException(status_code=503, detail="D1 client is not initialized.")
+        rows = await d1_client.query_all(
+            "SELECT api_key, MAX(api_key_name) AS api_key_name, MAX(api_key_group) AS api_key_group "
+            "FROM request_stats WHERE timestamp >= ? AND timestamp <= ? "
+            "AND api_key IS NOT NULL AND api_key != '' GROUP BY api_key",
+            [format_d1_datetime(start_dt), format_d1_datetime(end_dt)],
+        )
+    else:
+        async with async_session_scope() as session:
+            result = await session.execute(
+                select(
+                    RequestStat.api_key.label("api_key"),
+                    func.max(RequestStat.api_key_name).label("api_key_name"),
+                    func.max(RequestStat.api_key_group).label("api_key_group"),
+                )
+                .where(
+                    RequestStat.timestamp >= start_dt,
+                    RequestStat.timestamp <= end_dt,
+                    RequestStat.api_key.isnot(None),
+                    RequestStat.api_key != "",
+                )
+                .group_by(RequestStat.api_key)
+            )
+            rows = result.mappings().all()
+
+    for row in rows:
+        api_key = str(row.get("api_key") or "")
+        if _key_analytics_hash(api_key) == normalized_hash:
+            return api_key, row.get("api_key_name"), row.get("api_key_group")
+    raise HTTPException(status_code=404, detail="API key analytics target not found in the selected time range.")
 
 
 def _build_cleanup_time_filters(payload: LogsCleanupRequest) -> tuple[Optional[datetime], Optional[datetime], Optional[datetime], Dict[str, Any]]:
@@ -1053,6 +1124,145 @@ async def get_key_analytics_summary(
 
 
 @router.get(
+    "/v1/stats/key_analytics/{key_hash}/ip",
+    response_model=KeyAnalyticsIpDetailResponse,
+    dependencies=[Depends(rate_limit_dependency)],
+)
+async def get_key_analytics_ip_detail(
+    key_hash: str,
+    ip: str = Query(min_length=1, max_length=128),
+    token: str = Depends(verify_admin_api_key),
+    hours: Optional[int] = Query(default=24, ge=1, le=8760),
+    start_datetime: Optional[str] = None,
+    end_datetime: Optional[str] = None,
+    limit: int = Query(default=50, ge=1, le=100),
+    granularity: Literal["hour", "day"] = Query(default="hour"),
+):
+    """按需返回单个 API Key、单个 IP 的模型与时间分布。"""
+    if DISABLE_DATABASE:
+        raise HTTPException(status_code=503, detail="Database is disabled.")
+
+    start_dt, end_dt, _effective_hours = _build_key_analytics_time_range(hours, start_datetime, end_datetime)
+    normalized_hash = (key_hash or "").strip().lower()
+    matched_api_key, _matched_name, _matched_group = await _resolve_key_analytics_target(
+        normalized_hash, start_dt, end_dt
+    )
+    db_type = (DB_TYPE or "sqlite").lower()
+
+    if db_type == "d1":
+        from db import d1_client
+        cost_sql = _key_analytics_cost_sql()
+        params = [format_d1_datetime(start_dt), format_d1_datetime(end_dt), matched_api_key, ip]
+        model_rows = await d1_client.query_all(
+            "SELECT model, COUNT(*) AS request_count, "
+            "COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, "
+            "COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
+            f"COALESCE(SUM({cost_sql}), 0.0) AS cost, MAX(timestamp) AS last_used "
+            "FROM request_stats WHERE timestamp >= ? AND timestamp <= ? AND api_key = ? AND client_ip = ? "
+            "GROUP BY model ORDER BY request_count DESC LIMIT ?",
+            [*params, limit],
+        )
+        time_group = "strftime('%Y-%m-%d 00:00:00', timestamp)" if granularity == "day" else "strftime('%Y-%m-%d %H:00:00', timestamp)"
+        trend_rows = await d1_client.query_all(
+            f"SELECT {time_group} AS time_bucket, COUNT(*) AS request_count, "
+            "COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, "
+            "COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
+            f"COALESCE(SUM({cost_sql}), 0.0) AS cost, MAX(timestamp) AS last_used "
+            "FROM request_stats WHERE timestamp >= ? AND timestamp <= ? AND api_key = ? AND client_ip = ? "
+            "GROUP BY time_bucket ORDER BY time_bucket ASC",
+            params,
+        )
+    else:
+        async with async_session_scope() as session:
+            filters = (
+                RequestStat.timestamp >= start_dt,
+                RequestStat.timestamp <= end_dt,
+                RequestStat.api_key == matched_api_key,
+                RequestStat.client_ip == ip,
+            )
+            cost_expr = _key_analytics_sa_cost_expr()
+            model_result = await session.execute(
+                select(
+                    RequestStat.model.label("model"),
+                    func.count(RequestStat.id).label("request_count"),
+                    func.coalesce(func.sum(RequestStat.prompt_tokens), 0).label("prompt_tokens"),
+                    func.coalesce(func.sum(RequestStat.completion_tokens), 0).label("completion_tokens"),
+                    func.coalesce(func.sum(cost_expr), 0.0).label("cost"),
+                    func.max(RequestStat.timestamp).label("last_used"),
+                )
+                .where(*filters)
+                .group_by(RequestStat.model)
+                .order_by(desc("request_count"))
+                .limit(limit)
+            )
+            model_rows = model_result.mappings().all()
+
+            if db_type == "postgres":
+                time_group = func.date_trunc(granularity, RequestStat.timestamp)
+            elif db_type == "mysql":
+                fmt = "%Y-%m-%d 00:00:00" if granularity == "day" else "%Y-%m-%d %H:00:00"
+                time_group = func.date_format(RequestStat.timestamp, fmt)
+            else:
+                fmt = "%Y-%m-%d 00:00:00" if granularity == "day" else "%Y-%m-%d %H:00:00"
+                time_group = func.strftime(fmt, RequestStat.timestamp)
+            trend_result = await session.execute(
+                select(
+                    time_group.label("time_bucket"),
+                    func.count(RequestStat.id).label("request_count"),
+                    func.coalesce(func.sum(RequestStat.prompt_tokens), 0).label("prompt_tokens"),
+                    func.coalesce(func.sum(RequestStat.completion_tokens), 0).label("completion_tokens"),
+                    func.coalesce(func.sum(cost_expr), 0.0).label("cost"),
+                    func.max(RequestStat.timestamp).label("last_used"),
+                )
+                .where(*filters)
+                .group_by(time_group)
+                .order_by(time_group.asc() if hasattr(time_group, "asc") else time_group)
+            )
+            trend_rows = trend_result.mappings().all()
+
+    model_distribution = [
+        KeyAnalyticsModelDistributionItem(
+            model=row.get("model"),
+            request_count=_safe_int(row.get("request_count")),
+            prompt_tokens=_safe_int(row.get("prompt_tokens")),
+            completion_tokens=_safe_int(row.get("completion_tokens")),
+            cost=round(_safe_float(row.get("cost")), 8),
+        )
+        for row in model_rows
+    ]
+    trend = [
+        KeyAnalyticsIpTrendEntry(
+            timestamp=_stringify_datetime(row.get("time_bucket")) or str(row.get("time_bucket") or ""),
+            request_count=_safe_int(row.get("request_count")),
+            prompt_tokens=_safe_int(row.get("prompt_tokens")),
+            completion_tokens=_safe_int(row.get("completion_tokens")),
+            cost=round(_safe_float(row.get("cost")), 8),
+        )
+        for row in trend_rows
+    ]
+    last_used_value = max(
+        (row.get("last_used") for row in trend_rows if row.get("last_used") is not None),
+        key=lambda value: _stringify_datetime(value) or "",
+        default=None,
+    )
+
+    return KeyAnalyticsIpDetailResponse(
+        key_hash=normalized_hash,
+        ip=ip,
+        request_count=sum(item.request_count for item in trend),
+        prompt_tokens=sum(item.prompt_tokens for item in trend),
+        completion_tokens=sum(item.completion_tokens for item in trend),
+        cost=round(sum(item.cost for item in trend), 8),
+        last_used=_stringify_datetime(last_used_value),
+        model_distribution=model_distribution,
+        trend=trend,
+        granularity=granularity,
+        start_datetime=start_dt.isoformat(),
+        end_datetime=end_dt.isoformat(),
+    )
+
+
+@router.get(
     "/v1/stats/key_analytics/{key_hash}",
     response_model=KeyAnalyticsDetailResponse,
     dependencies=[Depends(rate_limit_dependency)],
@@ -1085,33 +1295,13 @@ async def get_key_analytics_detail(
     db_type = (DB_TYPE or "sqlite").lower()
     cost_sql = _key_analytics_cost_sql()
 
-    matched_api_key: Optional[str] = None
-    matched_name: Optional[str] = None
-    matched_group: Optional[str] = None
+    matched_api_key, matched_name, matched_group = await _resolve_key_analytics_target(
+        normalized_hash, start_dt, end_dt
+    )
 
     if db_type == "d1":
         from db import d1_client
-        if d1_client is None:
-            raise HTTPException(status_code=503, detail="D1 client is not initialized.")
-
         base_params = [format_d1_datetime(start_dt), format_d1_datetime(end_dt)]
-        candidate_rows = await d1_client.query_all(
-            "SELECT api_key, MAX(api_key_name) AS api_key_name, MAX(api_key_group) AS api_key_group "
-            "FROM request_stats WHERE timestamp >= ? AND timestamp <= ? "
-            "AND api_key IS NOT NULL AND api_key != '' GROUP BY api_key",
-            base_params,
-        )
-        for row in candidate_rows:
-            api_key = str(row.get("api_key") or "")
-            if _key_analytics_hash(api_key) == normalized_hash:
-                matched_api_key = api_key
-                matched_name = row.get("api_key_name")
-                matched_group = row.get("api_key_group")
-                break
-
-        if matched_api_key is None:
-            raise HTTPException(status_code=404, detail="API key analytics target not found in the selected time range.")
-
         detail_params = [*base_params, matched_api_key]
         ip_rows = await d1_client.query_all(
             "SELECT client_ip AS ip, COUNT(*) AS request_count, MAX(timestamp) AS last_used "
@@ -1130,13 +1320,12 @@ async def get_key_analytics_detail(
         )
         time_group = "strftime('%Y-%m-%d 00:00:00', timestamp)" if granularity == "day" else "strftime('%Y-%m-%d %H:00:00', timestamp)"
         trend_rows = await d1_client.query_all(
-            f"SELECT {time_group} AS time_bucket, COUNT(*) AS request_count, "
-            "SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END) AS success_count, "
+            f"SELECT {time_group} AS time_bucket, model, COUNT(*) AS request_count, "
             "COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, "
             "COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
             f"COALESCE(SUM({cost_sql}), 0.0) AS cost "
             "FROM request_stats WHERE timestamp >= ? AND timestamp <= ? AND api_key = ? "
-            "GROUP BY time_bucket ORDER BY time_bucket ASC",
+            "GROUP BY time_bucket, model ORDER BY time_bucket ASC",
             detail_params,
         )
         error_rows = await d1_client.query_all(
@@ -1147,32 +1336,6 @@ async def get_key_analytics_detail(
         )
     else:
         async with async_session_scope() as session:
-            candidate_query = (
-                select(
-                    RequestStat.api_key.label("api_key"),
-                    func.max(RequestStat.api_key_name).label("api_key_name"),
-                    func.max(RequestStat.api_key_group).label("api_key_group"),
-                )
-                .where(
-                    RequestStat.timestamp >= start_dt,
-                    RequestStat.timestamp <= end_dt,
-                    RequestStat.api_key.isnot(None),
-                    RequestStat.api_key != "",
-                )
-                .group_by(RequestStat.api_key)
-            )
-            candidate_result = await session.execute(candidate_query)
-            for row in candidate_result.mappings().all():
-                api_key = str(row.get("api_key") or "")
-                if _key_analytics_hash(api_key) == normalized_hash:
-                    matched_api_key = api_key
-                    matched_name = row.get("api_key_name")
-                    matched_group = row.get("api_key_group")
-                    break
-
-            if matched_api_key is None:
-                raise HTTPException(status_code=404, detail="API key analytics target not found in the selected time range.")
-
             filters = (
                 RequestStat.timestamp >= start_dt,
                 RequestStat.timestamp <= end_dt,
@@ -1222,6 +1385,9 @@ async def get_key_analytics_detail(
                     time_group.label("time_bucket"),
                     RequestStat.model.label("model"),
                     func.count(RequestStat.id).label("request_count"),
+                    func.coalesce(func.sum(RequestStat.prompt_tokens), 0).label("prompt_tokens"),
+                    func.coalesce(func.sum(RequestStat.completion_tokens), 0).label("completion_tokens"),
+                    func.coalesce(func.sum(cost_expr), 0.0).label("cost"),
                 )
                 .where(*filters)
                 .group_by(time_group, RequestStat.model)
@@ -1244,7 +1410,7 @@ async def get_key_analytics_detail(
 
     # IP 黑名单标注
     from core.ip_blacklist import is_ip_blacklisted
-    app = request.app
+    app = request.app if request is not None else get_app()
     global_bl = getattr(app.state, "global_ip_blacklist", None)
     key_bls = getattr(app.state, "api_key_ip_blacklists", []) or []
     # 找到当前 key 的 index
@@ -1289,6 +1455,9 @@ async def get_key_analytics_detail(
             timestamp=_stringify_datetime(row.get("time_bucket")) or str(row.get("time_bucket") or ""),
             model=row.get("model") or "unknown",
             request_count=_safe_int(row.get("request_count")),
+            prompt_tokens=_safe_int(row.get("prompt_tokens")),
+            completion_tokens=_safe_int(row.get("completion_tokens")),
+            cost=round(_safe_float(row.get("cost")), 8),
         )
         for row in trend_rows
     ]

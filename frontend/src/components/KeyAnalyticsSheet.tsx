@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   X, RefreshCw, Activity, BarChart3, AlertCircle,
   ChevronDown, ChevronUp, Globe, Box
@@ -57,6 +57,25 @@ interface ModelEntry {
   completion_tokens: number;
   total_tokens?: number;
   cost: number;
+}
+
+interface IpTrendEntry {
+  timestamp: string;
+  request_count: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost: number;
+}
+
+interface IpDetail {
+  ip: string;
+  request_count: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost: number;
+  last_used?: string | null;
+  model_distribution: ModelEntry[];
+  trend: IpTrendEntry[];
 }
 
 interface TrendEntry {
@@ -166,6 +185,12 @@ const getModelTokens = (entry: ModelEntry) => {
   return toNumber(entry.prompt_tokens) + toNumber(entry.completion_tokens);
 };
 
+const normalizeIpTrendData = (rows: IpTrendEntry[]): TrendPoint[] => rows.map(row => ({
+  timestamp: row.timestamp,
+  requests: toNumber(row.request_count),
+  tokens: toNumber(row.prompt_tokens) + toNumber(row.completion_tokens),
+}));
+
 const normalizeTrendData = (rows: TrendEntry[]) => {
   // 修改原因：详情接口当前按时间和模型返回趋势，后续也可能直接返回包含 Token 的时间桶。
   // 修改方式：前端按 timestamp 聚合请求量，并兼容 total_tokens、tokens、prompt_tokens 和 completion_tokens 字段。
@@ -209,6 +234,10 @@ export function KeyAnalyticsSheet({ open, onOpenChange, apiKeyValue, apiKeyName 
   const [trendData, setTrendData] = useState<TrendPoint[]>([]);
   const [errorData, setErrorData] = useState<ErrorEntry[]>([]);
   const [errorsExpanded, setErrorsExpanded] = useState(false);
+  const [expandedIp, setExpandedIp] = useState<string | null>(null);
+  const [ipDetails, setIpDetails] = useState<Record<string, IpDetail>>({});
+  const [ipDetailLoading, setIpDetailLoading] = useState<string | null>(null);
+  const [ipDetailErrors, setIpDetailErrors] = useState<Record<string, string>>({});
 
   const displayName = apiKeyName || (apiKeyValue ? `${apiKeyValue.slice(0, 8)}...${apiKeyValue.slice(-4)}` : '—');
 
@@ -225,6 +254,10 @@ export function KeyAnalyticsSheet({ open, onOpenChange, apiKeyValue, apiKeyName 
     setTrendData([]);
     setErrorData([]);
     setErrorsExpanded(false);
+    setExpandedIp(null);
+    setIpDetails({});
+    setIpDetailLoading(null);
+    setIpDetailErrors({});
 
     try {
       const hash = await keyHash(apiKeyValue);
@@ -257,6 +290,47 @@ export function KeyAnalyticsSheet({ open, onOpenChange, apiKeyValue, apiKeyName 
       setLoading(false);
     }
   }, [apiKeyValue, timeRange]);
+
+  const toggleIpDetail = useCallback(async (ip?: string | null) => {
+    if (!ip) return;
+    if (expandedIp === ip) {
+      setExpandedIp(null);
+      return;
+    }
+
+    setExpandedIp(ip);
+    if (ipDetails[ip] || ipDetailLoading === ip) return;
+
+    setIpDetailLoading(ip);
+    setIpDetailErrors(prev => {
+      const next = { ...prev };
+      delete next[ip];
+      return next;
+    });
+    try {
+      const hash = await keyHash(apiKeyValue);
+      const granularity = timeRange > 48 ? 'day' : 'hour';
+      const params = new URLSearchParams({
+        ip,
+        hours: String(timeRange),
+        granularity,
+      });
+      const response = await apiFetch(`/v1/stats/key_analytics/${hash}/ip?${params.toString()}`);
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.detail || `HTTP ${response.status}`);
+      }
+      const detail = await response.json() as IpDetail;
+      setIpDetails(prev => ({ ...prev, [ip]: detail }));
+    } catch (error) {
+      setIpDetailErrors(prev => ({
+        ...prev,
+        [ip]: error instanceof Error ? error.message : '加载失败',
+      }));
+    } finally {
+      setIpDetailLoading(current => current === ip ? null : current);
+    }
+  }, [apiKeyValue, expandedIp, ipDetailLoading, ipDetails, timeRange]);
 
   useEffect(() => {
     if (open && apiKeyValue) {
@@ -445,13 +519,109 @@ export function KeyAnalyticsSheet({ open, onOpenChange, apiKeyValue, apiKeyName 
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-border">
-                      {ipData.map((entry, i) => (
-                        <tr key={`${entry.ip || 'unknown'}-${i}`} className={`hover:bg-muted/50 transition-colors ${entry.blocked ? 'bg-red-500/5' : ''}`}>
-                          <td className="px-4 py-2.5 font-mono text-xs text-foreground">{entry.ip || '—'}</td>
-                          <td className="px-4 py-2.5 text-right text-muted-foreground">{toNumber(entry.request_count).toLocaleString()}</td>
-                          <td className="px-4 py-2.5 text-right text-xs text-muted-foreground whitespace-nowrap">{formatDateTime(entry.last_used)}</td>
-                        </tr>
-                      ))}
+                      {ipData.map((entry, i) => {
+                        const ip = entry.ip || '';
+                        const isExpanded = Boolean(ip) && expandedIp === ip;
+                        const detail = ip ? ipDetails[ip] : undefined;
+                        const detailTrend = detail ? normalizeIpTrendData(detail.trend || []) : [];
+                        return (
+                          <Fragment key={`${entry.ip || 'unknown'}-${i}`}>
+                            <tr className={`hover:bg-muted/50 transition-colors ${entry.blocked ? 'bg-red-500/5' : ''}`}>
+                              <td className="px-4 py-2.5">
+                                <button
+                                  type="button"
+                                  onClick={() => void toggleIpDetail(entry.ip)}
+                                  disabled={!ip}
+                                  aria-expanded={isExpanded}
+                                  className="flex items-center gap-2 font-mono text-xs text-foreground disabled:cursor-default"
+                                >
+                                  {ip && (isExpanded
+                                    ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
+                                    : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />)}
+                                  {entry.ip || '—'}
+                                </button>
+                              </td>
+                              <td className="px-4 py-2.5 text-right text-muted-foreground">{toNumber(entry.request_count).toLocaleString()}</td>
+                              <td className="px-4 py-2.5 text-right text-xs text-muted-foreground whitespace-nowrap">{formatDateTime(entry.last_used)}</td>
+                            </tr>
+                            {isExpanded && (
+                              <tr className={entry.blocked ? 'bg-red-500/[0.03]' : 'bg-muted/20'}>
+                                <td colSpan={3} className="p-0">
+                                  <div className="border-t border-border px-4 py-4">
+                                    {ipDetailLoading === ip ? (
+                                      <div className="h-28 flex items-center justify-center text-xs text-muted-foreground">
+                                        <RefreshCw className="w-3.5 h-3.5 animate-spin mr-2" /> 正在加载 IP 明细
+                                      </div>
+                                    ) : ipDetailErrors[ip] ? (
+                                      <div className="h-20 flex items-center justify-center text-xs text-red-600 dark:text-red-500">
+                                        {ipDetailErrors[ip]}
+                                      </div>
+                                    ) : detail ? (
+                                      <div className="space-y-4">
+                                        <div className="grid grid-cols-3 gap-2">
+                                          <div className="rounded-lg border border-border bg-background px-3 py-2">
+                                            <div className="text-[10px] text-muted-foreground">请求</div>
+                                            <div className="mt-0.5 text-sm font-semibold text-foreground">{toNumber(detail.request_count).toLocaleString()}</div>
+                                          </div>
+                                          <div className="rounded-lg border border-border bg-background px-3 py-2">
+                                            <div className="text-[10px] text-muted-foreground">Token</div>
+                                            <div className="mt-0.5 text-sm font-semibold text-foreground">{formatTokens(toNumber(detail.prompt_tokens) + toNumber(detail.completion_tokens))}</div>
+                                          </div>
+                                          <div className="rounded-lg border border-amber-500/20 bg-background px-3 py-2">
+                                            <div className="text-[10px] text-amber-600 dark:text-amber-400">费用</div>
+                                            <div className="mt-0.5 text-sm font-semibold text-amber-600 dark:text-amber-400">{formatCost(toNumber(detail.cost))}</div>
+                                          </div>
+                                        </div>
+
+                                        {detailTrend.length > 0 && (
+                                          <div className="h-36 rounded-lg border border-border bg-background p-2">
+                                            <ResponsiveContainer width="100%" height="100%">
+                                              <LineChart data={detailTrend} margin={{ top: 8, right: 8, bottom: 0, left: -20 }}>
+                                                <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--muted))" vertical={false} />
+                                                <XAxis dataKey="timestamp" stroke={AXIS_COLOR} fontSize={9} tickFormatter={(value) => formatTrendTick(String(value), timeRange)} />
+                                                <YAxis yAxisId="requests" stroke={AXIS_COLOR} fontSize={9} />
+                                                <YAxis yAxisId="tokens" orientation="right" stroke={AXIS_COLOR} fontSize={9} tickFormatter={formatTokens} />
+                                                <Tooltip
+                                                  contentStyle={tooltipStyle}
+                                                  itemStyle={{ fontSize: '11px' }}
+                                                  labelStyle={{ fontSize: '11px', fontWeight: 'bold' }}
+                                                  labelFormatter={(value) => formatDateTime(String(value))}
+                                                  formatter={(value: number | string, name: string) => {
+                                                    const num = toNumber(value);
+                                                    return [name === 'Token' ? formatTokens(num) : num.toLocaleString(), name];
+                                                  }}
+                                                />
+                                                <Line yAxisId="requests" type="monotone" dataKey="requests" name="请求量" stroke={LINE_COLORS[0]} strokeWidth={1.75} dot={false} connectNulls />
+                                                <Line yAxisId="tokens" type="monotone" dataKey="tokens" name="Token" stroke={LINE_COLORS[1]} strokeWidth={1.75} dot={false} connectNulls />
+                                              </LineChart>
+                                            </ResponsiveContainer>
+                                          </div>
+                                        )}
+
+                                        <div className="rounded-lg border border-border bg-background overflow-hidden">
+                                          <div className="grid grid-cols-[minmax(0,1fr)_64px_72px_78px] gap-2 bg-muted/60 px-3 py-2 text-[10px] text-muted-foreground">
+                                            <span>模型</span><span className="text-right">请求</span><span className="text-right">Token</span><span className="text-right">费用</span>
+                                          </div>
+                                          {detail.model_distribution.length > 0 ? detail.model_distribution.map((model, modelIndex) => (
+                                            <div key={`${model.model || 'unknown'}-${modelIndex}`} className="grid grid-cols-[minmax(0,1fr)_64px_72px_78px] gap-2 border-t border-border px-3 py-2 text-xs">
+                                              <span className="truncate font-mono text-foreground" title={model.model || ''}>{model.model || '—'}</span>
+                                              <span className="text-right text-muted-foreground">{toNumber(model.request_count).toLocaleString()}</span>
+                                              <span className="text-right text-foreground">{formatTokens(getModelTokens(model))}</span>
+                                              <span className="text-right font-mono text-amber-600 dark:text-amber-400">{formatCost(toNumber(model.cost))}</span>
+                                            </div>
+                                          )) : (
+                                            <div className="border-t border-border px-3 py-5 text-center text-xs text-muted-foreground">暂无模型明细</div>
+                                          )}
+                                        </div>
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                </td>
+                              </tr>
+                            )}
+                          </Fragment>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
