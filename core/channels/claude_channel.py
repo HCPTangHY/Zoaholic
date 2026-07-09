@@ -69,6 +69,8 @@ async def gpt2claude_tools_json(json_dict):
 
     # 处理 $ref 引用
     def resolve_refs(obj, defs):
+        if not isinstance(defs, dict):
+            defs = {}
         if isinstance(obj, dict):
             # 如果有 $ref 引用，替换为实际定义
             if "$ref" in obj and obj["$ref"].startswith("#/$defs/"):
@@ -93,12 +95,15 @@ async def gpt2claude_tools_json(json_dict):
 
         return obj
 
-    # 提取 $defs 定义
+    # 提取 $defs / defs 定义
     defs = {}
-    if "parameters" in json_dict and isinstance(json_dict["parameters"], dict) and "defs" in json_dict["parameters"]:
-        defs = json_dict["parameters"]["defs"]
-        # 从参数中删除 $defs，因为 Claude 不需要它
-        del json_dict["parameters"]["defs"]
+    if "parameters" in json_dict and isinstance(json_dict["parameters"], dict):
+        for defs_key in ("$defs", "defs"):
+            if defs_key in json_dict["parameters"]:
+                extracted = json_dict["parameters"].pop(defs_key)
+                if isinstance(extracted, dict):
+                    defs = extracted
+                break
 
     # 解析所有引用
     json_dict = resolve_refs(json_dict, defs)

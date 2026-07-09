@@ -76,20 +76,47 @@ def _append_authorized_virtual_models(all_models, unique_models, config, api_ind
         virtual_name = str(virtual_name).strip()
         if not (allow_all or virtual_name in allowed_names):
             continue
-        # 方案 B：检查虚拟模型 chain 中至少有一个 provider 的 group 跟当前 key 有交集
+        # 检查虚拟模型是否对当前 key 可达：
+        # 1. chain 中 channel 节点的 provider group 与 key 有交集
+        # 2. chain 中 model 节点引用的模型所在 provider group 与 key 有交集
+        # 3. fallthrough：虚拟模型名在常规渠道中存在且 group 匹配
         chain = virtual_config.get("chain") or virtual_config.get("targets") or []
         if chain:
             has_accessible_provider = False
             for target in chain:
                 if not isinstance(target, dict):
                     continue
-                if target.get("type") != "channel":
-                    continue
-                target_provider = target.get("value", "")
-                target_groups = provider_groups_map.get(target_provider)
-                if target_groups and allowed_groups.intersection(target_groups):
-                    has_accessible_provider = True
-                    break
+                node_type = target.get("type", "model")
+                if node_type == "channel":
+                    target_provider = target.get("value", "")
+                    target_groups = provider_groups_map.get(target_provider)
+                    if target_groups and allowed_groups.intersection(target_groups):
+                        has_accessible_provider = True
+                        break
+                elif node_type == "model":
+                    model_value = target.get("value", "")
+                    if model_value:
+                        for p in config.get("providers", []):
+                            pname = p.get("provider", "")
+                            p_model_dict = p.get("_model_dict_cache") or {}
+                            if model_value in p_model_dict:
+                                p_grps = provider_groups_map.get(pname)
+                                if p_grps and allowed_groups.intersection(p_grps):
+                                    has_accessible_provider = True
+                                    break
+                    if has_accessible_provider:
+                        break
+            # fallthrough：虚拟路由 chain 全部被分组过滤后，运行时回退到常规路由。
+            # 如果虚拟模型名在常规渠道中存在且分组匹配，模型仍然可达。
+            if not has_accessible_provider:
+                for p in config.get("providers", []):
+                    pname = p.get("provider", "")
+                    p_model_dict = p.get("_model_dict_cache") or {}
+                    if virtual_name in p_model_dict:
+                        p_grps = provider_groups_map.get(pname)
+                        if p_grps and allowed_groups.intersection(p_grps):
+                            has_accessible_provider = True
+                            break
             if not has_accessible_provider:
                 continue
         _append_model_info_if_missing(all_models, unique_models, virtual_name)

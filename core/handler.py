@@ -664,7 +664,7 @@ class ModelRequestHandler:
             current_info_for_byok["api_key"] = byok_template_key
 
         status_code = 500
-        error_message = None
+        error_message = ""
 
         index = 0
         # 获取配置的最大重试次数上限，默认为 10
@@ -1217,9 +1217,8 @@ class ModelRequestHandler:
                 # 目的：上游 401/403 等错误返回给用户即可，不在服务端日志泄露 BYOK key。
                 log_api_key = byok_template_key if (byok_real_key and is_byok_provider(provider)) else current_api
                 logger.error(f"Error {status_code} with provider {channel_id} API key: {log_api_key}: {error_message}")
-                if is_debug:
-                    import traceback
-                    traceback.print_exc()
+                import traceback
+                logger.error(f"[traceback] {traceback.format_exc()}")
 
                 # 更新重试路径中的状态码
                 if retry_path:
