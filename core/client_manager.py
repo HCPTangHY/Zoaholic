@@ -14,6 +14,19 @@ import httpx
 from core.utils import get_proxy
 
 
+_POOL_ACQUIRE_TIMEOUT = 10.0
+
+
+async def _enforce_pool_acquire_timeout(request: httpx.Request) -> None:
+    """防止单次请求的长读取超时覆盖连接池等待上限。"""
+    timeout = request.extensions.get("timeout")
+    if not isinstance(timeout, dict):
+        return
+    pool_timeout = timeout.get("pool")
+    if pool_timeout is None or pool_timeout > _POOL_ACQUIRE_TIMEOUT:
+        timeout["pool"] = _POOL_ACQUIRE_TIMEOUT
+
+
 class ClientManager:
     """
     HTTP 客户端管理器
@@ -82,6 +95,15 @@ class ClientManager:
                         "timeout": timeout,
                         "limits": limits,
                     }
+                    # 修改原因：渠道传入 timeout=900 这类整数时，httpx 会把 pool timeout 也覆盖为 900 秒。
+                    # 修改方式：在请求发送前把 pool timeout 限制为 10 秒，并保留调用方设置的 read timeout。
+                    # 目的：连接池耗尽时尽快进入渠道重试，避免 keepalive 先返回假 200 后等待十五分钟。
+                    event_hooks = dict(client_config.get("event_hooks") or {})
+                    event_hooks["request"] = [
+                        *event_hooks.get("request", []),
+                        _enforce_pool_acquire_timeout,
+                    ]
+                    client_config["event_hooks"] = event_hooks
 
                     # Anthropic 域名开 HTTP/2（Claude Code CLI 原生走 HTTP/2）
                     if "anthropic.com" in host or "claude.ai" in host:

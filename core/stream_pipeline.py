@@ -165,9 +165,16 @@ async def iter_sse_with_keepalive(
             yield (await transform(item)) if transform is not None else item
     finally:
         # 无论因 EOF、异常还是被消费者关闭（GeneratorExit）退出，都取消仍挂起的
-        # 单飞 __anext__ 任务，避免连接资源泄漏。
+        # 单飞 __anext__ 任务，并等待取消清理完成后再退出。
         if wait_task is not None and not wait_task.done():
             wait_task.cancel()
+            try:
+                await wait_task
+            except (asyncio.CancelledError, StopAsyncIteration):
+                pass
+            except Exception:
+                # 任务异常已由 done callback 读取；清理阶段不应覆盖原始流异常。
+                pass
 
 
 async def error_handling_wrapper(

@@ -274,13 +274,21 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
                 render_fn = stream_renderer or dialect.render_stream
                 # 默认拍扁：方言未声明 structured_stream 时，自动将结构化 content list 拍扁为 markdown string
                 should_flatten = not dialect.structured_stream
-                async for chunk in resp.body_iterator:
-                    chunk_text = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
-                    if should_flatten:
-                        chunk_text = _flatten_stream_content(chunk_text)
-                    converted = await render_fn(chunk_text) if render_fn else chunk_text
-                    if converted:
-                        yield converted
+                source_iterator = resp.body_iterator
+                try:
+                    async for chunk in source_iterator:
+                        chunk_text = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                        if should_flatten:
+                            chunk_text = _flatten_stream_content(chunk_text)
+                        converted = await render_fn(chunk_text) if render_fn else chunk_text
+                        if converted:
+                            yield converted
+                finally:
+                    # 修改原因：关闭外层方言流不会自动关闭 async for 正在消费的内层生成器。
+                    # 修改方式：无论正常结束、客户端断开还是转换异常，都显式关闭原响应迭代器。
+                    # 目的：退出 client.stream 上下文并把连接归还 httpx 连接池。
+                    if hasattr(source_iterator, "aclose"):
+                        await source_iterator.aclose()
 
             return LoggingStreamingResponse(convert_stream(), media_type="text/event-stream",
                                             current_info=current_info, app=app, debug=debug,
