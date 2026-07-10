@@ -5,7 +5,7 @@ OpenAI Tools 插件
 
 支持的后缀（可组合使用）：
 - Reasoning effort:
-  -high, -medium, -low, -minimal, -none, -xhigh
+  -high, -medium, -low, -minimal, -none, -xhigh, -max
   → 自动设置 reasoning_effort / reasoning.effort
 
 - Image generation:
@@ -34,14 +34,14 @@ from core.plugins import (
 # 插件元信息
 PLUGIN_INFO = {
     "name": "oai_tools",
-    "version": "2.0.0",
-    "description": "OpenAI 后缀工具插件 — 在模型名后追加 -high/-medium/-low/-image 等后缀，自动设置 reasoning_effort 或注入 image_generation tool。后缀可组合，如 gpt-4o-image-high。注意: -image 仅对 openai-responses 引擎生效。",
+    "version": "2.1.0",
+    "description": "OpenAI 后缀工具插件 — 在模型名后追加 -max/-xhigh/-high/-medium/-low/-image 等后缀，自动设置 reasoning_effort 或注入 image_generation tool。后缀可组合，如 gpt-5.6-image-max。注意: -image 仅对 openai-responses 引擎生效。",
     "author": "Zoaholic Team",
     "dependencies": [],
     "metadata": {
         "category": "interceptors",
         "tags": ["openai", "reasoning", "image", "tools", "gpt-5"],
-        "params_hint": "无需参数。后缀直接写在模型名后: -high / -medium / -low / -minimal / -none / -xhigh / -image",
+        "params_hint": "无需参数。后缀直接写在模型名后: -max / -xhigh / -high / -medium / -low / -minimal / -none / -image",
     },
 }
 
@@ -61,6 +61,7 @@ REASONING_EFFORT_SUFFIXES = {
     "-minimal": "minimal",
     "-none": "none",
     "-xhigh": "xhigh",
+    "-max": "max",
 }
 
 # Tool 后缀 → tool 注入配置
@@ -200,7 +201,7 @@ async def oai_tools_request_interceptor(
     """
     OpenAI Tools 请求拦截器
 
-    统一处理 -high/-medium/-low/-image 等后缀
+    统一处理 -max/-xhigh/-high/-medium/-low/-image 等后缀
     """
     model = payload.get("model", "")
 
