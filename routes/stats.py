@@ -282,6 +282,7 @@ class KeyAnalyticsIpDistributionItem(BaseModel):
     request_count: int = 0
     last_used: Optional[str] = None
     blocked: bool = False
+    quota_summary: Optional[Dict[str, Any]] = None
 
 
 class KeyAnalyticsModelDistributionItem(BaseModel):
@@ -319,6 +320,7 @@ class KeyAnalyticsIpDetailResponse(BaseModel):
     last_used: Optional[str] = None
     model_distribution: List[KeyAnalyticsModelDistributionItem]
     trend: List[KeyAnalyticsIpTrendEntry]
+    quota_rules: List[Dict[str, Any]] = Field(default_factory=list)
     granularity: Literal["hour", "day"]
     start_datetime: Optional[str] = None
     end_datetime: Optional[str] = None
@@ -1130,6 +1132,7 @@ async def get_key_analytics_summary(
 )
 async def get_key_analytics_ip_detail(
     key_hash: str,
+    request: Request = None,
     ip: str = Query(min_length=1, max_length=128),
     token: str = Depends(verify_admin_api_key),
     hours: Optional[int] = Query(default=24, ge=1, le=8760),
@@ -1245,6 +1248,9 @@ async def get_key_analytics_ip_detail(
         key=lambda value: _stringify_datetime(value) or "",
         default=None,
     )
+    request_app = getattr(request, "app", None)
+    quota_registry = getattr(request_app.state, "quota_registry", None) if request_app is not None else None
+    quota_rules = quota_registry.get_ip_quota_breakdown(matched_api_key, ip) if quota_registry else []
 
     return KeyAnalyticsIpDetailResponse(
         key_hash=normalized_hash,
@@ -1256,6 +1262,7 @@ async def get_key_analytics_ip_detail(
         last_used=_stringify_datetime(last_used_value),
         model_distribution=model_distribution,
         trend=trend,
+        quota_rules=quota_rules,
         granularity=granularity,
         start_datetime=start_dt.isoformat(),
         end_datetime=end_dt.isoformat(),
@@ -1430,12 +1437,17 @@ async def get_key_analytics_detail(
             return True
         return False
 
+    quota_registry = getattr(app.state, "quota_registry", None)
     ip_distribution = [
         KeyAnalyticsIpDistributionItem(
             ip=row.get("ip"),
             request_count=_safe_int(row.get("request_count")),
             last_used=_stringify_datetime(row.get("last_used")),
             blocked=_is_ip_blocked(row.get("ip")),
+            quota_summary=(
+                quota_registry.get_ip_quota_summary(matched_api_key, str(row.get("ip") or ""))
+                if quota_registry and row.get("ip") else None
+            ),
         )
         for row in ip_rows
     ]

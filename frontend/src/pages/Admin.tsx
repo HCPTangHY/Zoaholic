@@ -33,6 +33,7 @@ interface ApiKeyData {
     // 修改方式：在 preferences 类型中增加 quota 字段，并保留索引签名兼容其它旧配置项。
     // 目的：让 Admin 编辑器能以类型安全的方式读写统一配额规则。
     quota?: Record<string, string>;
+    quota_rules?: DimensionalQuotaRule[];
     name?: string;
     group?: string;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -65,6 +66,72 @@ interface QuotaDisplayGroup {
 
 type QuotaScopeValue = 'key' | 'ip';
 type QuotaMetricValue = 'request' | 'cost' | 'token' | 'token_in' | 'token_out' | 'unique_ip';
+type QuotaDimensionValue = 'ip' | 'model';
+type DimensionalMeasureValue = 'request' | 'cost' | 'token' | 'token_in' | 'token_out' | 'ip';
+type DimensionalAggregateValue = 'count' | 'sum' | 'count_distinct';
+
+interface DimensionalQuotaRule {
+  id: string;
+  group_by: QuotaDimensionValue[];
+  where: Partial<Record<QuotaDimensionValue, string>>;
+  measure: DimensionalMeasureValue;
+  aggregate: DimensionalAggregateValue;
+  limit: string;
+  label?: string;
+}
+
+const DIMENSION_OPTIONS: { value: QuotaDimensionValue; label: string }[] = [
+  { value: 'ip', label: 'IP' },
+  { value: 'model', label: '模型' },
+];
+
+const DIMENSIONAL_MEASURE_OPTIONS: { value: DimensionalMeasureValue; label: string; aggregate: DimensionalAggregateValue }[] = [
+  { value: 'request', label: '请求次数', aggregate: 'count' },
+  { value: 'cost', label: '金额', aggregate: 'sum' },
+  { value: 'token', label: '总 Token', aggregate: 'sum' },
+  { value: 'token_in', label: '输入 Token', aggregate: 'sum' },
+  { value: 'token_out', label: '输出 Token', aggregate: 'sum' },
+  { value: 'ip', label: '不同 IP 数', aggregate: 'count_distinct' },
+];
+
+function createDimensionalQuotaRule(): DimensionalQuotaRule {
+  return {
+    id: `qr_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    group_by: [],
+    where: {},
+    measure: 'request',
+    aggregate: 'count',
+    limit: '',
+  };
+}
+
+function normalizeDimensionalQuotaRules(value: unknown): DimensionalQuotaRule[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((raw, index) => {
+    if (!raw || typeof raw !== 'object') return [];
+    const item = raw as Record<string, unknown>;
+    const measure = DIMENSIONAL_MEASURE_OPTIONS.some(option => option.value === item.measure)
+      ? item.measure as DimensionalMeasureValue
+      : 'request';
+    const measureInfo = DIMENSIONAL_MEASURE_OPTIONS.find(option => option.value === measure)!;
+    const groupBy = Array.isArray(item.group_by)
+      ? item.group_by.filter((dimension): dimension is QuotaDimensionValue => dimension === 'ip' || dimension === 'model')
+      : [];
+    const whereSource = item.where && typeof item.where === 'object' ? item.where as Record<string, unknown> : {};
+    const where: Partial<Record<QuotaDimensionValue, string>> = {};
+    if (typeof whereSource.ip === 'string' && whereSource.ip.trim()) where.ip = whereSource.ip.trim();
+    if (typeof whereSource.model === 'string' && whereSource.model.trim()) where.model = whereSource.model.trim();
+    return [{
+      id: typeof item.id === 'string' && item.id.trim() ? item.id.trim() : `qr_imported_${index}`,
+      group_by: [...new Set(groupBy)].filter(dimension => !(measure === 'ip' && dimension === 'ip')),
+      where,
+      measure,
+      aggregate: measureInfo.aggregate,
+      limit: typeof item.limit === 'string' ? item.limit : '',
+      label: typeof item.label === 'string' ? item.label : undefined,
+    }];
+  });
+}
 
 const QUOTA_SCOPE_OPTIONS: { value: QuotaScopeValue; label: string }[] = [
   { value: 'key', label: 'Key 级' },
@@ -311,6 +378,7 @@ export default function Admin() {
   // 目的：让一个入口同时覆盖请求数、金额、Token 和 IP 等统一配额维度。
   const [formQuotaRules, setFormQuotaRules] = useState<{key: string; value: string}[]>([]);
   const [formModelLimits, setFormModelLimits] = useState<{key: string; value: string}[]>([]);
+  const [formDimensionalRules, setFormDimensionalRules] = useState<DimensionalQuotaRule[]>([]);
   const [formExcludedChannels, setFormExcludedChannels] = useState<string[]>([]);
   const [formExcludedModels, setFormExcludedModels] = useState<string[]>([]);
   const [formIpBlacklistText, setFormIpBlacklistText] = useState('');
@@ -560,6 +628,7 @@ export default function Admin() {
       }
       setFormQuotaRules(quotaRules);
       setFormModelLimits(modelLimits);
+      setFormDimensionalRules(normalizeDimensionalQuotaRules(source.preferences?.quota_rules));
       // 黑名单
       const ec = source.preferences?.excluded_channels;
       setFormExcludedChannels(Array.isArray(ec) ? [...ec] : (typeof ec === 'string' && ec.trim() ? ec.split(',').map((s: string) => s.trim()).filter(Boolean) : []));
@@ -575,6 +644,7 @@ export default function Admin() {
       setFormModels([]);
       setFormQuotaRules([]);
       setFormModelLimits([]);
+      setFormDimensionalRules([]);
       setFormExcludedChannels([]);
       setFormExcludedModels([]);
       setFormIpBlacklistText('');
@@ -750,6 +820,19 @@ export default function Admin() {
     } else {
       delete prefs.quota;
     }
+    const dimensionalRules = formDimensionalRules
+      .filter(rule => rule.limit.trim())
+      .map(rule => ({
+        ...rule,
+        group_by: [...new Set(rule.group_by)],
+        where: Object.fromEntries(Object.entries(rule.where).filter(([, value]) => Boolean(value?.trim()))),
+        limit: rule.limit.trim(),
+      }));
+    if (dimensionalRules.length > 0) {
+      prefs.quota_rules = dimensionalRules;
+    } else {
+      delete prefs.quota_rules;
+    }
     if (formExcludedChannels.length > 0) {
       prefs.excluded_channels = formExcludedChannels;
     } else {
@@ -897,12 +980,23 @@ export default function Admin() {
     const items: QuotaDisplayItem[] = [];
     for (const [statusKey, value] of Object.entries(qs)) {
       if (!value || typeof value !== 'object') continue;
-      const parsed = parseQuotaStatusKey(statusKey);
+      const isDimensional = statusKey.startsWith('rule:') && Array.isArray((value as any).group_by);
+      const parsed = isDimensional
+        ? {
+            scope: ((value as any).group_by as string[]).join('+') || 'key',
+            metric: (value as any).measure === 'ip' ? 'unique_ip' : String((value as any).measure || 'request'),
+            qualifier: String((value as any).label || 'default'),
+          }
+        : parseQuotaStatusKey(statusKey);
       const current = Number((value as any).current || 0);
       const limit = Number((value as any).limit || 0);
       const remainingRaw = (value as any).remaining;
       const remaining = Number(remainingRaw !== undefined ? remainingRaw : Math.max(0, limit - current));
-      const groupLabel = QUOTA_SCOPE_LABELS[parsed.scope] || parsed.scope;
+      const groupLabel = isDimensional
+        ? (((value as any).group_by as string[]).length > 0
+            ? `按 ${((value as any).group_by as string[]).map(dimension => QUOTA_SCOPE_LABELS[dimension] || dimension).join(' × ')}`
+            : 'Key 级')
+        : (QUOTA_SCOPE_LABELS[parsed.scope] || parsed.scope);
       const metricLabel = QUOTA_METRIC_LABELS[parsed.metric] || parsed.metric;
       const qualifierLabel = parsed.qualifier && parsed.qualifier !== 'default' ? ` · ${parsed.qualifier}` : '';
       items.push({
@@ -1244,6 +1338,148 @@ export default function Admin() {
             </button>
           );
         })}
+      </div>
+    );
+  };
+
+  const updateDimensionalRule = (ruleId: string, patch: Partial<DimensionalQuotaRule>) => {
+    setFormDimensionalRules(prev => prev.map(rule => rule.id === ruleId ? { ...rule, ...patch } : rule));
+  };
+
+  const toggleRuleDimension = (rule: DimensionalQuotaRule, dimension: QuotaDimensionValue) => {
+    if (rule.measure === 'ip' && dimension === 'ip') return;
+    const groupBy = rule.group_by.includes(dimension)
+      ? rule.group_by.filter(item => item !== dimension)
+      : [...rule.group_by, dimension];
+    updateDimensionalRule(rule.id, { group_by: groupBy });
+  };
+
+  const selectRuleMeasure = (rule: DimensionalQuotaRule, measure: DimensionalMeasureValue) => {
+    const option = DIMENSIONAL_MEASURE_OPTIONS.find(item => item.value === measure)!;
+    updateDimensionalRule(rule.id, {
+      measure,
+      aggregate: option.aggregate,
+      group_by: measure === 'ip' ? rule.group_by.filter(dimension => dimension !== 'ip') : rule.group_by,
+    });
+  };
+
+  const renderDimensionalRuleCard = () => {
+    const editStates = formApi ? (quotaStates[formApi] || {}) : {};
+    return (
+      <div className="bg-card border border-primary/25 rounded-xl p-4">
+        <div className="flex items-center gap-2 mb-3">
+          <BarChart3 className="w-4 h-4 text-primary" />
+          <span className="text-sm font-semibold text-foreground">维度与度量规则</span>
+          <span className="ml-auto text-[10px] text-muted-foreground">{formDimensionalRules.length} 条规则</span>
+        </div>
+        <div className="space-y-3">
+          {formDimensionalRules.length === 0 ? (
+            <p className="text-xs text-muted-foreground">暂无新规则。可以按 IP、模型或 IP × 模型分别建立额度。</p>
+          ) : formDimensionalRules.map(rule => {
+            const statusKey = `rule:${rule.id}`;
+            const status = (editStates as any)[statusKey];
+            const metric = rule.measure === 'ip' ? 'unique_ip' : rule.measure as QuotaMetricValue;
+            const measureLabel = DIMENSIONAL_MEASURE_OPTIONS.find(option => option.value === rule.measure)?.label || rule.measure;
+            return (
+              <div key={rule.id} className="rounded-lg border border-border bg-muted/20 p-3 space-y-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <div className="text-[10px] text-muted-foreground mb-1.5">分组维度</div>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => updateDimensionalRule(rule.id, { group_by: [] })}
+                        className={`rounded-full border px-2 py-1 text-[10px] ${rule.group_by.length === 0 ? 'border-primary bg-primary/10 text-primary' : 'border-border text-muted-foreground'}`}
+                      >
+                        整个 Key
+                      </button>
+                      {DIMENSION_OPTIONS.map(option => {
+                        const active = rule.group_by.includes(option.value);
+                        const disabled = rule.measure === 'ip' && option.value === 'ip';
+                        return (
+                          <button
+                            key={option.value}
+                            type="button"
+                            disabled={disabled}
+                            onClick={() => toggleRuleDimension(rule, option.value)}
+                            className={`rounded-full border px-2 py-1 text-[10px] ${active ? 'border-primary bg-primary/10 text-primary' : disabled ? 'border-border text-muted-foreground/40' : 'border-border text-muted-foreground hover:border-primary/50'}`}
+                            title={disabled ? '不同 IP 数不能同时按 IP 分组' : option.label}
+                          >
+                            {option.label}
+                          </button>
+                        );
+                      })}
+                      {rule.group_by.length > 1 && <span className="text-[10px] text-primary">{rule.group_by.join(' × ')}</span>}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setFormDimensionalRules(prev => prev.filter(item => item.id !== rule.id))}
+                    className="text-muted-foreground hover:text-destructive"
+                    title="删除规则"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+                <div>
+                  <div className="text-[10px] text-muted-foreground mb-1.5">度量</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {DIMENSIONAL_MEASURE_OPTIONS.map(option => (
+                      <button
+                        key={option.value}
+                        type="button"
+                        onClick={() => selectRuleMeasure(rule, option.value)}
+                        className={`rounded-full border px-2 py-1 text-[10px] ${rule.measure === option.value ? 'border-primary bg-primary/10 text-primary' : 'border-border text-muted-foreground hover:border-primary/50'}`}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <input
+                    value={rule.where.model || ''}
+                    onChange={event => updateDimensionalRule(rule.id, { where: { ...rule.where, model: event.target.value } })}
+                    placeholder="模型过滤，可选，如 gpt-5.6*"
+                    className="bg-background border border-border px-2 py-1.5 rounded-lg text-xs font-mono text-foreground"
+                  />
+                  <input
+                    value={rule.where.ip || ''}
+                    onChange={event => updateDimensionalRule(rule.id, { where: { ...rule.where, ip: event.target.value } })}
+                    placeholder="IP/CIDR 过滤，可选"
+                    className="bg-background border border-border px-2 py-1.5 rounded-lg text-xs font-mono text-foreground"
+                  />
+                  <input
+                    value={rule.label || ''}
+                    onChange={event => updateDimensionalRule(rule.id, { label: event.target.value })}
+                    placeholder="规则名称，可选"
+                    className="bg-background border border-border px-2 py-1.5 rounded-lg text-xs text-foreground"
+                  />
+                  <input
+                    value={rule.limit}
+                    onChange={event => updateDimensionalRule(rule.id, { limit: event.target.value })}
+                    placeholder="例如 20/min 或 1M/day:fixed"
+                    className="bg-background border border-border px-2 py-1.5 rounded-lg text-xs font-mono text-foreground"
+                  />
+                </div>
+                <div className="text-[10px] text-muted-foreground">
+                  聚合方式: <code className="bg-muted px-1 rounded">{rule.aggregate}</code>
+                  {' · '}当前分桶: {rule.group_by.length ? rule.group_by.join(' × ') : 'Key'}
+                </div>
+                {renderQuotaStatusBlock(status, metric, { statusKey, label: rule.label || measureLabel })}
+              </div>
+            );
+          })}
+        </div>
+        <button
+          type="button"
+          onClick={() => setFormDimensionalRules(prev => [...prev, createDimensionalQuotaRule()])}
+          className="mt-3 text-xs text-primary hover:text-primary/80 flex items-center gap-1"
+        >
+          <Plus className="w-3 h-3" /> 添加维度规则
+        </button>
       </div>
     );
   };
@@ -1672,16 +1908,22 @@ export default function Admin() {
                 <div className="text-sm font-semibold text-foreground border-b border-border pb-2 flex items-center gap-2">
                   <Wallet className="w-4 h-4 text-emerald-500" /> 配额 (Quota)
                 </div>
-                {/* 修改原因：配额编辑需要按 Scope 分组，而不是把 Key 级、Per-IP 和模型规则混在一个扁平列表中。 */}
-                {/* 修改方式：同一个 section 内渲染三张卡片：Key 级、Per-IP、模型限速。 */}
-                {/* 目的：让 Scope × Metric 关系在界面中直接可见，同时保持 formQuotaRules + formModelLimits 的保存逻辑不变。 */}
+                {/* 新规则按分组维度与度量编辑；已有 preferences.quota 仅在存在时显示兼容编辑区。 */}
                 <div className="space-y-3">
-                  {renderQuotaRuleCard('key', 'Key 级', <Key className="w-4 h-4" />)}
-                  {renderQuotaRuleCard('ip', 'Per-IP', <Globe className="w-4 h-4" />)}
-                  {renderModelLimitCard()}
+                  {renderDimensionalRuleCard()}
+                  {(formQuotaRules.length > 0 || formModelLimits.length > 0) && (
+                    <details className="rounded-xl border border-border bg-muted/10 p-3">
+                      <summary className="cursor-pointer text-xs font-medium text-muted-foreground">兼容旧配额规则</summary>
+                      <div className="mt-3 space-y-3">
+                        {renderQuotaRuleCard('key', '兼容 Key 级规则', <Key className="w-4 h-4" />)}
+                        {renderQuotaRuleCard('ip', '兼容 Per-IP 规则', <Globe className="w-4 h-4" />)}
+                        {renderModelLimitCard()}
+                      </div>
+                    </details>
+                  )}
                   <div className="text-[10px] text-muted-foreground space-y-0.5">
                     <div>格式: <code className="bg-muted px-1 rounded">数量/时间</code>，可选 <code className="bg-muted px-1 rounded">:fixed</code> 后缀。支持 <code className="bg-muted px-1 rounded">K</code> <code className="bg-muted px-1 rounded">M</code> 缩写。</div>
-                    <div>Key 级作用于整个 API Key；Per-IP 作用于每个客户端 IP；模型限速等价于 model scope 的 request metric。</div>
+                    <div>新规则将分组维度与度量分开；IP 和模型可以同时选择。兼容规则继续支持旧 preferences.quota 配置。</div>
                   </div>
                 </div>
               </section>

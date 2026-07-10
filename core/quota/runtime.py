@@ -16,6 +16,7 @@ from time import time
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 from .parser import Limit, Metric, Rule, Scope, WindowType
+from .dimensional import DimensionalQuotaCounter, parse_dimensional_rules
 
 logger = logging.getLogger('Zoaholic')
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -348,6 +349,68 @@ class QuotaCounter:
                 out[status_key] = self._status_for_scope(scope_id or 'key', rule.metric, limit, now)
         return out
 
+    def get_ip_breakdown(self, client_ip: str) -> List[dict]:
+        """返回旧 ip:* 规则在指定 IP 上的实时额度，供分析面板展示。"""
+        if not client_ip:
+            return []
+        now = time()
+        output = []
+        for rule in self.rules:
+            if rule.scope != Scope.IP:
+                continue
+            statuses = []
+            scope_id = f"ip:{client_ip}"
+            store_key = (scope_id, rule.metric.value)
+            has_runtime_bucket = store_key in self._store._sliding or store_key in self._store._fixed
+            for limit in rule.limits:
+                status = (
+                    self._status_for_scope(scope_id, rule.metric, limit, now)
+                    if has_runtime_bucket else _status(0, limit, now=now)
+                )
+                status["measure"] = rule.metric.value
+                status["aggregate"] = "count" if rule.metric == Metric.REQUEST else "sum"
+                status["remaining_ratio"] = (
+                    max(0.0, min(1.0, float(status.get("remaining", 0)) / float(status.get("limit", 0))))
+                    if float(status.get("limit", 0)) > 0 else 0.0
+                )
+                statuses.append(status)
+            worst = min(statuses, key=lambda item: item.get("remaining_ratio", 1.0)) if statuses else {}
+            output.append({
+                "id": f"legacy_ip_{rule.metric.value}_{rule.qualifier}",
+                "group_by": ["ip"],
+                "where": {},
+                "measure": rule.metric.value,
+                "aggregate": "count" if rule.metric == Metric.REQUEST else "sum",
+                "label": "",
+                "buckets": [{
+                    "dimensions": {"ip": client_ip},
+                    "current": worst.get("current", 0),
+                    "limit": worst.get("limit", 0),
+                    "remaining": worst.get("remaining", 0),
+                    "remaining_ratio": worst.get("remaining_ratio", 1.0),
+                    "limits": statuses,
+                }],
+            })
+        return output
+
+    def get_ip_summary(self, client_ip: str) -> Optional[dict]:
+        breakdown = self.get_ip_breakdown(client_ip)
+        limits = [limit for rule in breakdown for bucket in rule["buckets"] for limit in bucket["limits"]]
+        if not limits:
+            return None
+        worst = min(limits, key=lambda item: item.get("remaining_ratio", 1.0))
+        return {
+            "remaining_ratio": worst.get("remaining_ratio", 1.0),
+            "exhausted": any(item.get("remaining", 0) <= 0 for item in limits),
+            "rule_count": len(breakdown),
+            "bucket_count": len(breakdown),
+            "label": worst.get("label", ""),
+            "measure": worst.get("measure", ""),
+            "current": worst.get("current", 0),
+            "limit": worst.get("limit", 0),
+            "remaining": worst.get("remaining", 0),
+        }
+
     def reset_status(self, status_key: str) -> dict:
         """按状态 key 手动清零一条正交配额。"""
 
@@ -643,6 +706,8 @@ class QuotaRegistry:
     def __init__(self):
         self._counters: Dict[str, QuotaCounter] = {}
         self._global: Optional[QuotaCounter] = None
+        self._dimensional_counters: Dict[str, DimensionalQuotaCounter] = {}
+        self._global_dimensional: Optional[DimensionalQuotaCounter] = None
 
     def init_from_config(self, config: dict):
         """从应用配置初始化（启动或热更新时调用）。"""
@@ -654,6 +719,8 @@ class QuotaRegistry:
 
         self._counters.clear()
         self._global = None
+        self._dimensional_counters.clear()
+        self._global_dimensional = None
 
         gp = config.get('preferences') or {}
         gq = merge_legacy_to_quota(gp)
@@ -661,6 +728,9 @@ class QuotaRegistry:
             rules = _parse(gq)
             if rules:
                 self._global = QuotaCounter(rules)
+        global_dimensional_rules = parse_dimensional_rules(gp.get('quota_rules'))
+        if global_dimensional_rules:
+            self._global_dimensional = DimensionalQuotaCounter(global_dimensional_rules)
 
         for kc in config.get('api_keys', []):
             api = kc.get('api', '')
@@ -672,8 +742,11 @@ class QuotaRegistry:
                 rules = _parse(q)
                 if rules:
                     self._counters[api] = QuotaCounter(rules)
+            dimensional_rules = parse_dimensional_rules(prefs.get('quota_rules'))
+            if dimensional_rules:
+                self._dimensional_counters[api] = DimensionalQuotaCounter(dimensional_rules)
 
-        snapshot = pre_snapshot if pre_snapshot.get('c') or pre_snapshot.get('g') else self._read_snapshot_file()
+        snapshot = pre_snapshot if pre_snapshot.get('c') or pre_snapshot.get('g') or pre_snapshot.get('d') or pre_snapshot.get('gd') else self._read_snapshot_file()
         self._apply_snapshot(snapshot)
         self._save_snapshot()
 
@@ -685,9 +758,20 @@ class QuotaRegistry:
             if reason:
                 self._check_and_save()
                 return f"[global] {reason}"
+        if self._global_dimensional:
+            reason = self._global_dimensional.check_request(model, client_ip)
+            if reason:
+                self._check_and_save()
+                return f"[global] {reason}"
         counter = self._counters.get(api_key)
         if counter:
             reason = counter.check_request(model, client_ip)
+            if reason:
+                self._check_and_save()
+                return reason
+        dimensional_counter = self._dimensional_counters.get(api_key)
+        if dimensional_counter:
+            reason = dimensional_counter.check_request(model, client_ip)
             if reason:
                 self._check_and_save()
                 return reason
@@ -698,7 +782,10 @@ class QuotaRegistry:
         """检查 key 级 cost/token 是否耗尽（不记录请求计数）。用于 middleware 预检。"""
 
         counter = self._counters.get(api_key)
-        return counter.is_exhausted(model) if counter else False
+        if counter and counter.is_exhausted(model):
+            return True
+        dimensional_counter = self._dimensional_counters.get(api_key)
+        return dimensional_counter.is_exhausted(model) if dimensional_counter else False
 
     def record_usage(self, api_key: str, model: str, cost: float = 0.0, tokens: int = 0,
                      tokens_in: int = 0, tokens_out: int = 0, client_ip: str = ''):
@@ -710,8 +797,13 @@ class QuotaRegistry:
         counter = self._counters.get(api_key)
         if counter:
             counter.record_usage(model, cost, tokens, tokens_in=tokens_in, tokens_out=tokens_out, client_ip=client_ip)
+        dimensional_counter = self._dimensional_counters.get(api_key)
+        if dimensional_counter:
+            dimensional_counter.record_usage(model, cost, tokens, tokens_in=tokens_in, tokens_out=tokens_out, client_ip=client_ip)
         if self._global:
             self._global.record_usage(model, cost, tokens, tokens_in=tokens_in, tokens_out=tokens_out, client_ip=client_ip)
+        if self._global_dimensional:
+            self._global_dimensional.record_usage(model, cost, tokens, tokens_in=tokens_in, tokens_out=tokens_out, client_ip=client_ip)
         self._check_and_save()
 
     def get_counter(self, api_key: str) -> Optional[QuotaCounter]:
@@ -719,24 +811,74 @@ class QuotaRegistry:
 
     def get_key_status(self, api_key: str, model: str = 'default') -> dict:
         counter = self._counters.get(api_key)
-        return counter.get_status(model) if counter else {}
+        result = counter.get_status(model) if counter else {}
+        dimensional_counter = self._dimensional_counters.get(api_key)
+        if dimensional_counter:
+            result.update(dimensional_counter.get_status())
+        return result
+
+    def get_ip_quota_breakdown(self, api_key: str, client_ip: str) -> List[dict]:
+        output = []
+        legacy_counter = self._counters.get(api_key)
+        if legacy_counter:
+            output.extend(legacy_counter.get_ip_breakdown(client_ip))
+        dimensional_counter = self._dimensional_counters.get(api_key)
+        if dimensional_counter:
+            output.extend(dimensional_counter.get_ip_breakdown(client_ip))
+        return output
+
+    def get_ip_quota_summary(self, api_key: str, client_ip: str) -> Optional[dict]:
+        breakdown = self.get_ip_quota_breakdown(api_key, client_ip)
+        limits = [limit for rule in breakdown for bucket in rule.get('buckets', []) for limit in bucket.get('limits', [])]
+        if not limits:
+            if breakdown:
+                return {
+                    'remaining_ratio': 1.0,
+                    'exhausted': False,
+                    'rule_count': len(breakdown),
+                    'bucket_count': 0,
+                    'label': '',
+                    'measure': '',
+                    'current': 0,
+                    'limit': 0,
+                    'remaining': 0,
+                }
+            return None
+        worst = min(limits, key=lambda item: item.get('remaining_ratio', 1.0))
+        return {
+            'remaining_ratio': worst.get('remaining_ratio', 1.0),
+            'exhausted': any(item.get('remaining', 0) <= 0 for item in limits),
+            'rule_count': len([rule for rule in breakdown if rule.get('buckets')]),
+            'bucket_count': sum(len(rule.get('buckets', [])) for rule in breakdown),
+            'label': worst.get('label', ''),
+            'measure': worst.get('measure', ''),
+            'current': worst.get('current', 0),
+            'limit': worst.get('limit', 0),
+            'remaining': worst.get('remaining', 0),
+        }
 
     def reset_key_status(self, api_key: str, status_key: str) -> dict:
-        counter = self._counters.get(api_key)
-        if not counter:
-            raise KeyError(api_key)
-        result = counter.reset_status(status_key)
+        if status_key.startswith('rule:'):
+            dimensional_counter = self._dimensional_counters.get(api_key)
+            if not dimensional_counter:
+                raise KeyError(api_key)
+            result = dimensional_counter.reset_rule(status_key.split(':', 1)[1])
+        else:
+            counter = self._counters.get(api_key)
+            if not counter:
+                raise KeyError(api_key)
+            result = counter.reset_status(status_key)
         result['api_key'] = api_key
         self._save_snapshot()
         return result
 
     def has_quota(self, api_key: str) -> bool:
-        return api_key in self._counters
+        return api_key in self._counters or api_key in self._dimensional_counters
 
     # ── 快照持久化 ──
 
     def _capture_snapshot(self) -> dict:
-        data: dict = {'v': 1, 't': time(), 'c': {}}
+        data: dict = {'v': 1, 't': time(), 'c': {}, 'd': {}}
         for api_key, counter in self._counters.items():
             snap = counter._snapshot()
             if snap.get('fixed') or snap.get('ip_fixed'):
@@ -745,6 +887,14 @@ class QuotaRegistry:
             snap = self._global._snapshot()
             if snap.get('fixed') or snap.get('ip_fixed'):
                 data['g'] = snap
+        for api_key, counter in self._dimensional_counters.items():
+            snap = counter.snapshot()
+            if snap.get('buckets'):
+                data['d'][api_key] = snap
+        if self._global_dimensional:
+            snap = self._global_dimensional.snapshot()
+            if snap.get('buckets'):
+                data['gd'] = snap
         return data
 
     def _apply_snapshot(self, data: dict):
@@ -757,6 +907,12 @@ class QuotaRegistry:
                 total += counter._restore_snapshot(snap)
         if self._global and data.get('g'):
             total += self._global._restore_snapshot(data['g'])
+        for api_key, snap in data.get('d', {}).items():
+            counter = self._dimensional_counters.get(api_key)
+            if counter:
+                total += counter.restore_snapshot(snap)
+        if self._global_dimensional and data.get('gd'):
+            total += self._global_dimensional.restore_snapshot(data['gd'])
         if total > 0:
             logger.info(f"Restored {total} fixed quota windows from snapshot")
 
@@ -786,6 +942,13 @@ class QuotaRegistry:
                 dirty = True
         if self._global and self._global._snapshot_dirty:
             self._global._snapshot_dirty = False
+            dirty = True
+        for counter in self._dimensional_counters.values():
+            if counter._snapshot_dirty:
+                counter._snapshot_dirty = False
+                dirty = True
+        if self._global_dimensional and self._global_dimensional._snapshot_dirty:
+            self._global_dimensional._snapshot_dirty = False
             dirty = True
         if dirty:
             self._save_snapshot()

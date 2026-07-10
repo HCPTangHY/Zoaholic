@@ -43,11 +43,56 @@ interface SummaryResponse {
   data?: SummaryData[];
 }
 
+interface IpQuotaSummary {
+  remaining_ratio: number;
+  exhausted: boolean;
+  rule_count: number;
+  bucket_count: number;
+  label?: string;
+  measure?: string;
+  current?: number;
+  limit?: number;
+  remaining?: number;
+}
+
+interface QuotaLimitStatus {
+  measure: string;
+  aggregate: string;
+  current: number;
+  limit: number;
+  remaining: number;
+  remaining_ratio: number;
+  period: number | string;
+  window: string;
+  label: string;
+  reset_at?: number;
+}
+
+interface QuotaBucketStatus {
+  dimensions: Record<string, string>;
+  current: number;
+  limit: number;
+  remaining: number;
+  remaining_ratio: number;
+  limits: QuotaLimitStatus[];
+}
+
+interface QuotaRuleStatus {
+  id: string;
+  group_by: string[];
+  where: Record<string, string>;
+  measure: string;
+  aggregate: string;
+  label?: string;
+  buckets: QuotaBucketStatus[];
+}
+
 interface IpEntry {
   ip?: string | null;
   request_count: number;
   last_used?: string | null;
   blocked?: boolean;
+  quota_summary?: IpQuotaSummary | null;
 }
 
 interface ModelEntry {
@@ -76,6 +121,7 @@ interface IpDetail {
   last_used?: string | null;
   model_distribution: ModelEntry[];
   trend: IpTrendEntry[];
+  quota_rules: QuotaRuleStatus[];
 }
 
 interface TrendEntry {
@@ -177,6 +223,25 @@ const getSuccessRateColor = (value: number | null) => {
   if (normalized >= 95) return 'text-emerald-600 dark:text-emerald-500';
   if (normalized >= 80) return 'text-amber-600 dark:text-amber-500';
   return 'text-red-600 dark:text-red-500';
+};
+
+const QUOTA_MEASURE_LABELS: Record<string, string> = {
+  request: '请求次数',
+  cost: '金额',
+  token: '总 Token',
+  token_in: '输入 Token',
+  token_out: '输出 Token',
+  ip: '不同 IP 数',
+};
+
+const formatQuotaValue = (measure: string, value: number) => (
+  measure === 'cost' ? formatCost(value) : formatTokens(value)
+);
+
+const formatQuotaReset = (timestamp?: number) => {
+  if (!timestamp) return '';
+  const date = new Date(timestamp * 1000);
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
 };
 
 const getModelTokens = (entry: ModelEntry) => {
@@ -515,6 +580,7 @@ export function KeyAnalyticsSheet({ open, onOpenChange, apiKeyValue, apiKeyName 
                       <tr>
                         <th className="px-4 py-2.5">IP</th>
                         <th className="px-4 py-2.5 text-right">请求量</th>
+                        <th className="px-4 py-2.5 text-right">实时配额</th>
                         <th className="px-4 py-2.5 text-right">最近使用</th>
                       </tr>
                     </thead>
@@ -542,11 +608,27 @@ export function KeyAnalyticsSheet({ open, onOpenChange, apiKeyValue, apiKeyName 
                                 </button>
                               </td>
                               <td className="px-4 py-2.5 text-right text-muted-foreground">{toNumber(entry.request_count).toLocaleString()}</td>
+                              <td className="px-4 py-2.5 text-right">
+                                {entry.quota_summary ? (
+                                  <div className="ml-auto w-24" title={`${entry.quota_summary.current || 0}/${entry.quota_summary.limit || 0}`}>
+                                    <div className="mb-1 flex items-center justify-end gap-1 text-[10px] text-muted-foreground">
+                                      <span className={entry.quota_summary.exhausted ? 'text-red-500' : ''}>{Math.round(toNumber(entry.quota_summary.remaining_ratio) * 100)}%</span>
+                                      <span>· {entry.quota_summary.rule_count} 规则</span>
+                                    </div>
+                                    <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+                                      <div
+                                        className={`h-full rounded-full ${entry.quota_summary.exhausted ? 'bg-red-500' : entry.quota_summary.remaining_ratio < 0.3 ? 'bg-amber-500' : 'bg-emerald-500'}`}
+                                        style={{ width: `${Math.max(1, toNumber(entry.quota_summary.remaining_ratio) * 100)}%` }}
+                                      />
+                                    </div>
+                                  </div>
+                                ) : <span className="text-[10px] text-muted-foreground">未配置</span>}
+                              </td>
                               <td className="px-4 py-2.5 text-right text-xs text-muted-foreground whitespace-nowrap">{formatDateTime(entry.last_used)}</td>
                             </tr>
                             {isExpanded && (
                               <tr className={entry.blocked ? 'bg-red-500/[0.03]' : 'bg-muted/20'}>
-                                <td colSpan={3} className="p-0">
+                                <td colSpan={4} className="p-0">
                                   <div className="border-t border-border px-4 py-4">
                                     {ipDetailLoading === ip ? (
                                       <div className="h-28 flex items-center justify-center text-xs text-muted-foreground">
@@ -558,6 +640,50 @@ export function KeyAnalyticsSheet({ open, onOpenChange, apiKeyValue, apiKeyName 
                                       </div>
                                     ) : detail ? (
                                       <div className="space-y-4">
+                                        {(detail.quota_rules || []).length > 0 && (
+                                          <div className="rounded-lg border border-primary/20 bg-primary/[0.03] p-3">
+                                            <div className="mb-2 flex items-center justify-between gap-2">
+                                              <div className="text-xs font-semibold text-foreground">当前窗口配额</div>
+                                              <div className="text-[10px] text-muted-foreground">不随历史时间范围变化</div>
+                                            </div>
+                                            <div className="space-y-2">
+                                              {detail.quota_rules.flatMap(rule => (rule.buckets || []).length > 0
+                                                ? rule.buckets.map((bucket, bucketIndex) => (
+                                                <div key={`${rule.id}-${bucketIndex}`} className="rounded-md border border-border bg-background p-2">
+                                                  <div className="mb-1.5 flex flex-wrap items-center gap-1.5 text-[10px]">
+                                                    <span className="font-medium text-foreground">{rule.label || QUOTA_MEASURE_LABELS[rule.measure] || rule.measure}</span>
+                                                    {Object.entries(bucket.dimensions || {}).map(([dimension, value]) => (
+                                                      <span key={dimension} className="rounded bg-muted px-1.5 py-0.5 font-mono text-muted-foreground">{dimension}={value}</span>
+                                                    ))}
+                                                    <span className="ml-auto text-muted-foreground">{rule.aggregate}</span>
+                                                  </div>
+                                                  <div className="space-y-1.5">
+                                                    {(bucket.limits || []).map((limit, limitIndex) => {
+                                                      const ratio = Math.max(0, Math.min(1, toNumber(limit.remaining_ratio)));
+                                                      return (
+                                                        <div key={limitIndex}>
+                                                          <div className="mb-1 flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+                                                            <span>{limit.label} · {limit.window === 'fixed' ? '固定窗口' : '滑动窗口'}{limit.reset_at ? ` · ${formatQuotaReset(limit.reset_at)} 刷新` : ''}</span>
+                                                            <span className="whitespace-nowrap">{formatQuotaValue(rule.measure, toNumber(limit.current))} / {formatQuotaValue(rule.measure, toNumber(limit.limit))}</span>
+                                                          </div>
+                                                          <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+                                                            <div className={`h-full rounded-full ${ratio <= 0 ? 'bg-red-500' : ratio < 0.3 ? 'bg-amber-500' : 'bg-emerald-500'}`} style={{ width: `${Math.max(1, ratio * 100)}%` }} />
+                                                          </div>
+                                                        </div>
+                                                      );
+                                                    })}
+                                                  </div>
+                                                </div>
+                                              ))
+                                                : [(
+                                                  <div key={`${rule.id}-empty`} className="rounded-md border border-border bg-background p-2 text-[10px] text-muted-foreground">
+                                                    <span className="font-medium text-foreground">{rule.label || QUOTA_MEASURE_LABELS[rule.measure] || rule.measure}</span>
+                                                    <span className="ml-2">当前窗口尚无分桶记录</span>
+                                                  </div>
+                                                )])}
+                                            </div>
+                                          </div>
+                                        )}
                                         <div className="grid grid-cols-3 gap-2">
                                           <div className="rounded-lg border border-border bg-background px-3 py-2">
                                             <div className="text-[10px] text-muted-foreground">请求</div>
