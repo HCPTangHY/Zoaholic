@@ -103,6 +103,10 @@ class ChannelDefinition:
     # 修改方式：新增通用 ui_slots 字典，key 为插槽名（如 quota_display、key_detail），value 为内联 JS 字符串。
     # 目的：让渠道在 register_channel 时一次性声明所有前端插槽，以后加新插槽只需往 dict 里写新 key。
     ui_slots: Optional[Dict[str, str]] = None
+    # 修改原因：渠道级布尔配置开关此前在前端硬编码 engine 判断（如 WebSocket 传输开关），新渠道无法复用。
+    # 修改方式：渠道注册时声明 preference_toggles 列表，每项 {key, label, tip}，写入 provider.preferences。
+    # 目的：前端按渠道元数据动态渲染开关，新增渠道声明即可，无需改前端代码。
+    preference_toggles: Optional[List[Dict[str, str]]] = None
     # 修改原因：OAuth provider 注册需要从 main.py 的硬编码迁移到渠道注册表，插件渠道也要能声明自己的 provider。
     # 修改方式：在 ChannelDefinition 上保存运行时使用的 OAuthProvider 实例，但不在 to_dict API 输出中暴露。
     # 目的：启动时扫描注册表即可统一注册内置和外置 OAuth 渠道，同时避免把 provider 对象返回给前端。
@@ -146,6 +150,7 @@ class ChannelDefinition:
             # 修改方式：输出 resolve_slots_for_engine 解析得到的 resolved_ui_slots，而不是原始 self.ui_slots。
             # 目的：让插件和渠道都能通过同一个渠道元数据接口把插槽脚本及 requires_plugin 条件交给前端。
             "ui_slots": resolved_ui_slots,
+            "preference_toggles": self.preference_toggles or [],
             "source": self.source,
         }
 
@@ -215,6 +220,10 @@ def register_channel(
     # 修改方式：新增可选 ui_slots 参数（dict[str, str]），透传至 ChannelDefinition。
     # 目的：让渠道在单一 register_channel 调用中完成后端适配器和所有前端插槽 UI 的注册。
     ui_slots: Optional[Dict[str, str]] = None,
+    # 修改原因：渠道级布尔配置开关（如 WebSocket 传输）需要由渠道声明，前端按元数据动态渲染。
+    # 修改方式：新增可选 preference_toggles 参数，每项 {key, label, tip}，透传至 ChannelDefinition。
+    # 目的：新渠道声明即可出现配置开关，避免在前端硬编码 engine 白名单。
+    preference_toggles: Optional[List[Dict[str, str]]] = None,
     # 修改原因：OAuth provider 实例应由渠道自身在 register_channel 时声明，main.py 不应维护渠道清单。
     # 修改方式：新增可选 oauth_provider 参数；传入 provider 时会自动把渠道标记为 OAuth 渠道。
     # 目的：让内置渠道和插件渠道都通过同一个注册入口完成 OAuth provider 暴露。
@@ -272,6 +281,7 @@ def register_channel(
         # 修改方式：把 register_channel 的 ui_slots 参数写入 ChannelDefinition。
         # 目的：让渠道元数据接口能把各插槽脚本交给前端动态加载。
         ui_slots=ui_slots,
+        preference_toggles=preference_toggles,
         # 修改原因：main.py 需要通过注册表发现每个渠道声明的 OAuthProvider 实例。
         # 修改方式：把 register_channel 的 oauth_provider 参数写入 ChannelDefinition，但不改变 to_dict 输出。
         # 目的：消除启动期硬编码注册清单，并让外置插件可以复用同一条注册路径。

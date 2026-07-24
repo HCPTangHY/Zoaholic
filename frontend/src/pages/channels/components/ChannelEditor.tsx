@@ -1229,6 +1229,18 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                       </Switch.Root>
                     </div>
 
+                    {/* 修改原因：渠道级布尔配置开关此前硬编码 engine 白名单，新渠道无法复用。
+                        修改方式：按渠道注册声明的 preference_toggles 元数据动态渲染，写入 provider.preferences[toggle.key]。
+                        目的：后端渠道声明开关即自动出现（如 openai-responses/codex 的 WebSocket 传输），无需改前端。 */}
+                    {(channelTypes.find(c => c.id === formData.engine)?.preference_toggles || []).map(toggle => (
+                      <div key={toggle.key} className="flex items-center justify-between p-3 bg-muted/50 rounded-lg border border-border">
+                        <span className="text-sm text-foreground" title={toggle.tip || ''}>{toggle.label}</span>
+                        <Switch.Root checked={!!formData.preferences[toggle.key]} onCheckedChange={val => updatePreference(toggle.key, val)} className="w-11 h-6 bg-muted rounded-full data-[state=checked]:bg-primary">
+                          <Switch.Thumb className="block w-5 h-5 bg-white rounded-full transition-transform data-[state=checked]:translate-x-[22px]" />
+                        </Switch.Root>
+                      </div>
+                    ))}
+
                     {/* 模型价格（渠道级） */}
                     <div className="border-t border-border pt-4">
                       <div className="flex items-center justify-between mb-3">

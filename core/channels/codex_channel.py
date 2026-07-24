@@ -219,8 +219,13 @@ class _QuotaCapturingClient:
         return _QuotaCapturingStreamContext(self._client.stream(*args, **kwargs))
 
 
-async def fetch_codex_response_stream(client, url, headers, payload, model, timeout):
-    """包装 Responses API 流式 adapter，从响应头采集 quota，并按需做身份混淆还原。"""
+async def fetch_codex_response_stream(client, url, headers, payload, model, timeout, provider=None):
+    """包装 Responses API 流式 adapter，从响应头采集 quota，并按需做身份混淆还原。
+
+    provider.preferences.websocket 为真时优先走 WebSocket 传输（连接复用，官方 agent 场景延迟更低）；
+    握手失败或内容产出前断开时透明回退 HTTP SSE（chatgpt.com WS 端点存在策略性秒断，见 codex issue #13041）。
+    WS 模式下 quota 从握手响应头和 error 帧内嵌 headers 采集。
+    """
     # 修改原因：Codex 身份混淆必须在真正发送上游请求前完成，而 quota 捕获仍需要复用原有 client wrapper。
     # 修改方式：读取当前 OAuth 账号和 provider 开关，先混淆 headers/payload，再把响应 chunk 按 state 还原给客户端。
     # 目的：让上游看到混淆身份，同时保持客户端对请求和响应中的身份标识无感知。
@@ -228,6 +233,25 @@ async def fetch_codex_response_stream(client, url, headers, payload, model, time
     auth_id = _get_identity_confuse_auth_id()
     if auth_id:
         headers, payload, state = apply_codex_identity_confuse(headers, payload, auth_id)
+
+    from core.channels.responses_ws import (
+        WsUnavailable,
+        fetch_responses_ws_stream,
+        resolve_transport_proxy,
+        websocket_enabled,
+    )
+    if websocket_enabled(provider):
+        try:
+            async for chunk in fetch_responses_ws_stream(
+                url, headers, payload, model, timeout,
+                proxy=resolve_transport_proxy(provider),
+                on_headers=_store_quota_from_headers,
+            ):
+                yield _restore_codex_identity_chunk(chunk, state)
+            return
+        except WsUnavailable as e:
+            from core.log_config import logger
+            logger.info(f"[codex-ws] WS unavailable ({e}), fallback to HTTP SSE")
 
     capturing_client = _QuotaCapturingClient(client)
     async for chunk in fetch_responses_stream(capturing_client, url, headers, payload, model, timeout):
@@ -682,6 +706,7 @@ async def get_codex_passthrough_meta(request, engine, provider, api_key=None):
 def register():
     """注册 Codex OAuth 渠道。"""
     from .registry import register_channel
+    from .responses_ws import WS_PREFERENCE_TOGGLE
 
     register_channel(
         id="codex",
@@ -706,6 +731,10 @@ def register():
             "quota_display": CODEX_QUOTA_DISPLAY,
             "import_placeholder": "rt_xxxxxxxx...",
         },
+        # 修改原因：WebSocket 传输开关由渠道注册声明，前端按 preference_toggles 元数据动态渲染。
+        # 修改方式：声明共享的 WS 开关定义。
+        # 目的：避免前端硬编码 engine 白名单。
+        preference_toggles=[WS_PREFERENCE_TOGGLE],
         source="builtin",
     )
 

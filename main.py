@@ -977,6 +977,12 @@ app = FastAPI(lifespan=lifespan, debug=is_debug)
 app.include_router(api_router)
 app.include_router(oauth_router)
 
+# 修改原因：客户端（如新版 Codex CLI）需要直连 Zoaholic 的 Responses WebSocket mode。
+# 修改方式：注册 /v1/responses 的 WS 端点，协议与 OpenAI 官方一致，内部复用 handler 调度与统计链路。
+# 目的：提供客户端→网关→上游的完整 WS 透传路径，与 HTTP 入口并存互不影响。
+from core.dialects.openai_responses_ws import register_ws_endpoint
+register_ws_endpoint(app)
+
 
 def generate_markdown_docs():
     openapi_schema = app.openapi()

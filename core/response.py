@@ -382,6 +382,10 @@ async def fetch_response(
         yield response_json
 
 
+# stream_adapter 是否接受 provider 关键字的签名缓存（key: id(adapter)）
+_stream_adapter_provider_support: dict = {}
+
+
 async def fetch_response_stream(
     client,
     url,
@@ -404,7 +408,24 @@ async def fetch_response_stream(
     
     channel = get_channel(engine)
     if channel and channel.stream_adapter:
-        async for chunk in channel.stream_adapter(client, url, headers, payload, model, timeout):
+        # 修改原因：部分渠道（如 openai-responses/codex）需要根据 provider.preferences 选择传输方式（HTTP/WebSocket）。
+        # 修改方式：对声明了 provider 形参的 stream_adapter 传入当前 provider；签名缓存避免每次反射。
+        # 目的：传输选择逻辑下沉到渠道内部，不影响现有六参数 adapter。
+        adapter = channel.stream_adapter
+        support_key = id(adapter)
+        accepts_provider = _stream_adapter_provider_support.get(support_key)
+        if accepts_provider is None:
+            try:
+                import inspect
+                accepts_provider = "provider" in inspect.signature(adapter).parameters
+            except Exception:
+                accepts_provider = False
+            _stream_adapter_provider_support[support_key] = accepts_provider
+        if accepts_provider:
+            chunk_iter = adapter(client, url, headers, payload, model, timeout, provider=provider)
+        else:
+            chunk_iter = adapter(client, url, headers, payload, model, timeout)
+        async for chunk in chunk_iter:
             # 应用响应拦截器和新增出站阶段
             chunk = await _apply_response_path_interceptors(
                 chunk, engine, model, is_stream=True,
