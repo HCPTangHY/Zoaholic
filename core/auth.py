@@ -84,6 +84,26 @@ def _resolve_admin_api_index(app) -> Optional[int]:
     return None
 
 
+def is_api_key_disabled(app, api_index: Optional[int]) -> bool:
+    """检查 api_keys 条目是否被管理员禁用。未设置 enabled 字段视为启用。"""
+    if api_index is None:
+        return False
+    try:
+        entry = app.state.api_keys_db[api_index]
+    except Exception:
+        return False
+    return isinstance(entry, dict) and entry.get("enabled", True) is False
+
+
+def _is_admin_jwt_token(token: Optional[str]) -> bool:
+    """判断 token 是否是管理控制台 JWT（用于禁用检查的控制台豁免）。"""
+    try:
+        from core.jwt_utils import is_admin_jwt
+        return bool(token) and is_admin_jwt(token)
+    except Exception:
+        return False
+
+
 async def verify_api_key(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
@@ -160,6 +180,12 @@ async def verify_api_key(
 
     if api_index is None:
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
+
+    # 修改原因：管理后台需要不删除配置即可停用一个 Key 的能力。
+    # 修改方式：api_keys 条目 enabled=False 时在所有鉴权入口拒绝；admin JWT 豁免以避免控制台失联。
+    # 目的：禁用是配置级开关，保留统计数据，可随时在后台重新启用。
+    if is_api_key_disabled(app, api_index) and not _is_admin_jwt_token(token):
+        raise HTTPException(status_code=403, detail="API Key has been disabled")
 
     if is_key_ip_blocked(app, api_index, client_ip):
         # 修改原因：通过身份解析后才能知道当前请求命中的 API Key，Key 级黑名单应在此时检查。
@@ -254,6 +280,10 @@ async def verify_admin_api_key(
 
     if api_index is None:
         raise HTTPException(status_code=403, detail="Invalid or missing credentials")
+
+    # 禁用的 admin Key 同样不能用于管理接口（JWT 路径已在上方提前返回，不受影响）
+    if is_api_key_disabled(app, api_index):
+        raise HTTPException(status_code=403, detail="API Key has been disabled")
 
     if is_key_ip_blocked(app, api_index, client_ip):
         # 修改原因：admin API Key 也可以配置 Key 级 IP 黑名单。

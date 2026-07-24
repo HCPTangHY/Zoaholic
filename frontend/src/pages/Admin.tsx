@@ -8,7 +8,7 @@ import {
   Folder, CheckCircle2, AlertCircle, AlertTriangle,
   Wand2, Wallet, Brain, Download, Check, Ban, BarChart3,
   ShieldCheck, Puzzle, ArrowRight, Smartphone, PackageCheck,
-  Globe, Zap
+  Globe, Zap, Power, PowerOff
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { KeyAnalyticsSheet } from '../components/KeyAnalyticsSheet';
@@ -25,6 +25,10 @@ interface ApiKeyData {
   group?: string;
   model?: string[];
   ip_blacklist?: string[];
+  // 修改原因：新增 Key 级启用开关，禁用时不删除配置即可拒绝该 Key 的全部请求。
+  // 修改方式：enabled 为可选字段，缺省视为启用，与后端 is_api_key_disabled 判定一致。
+  // 目的：类型层面支持后台列表的禁用/启用切换。
+  enabled?: boolean;
   preferences?: {
     credits?: number;
     created_at?: string;
@@ -853,6 +857,10 @@ export default function Admin() {
     const newKeys = [...keys];
     if (editingIndex !== null) {
       target.ip_blacklist = keyIpBlacklist;
+      // 修改原因：target 由表单字段整体重建，不含原条目的 enabled 字段。
+      // 修改方式：编辑已有 Key 时从原条目继承 enabled=false。
+      // 目的：避免编辑保存被禁用的 Key 后意外将其重新启用。
+      if (keys[editingIndex]?.enabled === false) target.enabled = false;
       newKeys[editingIndex] = target;
     } else {
       newKeys.push(target);
@@ -876,6 +884,44 @@ export default function Admin() {
     }
   };
 
+
+
+  // ========== Toggle Enabled ==========
+  // 修改原因：后台缺少不删除配置即可停用一个 Key 的入口。
+  // 修改方式：切换 api_keys 条目的 enabled 字段（禁用时写 false，启用时删除字段），整体提交 api_keys。
+  // 目的：禁用后该 Key 请求被拒绝但配置与统计数据保留，可随时恢复。
+  const handleToggleEnabled = async (index: number) => {
+    const keyObj = keys[index];
+    const name = keyObj.name || keyObj.api?.slice(0, 12) + '...';
+    const disabling = keyObj.enabled !== false;
+    if (!confirm(`确定要${disabling ? '禁用' : '启用'} API Key "${name}" 吗？${disabling ? '\n禁用后该 Key 的所有请求都会被拒绝，但配置与统计数据保留。' : ''}`)) return;
+
+    const newKeys = keys.map((k, i) => {
+      if (i !== index) return k;
+      const next: ApiKeyData = { ...k };
+      if (disabling) {
+        next.enabled = false;
+      } else {
+        delete next.enabled;
+      }
+      return next;
+    });
+    try {
+      const res = await apiFetch('/v1/api_config/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ api_keys: newKeys })
+      });
+      if (res.ok) {
+        setKeys(newKeys);
+        fetchData();
+      } else {
+        toastError(disabling ? '禁用失败' : '启用失败');
+      }
+    } catch {
+      toastError('网络错误');
+    }
+  };
 
 
   // ========== Delete ==========
@@ -1673,7 +1719,11 @@ export default function Admin() {
                       <button onClick={() => copyToClipboard(keyObj.api)} className="text-muted-foreground/60 hover:text-foreground"><Copy className="w-3 h-3" /></button>
                     </div>
                   </div>
-                  <span className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium flex-shrink-0 ${status.cls}`}>{status.icon} {status.label}</span>
+                  {keyObj.enabled === false ? (
+                    <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium flex-shrink-0 bg-red-500/10 text-red-600 dark:text-red-500 border border-red-500/20"><PowerOff className="w-3.5 h-3.5" /> 已禁用</span>
+                  ) : (
+                    <span className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium flex-shrink-0 ${status.cls}`}>{status.icon} {status.label}</span>
+                  )}
                 </div>
                 <div className="flex flex-wrap items-center gap-2 mb-3 text-xs">
                   <span className={`px-2 py-0.5 rounded font-medium ${keyObj.role === 'admin' ? 'bg-purple-500/10 text-purple-600 dark:text-purple-400' : 'bg-muted text-muted-foreground'}`}>{keyObj.role || 'user'}</span>
@@ -1685,6 +1735,7 @@ export default function Admin() {
                   <button onClick={() => openCreditsDialog(keyObj.api)} className="p-1.5 text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10 rounded-md" title="充值"><Wallet className="w-4 h-4" /></button>
                   <button onClick={() => openKeyAnalytics(keyObj)} className="p-1.5 text-primary hover:bg-primary/10 rounded-md" title="用量分析"><BarChart3 className="w-4 h-4" /></button>
                   <button onClick={() => openSheet(null, keyObj)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="复制"><Copy className="w-4 h-4" /></button>
+                  <button onClick={() => handleToggleEnabled(idx)} className={`p-1.5 rounded-md ${keyObj.enabled === false ? 'text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10' : 'text-amber-600 dark:text-amber-500 hover:bg-amber-500/10'}`} title={keyObj.enabled === false ? '启用' : '禁用'}>{keyObj.enabled === false ? <Power className="w-4 h-4" /> : <PowerOff className="w-4 h-4" />}</button>
                   <button onClick={() => openSheet(idx)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="编辑"><Edit className="w-4 h-4" /></button>
                   <button onClick={() => handleDelete(idx)} className="p-1.5 text-red-600 dark:text-red-500 hover:bg-red-500/10 rounded-md" title="删除"><Trash2 className="w-4 h-4" /></button>
                 </div>
@@ -1791,9 +1842,16 @@ export default function Admin() {
                       </div>
                     </td>
                     <td className="px-6 py-4 text-center">
-                      <span className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium ${status.cls}`}>
-                        {status.icon} {status.label}
-                      </span>
+                      {/* 配置级禁用优先于余额/配额运行状态展示 */}
+                      {keyObj.enabled === false ? (
+                        <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium bg-red-500/10 text-red-600 dark:text-red-500 border border-red-500/20">
+                          <PowerOff className="w-3.5 h-3.5" /> 已禁用
+                        </span>
+                      ) : (
+                        <span className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium ${status.cls}`}>
+                          {status.icon} {status.label}
+                        </span>
+                      )}
                     </td>
                     <td className="px-6 py-4 text-right">
                       <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -1805,6 +1863,9 @@ export default function Admin() {
                         </button>
                         <button onClick={() => openSheet(null, keyObj)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="复制配置">
                           <Copy className="w-4 h-4" />
+                        </button>
+                        <button onClick={() => handleToggleEnabled(idx)} className={`p-1.5 rounded-md ${keyObj.enabled === false ? 'text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10' : 'text-amber-600 dark:text-amber-500 hover:bg-amber-500/10'}`} title={keyObj.enabled === false ? '启用' : '禁用'}>
+                          {keyObj.enabled === false ? <Power className="w-4 h-4" /> : <PowerOff className="w-4 h-4" />}
                         </button>
                         <button onClick={() => openSheet(idx)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="编辑">
                           <Edit className="w-4 h-4" />

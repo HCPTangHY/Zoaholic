@@ -287,6 +287,18 @@ class StatsMiddleware:
                     token = byok_template_key
 
             if api_index is not None:
+                # 修改原因：Key 级启用开关需要在中间件标准鉴权分支同样生效（方言前缀变动时的兜底路径）。
+                # 修改方式：与 core/auth.py 使用同一判定函数；admin JWT 豁免。
+                # 目的：禁用后所有入口一致拒绝。
+                try:
+                    from core.auth import is_api_key_disabled, _is_admin_jwt_token
+                    if is_api_key_disabled(app, api_index) and not _is_admin_jwt_token(token):
+                        response = openai_error_response("API Key has been disabled", 403)
+                        await response(scope, receive, send)
+                        reset_byok_context(byok_context_tokens)
+                        return
+                except Exception:
+                    pass
                 if is_key_ip_blocked(app, api_index, client_ip):
                     # 修改原因：标准 /v1 鉴权解析出当前 API Key 后，必须继续检查该 Key 自己的 IP 黑名单。
                     # 修改方式：用 api_index 匹配 app.state.api_key_ip_blacklists 中的预解析规则，命中即返回指定 403。

@@ -193,6 +193,19 @@ def _create_dialect_verify_api_key(dialect_id: str):
             from fastapi import HTTPException
             raise HTTPException(status_code=403, detail="Invalid or missing API Key")
 
+        # 修改原因：Key 级启用开关需要覆盖方言入口（如 /v1beta、/v1/messages），不能只拦标准 /v1 路由。
+        # 修改方式：与 core/auth.py 使用同一判定函数；admin JWT 映射的索引豁免，避免控制台失联。
+        # 目的：禁用后该 Key 在所有协议入口均被拒绝，重新启用即恢复。
+        try:
+            from core.auth import is_api_key_disabled, _is_admin_jwt_token
+            if is_api_key_disabled(app, api_index) and not _is_admin_jwt_token(token):
+                from fastapi import HTTPException
+                raise HTTPException(status_code=403, detail="API Key has been disabled")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
         if is_key_ip_blocked(app, api_index, client_ip):
             # 修改原因：方言入口解析出 API Key 下标后，也要执行当前 Key 的 IP 黑名单。
             # 修改方式：用 api_index 读取 app.state.api_key_ip_blacklists 对应规则。

@@ -31,7 +31,6 @@ WORKSPACE_RULES: List[tuple] = [
     ("api.yaml", "rw"),
     ("data/", "rd"),
     ("plugins/", "r"),
-    ("plugins/secret_plugins/", "r"),
     ("pyproject.toml", "r"),
     ("docker-compose.yml", "r"),
     ("Dockerfile", "r"),
