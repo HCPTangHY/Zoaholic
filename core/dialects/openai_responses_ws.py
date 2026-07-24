@@ -93,10 +93,121 @@ def _authenticate(websocket: WebSocket) -> tuple[Optional[int], Optional[str], O
     return api_index, token, None
 
 
+# ==================== Chat Completions → Responses API 转换 ====================
+
+
+def _chat_chunk_to_responses_events(chunk: dict) -> list[dict]:
+    """把 Chat Completions SSE chunk 转换为 Responses API 事件列表。
+
+    handler 返回的 Response body 是 Chat Completions SSE（方言渲染层在 HTTP 路由层，
+    WS 端点不经过）。需要在此转换为客户端期望的 Responses API 事件格式。
+
+    已经是 Responses 格式（有 type 字段）的 chunk 原样返回。
+    """
+    # 已经是 Responses API 格式
+    if chunk.get("type"):
+        return [chunk]
+
+    # 不是 Chat Completions chunk
+    if chunk.get("object") != "chat.completion.chunk":
+        return [chunk]
+
+    events: list[dict] = []
+    choices = chunk.get("choices") or []
+    usage = chunk.get("usage")
+
+    for choice in choices:
+        delta = choice.get("delta") or {}
+        finish_reason = choice.get("finish_reason")
+
+        # reasoning content
+        reasoning = delta.get("reasoning_content")
+        if reasoning:
+            events.append({
+                "type": "response.reasoning_summary_text.delta",
+                "delta": reasoning,
+            })
+
+        # text content
+        content = delta.get("content")
+        if content:
+            events.append({
+                "type": "response.output_text.delta",
+                "delta": content,
+            })
+
+        # tool calls
+        for tc in (delta.get("tool_calls") or []):
+            tc_func = tc.get("function") or {}
+            if tc_func.get("name"):
+                events.append({
+                    "type": "response.output_item.added",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": tc.get("id", ""),
+                        "name": tc_func["name"],
+                    },
+                    "output_index": tc.get("index", 0),
+                })
+            if tc_func.get("arguments"):
+                events.append({
+                    "type": "response.function_call_arguments.delta",
+                    "delta": tc_func["arguments"],
+                    "call_id": tc.get("id", ""),
+                    "output_index": tc.get("index", 0),
+                })
+
+        # finish → response.completed（附带 usage）
+        if finish_reason:
+            resp_usage = {}
+            if isinstance(usage, dict):
+                resp_usage = {
+                    "input_tokens": usage.get("prompt_tokens", 0),
+                    "output_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                }
+                cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+                if cached:
+                    resp_usage["input_tokens_details"] = {"cached_tokens": cached}
+            events.append({
+                "type": "response.completed",
+                "response": {
+                    "id": chunk.get("id", ""),
+                    "object": "response",
+                    "status": "completed",
+                    "model": chunk.get("model", ""),
+                    "usage": resp_usage,
+                },
+            })
+
+    # usage-only chunk（无 choices 或 choices 为空）→ response.completed
+    if not choices and isinstance(usage, dict):
+        resp_usage = {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        }
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        if cached:
+            resp_usage["input_tokens_details"] = {"cached_tokens": cached}
+        events.append({
+            "type": "response.completed",
+            "response": {
+                "id": chunk.get("id", ""),
+                "object": "response",
+                "status": "completed",
+                "model": chunk.get("model", ""),
+                "usage": resp_usage,
+            },
+        })
+
+    return events
+
+
 # ==================== SSE → WS 帧转发 ====================
 
 async def _handle_sse_line(websocket: WebSocket, line: bytes) -> None:
-    """把一行 SSE 数据转换为 WS 帧。事件原样透传，错误 chunk 映射为官方 error 帧。"""
+    """把一行 SSE 数据转换为 WS 帧。Chat Completions chunk 转 Responses 事件，错误 chunk 映射 error 帧。"""
     line = line.strip()
     if not line or line.startswith(b":") or line.startswith(b"event:"):
         return
@@ -129,10 +240,12 @@ async def _handle_sse_line(websocket: WebSocket, line: bytes) -> None:
             await _send_error_frame(websocket, status, str(err))
         return
 
-    try:
-        await websocket.send_text(json_dumps_text(event, ensure_ascii=False))
-    except Exception:
-        raise WebSocketDisconnect()
+    # Chat Completions chunk → Responses API 事件
+    for out_event in _chat_chunk_to_responses_events(event):
+        try:
+            await websocket.send_text(json_dumps_text(out_event, ensure_ascii=False))
+        except Exception:
+            raise WebSocketDisconnect()
 
 
 async def _relay_response_as_ws(response, websocket: WebSocket, app) -> None:
