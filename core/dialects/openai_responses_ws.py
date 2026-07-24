@@ -253,15 +253,22 @@ async def _relay_response_as_ws(response, websocket: WebSocket, app) -> None:
 
     LoggingStreamingResponse 的统计逻辑（usage 解析、enqueue_stats）在其 __call__
     的 finally 中完成，用假 scope/receive 驱动即可完整保留统计链路。
+
+    关键：send 回调中 WS 发送失败时只记录标记、不抛异常。
+    原因：客户端收到 response.completed 后立即断连，但上游适配器的 merge_usage()
+    在 generator 尾部（yield [DONE] 之前），如果 send 抛异常会导致
+    __call__ → aclose() → GeneratorExit，merge_usage 永远不执行，
+    completion_tokens 归零，stream_guard 把成功请求标为 502。
     """
     buffer = b""
     status_code = 200
+    ws_closed = False  # WS 断连后停止发送但不中断 ASGI 驱动
 
     async def receive():
         return {"type": "http.request", "body": b"", "more_body": False}
 
     async def send(message: dict) -> None:
-        nonlocal buffer, status_code
+        nonlocal buffer, status_code, ws_closed
         msg_type = message.get("type")
         if msg_type == "http.response.start":
             status_code = message.get("status", 200)
@@ -272,19 +279,26 @@ async def _relay_response_as_ws(response, websocket: WebSocket, app) -> None:
         if not body:
             return
         if status_code >= 400:
-            # 非 2xx：body 是完整 JSON 错误，收集后统一处理
             buffer += body
             return
+        if ws_closed:
+            return  # WS 已断，静默丢弃，让 ASGI 正常耗尽 generator
         buffer += body
         while b"\n" in buffer:
             line, buffer = buffer.split(b"\n", 1)
-            await _handle_sse_line(websocket, line)
+            try:
+                await _handle_sse_line(websocket, line)
+            except (WebSocketDisconnect, RuntimeError, Exception) as e:
+                if "not connected" in str(e).lower() or isinstance(e, WebSocketDisconnect):
+                    ws_closed = True
+                    return
+                raise
 
     scope = {"type": "http", "app": app, "method": "POST", "path": "/v1/responses", "headers": []}
     await response(scope, receive, send)
 
     # 收尾
-    if status_code >= 400:
+    if status_code >= 400 and not ws_closed:
         raw = buffer.decode("utf-8", errors="replace")
         try:
             err_json = json_loads(raw)
@@ -299,8 +313,11 @@ async def _relay_response_as_ws(response, websocket: WebSocket, app) -> None:
                 await _send_error_frame(websocket, status_code, raw[:500])
         except Exception:
             await _send_error_frame(websocket, status_code, raw[:500] or "upstream error")
-    elif buffer.strip():
-        await _handle_sse_line(websocket, buffer)
+    elif buffer.strip() and not ws_closed:
+        try:
+            await _handle_sse_line(websocket, buffer)
+        except Exception:
+            pass
 
 
 # ==================== 单帧处理 ====================
@@ -350,7 +367,10 @@ async def _handle_response_create(websocket: WebSocket, payload: dict, api_index
         "upstream_response_body": None,
         "response_body": None,
         "raw_data_expires_at": None,
-        "dialect_id": "openai-responses-ws",
+        # 修改原因：dialect_id 必须与注册的方言 ID 一致，否则 LoggingStreamingResponse 的
+        # 修改方式：设为 "openai-responses"（注册 ID），不要自创 ID。
+        # 目的：_try_extract_usage 能通过 get_dialect 找到正确的 parse_usage，token 统计正常入库。
+        "dialect_id": "openai-responses",
     }
     info_token = request_info.set(request_info_data)
     try:
