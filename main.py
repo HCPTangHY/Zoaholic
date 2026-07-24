@@ -1157,7 +1157,10 @@ if __name__ == '__main__':
         "port": PORT,
         "proxy_headers": True,
         "forwarded_allow_ips": "*",
-        "ws": "none",
+        # 修改原因：/v1/responses 新增 WebSocket 透传端点，原配置 ws="none" 会让 WS 握手落到 SPA fallback 返回 HTML。
+        # 修改方式：启用 websockets 实现（依赖已存在）。
+        # 目的：让客户端 WS 连接正常完成 101 升级。
+        "ws": "websockets",
         # "log_level": "warning"
     }
     
