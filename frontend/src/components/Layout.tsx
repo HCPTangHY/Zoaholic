@@ -12,10 +12,10 @@ const navItems = [
   { id: '/channels', label: '渠道配置', icon: Server },
   { id: '/playground', label: '测试工坊', icon: Terminal },
   { id: '/plugins', label: '插件管理', icon: Puzzle },
+  { id: '/admin', label: '密钥管理', icon: Key },
   { id: '/logs', label: '系统日志', icon: FileText },
   { id: '/backend-logs', label: '后台日志', icon: Terminal },
   { id: '/workspace', label: '工作区', icon: FolderOpen },
-  { id: '/admin', label: '密钥管理', icon: Key },
   { id: '/settings', label: '系统设置', icon: SettingsIcon },
 ];
 
