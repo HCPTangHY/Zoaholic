@@ -376,14 +376,18 @@ async def _handle_response_create(websocket: WebSocket, payload: dict, api_index
     try:
         request_model = await parse_responses_request(payload, {}, {})
         model_handler = get_model_handler()
+        # 修改原因：传 dialect_id + original_payload 会触发 evaluate_passthrough，
+        #   当 dialect_id == target_engine（都是 "openai-responses"）时走 passthrough 路径，
+        #   passthrough 用 _fetch_passthrough_stream 直接 httpx POST，完全绕过渠道的
+        #   stream_adapter（fetch_responses_stream_transport），WS 传输层被跳过。
+        # 修改方式：不传 original_payload，阻止 passthrough 触发，走正常 process_request 路径。
+        # 目的：正常路径使用 stream_adapter → WS 优先/HTTP 回退 → 连接池复用。
         response = await model_handler.request_model(
             request_model,
             api_index,
             BackgroundTasks(),
             endpoint="/v1/responses",
             dialect_id="openai-responses",
-            original_payload=payload,
-            original_headers=dict(websocket.headers),
             raw_request=None,
         )
         await _relay_response_as_ws(response, websocket, app)
