@@ -60,6 +60,7 @@ import re
 from fastapi import HTTPException
 
 from ..log_config import logger
+from .extension import should_overwrite_registration
 
 
 # ==================== 插件参数解析工具 ====================
@@ -300,6 +301,23 @@ class InterceptorEntry:
 InboundInterceptor = Callable[..., Any]
 
 
+def _should_register_over(
+    table: Dict[str, "InterceptorEntry"],
+    entry_id: str,
+    new_plugin_name: Optional[str],
+    overwrite: bool,
+) -> bool:
+    """重复注册冲突裁决。
+
+    规则：不在表中或显式 overwrite 时允许写入；冲突时版本号高者胜，
+    版本相同或不可比较时后注册者（时间/加载顺序靠后）胜。
+    """
+    if entry_id not in table or overwrite:
+        return True
+    existing = table[entry_id]
+    return should_overwrite_registration(existing.plugin_name, new_plugin_name)
+
+
 class InterceptorRegistry:
     """
     拦截器注册表
@@ -349,8 +367,9 @@ class InterceptorRegistry:
             metadata: 元数据
             overwrite: 是否覆盖已存在的拦截器
         """
-        if interceptor_id in self._inbound_interceptors and not overwrite:
-            raise ValueError(f"Inbound interceptor '{interceptor_id}' already registered")
+        if not _should_register_over(self._inbound_interceptors, interceptor_id, plugin_name, overwrite):
+            logger.debug(f"Inbound interceptor '{interceptor_id}' keep existing registration (higher plugin version)")
+            return self._inbound_interceptors[interceptor_id]
         
         # 修改原因：前端需要从每个拦截器条目的 metadata.stage 判断插件属于哪个阶段。
         # 修改方式：注册时为未显式提供 stage 的旧插件补默认值，不覆盖插件自定义 metadata。
@@ -447,8 +466,9 @@ class InterceptorRegistry:
         回调签名为：
             async def interceptor(request_data, request, provider, api_key_info, enabled_plugins) -> request_data
         """
-        if interceptor_id in self._channel_inbound_interceptors and not overwrite:
-            raise ValueError(f"Channel inbound interceptor '{interceptor_id}' already registered")
+        if not _should_register_over(self._channel_inbound_interceptors, interceptor_id, plugin_name, overwrite):
+            logger.debug(f"Channel inbound interceptor '{interceptor_id}' keep existing registration (higher plugin version)")
+            return self._channel_inbound_interceptors[interceptor_id]
 
         # 修改原因：新增 channel_inbound 阶段后，前端需要从 metadata.stage 识别该插件能力。
         # 修改方式：注册时补充 channel_inbound_interceptors 默认 stage，并保留调用方传入的其它 metadata。
@@ -552,8 +572,9 @@ class InterceptorRegistry:
         Raises:
             ValueError: 如果拦截器已存在且 overwrite=False
         """
-        if interceptor_id in self._request_interceptors and not overwrite:
-            raise ValueError(f"Request interceptor '{interceptor_id}' already registered")
+        if not _should_register_over(self._request_interceptors, interceptor_id, plugin_name, overwrite):
+            logger.debug(f"Request interceptor '{interceptor_id}' keep existing registration (higher plugin version)")
+            return self._request_interceptors[interceptor_id]
         
         # 修改原因：前端需要从 metadata.stage 识别请求拦截阶段。
         # 修改方式：注册时补充 request_interceptors 默认 stage，不覆盖已有 stage。
@@ -673,8 +694,9 @@ class InterceptorRegistry:
         Returns:
             注册的 InterceptorEntry 对象
         """
-        if interceptor_id in self._response_interceptors and not overwrite:
-            raise ValueError(f"Response interceptor '{interceptor_id}' already registered")
+        if not _should_register_over(self._response_interceptors, interceptor_id, plugin_name, overwrite):
+            logger.debug(f"Response interceptor '{interceptor_id}' keep existing registration (higher plugin version)")
+            return self._response_interceptors[interceptor_id]
         
         # 修改原因：前端需要从 metadata.stage 识别响应拦截阶段。
         # 修改方式：注册时补充 response_interceptors 默认 stage，不覆盖已有 stage。
@@ -783,8 +805,9 @@ class InterceptorRegistry:
         回调签名为：
             async def interceptor(response_chunk, engine, model, provider, is_stream, enabled_plugins) -> response_chunk
         """
-        if interceptor_id in self._channel_outbound_interceptors and not overwrite:
-            raise ValueError(f"Channel outbound interceptor '{interceptor_id}' already registered")
+        if not _should_register_over(self._channel_outbound_interceptors, interceptor_id, plugin_name, overwrite):
+            logger.debug(f"Channel outbound interceptor '{interceptor_id}' keep existing registration (higher plugin version)")
+            return self._channel_outbound_interceptors[interceptor_id]
 
         # 修改原因：新增 channel_outbound 阶段后，前端需要从 metadata.stage 识别该插件能力。
         # 修改方式：注册时补充 channel_outbound_interceptors 默认 stage，并保留调用方传入的其它 metadata。
@@ -873,8 +896,9 @@ class InterceptorRegistry:
         回调签名为：
             async def interceptor(response_chunk, engine, model, api_key_info, is_stream, enabled_plugins) -> response_chunk
         """
-        if interceptor_id in self._key_outbound_interceptors and not overwrite:
-            raise ValueError(f"Key outbound interceptor '{interceptor_id}' already registered")
+        if not _should_register_over(self._key_outbound_interceptors, interceptor_id, plugin_name, overwrite):
+            logger.debug(f"Key outbound interceptor '{interceptor_id}' keep existing registration (higher plugin version)")
+            return self._key_outbound_interceptors[interceptor_id]
 
         # 修改原因：新增 key_outbound 阶段后，前端需要从 metadata.stage 识别该插件能力。
         # 修改方式：注册时补充 key_outbound_interceptors 默认 stage，并保留调用方传入的其它 metadata。
@@ -971,8 +995,9 @@ class InterceptorRegistry:
         Returns:
             注册的 InterceptorEntry 对象
         """
-        if enricher_id in self._balance_enrichers and not overwrite:
-            raise ValueError(f"Balance enricher '{enricher_id}' already registered")
+        if not _should_register_over(self._balance_enrichers, enricher_id, plugin_name, overwrite):
+            logger.debug(f"Balance enricher '{enricher_id}' keep existing registration (higher plugin version)")
+            return self._balance_enrichers[enricher_id]
         
         # 修改原因：余额补充器也会出现在插件能力列表中，需要与拦截器阶段保持同一 metadata.stage 口径。
         # 修改方式：注册时补充 balance_enrichers 默认 stage，不覆盖已有 stage。

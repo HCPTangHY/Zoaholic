@@ -4,10 +4,19 @@
 管理扩展点和扩展的注册与查询。
 """
 
+import logging
 from typing import Any, Callable, Dict, List, Optional, Set, Type
 from collections import defaultdict
 
-from .extension import ExtensionPoint, Extension, ExtensionPointType, BUILTIN_EXTENSION_POINTS
+from .extension import (
+    ExtensionPoint,
+    Extension,
+    ExtensionPointType,
+    BUILTIN_EXTENSION_POINTS,
+    should_overwrite_registration,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class PluginRegistry:
@@ -93,19 +102,35 @@ class PluginRegistry:
         
         ep = self._extension_points[extension_point]
         
-        # 检查是否为单例扩展点
+        # 单例扩展点冲突：版本号高者胜；版本相同或不可比较时后注册者（时间/加载顺序）胜
         if ep.singleton and self._extensions[extension_point] and not overwrite:
-            existing = list(self._extensions[extension_point].keys())[0]
-            raise ValueError(
-                f"Extension point '{extension_point}' is singleton, "
-                f"already has extension '{existing}'"
-            )
+            existing_id = list(self._extensions[extension_point].keys())[0]
+            existing = self._extensions[extension_point][existing_id]
+            if existing_id != extension_id:
+                if should_overwrite_registration(existing.plugin_name, plugin_name):
+                    del self._extensions[extension_point][existing_id]
+                    logger.info(
+                        f"Singleton extension '{existing_id}' on '{extension_point}' "
+                        f"replaced by '{extension_id}'"
+                    )
+                else:
+                    logger.debug(
+                        f"Singleton extension '{extension_id}' on '{extension_point}' "
+                        f"rejected, keep '{existing_id}' (higher plugin version)"
+                    )
+                    return existing
         
-        # 检查扩展是否已存在
+        # 重复注册冲突：版本号高者胜；版本相同或不可比较时后注册者（时间/加载顺序）胜
         if extension_id in self._extensions[extension_point] and not overwrite:
-            raise ValueError(
-                f"Extension '{extension_id}' already registered "
-                f"for extension point '{extension_point}'"
+            existing = self._extensions[extension_point][extension_id]
+            if not should_overwrite_registration(existing.plugin_name, plugin_name):
+                logger.debug(
+                    f"Extension '{extension_id}' on '{extension_point}' keep existing "
+                    f"registration (higher plugin version)"
+                )
+                return existing
+            logger.debug(
+                f"Extension '{extension_id}' on '{extension_point}' overwritten by re-registration"
             )
         
         # 验证实现是否满足接口要求

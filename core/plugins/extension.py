@@ -76,6 +76,54 @@ class Extension:
             self.metadata = {}
 
 
+# ==================== 重复注册冲突裁决 ====================
+
+
+def _version_key(version: Optional[str]) -> tuple:
+    """把版本号字符串解析成可比较的元组，空版本返回空元组。"""
+    if not version:
+        return ()
+    import re
+    parts = re.findall(r"\d+", str(version))
+    return tuple(int(p) for p in parts) if parts else ()
+
+
+def _cmp_version(a: tuple, b: tuple) -> int:
+    """比较两个版本元组，长度不足补零。返回 1 / 0 / -1。"""
+    n = max(len(a), len(b))
+    a = a + (0,) * (n - len(a))
+    b = b + (0,) * (n - len(b))
+    return (a > b) - (a < b)
+
+
+def get_plugin_version(plugin_name: Optional[str]) -> Optional[str]:
+    """从插件管理器读取插件版本号；查询失败或未加载返回 None。"""
+    if not plugin_name:
+        return None
+    try:
+        from .manager import get_plugin_manager
+        info = get_plugin_manager().loader.get_plugin(plugin_name)
+        return getattr(info, "version", None) if info else None
+    except Exception:
+        return None
+
+
+def should_overwrite_registration(
+    existing_plugin_name: Optional[str],
+    new_plugin_name: Optional[str],
+) -> bool:
+    """重复注册冲突裁决。
+
+    规则：版本号高者胜；版本相同或任一方版本不可比较时，
+    后注册者（时间/加载顺序靠后）覆盖先注册者。
+    """
+    old_v = _version_key(get_plugin_version(existing_plugin_name))
+    new_v = _version_key(get_plugin_version(new_plugin_name))
+    if _cmp_version(new_v, old_v) < 0:
+        return False
+    return True
+
+
 # 预定义的扩展点
 BUILTIN_EXTENSION_POINTS = {
     ExtensionPointType.CHANNELS: ExtensionPoint(
