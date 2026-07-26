@@ -57,7 +57,12 @@ DEFAULT_BASE_URL = "https://api.anthropic.com"
 CLAUDE_REFRESH_MIN_BACKOFF = 5
 CLAUDE_REFRESH_MAX_BACKOFF = 300
 CLAUDE_REFRESH_MAX_RETRIES = 3
-CLAUDE_CODE_USER_AGENT = "claude-code/2.1.97"
+# 修改原因：Anthropic 会根据 User-Agent 的产品名+版本号判定是否为官方 CLI 请求，
+#   旧值 claude-code/2.1.97 已被识别为第三方。
+# 修改方式：对齐 sub2api constants.go 中 CLICurrentVersion 和 DefaultHeaders["User-Agent"]。
+# 目的：降低被判定 third-party 而走 extra usage 的概率。
+CLAUDE_CODE_CLI_VERSION = "2.1.161"
+CLAUDE_CODE_USER_AGENT = f"claude-cli/{CLAUDE_CODE_CLI_VERSION} (external, cli)"
 
 # ── Session ID 缓存（per api_key，1 小时 TTL） ──
 _session_id_cache: dict[str, tuple[str, float]] = {}
@@ -113,11 +118,14 @@ def _strip_gateway_headers(headers: dict) -> dict:
         k: v for k, v in headers.items()
         if not any(k.lower().startswith(p) for p in _GATEWAY_HEADER_PREFIXES)
     }
+# 修改原因：anthropic-beta 头的完整集合是 Anthropic 判定请求来源的关键维度之一，
+#   缺少任何"官方 CLI 请求才带"的 beta 都会被降级到第三方额度。
+# 修改方式：对齐 sub2api FullClaudeCodeMimicryBetas() 的完整列表及顺序。
+# 目的：确保与真实 Claude Code CLI 流量一致，避免 third-party 降级。
 CLAUDE_CODE_ANTHROPIC_BETA = (
     "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"
-    "context-management-2025-06-27,prompt-caching-scope-2026-01-05,"
-    "structured-outputs-2025-12-15,fast-mode-2026-02-01,"
-    "token-efficient-tools-2026-03-28"
+    "prompt-caching-scope-2026-01-05,effort-2025-11-24,"
+    "context-management-2025-06-27,extended-cache-ttl-2025-04-11"
 )
 
 # 修改原因：CPA 在 refresh 遇到 429 时会按 refresh_token 记录 Retry-After 阻塞窗口。
@@ -410,7 +418,7 @@ class ClaudeCodeProvider(OAuthProvider):
             "Authorization": f"Bearer {access_token}",
             "anthropic-beta": "oauth-2025-04-20",
             "Content-Type": "application/json",
-            "User-Agent": "claude-code/2.1.97",
+            "User-Agent": CLAUDE_CODE_USER_AGENT,
         }
         try:
             async with httpx.AsyncClient(timeout=15) as client:
@@ -785,7 +793,7 @@ _CC_TOOL_STUBS: list[dict] = [
 _BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
 _BILLING_SALT = "59cf53e54c78"
 _BILLING_SAMPLE_INDEXES = (4, 7, 20)
-_BILLING_CC_VERSION = "2.1.97"
+_BILLING_CC_VERSION = CLAUDE_CODE_CLI_VERSION
 _BILLING_ENTRYPOINT = "cli"
 
 
@@ -1088,11 +1096,26 @@ def _apply_claude_code_headers(headers: dict, api_key: str | None) -> None:
     if _get_header_case_insensitive(headers, "x-client-request-id")[0] is None:
         headers["x-client-request-id"] = str(uuid.uuid4())
 
-    # X-Stainless SDK 头 — 模拟 Node.js/@anthropic-ai/sdk
+    # anthropic-version — 固定值，官方 CLI 始终携带
+    if _get_header_case_insensitive(headers, "anthropic-version")[0] is None:
+        headers["anthropic-version"] = "2023-06-01"
+
+    # Anthropic-Dangerous-Direct-Browser-Access — 官方 CLI 固定携带
+    if _get_header_case_insensitive(headers, "Anthropic-Dangerous-Direct-Browser-Access")[0] is None:
+        headers["Anthropic-Dangerous-Direct-Browser-Access"] = "true"
+
+    # X-Stainless SDK 头 — 完整模拟 Node.js/@anthropic-ai/sdk 指纹
+    # 修改原因：sub2api 注入 8 个 X-Stainless 头，我们之前只有 4 个，缺失的头会被判第三方。
+    # 修改方式：对齐 sub2api DefaultHeaders 的完整列表。
+    # 目的：请求头指纹与真实 Claude CLI 流量一致。
     for hdr, val in [
         ("X-Stainless-Retry-Count", "0"),
         ("X-Stainless-Runtime", "node"),
+        ("X-Stainless-Runtime-Version", "v24.3.0"),
         ("X-Stainless-Lang", "js"),
+        ("X-Stainless-Package-Version", "0.94.0"),
+        ("X-Stainless-OS", "Linux"),
+        ("X-Stainless-Arch", "arm64"),
         ("X-Stainless-Timeout", "600"),
     ]:
         if _get_header_case_insensitive(headers, hdr)[0] is None:
