@@ -3,12 +3,12 @@
 本文件自包含 Claude Code OAuth provider、渠道注册和响应头额度采集逻辑。
 复用 claude_channel 的 request/response adapter，只处理 OAuth 认证和额度采集。
 
-OAuth 流程参考 CLIProxyAPI (CPA) 的 internal/auth/claude/ 实现：
+OAuth 流程参考 sub2api 的 internal/pkg/oauth/ 实现：
 - Auth URL: https://claude.ai/oauth/authorize
-- Token URL: https://api.anthropic.com/v1/oauth/token
+- Token URL: https://platform.claude.com/v1/oauth/token
 - Client ID: 9d1c250a-e61b-44d9-88ed-5944d1962f5e
-- Redirect: http://localhost:54545/callback
-- Scope: user:profile user:inference user:sessions:claude_code ...
+- Redirect: https://platform.claude.com/oauth/code/callback
+- Scope: org:create_api_key user:profile user:inference user:sessions:claude_code ...
 - PKCE: S256
 - Token exchange/refresh 用 JSON body（不是 form-urlencoded）
 """
@@ -45,9 +45,12 @@ _oauth_manager = None
 
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 AUTH_URL = "https://claude.ai/oauth/authorize"
-DEFAULT_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
-DEFAULT_REDIRECT_URI = "http://localhost:54545/callback"
-SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+# 修改原因：Anthropic 已将 OAuth token 端点从 api.anthropic.com 迁移到 platform.claude.com，旧地址返回 405。
+# 修改方式：对齐 sub2api 的 oauth.TokenURL 和 oauth.RedirectURI。
+# 目的：修复 CC OAuth 登录 token exchange 405 报错。
+DEFAULT_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+DEFAULT_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
+SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 
@@ -300,9 +303,9 @@ class ClaudeCodeProvider(OAuthProvider):
     4. 不需要 id_token 解析（邮箱直接在 account.email_address 里）
     """
 
-    # 修改原因：CPA 的 Claude Code OAuth redirect_uri 固定为 localhost:54545/callback，路由层会读取这个字段。
-    # 修改方式：在 provider 上显式声明手动模式回调地址，避免落回 OAuthProvider 基类的 localhost:8080/callback。
-    # 目的：保证授权 URL 和 token exchange 使用 Anthropic 白名单内的固定回调地址。
+    # 修改原因：Anthropic OAuth 回调地址已迁移到 platform.claude.com/oauth/code/callback，不再用 localhost。
+    # 修改方式：声明新的回调地址，路由层读取后传给 authorize 和 exchange 两步。
+    # 目的：保证与 Anthropic 白名单一致。
     localhost_redirect_uri = DEFAULT_REDIRECT_URI
 
     @property
@@ -511,7 +514,8 @@ class ClaudeCodeProvider(OAuthProvider):
         token_url = self._resolve_token_url(config)
         headers = {
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": "axios/1.13.6",
         }
         attempts = CLAUDE_REFRESH_MAX_RETRIES if refresh_token else 1
         last_error: Exception | None = None

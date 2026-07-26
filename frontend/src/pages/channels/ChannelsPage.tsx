@@ -466,14 +466,14 @@ export default function ChannelsPage() {
             <h3 className="text-sm font-semibold">完成 OAuth 登录</h3>
             <div className="text-xs text-muted-foreground space-y-2">
               <p>1. 在弹出的窗口中完成登录</p>
-              <p>2. 登录后浏览器会跳转到一个<strong>无法访问</strong>的页面，这是正常的</p>
-              <p>3. 复制该页面地址栏的<strong>完整 URL</strong>，粘贴到下方</p>
+              <p>2. 登录后页面会显示 Authentication Code</p>
+              <p>3. 复制代码粘贴到下方（也支持粘贴完整回调 URL）</p>
             </div>
             <input
               type="text"
               value={manualUrl}
               onChange={e => setManualUrl(e.target.value)}
-              placeholder="http://localhost:1455/auth/callback?code=..."
+              placeholder="粘贴 Authentication Code 或完整回调 URL"
               className="w-full bg-muted border border-border rounded-lg p-3 text-sm font-mono outline-none focus:border-primary"
               autoFocus
             />

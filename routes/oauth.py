@@ -328,7 +328,20 @@ def _normalize_batch_import_data(data) -> list[dict]:
     if isinstance(data, dict) and isinstance(data.get("accounts"), list):
         return [_normalize_sub2api_account(account) for account in data.get("accounts", [])]
     if isinstance(data, list):
-        return [_normalize_cpa_import_item(item) for item in data]
+        # 修改原因：用户需要批量粘贴纯 refresh_token 列表（一行一个），data 是 ["rt1", "rt2", ...] 字符串数组。
+        # 修改方式：列表元素为字符串时包装为最小凭据结构，由后续 refresh 逻辑获取 access_token 和 email。
+        # 目的：复用现有 batch_import 链路，不新增端点。
+        results = []
+        for item in data:
+            if isinstance(item, str) and item.strip():
+                results.append({
+                    "key_id": f"token_{len(results) + 1}",
+                    "token_data": {"refresh_token": item.strip()},
+                    "source_format": "refresh_token",
+                })
+            else:
+                results.append(_normalize_cpa_import_item(item))
+        return results
     if isinstance(data, dict) and "access_token" in data:
         return [_normalize_cpa_import_item(data)]
     if isinstance(data, dict):

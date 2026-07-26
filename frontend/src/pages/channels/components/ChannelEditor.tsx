@@ -59,6 +59,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
   const [batchImportResult, setBatchImportResult] = useState<any>(null);
   const [batchImportLoading, setBatchImportLoading] = useState(false);
   const [batchImportError, setBatchImportError] = useState('');
+  const [batchImportMode, setBatchImportMode] = useState<'json' | 'refresh_tokens'>('json');
   const keyMoreMenuRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!keyMoreMenuOpen) return;
@@ -490,8 +491,27 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                         <span className="text-sm font-medium text-foreground">批量导入 OAuth 凭证</span>
                         <button type="button" onClick={() => { setBatchImportOpen(false); setBatchImportResult(null); setBatchImportError(''); setBatchJsonText(''); }} className="text-muted-foreground hover:text-foreground"><X className="w-4 h-4" /></button>
                       </div>
-                      <p className="text-xs text-muted-foreground">支持 sub2api 导出 JSON（含 accounts 数组）、CPA 单文件、CPA 多文件数组。也可上传 .json 或 .zip 文件。</p>
-                      <div className="flex gap-2">
+                      <div className="flex gap-1 border-b border-border pb-2">
+                        <button type="button" onClick={() => { setBatchImportMode('json'); setBatchImportResult(null); setBatchImportError(''); }} className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${batchImportMode === 'json' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-muted'}`}>CPA / sub2api</button>
+                        <button type="button" onClick={() => { setBatchImportMode('refresh_tokens'); setBatchImportResult(null); setBatchImportError(''); }} className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${batchImportMode === 'refresh_tokens' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground hover:bg-muted'}`}>Refresh Token 列表</button>
+                      </div>
+                      {batchImportMode === 'json' && <p className="text-xs text-muted-foreground">支持 sub2api 导出 JSON（含 accounts 数组）、CPA 单文件、CPA 多文件数组。也可上传 .json 或 .zip 文件。</p>}
+                      {batchImportMode === 'refresh_tokens' && (
+                        <>
+                          <p className="text-xs text-muted-foreground">每行一个 refresh_token，导入时自动刷新验证。</p>
+                          <textarea
+                            value={batchJsonText}
+                            onChange={e => { setBatchJsonText(e.target.value); setBatchImportResult(null); setBatchImportError(''); }}
+                            placeholder={'粘贴 refresh_token，每行一个\n\neyJhbGciOi...\neyJhbGciOi...'}
+                            className="w-full h-32 bg-background border border-border rounded-lg px-3 py-2 text-xs font-mono outline-none text-foreground resize-y"
+                          />
+                          {batchJsonText.trim() && (() => {
+                            const lines = batchJsonText.split('\n').map(s => s.trim()).filter(Boolean);
+                            return <p className="text-xs text-emerald-600">共 {lines.length} 个 refresh_token，导入时逐个刷新验证</p>;
+                          })()}
+                        </>
+                      )}
+                      {batchImportMode === 'json' && <div className="flex gap-2">
                         <label className="cursor-pointer text-xs text-primary hover:text-primary/80 flex items-center gap-1 border border-border rounded px-2 py-1">
                           <FileUp className="w-3 h-3" /> 上传文件
                           <input type="file" accept=".json,.zip" className="hidden" onChange={async (e) => {
@@ -516,14 +536,14 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                             e.target.value = '';
                           }} />
                         </label>
-                      </div>
-                      <textarea
+                      </div>}
+                      {batchImportMode === 'json' && <textarea
                         value={batchJsonText}
                         onChange={e => { setBatchJsonText(e.target.value); setBatchImportResult(null); setBatchImportError(''); }}
                         placeholder='{"accounts": [...]} 或 [{...}, {...}] 或单个 {"access_token": ...}'
                         className="w-full h-32 bg-background border border-border rounded-lg px-3 py-2 text-xs font-mono outline-none text-foreground resize-y"
-                      />
-                      {batchJsonText && (() => {
+                      />}
+                      {batchImportMode === 'json' && batchJsonText && (() => {
                         try {
                           const d = JSON.parse(batchJsonText);
                           // normalize to preview items
@@ -604,7 +624,13 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                           onClick={async () => {
                             setBatchImportLoading(true); setBatchImportError(''); setBatchImportResult(null);
                             try {
-                              const data = JSON.parse(batchJsonText);
+                              let data: any;
+                              if (batchImportMode === 'refresh_tokens') {
+                                data = batchJsonText.split('\n').map(s => s.trim()).filter(Boolean);
+                                if (data.length === 0) { setBatchImportError('请输入至少一个 refresh_token'); setBatchImportLoading(false); return; }
+                              } else {
+                                data = JSON.parse(batchJsonText);
+                              }
                               const res = await apiFetch('/v1/oauth/batch_import', {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },

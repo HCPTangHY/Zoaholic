@@ -351,11 +351,23 @@ export function useChannelOAuth({
     if (!oauthManualState || !manualUrl.trim()) return;
     setExchanging(true);
     try {
-      const url = new URL(manualUrl.trim());
-      const code = url.searchParams.get('code');
-      const callbackState = url.searchParams.get('state');
+      // 修改原因：Anthropic 新的 redirect_uri (platform.claude.com) 不再在 URL 参数中携带 code，
+      //   而是在页面上显示纯文本的 authentication code 让用户复制。
+      // 修改方式：先尝试解析为 URL（兼容旧流程），失败则将整个输入作为纯 auth code 处理。
+      // 目的：同时支持粘贴完整回调 URL 和纯 authentication code 文本。
+      const input = manualUrl.trim();
+      let code: string | null = null;
+      let callbackState: string | null = null;
+      try {
+        const url = new URL(input);
+        code = url.searchParams.get('code');
+        callbackState = url.searchParams.get('state');
+      } catch {
+        // 不是合法 URL，将整个输入作为 auth code（可能包含 #state 后缀）
+        code = input;
+      }
       if (!code) {
-        toastError('URL 中未找到 authorization code');
+        toastError('未找到 authorization code');
         return;
       }
       if (callbackState && callbackState !== oauthManualState.state) {
