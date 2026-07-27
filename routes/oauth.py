@@ -450,6 +450,63 @@ async def _sync_provider_api_key_rename(app, channel_id: str, old_key_id: str, n
     return True
 
 
+async def _sync_provider_api_key_add(app, channel_id: str, key_id: str) -> bool:
+    """OAuth 导入成功后，把新 key_id 追加到当前 provider 的 api 列表并持久化。
+
+    修改原因：渠道 Key 列表以 api.yaml 中 provider.api 为索引，OAuth 导入只写 oauth_state.json，
+    导致新账号不出现在渠道 Key 列表中，也不参与请求调度。
+    修改方式：定位 engine/provider 匹配的 provider，把新 key_id 追加到 api 列表末尾（已存在则跳过），
+    复用 _persist_config 写回配置并热更新运行时。
+    目的：导入后立即可见可用，无需管理员手工编辑渠道。
+    """
+    if not key_id:
+        return False
+    config = getattr(getattr(app, "state", None), "config", None)
+    if not isinstance(config, dict):
+        return False
+    providers = config.get("providers")
+    if not isinstance(providers, list):
+        return False
+
+    changed = False
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        provider_name = str(provider.get("provider") or provider.get("name") or "").strip()
+        provider_engine = str(provider.get("engine") or "").strip()
+        if provider_name != channel_id and provider_engine != channel_id:
+            continue
+
+        api_value = provider.get("api")
+        if isinstance(api_value, list):
+            existing = set()
+            for item in api_value:
+                if isinstance(item, dict) and len(item) == 1:
+                    raw_key = str(next(iter(item.keys()))).strip().lstrip("!")
+                    existing.add(raw_key)
+                elif isinstance(item, str):
+                    existing.add(item.strip().lstrip("!"))
+            if key_id not in existing:
+                api_value.append(key_id)
+                changed = True
+        elif isinstance(api_value, str):
+            if api_value.strip().lstrip("!") != key_id:
+                provider["api"] = [api_value, key_id] if api_value.strip() else [key_id]
+                changed = True
+        elif api_value is None:
+            provider["api"] = [key_id]
+            changed = True
+        break
+
+    if not changed:
+        return False
+
+    from routes.admin import _persist_config
+
+    await _persist_config(app, sections_to_verify=["providers"], changed_providers={channel_id})
+    return True
+
+
 def _require_provider_name(value: str | None) -> str | None:
     """规范化并校验 provider name。"""
     # 修改原因：所有 OAuth 凭据操作都必须限定渠道名，空 provider 会退回旧的全局账号语义。
@@ -706,10 +763,14 @@ async def import_account(request: Request):
             final_key_id = email if email else key_id
             already_exists = _key_exists_in_provider(request.app, channel_id, final_key_id)
             await oauth_mgr.register(channel_id, final_key_id, type_name, updated)
+            if not already_exists:
+                await _sync_provider_api_key_add(request.app, channel_id, final_key_id)
             return {"message": "Account imported", "key_id": final_key_id, "already_exists": already_exists}
         else:
             already_exists = _key_exists_in_provider(request.app, channel_id, key_id)
             await oauth_mgr.register(channel_id, key_id, type_name, token_data)
+            if not already_exists:
+                await _sync_provider_api_key_add(request.app, channel_id, key_id)
             return {"message": "Account imported", "key_id": key_id, "already_exists": already_exists}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -780,6 +841,8 @@ async def batch_import(request: Request):
             final_key_id = email or key_id
             already_exists = _key_exists_in_provider(request.app, channel_id, final_key_id)
             await oauth_mgr.register(channel_id, final_key_id, type_name, token_data)
+            if not already_exists:
+                await _sync_provider_api_key_add(request.app, channel_id, final_key_id)
             success += 1
             results.append({"key_id": final_key_id, "status": "success", "already_exists": already_exists})
         except Exception as exc:

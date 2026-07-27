@@ -875,13 +875,12 @@ def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None) -> di
     # 目的：保证本次请求只使用本次 sanitize 产生的反向映射。
     _reset_reverse_maps()
 
-    # ── Layer 1: system prompt 重写（对齐 sub2api gateway_claude_oauth_body.go） ──
-    # 修改原因：Anthropic 通过 system 块的结构和内容判定是否为真实 CLI 请求，
-    #   把用户自定义 system prompt 直接放在 system 里会被识别为第三方。
-    # 修改方式：
-    #   1) system 块替换为 [billing_block, CC身份前缀]——与真实 CLI 一致
-    #   2) 原始 system prompt 转移到 messages 开头作为 user/assistant 对注入
-    # 目的：让模型仍能收到完整指令，同时 system 块形态与真实 CLI 一致。
+    # ── Layer 1: system prompt 重写 ──
+    # 修改原因：Anthropic 要求 system 块以 billing header 开头才能走 plan limits，
+    #   但用户自定义 system prompt 降级到 messages 后会显著削弱指令遵循。
+    # 修改方式：system 块保持 [billing_block, CC身份前缀, 原始system] 顺序拼接，
+    #   不再把原始 system prompt 转移到 messages。
+    # 目的：billing 头仍在首位保证计费判定，原始指令保持 system 优先级生效。
     _CC_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
     system = payload.get("system")
     _ua = ""
@@ -911,17 +910,10 @@ def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None) -> di
                 parts.append(blk.strip())
         original_system_text = "\n\n".join(parts)
 
-    # 替换 system 为官方形态
+    # system 块按伪装头在前、原始 prompt 在后的顺序拼接
     payload["system"] = [billing_block, cc_identity_block]
-
-    # 原始 system prompt 转移到 messages 开头
     if original_system_text and original_system_text != _CC_IDENTITY:
-        injection_pair = [
-            {"role": "user", "content": [{"type": "text", "text": f"[System Instructions]\n{original_system_text}"}]},
-            {"role": "assistant", "content": [{"type": "text", "text": "Understood. I will follow these instructions."}]},
-        ]
-        messages = payload.get("messages", [])
-        payload["messages"] = injection_pair + (messages if isinstance(messages, list) else [])
+        payload["system"].append({"type": "text", "text": original_system_text})
 
     # ── Layer 3: Tool name 重命名 ──
     # 修改原因：原有的 _TOOL_RENAME_MAP 只覆盖了40个通用名，Clonoth 等客户端特有的

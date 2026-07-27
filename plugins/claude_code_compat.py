@@ -85,7 +85,7 @@ _reverse_prop_map: ContextVar[dict] = ContextVar("_ccc_reverse_prop_map", defaul
 # 修改原因：普通 Claude 渠道挂载插件时，需要与 claude-code 核心 channel 使用同一组默认版本和 billing 参数。
 # 修改方式：将核心 channel 的默认版本、billing salt、采样索引和 header 前缀提升为插件常量。
 # 目的：让插件生成的 User-Agent 和 billing header 与 Claude Code 伪装逻辑保持一致。
-DEFAULT_CLAUDE_CODE_VERSION = "2.1.97"
+DEFAULT_CLAUDE_CODE_VERSION = "2.1.161"
 DEFAULT_BILLING_SALT = "59cf53e54c78"
 DEFAULT_ENTRYPOINT_ENV = "CLAUDE_CODE_ENTRYPOINT"
 DEFAULT_ENTRYPOINT = "cli"
@@ -98,9 +98,8 @@ CLAUDE_CODE_IDENTITY_TEXT = "You are Claude Code, Anthropic's official CLI for C
 # 目的：防止普通 Claude 渠道仅带 tools beta，缺少 OAuth、thinking、redact 和 token-efficient tools 等标识。
 CLAUDE_CODE_ANTHROPIC_BETA = (
     "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,"
-    "context-management-2025-06-27,prompt-caching-scope-2026-01-05,"
-    "structured-outputs-2025-12-15,fast-mode-2026-02-01,"
-    "token-efficient-tools-2026-03-28"
+    "prompt-caching-scope-2026-01-05,effort-2025-11-24,"
+    "context-management-2025-06-27,extended-cache-ttl-2025-04-11"
 )
 
 # 修改原因：X-Claude-Code-Session-Id 需要在同一个 api key 上稳定一段时间，而不是每次请求变化。
@@ -332,17 +331,17 @@ def resolve_plugin_config(provider):
     return {
         "version": version,
         "entrypoint": entrypoint,
-        "user_agent": f"claude-code/{version}",
+        "user_agent": f"claude-cli/{version} (external, cli)",
         "billing_salt": billing_salt,
     }
 
 
 def parse_version_from_ua(ua, default_version=DEFAULT_CLAUDE_CODE_VERSION):
-    """从 User-Agent 解析 Claude Code 版本号，如 claude-code/2.1.97。"""
+    """从 User-Agent 解析 Claude Code 版本号，如 claude-cli/2.1.161。"""
     if not ua:
         return default_version
     for part in str(ua).split():
-        if part.startswith("claude-code/"):
+        if part.startswith("claude-code/") or part.startswith("claude-cli/"):
             version = part.split("/", 1)[1].strip()
             if version:
                 return version
@@ -350,14 +349,14 @@ def parse_version_from_ua(ua, default_version=DEFAULT_CLAUDE_CODE_VERSION):
 
 
 def parse_entrypoint_from_ua(ua, default_entrypoint=DEFAULT_ENTRYPOINT):
-    """从 User-Agent 解析 entrypoint，如 claude-code/2.1.97 vscode。"""
+    """从 User-Agent 解析 entrypoint，如 claude-cli/2.1.161 (external, cli)。"""
     if not ua:
         return default_entrypoint
     parts = str(ua).split()
     for index, part in enumerate(parts):
-        if part.startswith("claude-code/") and index + 1 < len(parts):
-            entrypoint = parts[index + 1].lower()
-            if entrypoint in ("cli", "vscode", "local-agent", "jetbrains", "emacs", "vim"):
+        if (part.startswith("claude-code/") or part.startswith("claude-cli/")) and index + 1 < len(parts):
+            entrypoint = parts[index + 1].lower().strip("(,)")
+            if entrypoint in ("cli", "vscode", "local-agent", "jetbrains", "emacs", "vim", "external"):
                 return entrypoint
     return default_entrypoint
 
@@ -400,7 +399,7 @@ def build_billing_header(messages, version=DEFAULT_CLAUDE_CODE_VERSION, entrypoi
     digest = hashlib.sha256(f"{billing_salt}{sampled}{version}".encode("utf-8")).hexdigest()[:3]
     return (
         f"{BILLING_HEADER_PREFIX} cc_version={version}.{digest}; "
-        f"cc_entrypoint={entrypoint}; cch=00000;"
+        f"cc_entrypoint={entrypoint};"
     )
 
 
@@ -424,11 +423,7 @@ def system_is_empty(system):
 
 
 def ensure_billing_header(payload, headers, billing_salt=DEFAULT_BILLING_SALT, default_version=DEFAULT_CLAUDE_CODE_VERSION, default_entrypoint=DEFAULT_ENTRYPOINT):
-    """Layer 1：注入 billing header，并在 system 为空时补 Claude Code 身份声明。"""
-    system = payload.get("system")
-    if has_billing_header(system):
-        return
-
+    """Layer 1：system prompt 重写 — billing + CC identity 在前，原 system 拼接在后。"""
     ua = str(get_header_case_insensitive(headers, "User-Agent") or "")
     version = parse_version_from_ua(ua, default_version)
     entrypoint = parse_entrypoint_from_ua(ua, default_entrypoint)
@@ -436,18 +431,29 @@ def ensure_billing_header(payload, headers, billing_salt=DEFAULT_BILLING_SALT, d
         "type": "text",
         "text": build_billing_header(payload.get("messages", []), version, entrypoint, billing_salt),
     }
+    cc_identity_block = {"type": "text", "text": CLAUDE_CODE_IDENTITY_TEXT}
 
-    if system_is_empty(system):
-        payload["system"] = [
-            billing_block,
-            {"type": "text", "text": CLAUDE_CODE_IDENTITY_TEXT},
-        ]
-    elif isinstance(system, str):
-        payload["system"] = [billing_block, {"type": "text", "text": system}]
+    system = payload.get("system")
+
+    # 提取原始 system prompt 文本
+    original_system_text = ""
+    if isinstance(system, str):
+        original_system_text = system.strip()
     elif isinstance(system, list):
-        payload["system"] = [billing_block, *system]
-    else:
-        payload["system"] = [billing_block, system]
+        parts = []
+        for blk in system:
+            if isinstance(blk, dict):
+                t = (blk.get("text") or "").strip()
+                if t and not t.startswith(BILLING_HEADER_PREFIX) and t != CLAUDE_CODE_IDENTITY_TEXT:
+                    parts.append(t)
+            elif isinstance(blk, str) and blk.strip():
+                parts.append(blk.strip())
+        original_system_text = "\n\n".join(parts)
+
+    # system 块按伪装头在前、原始 prompt 在后的顺序拼接
+    payload["system"] = [billing_block, cc_identity_block]
+    if original_system_text and original_system_text != CLAUDE_CODE_IDENTITY_TEXT:
+        payload["system"].append({"type": "text", "text": original_system_text})
 
 
 def clean_third_party_text(text):
@@ -531,7 +537,10 @@ def rename_tools_in_messages(messages, renamed):
 
 
 def rename_tools(payload):
-    """Layer 3：把 tools 数组里的第三方工具名重命名为 Claude Code PascalCase。"""
+    """Layer 3：把 tools 数组里的第三方工具名重命名为 Claude Code PascalCase。
+
+    先查映射表，未命中且包含下划线/连字符的名称自动转 PascalCase。
+    """
     renamed = {}
     tools = payload.get("tools")
     if isinstance(tools, list):
@@ -541,10 +550,19 @@ def rename_tools(payload):
             name = tool.get("name")
             if not isinstance(name, str):
                 continue
-            new_name = TOOL_RENAME_MAP.get(name.lower())
-            if new_name and name != new_name:
-                renamed[name] = new_name
-                tool["name"] = new_name
+            lower = name.lower()
+            mapped = TOOL_RENAME_MAP.get(lower)
+            if mapped and name != mapped:
+                renamed[name] = mapped
+                tool["name"] = mapped
+            elif "_" in name or "-" in name:
+                # 自动 snake_case/kebab-case → PascalCase
+                new_name = "".join(
+                    seg.capitalize() for seg in name.replace("-", "_").split("_") if seg
+                )
+                if new_name and new_name != name:
+                    renamed[name] = new_name
+                    tool["name"] = new_name
 
     rename_tools_in_messages(payload.get("messages"), renamed)
     return renamed
@@ -661,7 +679,7 @@ def apply_claude_code_headers(headers, api_key=None, config=None):
 
     resolved_config = config or {}
     version = resolved_config.get("version") or DEFAULT_CLAUDE_CODE_VERSION
-    user_agent = resolved_config.get("user_agent") or f"claude-code/{version}"
+    user_agent = resolved_config.get("user_agent") or f"claude-cli/{version} (external, cli)"
 
     # 修改原因：普通 Claude adapter 默认发送 x-api-key，但 Claude Code OAuth 使用 Bearer token。
     # 修改方式：移除 x-api-key，并优先用传入 api_key 生成 Authorization；没有 api_key 时使用原 x-api-key 值。
@@ -683,10 +701,22 @@ def apply_claude_code_headers(headers, api_key=None, config=None):
     if get_header_case_insensitive(headers, "x-client-request-id") is None:
         headers["x-client-request-id"] = str(uuid.uuid4())
 
+    # anthropic-version 补全
+    if get_header_case_insensitive(headers, "anthropic-version") is None:
+        headers["anthropic-version"] = "2023-06-01"
+
+    # Anthropic-Dangerous-Direct-Browser-Access 补全
+    if get_header_case_insensitive(headers, "Anthropic-Dangerous-Direct-Browser-Access") is None:
+        headers["Anthropic-Dangerous-Direct-Browser-Access"] = "true"
+
     stainless_defaults = [
         ("X-Stainless-Retry-Count", "0"),
         ("X-Stainless-Runtime", "node"),
+        ("X-Stainless-Runtime-Version", "v24.3.0"),
         ("X-Stainless-Lang", "js"),
+        ("X-Stainless-Package-Version", "0.94.0"),
+        ("X-Stainless-OS", "Linux"),
+        ("X-Stainless-Arch", "arm64"),
         ("X-Stainless-Timeout", "600"),
     ]
     for header_name, value in stainless_defaults:
@@ -724,7 +754,7 @@ def _is_native_claude_code(request, headers):
     # fallback 到上游构建的 headers
     if not client_ua:
         client_ua = str(get_header_case_insensitive(headers, "User-Agent") or "")
-    return "claude-code/" in client_ua or "claude-cli/" in client_ua
+    return "claude-code/" in client_ua or "claude-cli/" in client_ua or "claude-code-" in client_ua
 
 
 async def claude_code_compat_request_interceptor(request, engine, provider, api_key, url, headers, payload):

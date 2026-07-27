@@ -42,6 +42,10 @@ from . import gemini_cli_channel
 # 修改方式：与其他自包含 OAuth 渠道一样显式导入 antigravity_channel。
 # 目的：让注册表、OAuthManager 和管理端都能发现 antigravity engine。
 from . import antigravity_channel
+# 修改原因：Grok (xAI) OAuth 是新的内置渠道，必须在 channels 包导入时加载模块定义。
+# 修改方式：与其他自包含 OAuth 渠道一样显式导入 grok_channel。
+# 目的：让注册表、OAuthManager 和管理端都能发现 grok engine。
+from . import grok_channel
 
 # 调用各渠道的 register() 函数
 openai_channel.register()
@@ -68,6 +72,7 @@ gemini_cli_channel.register()
 # 修改方式：在内置渠道注册序列末尾调用 antigravity_channel.register()。
 # 目的：让 core.channels.get_channel("antigravity") 和 OAuth provider 扫描都能工作。
 antigravity_channel.register()
+grok_channel.register()
 
 __all__ = [
     # 类型定义
