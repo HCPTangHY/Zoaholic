@@ -265,6 +265,11 @@ async def get_version(api_index: int = Depends(verify_admin_api_key)):
     result = {
         "version": _get_current_version(app),
         "deploy_type": deploy_type,
+        # 修改原因：前端侧边栏/登录页的 GitHub 链接需要显示当前部署对应的作者/仓库，方便区分是哪个 fork。
+        # 修改方式：直接回传后端已有的 GITHUB_REPO（可由环境变量覆盖）及完整仓库 URL。
+        # 目的：fork 部署只需设置 GITHUB_REPO 环境变量，前端就能自动显示正确的作者/仓库名。
+        "repo": GITHUB_REPO,
+        "repo_url": f"https://github.com/{GITHUB_REPO}",
     }
     if deploy_type == "git":
         result["git"] = _get_git_info()
