@@ -7,6 +7,7 @@ OpenAI Chat Completions 到 Gemini 再到 Antigravity 的请求转换，以及�
 import asyncio
 import copy
 import hashlib
+import os
 import random
 import re
 import time
@@ -32,8 +33,13 @@ from core.utils import get_model_dict
 # OAuth 与上游协议常量
 # ═══════════════════════════════════════════════════════════════════
 
-CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
-CLIENT_SECRET = "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"
+# 修改原因：原先把 Antigravity 的 Google OAuth client_id/client_secret 明文硬编码在源码里，
+#           GitHub Secret Scanning 会识别出 GOCSPX- 开头的 Google OAuth client secret 并拒绝推送。
+# 修改方式：改为纯环境变量读取，代码库中不再保留任何凭据明文；缺失时为空字符串。
+# 目的：仓库里不含可被扫描到的密钥；部署方通过 .env / 环境变量提供
+#       ANTIGRAVITY_CLIENT_ID 与 ANTIGRAVITY_CLIENT_SECRET（使用 Antigravity 渠道时必填）。
+CLIENT_ID = os.getenv("ANTIGRAVITY_CLIENT_ID", "")
+CLIENT_SECRET = os.getenv("ANTIGRAVITY_CLIENT_SECRET", "")
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo?alt=json"

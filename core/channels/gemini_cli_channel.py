@@ -30,8 +30,14 @@ _oauth_manager = None
 # OAuth 常量
 # ═══════════════════════════════════════════════════════════════════
 
-CLIENT_ID = os.getenv("GEMINI_CLI_CLIENT_ID", __import__("base64").b64decode("NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRybnA5ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t").decode())
-CLIENT_SECRET = os.getenv("GEMINI_CLI_CLIENT_SECRET", __import__("base64").b64decode("R09DU1BYLTR1SGdNUG0tMW83U2stZ2VWNkN1NWNsWEZzeGw=").decode())
+# 修改原因：原先把 Gemini CLI 的 OAuth client_id/client_secret 以 base64 形式内置在源码里，
+#           GitHub Secret Scanning 会解 base64 并识别出 GOCSPX- 开头的 Google OAuth client secret，
+#           从而拒绝推送（found secret(s) in the commit）。
+# 修改方式：改为纯环境变量读取，代码库中不再保留任何凭据明文/编码；缺失时为空字符串。
+# 目的：仓库里不含可被扫描到的密钥；部署方通过 .env / 环境变量提供 GEMINI_CLI_CLIENT_ID 与
+#       GEMINI_CLI_CLIENT_SECRET（使用 Gemini CLI 渠道时必填，否则 OAuth 无法完成）。
+CLIENT_ID = os.getenv("GEMINI_CLI_CLIENT_ID", "")
+CLIENT_SECRET = os.getenv("GEMINI_CLI_CLIENT_SECRET", "")
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 DEFAULT_REDIRECT_URI = "http://localhost:8085/oauth2callback"
