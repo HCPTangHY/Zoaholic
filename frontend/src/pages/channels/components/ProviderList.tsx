@@ -1,8 +1,63 @@
 import { BarChart3, CheckCircle2, Edit, Files, Folder, Play, Power, Puzzle, Search, Trash2, X, XCircle } from 'lucide-react';
 import type React from 'react';
+import { useEffect, useState } from 'react';
 
 import { ProviderLogo } from '../../../components/ProviderLogos';
-import type { Segment } from '../types';
+import type { ProviderSortMode, Segment } from '../types';
+
+// 修改原因：原权重输入框每次 onChange 都会调用 handleUpdateWeight，触发保存+按权重重排，
+//           用户在输入中途（例如 10 前加 1 变成 110 的过程）就会看到列表跳序。
+// 修改方式：抽出受控的本地输入组件，只有在失焦（blur）或按下 Enter 时才把最终值提交给上层。
+// 目的：让权重编辑“确认后再排序”，输入过程中列表保持稳定。
+function WeightInput({
+  value,
+  onCommit,
+  className,
+  onClick,
+}: {
+  value: number;
+  onCommit: (newWeight: number) => void;
+  className?: string;
+  onClick?: (e: React.MouseEvent) => void;
+}) {
+  const [draft, setDraft] = useState<string>(String(value));
+
+  // 外部权重变化（例如保存成功后刷新）时，同步回本地草稿，避免显示陈旧值。
+  useEffect(() => {
+    setDraft(String(value));
+  }, [value]);
+
+  const commit = () => {
+    const parsed = parseInt(draft, 10);
+    const next = Number.isNaN(parsed) ? 0 : parsed;
+    if (next !== value) {
+      onCommit(next);
+    } else {
+      // 值没变（或被清空后仍等于原值）时，纠正草稿显示。
+      setDraft(String(value));
+    }
+  };
+
+  return (
+    <input
+      type="number"
+      value={draft}
+      onChange={e => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={e => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          (e.target as HTMLInputElement).blur();
+        } else if (e.key === 'Escape') {
+          setDraft(String(value));
+          (e.target as HTMLInputElement).blur();
+        }
+      }}
+      onClick={onClick}
+      className={className}
+    />
+  );
+}
 
 // 修改原因：渠道列表渲染占据 ChannelsPage 大部分 JSX，需要独立成组件。
 // 修改方式：把原筛选栏、移动端卡片、桌面表格和不活跃分组整体迁移，并用 props 注入 handlers。
@@ -20,6 +75,8 @@ export interface ProviderListProps {
   setFilterGroup: (value: string) => void;
   filterStatus: '' | 'enabled' | 'disabled';
   setFilterStatus: (value: '' | 'enabled' | 'disabled') => void;
+  sortMode: ProviderSortMode;
+  setSortMode: (value: ProviderSortMode) => void;
   availableEngines: string[];
   availableGroups: string[];
   hasActiveFilters: string | boolean;
@@ -47,7 +104,7 @@ export interface ProviderListProps {
 
 export function ProviderList({
   loading, totalListItemCount, visibleListItemCount, filterKeyword, setFilterKeyword, filterEngine, setFilterEngine,
-  filterGroup, setFilterGroup, filterStatus, setFilterStatus, availableEngines, availableGroups, hasActiveFilters,
+  filterGroup, setFilterGroup, filterStatus, setFilterStatus, sortMode, setSortMode, availableEngines, availableGroups, hasActiveFilters,
   segments, expandedInactiveGroups, toggleInactiveGroup, runtimeKeyStatus, getMatchedModels, getProviderAnalyticsName,
   setAnalyticsProvider, setAnalyticsOpen, openTestDialog, handleToggleProvider, handleCopyProvider, openModal, handleDeleteProvider,
   handleUpdateWeight, buildSubChannelProvider, handleToggleSubChannel, openSubChannelEdit, handleDeleteSubChannel,
@@ -93,10 +150,9 @@ export function ProviderList({
         <div className="flex items-center justify-between pt-3 border-t border-border gap-2">
           <div className="flex items-center gap-1.5 flex-shrink-0">
             <span className="text-xs text-muted-foreground">权重:</span>
-            <input
-              type="number"
+            <WeightInput
               value={weight}
-              onChange={e => handleUpdateWeight(idx, parseInt(e.target.value) || 0)}
+              onCommit={newWeight => handleUpdateWeight(idx, newWeight)}
               className="w-12 bg-muted border border-border rounded px-1.5 py-1 text-center font-mono text-xs text-foreground"
             />
           </div>
@@ -221,6 +277,18 @@ export function ProviderList({
             <option value="">全部状态</option>
             <option value="enabled">已启用</option>
             <option value="disabled">已禁用</option>
+          </select>
+
+          {/* 排序方式：支持权重降序 / 启用优先 / 名称 */}
+          <select
+            value={sortMode}
+            onChange={e => setSortMode(e.target.value as ProviderSortMode)}
+            className="bg-background border border-border rounded-lg px-3 py-2 text-sm text-foreground min-w-[120px]"
+            title="列表排序方式"
+          >
+            <option value="weight">权重降序</option>
+            <option value="enabled">启用优先</option>
+            <option value="name">名称</option>
           </select>
 
           {/* 清除筛选 */}
@@ -403,10 +471,9 @@ export function ProviderList({
                       </span>
                     </td>
                     <td className="px-4 py-3 text-center">
-                      <input
-                        type="number"
+                      <WeightInput
                         value={weight}
-                        onChange={e => handleUpdateWeight(idx, parseInt(e.target.value) || 0)}
+                        onCommit={newWeight => handleUpdateWeight(idx, newWeight)}
                         onClick={e => e.stopPropagation()}
                         className="w-14 bg-muted border border-border rounded px-1 py-1 text-center font-mono text-sm text-foreground focus:border-primary outline-none"
                       />
