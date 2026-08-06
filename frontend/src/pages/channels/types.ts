@@ -211,3 +211,8 @@ export interface ProviderListItem {
 export type Segment =
   | { type: 'active'; item: ProviderListItem }
   | { type: 'inactive'; items: ProviderListItem[]; startIndex: number };
+
+// 修改原因：渠道列表原本只能按权重降序展示，无法把启用的渠道靠前或按名称排序。
+// 修改方式：新增前端排序方式枚举，供筛选栏下拉选择。
+// 目的：在不改后端、不持久化自定义顺序的前提下，支持多种展示排序。
+export type ProviderSortMode = 'weight' | 'enabled' | 'name';

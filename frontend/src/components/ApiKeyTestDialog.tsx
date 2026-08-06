@@ -13,6 +13,9 @@ import {
   ChevronDown,
   ChevronUp,
   Settings2,
+  ToggleLeft,
+  ToggleRight,
+  Trash2,
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import { formatApiKeyTestError, getInitialApiKeyTestModel, normalizeApiKeyTestModels } from '../lib/apiKeyTestDialog';
@@ -50,6 +53,10 @@ export interface ApiKeyTestDialogProps {
 
   /** 把「失效 key」标记为 disabled（仅修改当前编辑中的 formData，保存后生效） */
   onDisableKeys?: (indices: number[]) => void;
+  /** 切换单个 key 的启用/禁用状态（保存后生效） */
+  onToggleKeyDisabled?: (idx: number) => void;
+  /** 删除单个 key（保存后生效；OAuth 账号可能即时生效，由调用方决定） */
+  onDeleteKey?: (idx: number) => void;
 }
 
 export function ApiKeyTestDialog({
@@ -63,6 +70,8 @@ export function ApiKeyTestDialog({
   availableModels,
   initialKeyIndex,
   onDisableKeys,
+  onToggleKeyDisabled,
+  onDeleteKey,
 }: ApiKeyTestDialogProps) {
   const { token } = useAuthStore();
 
@@ -136,10 +145,12 @@ export function ApiKeyTestDialog({
     return hasModel && hasKey;
   };
 
-  const testSingleKey = async (idx: number, modelOverride?: string) => {
+  // 单 key 手动/自动测试增加 allowDisabled 参数（默认放行）；只有"测试全部"批量入口才继续遵守 includeDisabled。
+  // 目的：解耦"批量测试范围"与"单个 key 手动测试"，方便用户按需验证任意一把 key。
+  const testSingleKey = async (idx: number, modelOverride?: string, allowDisabled = true) => {
     const keyObj = apiKeys[idx];
     if (!keyObj) return;
-    if (!includeDisabled && keyObj.disabled) return;
+    if (!allowDisabled && !includeDisabled && keyObj.disabled) return;
 
     const apiKey = keyObj.key.trim();
     if (!apiKey) return;
@@ -273,7 +284,8 @@ export function ApiKeyTestDialog({
         if (!runningRef.current) return;
         const idx = queue.shift();
         if (idx === undefined) return;
-        await testSingleKey(idx);
+        // 批量"测试全部"仍遵守 includeDisabled（queue 已按该开关过滤），显式传 allowDisabled=false。
+        await testSingleKey(idx, undefined, false);
       }
     };
 
@@ -553,14 +565,36 @@ export function ApiKeyTestDialog({
                         </div>
 
                         {/* 单个测试按钮 */}
+                        {/* 未勾选"包含已禁用"时也应能测试单个（包括已禁用）key。
+                            按钮不再因 isSkipped 而禁用，testSingleKey 默认 allowDisabled=true。 */}
                         <button
                           onClick={() => void testSingleKey(idx)}
-                          disabled={r.status === 'testing' || isSkipped || !keyText}
+                          disabled={r.status === 'testing' || !keyText}
                           className="p-1.5 rounded-md text-primary hover:bg-primary/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0"
                           title="测试此 Key"
                         >
                           <Play className="w-3.5 h-3.5" />
                         </button>
+
+                        {/* 在测试按钮旁新增开关和删除按钮，仅在回调存在时渲染（保存后生效）。 */}
+                        {onToggleKeyDisabled && (
+                          <button
+                            onClick={() => onToggleKeyDisabled(idx)}
+                            className={`p-1 flex-shrink-0 transition-colors ${k.disabled ? 'text-muted-foreground hover:text-foreground' : 'text-emerald-500 hover:text-emerald-600'}`}
+                            title={k.disabled ? '启用此 Key' : '禁用此 Key'}
+                          >
+                            {k.disabled ? <ToggleLeft className="w-4 h-4" /> : <ToggleRight className="w-4 h-4" />}
+                          </button>
+                        )}
+                        {onDeleteKey && (
+                          <button
+                            onClick={() => onDeleteKey(idx)}
+                            className="p-1 text-red-500 hover:text-red-600 transition-colors flex-shrink-0"
+                            title="删除此 Key"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                       </div>
 
                       {isErrorExpanded && (

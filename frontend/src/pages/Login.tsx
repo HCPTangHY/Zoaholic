@@ -2,14 +2,29 @@ import { useEffect, useState } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { useNavigate } from 'react-router-dom';
 import { Activity, Key, LogIn, Github } from 'lucide-react';
+import { REDIRECT_AFTER_LOGIN_KEY } from '../lib/session';
+import { DEFAULT_REPO_SLUG, repoUrl } from '../lib/repo';
 
 export default function Login() {
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  // 修改原因：登录失效被动跳转时，登录页需提示用户“会话已过期”，而不是空白登录页。
+  // 修改方式：如果 sessionStorage 里存在来源页，说明是被动跳转，展示一行提示。
+  const [expiredHint, setExpiredHint] = useState(false);
   const login = useAuthStore((state) => state.login);
   const navigate = useNavigate();
+
+  useEffect(() => {
+    try {
+      if (sessionStorage.getItem(REDIRECT_AFTER_LOGIN_KEY)) {
+        setExpiredHint(true);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
 
   // 若后端提示需要初始化，则跳转到 /setup
   useEffect(() => {
@@ -61,7 +76,19 @@ export default function Login() {
       }
 
       login(token, 'admin');
-      navigate('/');
+      // 修改原因：登录成功后应尽量回到登录失效前所在页面，而不是一律回首页。
+      // 修改方式：读取并清除 sessionStorage 里的来源页，存在且不是 /login 时跳转回去。
+      let redirectTo = '/';
+      try {
+        const saved = sessionStorage.getItem(REDIRECT_AFTER_LOGIN_KEY);
+        sessionStorage.removeItem(REDIRECT_AFTER_LOGIN_KEY);
+        if (saved && saved !== '/login' && saved.startsWith('/')) {
+          redirectTo = saved;
+        }
+      } catch {
+        // ignore
+      }
+      navigate(redirectTo, { replace: true });
     } catch {
       setError('网络错误，请检查后端服务是否正常启动');
     } finally {
@@ -79,6 +106,12 @@ export default function Login() {
           <h1 className="text-2xl font-bold text-foreground tracking-tight">Zoaholic Gateway</h1>
           <p className="text-muted-foreground mt-2">请输入 API Key 登录管理控制台</p>
         </div>
+
+        {expiredHint && (
+          <div className="mb-4 text-amber-700 dark:text-amber-300 text-sm font-medium bg-amber-500/10 border border-amber-500/20 px-3 py-2 rounded-lg text-center">
+            登录已过期，请重新登录
+          </div>
+        )}
 
         <form onSubmit={handleLogin} className="bg-card border border-border p-8 rounded-2xl shadow-lg">
           <div className="space-y-4">
@@ -123,13 +156,17 @@ export default function Login() {
         </form>
 
         <div className="flex justify-center mt-6">
+          {/* 修改原因：原链接只显示 “GitHub”，无法区分当前是哪个作者的 Zoaholic 仓库。
+              修改方式：展示作者/仓库名，与侧边栏保持一致。 */}
+          {/* 登录页处于未鉴权状态，无法可靠调用需鉴权的 /v1/system/version，这里直接用默认常量兵底。 */}
           <a
-            href="https://github.com/HCPTangHY/Zoaholic"
+            href={repoUrl(DEFAULT_REPO_SLUG)}
             target="_blank"
             rel="noopener noreferrer"
+            title={DEFAULT_REPO_SLUG}
             className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
           >
-            <Github className="w-4 h-4" /> GitHub
+            <Github className="w-4 h-4" /> {DEFAULT_REPO_SLUG}
           </a>
         </div>
       </div>

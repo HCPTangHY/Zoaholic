@@ -298,6 +298,8 @@ export default function ChannelsPage() {
         setFilterGroup={core.setFilterGroup}
         filterStatus={core.filterStatus}
         setFilterStatus={core.setFilterStatus}
+        sortMode={core.sortMode}
+        setSortMode={core.setSortMode}
         availableEngines={virtualModelsState.availableEngines}
         availableGroups={virtualModelsState.availableGroups}
         hasActiveFilters={core.hasActiveFilters}
@@ -416,6 +418,8 @@ export default function ChannelsPage() {
           availableModels={keyTestOverride?.models || getProviderModelNameListForUi()}
           initialKeyIndex={keyTestInitialIndex}
           onDisableKeys={disableKeysInForm}
+          onToggleKeyDisabled={toggleKeyDisabled}
+          onDeleteKey={(idx) => void deleteKey(idx)}
         />
       )}
 

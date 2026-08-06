@@ -76,6 +76,25 @@ def _append_provider_rule(provider_rules: List[str], provider_name: str, model_n
         provider_rules.append(rule)
 
 
+def _append_literal_model_rules(
+    provider_rules: List[str],
+    model_name: str,
+    config: Dict[str, Any],
+    request_model: str,
+) -> None:
+    """Append providers exposing a public model ID that contains a slash."""
+    for provider in config["providers"]:
+        if provider.get("enabled") is False:
+            continue
+        model_dict = provider["_model_dict_cache"]
+        if model_name in model_dict:
+            _append_provider_rule(provider_rules, provider["provider"], model_name)
+        else:
+            pool_model = _get_pool_sharing_model_name(provider, request_model, model_dict)
+            if model_name == request_model and pool_model:
+                _append_provider_rule(provider_rules, provider["provider"], pool_model)
+
+
 def _is_virtual_model_authorized(request_model: str, config: Dict[str, Any], api_index: int) -> bool:
     """判断当前 API Key 是否允许访问虚拟模型名。"""
     # 修改原因：虚拟模型只是新的模型名入口，必须复用 API Key 的 model 授权数组。
@@ -318,20 +337,18 @@ async def get_provider_rules(
         if model_rule.startswith("<") and model_rule.endswith(">"):
             model_rule = model_rule[1:-1]
             # 处理带斜杠的模型名
-            for provider in config['providers']:
-                # 跳过禁用的渠道
-                if provider.get("enabled") is False:
-                    continue
-                model_dict = provider["_model_dict_cache"]
-                if model_rule in model_dict.keys():
-                    _append_provider_rule(provider_rules, provider['provider'], model_rule)
-                else:
-                    pool_model = _get_pool_sharing_model_name(provider, request_model, model_dict)
-                    if model_rule == request_model and pool_model:
-                        _append_provider_rule(provider_rules, provider['provider'], pool_model)
+            _append_literal_model_rules(provider_rules, model_rule, config, request_model)
         else:
-            provider_name = model_rule.split("/")[0]
-            model_name_split = "/".join(model_rule.split("/")[1:])
+            provider_name, model_name_split = model_rule.split("/", 1)
+            is_local_provider = is_local_api_key(provider_name) and provider_name in app.state.api_list
+            is_configured_provider = any(
+                provider.get("provider") == provider_name
+                for provider in config["providers"]
+            )
+            if not is_local_provider and not is_configured_provider:
+                _append_literal_model_rules(provider_rules, model_rule, config, request_model)
+                return provider_rules
+
             models_list = []
             matched_provider = None
 
@@ -361,6 +378,16 @@ async def get_provider_rules(
                     request_model,
                     matched_provider["_model_dict_cache"]
                 )
+
+            # If the provider name is also the public model namespace (for
+            # example provider="vendor", model_prefix="vendor/"), prefer the
+            # complete public model ID when it is explicitly requested.
+            if (
+                matched_provider is not None
+                and model_rule == request_model
+                and model_rule in models_list
+            ):
+                _append_provider_rule(provider_rules, provider_name, model_rule)
 
             # api_keys 中 model 为 provider_name/* 时，表示所有模型都匹配
             if model_name_split == "*":

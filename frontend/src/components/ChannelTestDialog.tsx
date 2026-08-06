@@ -35,6 +35,10 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
   const [expandedErrorModel, setExpandedErrorModel] = useState<string | null>(null);
   const [copiedErrorModel, setCopiedErrorModel] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  // 修改原因：startAllTests 中的 runNext 闭包会读到旧的 isRunning（仍为 false），
+  //           导致 while 条件首轮即为假，循环直接退出——"全部测试"无任何反应。
+  // 修改方式：用 runningRef 同步记录运行状态，循环条件改读 ref，与 ApiKeyTestDialog 保持一致。
+  const runningRef = useRef(false);
 
   // 解析模型列表
   useEffect(() => {
@@ -188,6 +192,7 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
   };
 
   const startAllTests = async () => {
+    runningRef.current = true;
     setIsRunning(true);
     abortControllerRef.current = new AbortController();
 
@@ -203,7 +208,7 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
     // 并发测试
     const queue = [...models];
     const runNext = async () => {
-      while (queue.length > 0 && isRunning) {
+      while (queue.length > 0 && runningRef.current) {
         const modelInfo = queue.shift();
         if (!modelInfo) break;
         await testSingleModel(modelInfo);
@@ -216,10 +221,12 @@ export function ChannelTestDialog({ open, onOpenChange, provider }: ChannelTestD
     }
     await Promise.all(tasks);
 
+    runningRef.current = false;
     setIsRunning(false);
   };
 
   const stopTest = () => {
+    runningRef.current = false;
     setIsRunning(false);
     abortControllerRef.current?.abort();
   };

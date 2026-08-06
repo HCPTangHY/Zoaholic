@@ -38,6 +38,7 @@ import type {
   PluginOption,
   ProviderFormData,
   ProviderModelOption,
+  ProviderSortMode,
   Segment,
   SubChannelFormData,
   UiSlotValue,
@@ -77,6 +78,11 @@ import {
 // 修改原因：ChannelsPage 需要先精简为页面骨架，但原页面状态和处理函数数量很多。
 // 修改方式：本 hook 现在只保留核心数据、运行时 Key 状态、余额状态和真实渠道列表筛选。
 // 目的：编辑器与虚拟模型逻辑迁入各自 hook 后，核心 hook 仍提供页面组合所需的稳定基础数据。
+// 修改原因：排序偏好需要跨会话保留，避免每次进入页面都重置。
+// 修改方式：把 localStorage 的键名抽为常量，供初始化读取和写回复用。
+// 目的：集中管理存储键，避免字符串写错导致读写不一致。
+export const CHANNEL_SORT_MODE_STORAGE_KEY = 'zoaholic.channels.sortMode';
+
 export interface RuntimeKeyStatusMap {
   [provider: string]: { auto_disabled: { key: string; remaining_seconds: number; duration: number; reason: string }[]; cooling: any[] };
 }
@@ -151,6 +157,8 @@ export interface UseChannelsCoreResult {
   setExpandedInactiveGroups: Dispatch<SetStateAction<Set<number>>>;
   toggleInactiveGroup: (groupKey: number) => void;
   segments: Segment[];
+  sortMode: ProviderSortMode;
+  setSortMode: (value: ProviderSortMode) => void;
 }
 
 export function useChannelsCore(): UseChannelsCoreResult {
@@ -184,6 +192,28 @@ export function useChannelsCore(): UseChannelsCoreResult {
   const [filterEngine, setFilterEngine] = useState<string>(''); // '' = 全部
   const [filterGroup, setFilterGroup] = useState<string>('');   // '' = 全部
   const [filterStatus, setFilterStatus] = useState<'' | 'enabled' | 'disabled'>('');
+  // 修改原因：渠道列表需要支持权重/启用优先/名称多种展示排序，并且用户选择应在刷新后保留。
+  // 修改方式：新增 sortMode 状态，初始值从 localStorage 读取（非法值回退权重降序），变化时写回。
+  // 目的：记住用户的排序偏好，避免每次进入页面都重置为默认权重降序。
+  const [sortMode, setSortMode] = useState<ProviderSortMode>(() => {
+    if (typeof window === 'undefined') return 'weight';
+    try {
+      const saved = window.localStorage.getItem(CHANNEL_SORT_MODE_STORAGE_KEY);
+      if (saved === 'weight' || saved === 'enabled' || saved === 'name') return saved;
+    } catch {
+      // localStorage 不可用（隐私模式等）时静默回退默认值。
+    }
+    return 'weight';
+  });
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(CHANNEL_SORT_MODE_STORAGE_KEY, sortMode);
+    } catch {
+      // 写入失败不影响功能，仅丢失偏好持久化。
+    }
+  }, [sortMode]);
 
   const { token } = useAuthStore();
 
@@ -516,9 +546,30 @@ export function useChannelsCore(): UseChannelsCoreResult {
   const providerListItems = useMemo(() => {
     // 修改原因：虚拟模型已由手风琴单独收纳，主列表只应该参与真实渠道排序和真实渠道操作。
     // 修改方式：调用 helper 只生成真实渠道条目，并保留原始 providers 下标。
-    // 目的：避免虚拟模型进入不活跃分段、真实渠道编辑和删除逻辑。
-    return buildProviderListItems(providers);
-  }, [providers]);
+    //           再按当前 sortMode 对列表条目做展示排序（不改动 providers 原数组和其下标）。
+    // 目的：避免虚拟模型进入不活跃分段、真实渠道编辑和删除逻辑；同时支持权重/启用优先/名称多种排序。
+    const items = buildProviderListItems(providers);
+    if (sortMode === 'weight') {
+      // buildProviderListItems 已按权重降序，保持默认行为。
+      return items;
+    }
+    const sorted = [...items];
+    if (sortMode === 'enabled') {
+      // 启用优先：enabled 的排前面，同为启用/禁用时再按权重降序。
+      sorted.sort((a, b) => {
+        const aEnabled = a.p?.enabled !== false ? 1 : 0;
+        const bEnabled = b.p?.enabled !== false ? 1 : 0;
+        if (aEnabled !== bEnabled) return bEnabled - aEnabled;
+        return getProviderWeight(b.p) - getProviderWeight(a.p);
+      });
+    } else if (sortMode === 'name') {
+      // 名称升序（不区分大小写）。
+      sorted.sort((a, b) =>
+        String(a.p?.provider || '').localeCompare(String(b.p?.provider || ''), undefined, { sensitivity: 'base' })
+      );
+    }
+    return sorted;
+  }, [providers, sortMode]);
 
   // ── 可用引擎列表和分组列表（从当前真实渠道数据中提取）──
   const availableEngines = useMemo(() => {
@@ -680,5 +731,6 @@ export function useChannelsCore(): UseChannelsCoreResult {
     expandedInactiveGroups, setExpandedInactiveGroups,
     toggleInactiveGroup,
     segments,
+    sortMode, setSortMode,
   };
 }

@@ -4,6 +4,7 @@ import { LayoutDashboard, Server, Terminal, Key, Settings as SettingsIcon, LogOu
 import { useAuthStore } from '../store/authStore';
 import { useThemeStore } from '../store/themeStore';
 import { apiFetch } from '../lib/api';
+import { DEFAULT_REPO_SLUG, repoUrl } from '../lib/repo';
 import { toastSuccess, toastError } from './Toast';
 import * as Dialog from '@radix-ui/react-dialog';
 
@@ -29,6 +30,8 @@ function NavContent({
   checkingUpdate,
   onCheckUpdate,
   hasUpdate,
+  repoSlug,
+  repoHref,
 }: {
   pathname: string;
   theme: string;
@@ -39,6 +42,8 @@ function NavContent({
   checkingUpdate: boolean;
   onCheckUpdate: () => void;
   hasUpdate: boolean;
+  repoSlug: string;
+  repoHref: string;
 }) {
   return (
     <>
@@ -77,13 +82,17 @@ function NavContent({
           </button>
         </div>
 
+        {/* 修改原因：原链接只显示 “GitHub”，无法区分当前是哪个作者的 Zoaholic 仓库。
+            修改方式：展示作者/仓库名（从 URL 提取），并用 title 属性补充完整仓库路径。 */}
         <a
-          href="https://github.com/HCPTangHY/Zoaholic"
+          href={repoHref}
           target="_blank"
           rel="noopener noreferrer"
+          title={repoSlug}
           className="flex items-center gap-3 px-4 py-2 text-sm text-muted-foreground hover:text-foreground transition-colors"
         >
-          <Github className="w-5 h-5" /> GitHub
+          <Github className="w-5 h-5 flex-shrink-0" />
+          <span className="truncate">{repoSlug}</span>
         </a>
 
         {versionLabel && (
@@ -123,6 +132,10 @@ export default function Layout() {
   const [currentVersion, setCurrentVersion] = useState('');
   const [deployType, setDeployType] = useState('');
   const [gitInfo, setGitInfo] = useState<{commit?: string}>({});
+  // 修改原因：GitHub 链接需显示当前部署对应的作者/仓库名。
+  // 修改方式：从 /v1/system/version 读取 repo/repo_url，缺失时回退默认常量。
+  const [repoSlug, setRepoSlug] = useState<string>(DEFAULT_REPO_SLUG);
+  const [repoHref, setRepoHref] = useState<string>(repoUrl(DEFAULT_REPO_SLUG));
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updating, setUpdating] = useState(false);
   const [showUpdateDialog, setShowUpdateDialog] = useState(false);
@@ -151,6 +164,8 @@ export default function Layout() {
           setCurrentVersion(data.version || '');
           setDeployType(data.deploy_type || '');
           setGitInfo(data.git || {});
+          if (data.repo) setRepoSlug(data.repo);
+          setRepoHref(data.repo_url || repoUrl(data.repo || DEFAULT_REPO_SLUG));
         }
         // 静默检查更新
         const uRes = await apiFetch('/v1/system/check-update', { headers: { Authorization: `Bearer ${token}` } });
@@ -249,6 +264,8 @@ export default function Layout() {
     checkingUpdate,
     onCheckUpdate: handleCheckUpdate,
     hasUpdate,
+    repoSlug,
+    repoHref,
   };
 
   const currentLabel = navItems.find(item => item.id === location.pathname)?.label || 'Zoaholic';

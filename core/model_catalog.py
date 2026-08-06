@@ -122,6 +122,22 @@ def _append_authorized_virtual_models(all_models, unique_models, config, api_ind
         _append_model_info_if_missing(all_models, unique_models, virtual_name)
 
 
+def _split_scoped_model_rule(model_rule, config, api_list):
+    """Return provider/model parts only when the prefix names a real provider."""
+    if not isinstance(model_rule, str) or "/" not in model_rule:
+        return None
+
+    provider_name, model_name = model_rule.split("/", 1)
+    is_local_provider = is_local_api_key(provider_name) and provider_name in api_list
+    is_configured_provider = any(
+        provider.get("provider") == provider_name
+        for provider in config.get("providers", [])
+    )
+    if not is_local_provider and not is_configured_provider:
+        return None
+    return provider_name, model_name
+
+
 def post_all_models(api_index, config, api_list, models_list):
     all_models = []
     unique_models = set()
@@ -136,6 +152,7 @@ def post_all_models(api_index, config, api_list, models_list):
     
     if config['api_keys'][api_index]['model']:
         for model in config['api_keys'][api_index]['model']:
+            configured_model = model
             if model == "all":
                 # 如果模型名为 all，则返回所有模型并去重，按分组过滤
                 all_models = get_all_models(config, allowed_groups)
@@ -143,9 +160,22 @@ def post_all_models(api_index, config, api_list, models_list):
                 _append_authorized_virtual_models(all_models, unique_models, config, api_index)
                 all_models.sort(key=lambda x: x["id"])
                 return all_models
-            if "/" in model:
-                provider = model.split("/")[0]
-                model = model.split("/")[1]
+
+            # A slash can be part of the public model ID. Angle brackets are the
+            # existing explicit escape; otherwise only a known provider prefix
+            # is interpreted as provider/model syntax.
+            if (
+                isinstance(model, str)
+                and "/" in model
+                and model.startswith("<")
+                and model.endswith(">")
+            ):
+                _append_model_info_if_missing(all_models, unique_models, model[1:-1])
+                continue
+
+            scoped_rule = _split_scoped_model_rule(model, config, api_list)
+            if scoped_rule is not None:
+                provider, model = scoped_rule
                 if model == "*":
                     if is_local_api_key(provider) and provider in api_list:
                         # 分组过滤：仅当本地聚合器 Key 与当前请求 Key 分组有交集时才包含
@@ -260,6 +290,7 @@ def post_all_models(api_index, config, api_list, models_list):
                             upstream_candidates = {v for k, v in model_dict.items() if v != k}
                             # 如果渠道配置了 model_prefix，只展示带前缀的模型名
                             prefix = provider_item.get('model_prefix', '').strip()
+                            visible_model = configured_model if configured_model in model_dict else model
                             for model_item in model_dict.keys():
                                 # 跳过通配符标记，"*" 不是真实模型名
                                 if model_item == "*":
@@ -275,7 +306,7 @@ def post_all_models(api_index, config, api_list, models_list):
                                 # 如果有前缀，只返回带前缀的模型名
                                 if prefix and not model_item.startswith(prefix):
                                     continue
-                                if model_item not in unique_models and model_item == model:
+                                if model_item not in unique_models and model_item == visible_model:
                                     unique_models.add(model_item)
                                     model_info = {
                                         "id": model_item,

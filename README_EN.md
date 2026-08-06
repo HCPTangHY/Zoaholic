@@ -81,7 +81,7 @@ docker run --rm -p 8000:8000 \
   -e PORT=8000 \
   -e CONFIG_STORAGE=db \
   -e DATABASE_URL="postgresql://user:pass@host:5432/db?sslmode=require" \
-  ghcr.io/hcptanghy/zoaholic:latest
+  ghcr.io/qianzhuowo/zoaholic:latest
 ```
 
 ### 3) First-time initialization
