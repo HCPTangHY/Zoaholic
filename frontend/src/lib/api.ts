@@ -30,21 +30,42 @@ const LOCAL_AUTH_FAILURE_DETAILS = new Set([
   'Invalid or missing API Key',
   'Invalid or missing credentials',
   'Permission denied',
+  // 修改原因：Key 被管理员禁用后，本地鉴权层同样会返回该文案，此时管理端 JWT 也应视为失效。
+  'API Key has been disabled',
 ]);
 
 /**
  * 判断 401/403 响应是否来自本地鉴权层。
  *
- * 本地鉴权层（core/auth.py）只返回 403 + FastAPI 标准 {"detail": "..."} 格式。
- * 上游透传的错误通常是 {"error": {...}} 或其他结构，不会命中这里的匹配。
+ * 存在两种本地鉴权失败来源：
+ * 1) core/auth.py 的 Depends 鉴权：返回 FastAPI 标准 {"detail": "..."}。
+ * 2) core/middleware.py 的 StatsMiddleware：对 /v1 端点鉴权失败时返回
+ *    OpenAI 风格 {"error": {"message": "...", "type": "..."}}。
+ *
+ * 管理控制台大部分请求打到 /v1 管理端点，JWT 失效时命中的是第 2 种格式；
+ * 早期实现只识别第 1 种，导致 JWT 过期后不弹提示、不跳转登录页。
+ *
+ * 上游透传的错误 message 不会与本地固定文案完全一致，因此按精确文案匹配可避免误登出。
  */
 async function isLocalAuthFailure(res: Response): Promise<boolean> {
   if (res.status !== 401 && res.status !== 403) return false;
 
   try {
     const data = await res.clone().json();
-    if (data && typeof data === 'object' && typeof data.detail === 'string') {
-      return LOCAL_AUTH_FAILURE_DETAILS.has(data.detail);
+    if (!data || typeof data !== 'object') return false;
+
+    // 1) FastAPI 标准 detail 格式（core/auth.py）
+    if (typeof data.detail === 'string' && LOCAL_AUTH_FAILURE_DETAILS.has(data.detail)) {
+      return true;
+    }
+
+    // 2) OpenAI 风格 error.message 格式（core/middleware.py 的 StatsMiddleware）
+    const errorObj = (data as { error?: unknown }).error;
+    if (errorObj && typeof errorObj === 'object') {
+      const message = (errorObj as { message?: unknown }).message;
+      if (typeof message === 'string' && LOCAL_AUTH_FAILURE_DETAILS.has(message)) {
+        return true;
+      }
     }
   } catch {
     // 响应体不是 JSON，不是本地鉴权错误

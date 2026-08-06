@@ -21,7 +21,7 @@ from core.log_config import logger
 router = APIRouter()
 
 # GitHub 仓库信息
-GITHUB_REPO = os.getenv("GITHUB_REPO", "HCPTangHY/Zoaholic")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "qianzhuowo/Zoaholic")
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}"
 GHCR_IMAGE = os.getenv("GHCR_IMAGE", f"ghcr.io/{GITHUB_REPO.lower()}")
 PYPI_PACKAGE = os.getenv("PYPI_PACKAGE", "zoaholic")

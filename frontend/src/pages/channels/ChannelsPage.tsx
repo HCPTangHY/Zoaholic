@@ -418,6 +418,8 @@ export default function ChannelsPage() {
           availableModels={keyTestOverride?.models || getProviderModelNameListForUi()}
           initialKeyIndex={keyTestInitialIndex}
           onDisableKeys={disableKeysInForm}
+          onToggleKeyDisabled={toggleKeyDisabled}
+          onDeleteKey={(idx) => void deleteKey(idx)}
         />
       )}
 

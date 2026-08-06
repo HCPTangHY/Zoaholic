@@ -7,7 +7,7 @@
  * 默认仓库标识（owner/repo）。作为后端字段缺失时的兜底。
  * 与 routes/system.py 的 GITHUB_REPO 默认值保持一致。
  */
-export const DEFAULT_REPO_SLUG = 'HCPTangHY/Zoaholic';
+export const DEFAULT_REPO_SLUG = 'qianzhuowo/Zoaholic';
 
 /**
  * 由 owner/repo 组装完整 GitHub 仓库 URL。
