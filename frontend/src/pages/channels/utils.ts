@@ -229,13 +229,14 @@ export function withRackCompactBalanceFallback(gauges: QuotaGauge[], bal: Balanc
 }
 
 export function sortProvidersByWeight(list: any[]): any[] {
-  // 修改原因：保存后需要从后端重新获取 providers，并继续保持页面原有的权重降序显示。
-  // 修改方式：把原先散落在加载和保存逻辑中的排序规则抽成纯 helper。
-  // 目的：避免刷新、保存和权重更新使用不同排序实现导致列表顺序不一致。
+  // 排序规则：权重降序 → 同权重按名称自然排序（数字感知 + Unicode）
   return [...list].sort((a, b) => {
     const weightA = a.preferences?.weight ?? a.weight ?? 0;
     const weightB = b.preferences?.weight ?? b.weight ?? 0;
-    return weightB - weightA;
+    if (weightB !== weightA) return weightB - weightA;
+    const nameA = String(a.provider || '');
+    const nameB = String(b.provider || '');
+    return nameA.localeCompare(nameB, undefined, { numeric: true, sensitivity: 'base' });
   });
 }
 

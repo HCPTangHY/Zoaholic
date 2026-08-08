@@ -482,20 +482,15 @@ export function PipelineView({
   return (
     <div className="bg-card border border-border rounded-xl px-4 pt-4 pb-3 overflow-visible">
       {/* Pipeline flow — 上游居中 */}
-      <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-start w-full min-w-0 gap-x-1">
-        {/* 左侧: start → inbound → overrides → request → */}
-        <div className="flex min-w-0 items-center justify-end gap-0">
-          <EndpointDot icon={<Smartphone className="w-3.5 h-3.5" />} label="入" />
-          <Connector />
-          <PipeNode icon={<ShieldCheck className="w-4 h-4" />} label="渠道入站" badge={channelInboundPlugins.length} badgeEmpty={channelInboundPlugins.length === 0} active={activeNode === 'inbound'} onClick={() => toggle('inbound')} />
-          <Connector />
-          <PipeNode icon={<SlidersHorizontal className="w-4 h-4" />} label="覆写" badge={overrideAndHeaderCount} badgeEmpty={overrideAndHeaderCount === 0} active={activeNode === 'overrides'} onClick={() => toggle('overrides')} />
-          <Connector />
-          <PipeNode icon={<Puzzle className="w-4 h-4" />} label="请求拦截" badge={requestPlugins.length} badgeEmpty={requestPlugins.length === 0} active={activeNode === 'request'} onClick={() => toggle('request')} />
-          <Connector />
-        </div>
-
-        {/* 中间: upstream — 使用 ProviderLogo */}
+      <div className="flex items-start w-full min-w-0 overflow-x-auto pt-2 pb-1 gap-0">
+        <EndpointDot icon={<Smartphone className="w-3.5 h-3.5" />} label="入" />
+        <Connector />
+        <PipeNode icon={<ShieldCheck className="w-4 h-4" />} label="渠道入站" badge={channelInboundPlugins.length} badgeEmpty={channelInboundPlugins.length === 0} active={activeNode === 'inbound'} onClick={() => toggle('inbound')} />
+        <Connector />
+        <PipeNode icon={<SlidersHorizontal className="w-4 h-4" />} label="覆写" badge={overrideAndHeaderCount} badgeEmpty={overrideAndHeaderCount === 0} active={activeNode === 'overrides'} onClick={() => toggle('overrides')} />
+        <Connector />
+        <PipeNode icon={<Puzzle className="w-4 h-4" />} label="请求拦截" badge={requestPlugins.length} badgeEmpty={requestPlugins.length === 0} active={activeNode === 'request'} onClick={() => toggle('request')} />
+        <Connector />
         <div className="flex flex-col items-center cursor-pointer group flex-shrink-0 mx-0.5" onClick={() => toggle('upstream')}>
           <div className={`relative w-10 h-10 rounded-xl flex items-center justify-center border-[1.5px] border-dashed transition-all overflow-visible
             ${activeNode === 'upstream'
@@ -517,18 +512,14 @@ export function PipelineView({
             上游
           </span>
         </div>
-
-        {/* 右侧: → response → key rules → end */}
-        <div className="flex min-w-0 items-center justify-start gap-0">
-          <Connector />
-          <PipeNode icon={<PackageCheck className="w-4 h-4" />} label="响应" badge={responsePlugins.length} badgeEmpty={responsePlugins.length === 0} active={activeNode === 'response'} onClick={() => toggle('response')} />
-          <Connector />
-          <PipeNode icon={<Power className="w-4 h-4" />} label="规则" badge={safeKeyRules.length} badgeEmpty={safeKeyRules.length === 0} active={activeNode === 'keyrules'} onClick={() => toggle('keyrules')} />
-          <Connector />
-          <PipeNode icon={<PackageCheck className="w-4 h-4" />} label="渠道出站" badge={channelOutboundPlugins.length} badgeEmpty={channelOutboundPlugins.length === 0} active={activeNode === 'ch_outbound'} onClick={() => toggle('ch_outbound')} />
-          <Connector />
-          <EndpointDot icon={<CheckCircle2 className="w-3.5 h-3.5" />} label="出" />
-        </div>
+        <Connector />
+        <PipeNode icon={<PackageCheck className="w-4 h-4" />} label="响应" badge={responsePlugins.length} badgeEmpty={responsePlugins.length === 0} active={activeNode === 'response'} onClick={() => toggle('response')} />
+        <Connector />
+        <PipeNode icon={<Power className="w-4 h-4" />} label="规则" badge={safeKeyRules.length} badgeEmpty={safeKeyRules.length === 0} active={activeNode === 'keyrules'} onClick={() => toggle('keyrules')} />
+        <Connector />
+        <PipeNode icon={<PackageCheck className="w-4 h-4" />} label="渠道出站" badge={channelOutboundPlugins.length} badgeEmpty={channelOutboundPlugins.length === 0} active={activeNode === 'ch_outbound'} onClick={() => toggle('ch_outbound')} />
+        <Connector />
+        <EndpointDot icon={<CheckCircle2 className="w-3.5 h-3.5" />} label="出" />
       </div>
 
       {/* 展开详情面板 */}

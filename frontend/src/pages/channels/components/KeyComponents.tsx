@@ -325,7 +325,7 @@ export function RackGrid({ children, onClick }: { children: React.ReactNode; onC
   // 修改原因：选中卡片展开成完整行后，用户需要点击机房网格空白处取消选中。
   // 修改方式：让 RackGrid 接收并透传 onClick，只在调用方判断 target 是否为网格本身。
   // 目的：避免点击卡片或完整行内部控件时误取消编辑状态。
-  return <div className="flex flex-wrap gap-1.5 pb-1" onClick={onClick}>{children}</div>;
+  return <div className="grid gap-1.5 pb-1" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(76px, 1fr))' }} onClick={onClick}>{children}</div>;
 }
 
 export function RackCoolingBorder({ remainSec, totalDuration }: { remainSec: number; totalDuration: number }) {
@@ -470,7 +470,7 @@ export function RackCard({ idx, keyObj, providerName, engine, enabledPlugins, ru
       onClick={onFocus}
       onKeyDown={handleKeyDown}
       className={`relative h-[92px] overflow-hidden rounded-lg border ${cardSurfaceClass} text-foreground transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 ${cardBorder} ${isGrayed ? 'opacity-50' : 'hover:border-muted-foreground/30'}`}
-      style={{ width: 'calc((100% - 5 * 6px) / 6)', isolation: 'isolate' }}
+      style={{ isolation: 'isolate' }}
     >
       {/* 修改原因：key_border 和 key_background 插槽在完整行模式已有挂载点，机房卡片也必须保留同等扩展能力；渠道脚本还需要知道当前是小卡片布局。
           修改方式：把 key_background 放在卡片背景层，把 key_border 放在外层绝对覆盖层，并透传 quota/account/balance 上下文和 mode: 'rack'。

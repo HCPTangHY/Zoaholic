@@ -334,15 +334,21 @@ export function useChannelsCore(): UseChannelsCoreResult {
       setLocalCountdowns(prev => {
         const next = { ...prev };
         let anyExpired = false;
+        let changed = false;
         for (const prov of Object.keys(next)) {
           for (const key of Object.keys(next[prov])) {
             const entry = next[prov][key];
             if (entry.remaining > 0) {
               next[prov] = { ...next[prov], [key]: { ...entry, remaining: entry.remaining - 1 } };
+              changed = true;
               if (entry.remaining - 1 <= 0) anyExpired = true;
             }
           }
         }
+        // 修改原因：倒计时每秒都返回新对象，即使没有任何冷却中的 key 也会触发整页重渲染。
+        // 修改方式：没有实际递减时返回原引用，保持 state 不变。
+        // 目的：消除每秒一次的无意义整页重渲染。
+        if (!changed) return prev;
         if (anyExpired) setTimeout(() => refreshKeyStatus(), 500);
         return next;
       });

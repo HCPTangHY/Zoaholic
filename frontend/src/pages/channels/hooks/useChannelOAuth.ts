@@ -43,7 +43,7 @@ export interface UseChannelOAuthResult {
   rawImportPlaceholderValue: any;
   rawImportPlaceholder: string | undefined;
   importPlaceholder: string;
-  refreshOAuthAccounts: () => Promise<void>;
+  refreshOAuthAccounts: (opts?: { syncFormKeys?: boolean }) => Promise<void>;
   handleOAuthKeyFocus: (idx: number, keyStr: string) => void;
   handleOAuthKeyBlur: (idx: number, newValue: string) => Promise<void>;
   openImportModal: (idx: number) => void;
@@ -95,7 +95,7 @@ export function useChannelOAuth({
     });
   }, [setFormData]);
 
-  const refreshOAuthAccounts = useCallback(async () => {
+  const refreshOAuthAccounts = useCallback(async (opts?: { syncFormKeys?: boolean }) => {
     // 修改原因：OAuth 账号列表按 provider name 分层保存，打开编辑面板和登录成功后都要读取当前渠道分组。
     // 修改方式：请求 /v1/oauth/accounts?provider=当前渠道名，成功后统一归一化 quota 字段。
     // 目的：避免不同 OAuth 渠道之间串读同邮箱账号状态。
@@ -111,11 +111,25 @@ export function useChannelOAuth({
         return;
       }
       const data = await res.json();
-      setOauthAccounts(normalizeOAuthAccountStateMap(data));
+      const normalized = normalizeOAuthAccountStateMap(data);
+      setOauthAccounts(normalized);
+      // 把 oauth_state 中存在但 formData.api_keys 中不存在的 key 追加到表单
+      if (opts?.syncFormKeys && normalized && Object.keys(normalized).length > 0) {
+        setFormData(prev => {
+          if (!prev) return prev;
+          const existingKeys = new Set(prev.api_keys.map(k => k.key.replace(/^!/, '').trim()));
+          const newKeyIds = Object.keys(normalized).filter(k => k && !existingKeys.has(k));
+          if (newKeyIds.length === 0) return prev;
+          const newEntries = newKeyIds.map(k => ({ key: k, disabled: false, label: '' }));
+          // 移除尾部空 key 后追加新 key，再补回一个空行
+          const trimmedKeys = prev.api_keys.filter(k => k.key.trim());
+          return { ...prev, api_keys: [...trimmedKeys, ...newEntries, { key: '', disabled: false, label: '' }] };
+        });
+      }
     } catch {
       setOauthAccounts({});
     }
-  }, [token, formData?.provider]);
+  }, [token, formData?.provider, setFormData]);
 
   useEffect(() => {
     // 修改原因：OAuth 账号状态只在 OAuth 编辑面板打开时有意义，关闭后继续保留会造成渠道间状态串扰。

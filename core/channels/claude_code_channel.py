@@ -420,22 +420,33 @@ class ClaudeCodeProvider(OAuthProvider):
             "Content-Type": "application/json",
             "User-Agent": CLAUDE_CODE_USER_AGENT,
         }
+        # 推导 profile 端点（与 usage 同域）
+        profile_url = usage_url.replace("/api/oauth/usage", "/api/oauth/profile")
+
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(
-                    usage_url,
-                    headers=headers,
+                import asyncio as _asyncio
+                usage_task = client.get(usage_url, headers=headers)
+                profile_task = client.get(profile_url, headers=headers)
+                usage_resp, profile_resp = await _asyncio.gather(
+                    usage_task, profile_task, return_exceptions=True
                 )
-                if resp.status_code != 200:
-                    # 修改原因：此前上游 HTTP 错误被转成 None，路由层无法把具体失败原因返回给前端。
-                    # 修改方式：非 200 响应直接抛出包含状态码和响应正文片段的 ValueError。
-                    # 目的：让 Claude Code usage 接口失败时，管理员能在前端控制台看到可排查的上游错误。
-                    raise ValueError(f"upstream {resp.status_code}: {resp.text[:500]}")
-                data = resp.json()
+
+                # usage 是必须的
+                if isinstance(usage_resp, Exception):
+                    raise usage_resp
+                if usage_resp.status_code != 200:
+                    raise ValueError(f"upstream {usage_resp.status_code}: {usage_resp.text[:500]}")
+                data = usage_resp.json()
+
+                # profile 是可选的（Free 账号会 429）
+                profile_data = None
+                if not isinstance(profile_resp, Exception) and profile_resp.status_code == 200:
+                    try:
+                        profile_data = profile_resp.json()
+                    except Exception:
+                        pass
         except Exception:
-            # 修改原因：此前异常被静默吞掉，导致上层只能得到 Quota not available。
-            # 修改方式：保留异常原样向上抛出，不在 provider 层改写为 None。
-            # 目的：让路由层统一生成带错误详情的 JSON 响应。
             raise
 
         result = {}
@@ -455,19 +466,60 @@ class ClaudeCodeProvider(OAuthProvider):
                 model_tag = key[len("seven_day_"):]
                 result[f"quota_outer_{model_tag}"] = round(100 - (val.get("utilization") or 0), 1)
                 result[f"quota_outer_{model_tag}_resets_at"] = val.get("resets_at")
+        # limits 数组中的 scoped 限额（如 Fable）
+        limits = data.get("limits")
+        if isinstance(limits, list):
+            for lim in limits:
+                if not isinstance(lim, dict):
+                    continue
+                if lim.get("kind") != "weekly_scoped":
+                    continue
+                scope = lim.get("scope") or {}
+                model = (scope.get("model") or {}).get("display_name", "")
+                if not model:
+                    continue
+                tag = model.lower().replace(" ", "_")
+                pct = lim.get("percent")
+                if pct is not None:
+                    result[f"quota_outer_{tag}"] = round(100 - pct, 1)
+                    result[f"quota_outer_{tag}_resets_at"] = lim.get("resets_at")
+                    result[f"quota_outer_{tag}_active"] = lim.get("is_active", False)
         # extra_usage
         eu = data.get("extra_usage")
-        if eu and isinstance(eu, dict) and eu.get("is_enabled"):
-            result["extra_usage_enabled"] = True
+        if eu and isinstance(eu, dict):
+            result["extra_usage_enabled"] = bool(eu.get("is_enabled"))
             result["extra_usage_monthly_limit"] = eu.get("monthly_limit")
             result["extra_usage_used"] = eu.get("used_credits")
             result["extra_usage_utilization"] = eu.get("utilization")
+            result["extra_usage_ever"] = eu.get("credits_ever_enabled")
+            result["extra_usage_user_disabled"] = eu.get("user_disabled")
 
-        # 修改原因：usage 接口未必返回订阅类型，但前端刷新 quota 后仍需要在 raw 数据中读到 tier。
-        # 修改方式：从已保存 credential 中取 subscription_type 并补入 fetch_quota 结果。
-        # 目的：让 quota_display 既能从 account 读 tier，也能从 data.raw 读到同一字段。
+        # profile 数据：计划类型和 rate_limit_tier
+        if profile_data and isinstance(profile_data, dict):
+            acct = profile_data.get("account") or {}
+            org = profile_data.get("organization") or {}
+            # 判定计划类型
+            if acct.get("has_claude_max"):
+                plan = "Max"
+            elif acct.get("has_claude_pro"):
+                plan = "Pro"
+            elif org.get("organization_type") == "claude_team" and org.get("subscription_status") == "active":
+                plan = "Team"
+            else:
+                plan = "Free"
+            result["plan_type"] = plan
+            result["rate_limit_tier"] = org.get("rate_limit_tier")
+            result["subscription_status"] = org.get("subscription_status")
+            result["has_extra_usage_org"] = org.get("has_extra_usage_enabled")
+
+        # fallback：从已保存 credential 中取 subscription_type
         if credential.get("subscription_type"):
-            result["subscription_type"] = credential["subscription_type"]
+            result.setdefault("subscription_type", credential["subscription_type"])
+
+        # 把 quota_inner/quota_outer 之外的所有字段打包进 raw，供前端 ui_slots 读取
+        raw = {k: v for k, v in result.items() if k not in ("quota_inner", "quota_outer")}
+        if raw:
+            result["raw"] = raw
 
         return result if result else None
 
@@ -1239,6 +1291,32 @@ async def _passthrough_sanitize(payload, modifications, request, engine, provide
     return _sanitize_for_plan_billing(payload, headers=original_headers)
 
 
+async def _passthrough_stream_with_reverse_map(client, url, headers, payload, model, timeout):
+    """透传流式响应：对每个 chunk 执行反向工具名映射。"""
+    from core.passthrough import _fetch_passthrough_stream
+    try:
+        async for chunk in _fetch_passthrough_stream(client, url, headers, payload, timeout):
+            if isinstance(chunk, str):
+                yield _reverse_map_chunk(chunk)
+            else:
+                yield chunk
+    finally:
+        _reset_reverse_maps()
+
+
+async def _passthrough_response_with_reverse_map(client, url, headers, payload, model, timeout):
+    """透传非流式响应：对每个 chunk 执行反向工具名映射。"""
+    from core.passthrough import _fetch_passthrough_response
+    try:
+        async for chunk in _fetch_passthrough_response(client, url, headers, payload, timeout):
+            if isinstance(chunk, str):
+                yield _reverse_map_chunk(chunk)
+            else:
+                yield chunk
+    finally:
+        _reset_reverse_maps()
+
+
 # 修改原因：Claude Code 的 extra_usage 可视化属于渠道专属 UI，不能继续由 Channels.tsx 写死计算和样式。
 # 修改方式：在渠道文件中注册 key_background、quota_display、balance_summary 三个内联 JS 插槽，旧金额脚本常量仅保留给外部兼容。
 # 目的：前端只提供通用挂载点，CC 的额度条、金额标签和余额汇总都随渠道元数据下发。
@@ -1311,26 +1389,33 @@ export default function render(ctx) {
     // 修改原因：合并后单一 quota_display 同时服务完整行和机房卡片，extra_usage 金额在圆环中心会溢出。
     // 修改方式：rack 模式只输出百分比或 tier 缩写；row 模式继续组合 tier、百分比和 extra_usage 金额。
     // 目的：完整行保留 Claude Code 的完整额度信息，机房卡片中心只保留可读的短文本。
-    const subType = account?.subscription_type || account?.subscriptionType || data?.raw?.subscription_type || '';
-    const tierMap = { 'pro': 'Pro', 'max': 'Max', 'team': 'Team', 'enterprise': 'Enterprise' };
+    const planType = data?.raw?.plan_type || data?.plan_type || '';
+    const subType = planType || account?.subscription_type || account?.subscriptionType || data?.raw?.subscription_type || '';
+    const tierMap = { 'pro': 'Pro', 'max': 'Max', 'team': 'Team', 'enterprise': 'Enterprise', 'free': 'Free' };
     const tierLabel = tierMap[subType.toLowerCase()] || (subType ? subType.charAt(0).toUpperCase() + subType.slice(1) : '');
     const shortTierLabel = tierLabel === 'Enterprise' ? 'Ent' : tierLabel;
+    const rateTier = data?.raw?.rate_limit_tier || '';
+    const is20x = rateTier.includes('20x');
+    const tierSuffix = is20x ? '⁺' : '';
     const q5 = typeof data?.quota_inner === 'number' ? data.quota_inner : null;
     const q7 = typeof data?.quota_outer === 'number' ? data.quota_outer : null;
     const pcts = [q5, q7].filter(v => v != null);
     const minPct = pcts.length ? Math.round(Math.min(...pcts)) : null;
 
+    const fullTier = tierLabel ? tierLabel + tierSuffix : '';
+    const shortTier = shortTierLabel ? shortTierLabel + tierSuffix : '';
+
     if (mode === 'rack') {
         if (minPct != null) {
             el.style.display = '';
-            el.textContent = minPct + '%';
+            el.textContent = (shortTier ? shortTier + ' ' : '') + minPct + '%';
             el.removeAttribute('title');
             const colorCls = minPct >= 50 ? 'text-emerald-600' : minPct >= 20 ? 'text-amber-600' : 'text-red-500';
             el.className = 'text-[9px] font-bold font-mono leading-none ' + colorCls;
-        } else if (shortTierLabel) {
+        } else if (shortTier) {
             el.style.display = '';
-            el.textContent = shortTierLabel;
-            el.title = tierLabel;
+            el.textContent = shortTier;
+            el.title = fullTier;
             el.className = 'text-[8px] font-semibold leading-none text-blue-500 truncate max-w-[50px]';
         } else {
             el.textContent = '';
@@ -1340,7 +1425,7 @@ export default function render(ctx) {
         return;
     }
 
-    const quotaLabel = minPct != null ? (tierLabel ? tierLabel + ' ' + minPct + '%' : minPct + '%') : tierLabel;
+    const quotaLabel = minPct != null ? (fullTier ? fullTier + ' ' + minPct + '%' : minPct + '%') : fullTier;
     const limit = account?.extra_usage_enabled ? (account.extra_usage_limit ?? account.extra_usage_monthly_limit ?? 0) : 0;
     const used = account?.extra_usage_enabled ? (account.extra_usage_used ?? 0) : 0;
     const remaining = Math.max(0, limit - used);
@@ -1401,6 +1486,8 @@ def register():
         request_adapter=get_claude_code_payload,
         passthrough_adapter=get_claude_code_passthrough_meta,
         passthrough_payload_adapter=_passthrough_sanitize,
+        passthrough_stream_adapter=_passthrough_stream_with_reverse_map,
+        passthrough_response_adapter=_passthrough_response_with_reverse_map,
         response_adapter=fetch_claude_code_response,
         stream_adapter=fetch_claude_code_response_stream,
         is_oauth=True,

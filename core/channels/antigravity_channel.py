@@ -55,11 +55,14 @@ COUNT_TOKENS_ACTION = "countTokens"
 LOAD_CODE_ASSIST_ACTION = "loadCodeAssist"
 FETCH_AVAILABLE_MODELS_ACTION = "fetchAvailableModels"
 
-RELEASES_URL = "https://antigravity-auto-updater-974169037036.us-central1.run.app/releases"
-DEFAULT_ANTIGRAVITY_VERSION = "1.21.9"
+RELEASES_URL = "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml"
+DEFAULT_ANTIGRAVITY_VERSION = "2.2.1"
 VERSION_CACHE_TTL_SECONDS = 6 * 60 * 60
 ANTIGRAVITY_API_CLIENT_HEADER = "gl-node/22.21.1"
 TOKEN_USER_AGENT = "Go-http-client/2.0"
+ONBOARD_USER_ACTION = "onboardUser"
+ONBOARD_MAX_ATTEMPTS = 5
+ONBOARD_POLL_INTERVAL = 2.0
 
 _PROJECT_ADJECTIVES = ["useful", "bright", "swift", "calm", "bold"]
 _PROJECT_NOUNS = ["fuze", "wave", "spark", "flow", "core"]
@@ -118,24 +121,38 @@ def _extract_version_from_releases_payload(payload: Any) -> str:
     return _scan(payload)
 
 
+def _extract_version_from_yaml_manifest(text: str) -> str:
+    """从 YAML manifest 中提取 version 字段。"""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.lower().startswith("version:"):
+            value = line.split(":", 1)[1].strip().strip('"').strip("'")
+            if re.match(r"^\d+\.\d+\.\d+$", value):
+                return value
+    return ""
+
+
 async def _fetch_antigravity_version() -> str:
-    """请求 Antigravity updater 获取最新版本号。"""
-    # 修改原因：User-Agent 中的 IDE 版本是 Antigravity 指纹的一部分，不能长期写死。
-    # 修改方式：使用 HTTP/1.1 客户端访问官方 updater，并按宽松格式解析版本号。
-    # 目的：在 updater 可用时自动跟随最新版本，不可用时安全回退。
-    async with httpx.AsyncClient(timeout=15, http2=False) as client:
+    """请求 Antigravity Hub updater manifest 获取最新版本号。"""
+    async with httpx.AsyncClient(timeout=10, http2=False) as client:
         response = await client.get(
             RELEASES_URL,
             headers={
-                "User-Agent": f"antigravity/{DEFAULT_ANTIGRAVITY_VERSION} darwin/arm64",
-                "Connection": "close",
+                "User-Agent": "electron-builder",
+                "Cache-Control": "no-cache",
             },
         )
         response.raise_for_status()
-        try:
-            payload = response.json()
-        except Exception:
-            payload = response.text
+        text = response.text
+    # 优先按 YAML manifest 解析
+    version = _extract_version_from_yaml_manifest(text)
+    if version:
+        return version
+    # 兼容旧 JSON 格式
+    try:
+        payload = json_loads(text)
+    except Exception:
+        payload = text
     version = _extract_version_from_releases_payload(payload)
     if not version:
         raise ValueError("Antigravity updater response did not contain a version")
@@ -324,6 +341,9 @@ class AntigravityProvider(OAuthProvider):
         email = await self._fetch_email(access_token)
         load_payload = await self._load_code_assist(access_token, config=config)
         project_id = _extract_project_from_load_code_assist(load_payload) or _extract_antigravity_project_id(self._resolve_provider_config(config), include_context=False)
+        if not project_id and access_token:
+            tier_id = _default_tier_id_from_load_code_assist(load_payload)
+            project_id = await self._onboard_user(access_token, tier_id, config=config)
         return self._build_credential({}, token_response, email=email, project_id=project_id, load_code_assist=load_payload)
 
     async def refresh_token(self, credential: dict, config: dict | None = None) -> dict:
@@ -340,8 +360,12 @@ class AntigravityProvider(OAuthProvider):
         token_response = await self._post_token_form(data, config=config)
         updated = self._build_credential(credential, token_response)
         if not updated.get("project_id"):
-            load_payload = await self._load_code_assist(updated.get("access_token"), config=config)
+            access_token = updated.get("access_token")
+            load_payload = await self._load_code_assist(access_token, config=config)
             project_id = _extract_project_from_load_code_assist(load_payload)
+            if not project_id and access_token:
+                tier_id = _default_tier_id_from_load_code_assist(load_payload)
+                project_id = await self._onboard_user(access_token, tier_id, config=config)
             updated = self._build_credential(updated, {}, project_id=project_id, load_code_assist=load_payload)
         return updated
 
@@ -484,7 +508,7 @@ class AntigravityProvider(OAuthProvider):
         if not access_token:
             return {}
         version = await get_antigravity_version()
-        body = {"metadata": {"ide_type": "ANTIGRAVITY", "ide_version": version, "ide_name": "antigravity"}}
+        body = {"metadata": {"ideType": "ANTIGRAVITY"}}
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
@@ -508,6 +532,44 @@ class AntigravityProvider(OAuthProvider):
             except Exception:
                 continue
         return {}
+
+    async def _onboard_user(self, access_token: str, tier_id: str = "free-tier", config: dict | None = None) -> str:
+        """loadCodeAssist 未返回 project 时，通过 onboardUser 初始化项目。"""
+        if not access_token:
+            return ""
+        version = await get_antigravity_version()
+        body = {
+            "tier_id": tier_id,
+            "metadata": {"ide_type": "ANTIGRAVITY", "ide_version": version, "ide_name": "antigravity"},
+        }
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "*/*",
+            "Content-Type": "application/json",
+            "User-Agent": f"{_antigravity_user_agent(version)} google-api-nodejs-client/10.3.0",
+            "X-Goog-Api-Client": ANTIGRAVITY_API_CLIENT_HEADER,
+        }
+        url = _build_antigravity_url_from_base(DEFAULT_BASE_URL, ONBOARD_USER_ACTION)
+        for attempt in range(ONBOARD_MAX_ATTEMPTS):
+            try:
+                async with httpx.AsyncClient(timeout=30, http2=False) as client:
+                    response = await client.post(url, json=body, headers=headers)
+                if response.status_code != 200:
+                    return ""
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    return ""
+                if payload.get("done") is True:
+                    resp_data = payload.get("response")
+                    if isinstance(resp_data, dict):
+                        project = _extract_project_from_load_code_assist(resp_data)
+                        if project:
+                            return project
+                    return ""
+                await asyncio.sleep(ONBOARD_POLL_INTERVAL)
+            except Exception:
+                return ""
+        return ""
 
     def _build_credential(
         self,
@@ -554,8 +616,8 @@ class AntigravityProvider(OAuthProvider):
 
 
 def _antigravity_user_agent(version: str) -> str:
-    """生成 Antigravity 生成接口 User-Agent。"""
-    return f"antigravity/{version} darwin/arm64"
+    """生成 Antigravity Hub 生成接口 User-Agent。"""
+    return f"antigravity/hub/{version} darwin/arm64"
 
 
 def _antigravity_load_code_assist_user_agent(version: str) -> str:
@@ -711,6 +773,25 @@ def _extract_antigravity_project_id(provider: dict | None, include_context: bool
         or preferences.get("cloudaicompanionProject")
     )
     return str(project).strip() if project else ""
+
+
+def _default_tier_id_from_load_code_assist(payload: dict | None) -> str:
+    """从 loadCodeAssist 响应中提取 default tier ID，用于 onboardUser。"""
+    if not isinstance(payload, dict):
+        return "free-tier"
+    allowed_tiers = payload.get("allowedTiers")
+    if isinstance(allowed_tiers, list):
+        for tier in allowed_tiers:
+            if isinstance(tier, dict) and tier.get("isDefault") is True:
+                tid = str(tier.get("id", "")).strip()
+                if tid:
+                    return tid
+    current_tier = payload.get("currentTier")
+    if isinstance(current_tier, dict):
+        tid = str(current_tier.get("id", "")).strip()
+        if tid:
+            return tid
+    return "free-tier"
 
 
 def _extract_project_from_load_code_assist(payload: dict | None) -> str:
@@ -1007,19 +1088,71 @@ def _build_request_id(is_image: bool) -> str:
     return f"agent-{uuid4()}"
 
 
+# gemini-3.1-pro-high 上游已不接受作为模型名，需拆为 base + thinkingLevel
+_THINKING_SUFFIX_MAP = {
+    "high": ("low", "high"),   # -high → 发 -low，注入 thinkingLevel=high
+    "medium": ("low", "medium"),
+}
+# 模型前缀白名单：只对这些前缀做后缀拆分
+_THINKING_SUFFIX_MODEL_PREFIXES = ("gemini-3.1-pro-", "gemini-3-pro-")
+
+_GEMINI_REASONING_PREFIXES = (
+    "gemini-3.1-pro-high", "gemini-3-pro-high", "gemini-3-pro-preview",
+    "gemini-2.5-flash-thinking",
+)
+
+
+def _is_gemini_reasoning_model(model: str) -> bool:
+    lower = str(model or "").lower()
+    return any(lower.startswith(p) for p in _GEMINI_REASONING_PREFIXES)
+
+
+def _rewrite_thinking_suffix(model: str) -> tuple[str, str | None]:
+    """拆分 -high/-medium 后缀：返回 (upstream_model, thinkingLevel or None)。"""
+    lower = str(model or "").lower()
+    for prefix in _THINKING_SUFFIX_MODEL_PREFIXES:
+        if lower.startswith(prefix):
+            suffix = lower[len(prefix):]
+            if suffix in _THINKING_SUFFIX_MAP:
+                base_suffix, level = _THINKING_SUFFIX_MAP[suffix]
+                return prefix + base_suffix, level
+    return model, None
+
+
+def _sanitize_reasoning_model_payload(request_payload: dict, model: str, thinking_level: str | None) -> None:
+    """reasoning 模型：移除不允许的参数，注入 thinkingLevel。"""
+    is_reasoning = _is_gemini_reasoning_model(model)
+    if not is_reasoning and not thinking_level:
+        return
+    gen_config = request_payload.get("generationConfig")
+    if isinstance(gen_config, dict):
+        if is_reasoning:
+            for forbidden in ("temperature", "topP", "top_p", "topK", "top_k", "stopSequences", "stop_sequences"):
+                gen_config.pop(forbidden, None)
+        if thinking_level:
+            thinking_config = gen_config.setdefault("thinkingConfig", {})
+            thinking_config["thinkingLevel"] = thinking_level
+            thinking_config.setdefault("includeThoughts", True)
+    elif thinking_level:
+        request_payload["generationConfig"] = {"thinkingConfig": {"thinkingLevel": thinking_level, "includeThoughts": True}}
+    if is_reasoning and "toolConfig" in request_payload:
+        tools = request_payload.get("tools")
+        if not tools or (isinstance(tools, list) and len(tools) == 0):
+            request_payload.pop("toolConfig", None)
+
+
 def _build_antigravity_payload(gemini_payload: dict, original_model: str, provider: dict | None, request: Any) -> dict:
     """把 Gemini payload 包成 Antigravity v1internal payload。"""
-    # 修改原因：Antigravity API 不接受普通 Gemini /models body，需要外层 model/userAgent/requestType/project/requestId/request 包裹。
-    # 修改方式：复用 Gemini 内容转换结果作为 request 子对象，再补 sessionId、project 和 requestId 等 IDE 字段。
-    # 目的：让 OpenAI Chat Completions 请求以真实 Antigravity IDE 形态发往 Cloud Code API。
+    upstream_model, thinking_level = _rewrite_thinking_suffix(original_model)
     is_image = _is_image_model(original_model)
     request_payload = _normalize_antigravity_request_payload(gemini_payload)
     request_payload["sessionId"] = _build_session_id(_first_user_message_text(request))
-    _apply_claude_validated_tool_config(request_payload, original_model)
+    _apply_claude_validated_tool_config(request_payload, upstream_model)
+    _sanitize_reasoning_model_payload(request_payload, upstream_model, thinking_level)
 
     project = _extract_antigravity_project_id(provider) or _random_project_id()
     body = {
-        "model": original_model,
+        "model": upstream_model,
         "userAgent": "antigravity",
         "requestType": "image_gen" if is_image else "agent",
         "project": project,

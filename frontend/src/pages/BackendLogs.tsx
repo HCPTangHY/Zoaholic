@@ -155,6 +155,7 @@ export default function BackendLogs() {
   const [effectiveBufferSize, setEffectiveBufferSize] = useState(DEFAULT_BUFFER_SIZE);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const pendingScrollToBottomRef = useRef(false);
+  const isNearBottomRef = useRef(true);
 
   const loggerOptions = useMemo(() => {
     const names = new Set<string>();
@@ -183,6 +184,12 @@ export default function BackendLogs() {
   const scrollToBottom = () => {
     if (!scrollerRef.current) return;
     scrollerRef.current.scrollTop = scrollerRef.current.scrollHeight;
+  };
+
+  const checkNearBottom = () => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    isNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
   };
 
   const fetchBackendLogSettings = async () => {
@@ -307,7 +314,7 @@ export default function BackendLogs() {
   useEffect(() => {
     if (!autoRefresh || !token) return;
     const timer = window.setInterval(() => {
-      fetchBackendLogs({ scrollAfterLoad: false });
+      fetchBackendLogs({ scrollAfterLoad: isNearBottomRef.current });
     }, POLL_INTERVAL_MS);
 
     return () => window.clearInterval(timer);
@@ -593,7 +600,7 @@ export default function BackendLogs() {
             <p className="text-xs mt-2 opacity-80">可尝试切换关键字、输出流、日志级别、仅错误模式或 logger 名称筛选，或等待应用产生新的日志。</p>
           </div>
         ) : (
-          <div ref={scrollerRef} className="flex-1 min-h-0 overflow-auto bg-background/60">
+          <div ref={scrollerRef} onScroll={checkNearBottom} className="flex-1 min-h-0 overflow-auto bg-background/60">
             <div className="w-full min-w-0 font-mono text-xs">
               {items.map(item => {
                 const levelMeta = getLevelMeta(item.level);

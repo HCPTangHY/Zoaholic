@@ -142,7 +142,7 @@ export interface UseChannelEditorResult {
   refreshKeyStatus: UseChannelsCoreResult['refreshKeyStatus'];
   restoreChannelModalScrollLock: () => void;
   applyChannelModalScrollLock: () => void;
-  refreshOAuthAccounts: () => Promise<void>;
+  refreshOAuthAccounts: (opts?: { syncFormKeys?: boolean }) => Promise<void>;
   openModal: (provider?: any, index?: number | null) => Promise<void>;
   updateFormData: (field: keyof ProviderFormData, value: any) => void;
   updatePreference: (field: keyof ProviderFormData['preferences'], value: any) => void;
@@ -280,21 +280,25 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
   const restoreChannelModalScrollLock = useCallback(() => {
     if (!channelModalBodyStyleRef.current) return;
     channelModalBodyStyleRef.current = null;
-    const scrollY = channelModalScrollYRef.current;
-    // Radix Dialog 关闭后会异步恢复 body style，需要等它完成再滚动
+    const savedTop = channelModalScrollYRef.current;
+    // 页面实际滚动容器是 Layout 的 <main>，不是 window；Radix Dialog 关闭后会异步恢复 body style 与焦点，分两帧恢复避免被覆盖。
     requestAnimationFrame(() => {
-      window.scrollTo(0, scrollY);
+      requestAnimationFrame(() => {
+        const scroller = document.querySelector('main');
+        if (scroller) scroller.scrollTop = savedTop;
+      });
     });
   }, []);
 
   const applyChannelModalScrollLock = useCallback(() => {
     if (channelModalBodyStyleRef.current) return;
-    const currentScrollY = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
-    channelModalScrollYRef.current = currentScrollY;
+    // 页面实际滚动容器是 Layout 的 <main className="flex-1 overflow-auto">，window.scrollY 恒为 0。
+    const scroller = document.querySelector('main');
+    channelModalScrollYRef.current = scroller ? scroller.scrollTop : 0;
     channelModalBodyStyleRef.current = { locked: true } as any;
   }, []);
 
-  const isChannelScrollLockedDialogOpen = isModalOpen || testDialogOpen || keyTestDialogOpen;
+  const isChannelScrollLockedDialogOpen = isModalOpen || testDialogOpen || keyTestDialogOpen || analyticsOpen;
 
   useEffect(() => {
     // 修改原因：旧逻辑把 restoreChannelModalScrollLock 放在依赖 isModalOpen 的 effect cleanup 中，false → true 打开弹窗时会先执行旧 cleanup，导致刚设置的滚动锁被立即清掉。

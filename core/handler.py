@@ -754,6 +754,11 @@ class ModelRequestHandler:
         # 初始化重试路径记录
         retry_path: List[Dict[str, Any]] = []
         current_retry_count = 0
+        # 修改原因：虚拟路由内 key 冷却时间短于重试循环耗时时，cooldown 过期 →
+        #   is_all_rate_limited False → 再次尝试 → 失败 → index 被 grp_start 重置 → 无限循环。
+        # 修改方式：按 provider 记录本次请求内的失败次数。
+        # 目的：达到可用 key 数后强制视为耗尽，不再被 cooldown 过期欺骗。
+        _provider_attempt_counts: Dict[str, int] = {}
 
         # ── 虚拟路由优先级分组索引 ──
         # matching_providers 已按 _virtual_priority 升序排列（0,0,0,1,1,2...）
@@ -792,6 +797,15 @@ class ModelRequestHandler:
 
             provider_name = provider['provider']
             provider_is_byok = is_byok_provider(provider)
+
+            # ── 单次请求 provider 耗尽保护 ──
+            # 修改原因：key 冷却过期后 is_all_rate_limited 返回 False，虚拟路由的
+            #   index=grp_start 重置导致同一 provider 被无限重试。
+            # 修改方式：本次请求内失败次数 >= 该 provider 可用 key 数 → 直接跳过。
+            # 目的：每个 provider 在一次请求内最多尝试「可用 key 数」次，然后强制降级。
+            if not provider_is_byok and _provider_attempt_counts.get(provider_name, 0) >= _provider_key_slots(provider):
+                continue
+
             attempt_request_data = _clone_request_data_for_channel_attempt(request_data)
 
             # ── 渠道入站拦截器：provider 已选定、channel adapter 转格式前 ──
@@ -834,12 +848,12 @@ class ModelRequestHandler:
                         for gi in range(grp_start, grp_end):
                             gi_provider = matching_providers[gi]
                             if is_byok_provider(gi_provider):
-                                # 修改原因：BYOK provider 不依赖本地 key pool，不能被视为本地 key 全部限流。
-                                # 修改方式：虚拟路由分组检查遇到 BYOK provider 时直接认为该组未被本地限流耗尽。
-                                # 目的：避免缺失 circular list 或 "*" 占位符导致 BYOK provider 被错误跳过。
                                 group_all_exhausted = False
                                 break
                             gi_provider_name = gi_provider["provider"]
+                            # 单次请求 provider 耗尽保护
+                            if _provider_attempt_counts.get(gi_provider_name, 0) >= _provider_key_slots(gi_provider):
+                                continue
                             gi_circular_list = provider_api_circular_list.get(gi_provider_name)
                             if gi_circular_list and not await gi_circular_list.is_all_rate_limited(original_model):
                                 group_all_exhausted = False
@@ -968,6 +982,7 @@ class ModelRequestHandler:
                     httpx.ConnectError) as e:
                 # 记录重试路径
                 current_retry_count += 1
+                _provider_attempt_counts[provider_name] = _provider_attempt_counts.get(provider_name, 0) + 1
                 
                 # 获取完整的错误详情
                 error_details = getattr(e, "detail", None) if isinstance(e, HTTPException) else None
@@ -1273,15 +1288,12 @@ class ModelRequestHandler:
                             for gi in range(grp_start, grp_end):
                                 gi_provider = matching_providers[gi]
                                 if is_byok_provider(gi_provider):
-                                    # 修改原因：BYOK provider 没有本地限流状态，不能因为没有 circular list 就被视为不可用。
-                                    # 修改方式：虚拟路由重试检查遇到 BYOK provider 时直接认为组内仍有可用渠道。
-                                    # 目的：避免 "*" 占位符进入 key pool，同时保持 BYOK provider 的路由兼容性。
                                     group_has_available = True
                                     break
                                 gi_name = gi_provider["provider"]
-                                # 修改原因：provider_api_circular_list 改为普通 dict 后，读取缺失 provider 需要显式判空。
-                                # 修改方式：使用 get 取得已有循环列表，再执行 is_all_rate_limited 检查。
-                                # 目的：避免虚拟路由重试检查创建空 key 池。
+                                # 单次请求 provider 耗尽保护
+                                if _provider_attempt_counts.get(gi_name, 0) >= _provider_key_slots(gi_provider):
+                                    continue
                                 gi_circular_list = provider_api_circular_list.get(gi_name)
                                 if gi_circular_list:
                                     if not await gi_circular_list.is_all_rate_limited(original_model):
