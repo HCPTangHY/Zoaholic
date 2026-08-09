@@ -296,8 +296,8 @@ export function PluginParamsForm({ options, schema: schemaInput, onChange, disab
                 value={value}
                 onChange={event => updateValue(param.key, event.target.value)}
                 placeholder={param.placeholder || paramsHint || '留空使用默认值'}
-                rows={compact ? 3 : 5}
-                className={`${controlBaseClass} ${compact ? 'h-16 py-1' : 'min-h-[96px] py-2'}`}
+                rows={5}
+                className={`${controlBaseClass} ${compact ? '!h-28 py-1.5' : 'min-h-[96px] py-2'}`}
               />
             )}
             {param.type === 'number' && (

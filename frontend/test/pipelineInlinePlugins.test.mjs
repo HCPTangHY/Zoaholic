@@ -12,7 +12,7 @@ const adminSource = readFileSync(path.resolve(frontendRoot, 'src/pages/Admin.tsx
 // 修改原因：Pipeline 面板需要在常用场景中直接完成插件增删和参数编辑，避免每次打开 InterceptorSheet。
 // 修改方式：用源码断言固定 onPluginsChange、可操作 PluginCard、阶段化添加菜单和 ChannelEditor 接线。
 // 目的：防止后续重构把 inline 插件操作退回纯展示状态。
-assert.match(pipelineSource, /onPluginsChange:\s*\(plugins: string\[\]\) => void/, 'PipelineViewProps 应暴露 onPluginsChange');
+assert.match(pipelineSource, /onPluginsChange:\s*\(plugins: EnabledPluginValue\[\]\) => void/, 'PipelineViewProps 应暴露 onPluginsChange');
 assert.match(pipelineSource, /function PluginCard[\s\S]*onRemove[\s\S]*onOptsChange/, 'PluginCard 应支持删除和参数更新');
 assert.match(pipelineSource, /<X className="w-3 h-3" \/>/, 'PluginCard 应有小号删除按钮');
 assert.match(pipelineSource, /PluginParamsForm/, '参数区域应使用可视化参数表单');

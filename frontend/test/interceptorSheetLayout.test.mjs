@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(path.resolve(__dirname, '../src/components/InterceptorSheet.tsx'), 'utf8');
 
-assert.match(source, /type InterceptorTab = 'all' \| 'request' \| 'response'/, '应该有全部、请求拦截、响应拦截三个 Tab 状态');
+assert.match(source, /type InterceptorTab = 'all'[\s\S]*'request'[\s\S]*'response'/, '应该包含全部、请求拦截、响应拦截等 Tab 状态');
 assert.match(source, /label: '全部'/, 'Tab 应包含全部');
 assert.match(source, /label: '请求拦截'/, 'Tab 应包含请求拦截');
 assert.match(source, /label: '响应拦截'/, 'Tab 应包含响应拦截');

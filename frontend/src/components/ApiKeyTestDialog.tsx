@@ -19,10 +19,11 @@ import {
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import { formatApiKeyTestError, getInitialApiKeyTestModel, normalizeApiKeyTestModels } from '../lib/apiKeyTestDialog';
-import { toastSuccess, toastError, toastWarning } from '../components/Toast';
+import { toastWarning } from '../components/Toast';
 import { useAuthStore } from '../store/authStore';
 
 export interface ApiKeyObj {
+  _clientId: string;
   key: string;
   disabled: boolean;
 }
@@ -87,24 +88,44 @@ export function ApiKeyTestDialog({
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const [isRunning, setIsRunning] = useState(false);
-  const runningRef = useRef(false);
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const openRef = useRef(open);
+  const lifecycleEpochRef = useRef(0);
+  const nextBatchRunIdRef = useRef(0);
+  const activeBatchRunIdRef = useRef<number | null>(null);
+  const requestVersionsRef = useRef(new Map<string, number>());
+  const activeRequestsRef = useRef(new Map<string, { controller: AbortController; batchRunId: number | null; clientId: string }>());
+  const autoTestTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoDisableInvalidRef = useRef(autoDisableInvalid);
+  // 异步测试完成时必须读取最新 Key 列表，不能使用发起请求那次渲染的旧数组。
+  const apiKeysRef = useRef(apiKeys);
+  apiKeysRef.current = apiKeys;
+  openRef.current = open;
+  autoDisableInvalidRef.current = autoDisableInvalid;
 
-  const [results, setResults] = useState<Map<number, KeyTestResult>>(new Map());
-  const [lastPreviewIdx, setLastPreviewIdx] = useState<number | null>(null);
-  const [copiedKeyIndex, setCopiedKeyIndex] = useState<number | null>(null);
+  // 所有测试及交互状态按稳定 client id 保存，数组删除/重排不会把旧状态顶给后继 Key。
+  const [results, setResults] = useState<Map<string, KeyTestResult>>(new Map());
+  const [lastPreviewKeyId, setLastPreviewKeyId] = useState<string | null>(null);
+  const [copiedKeyId, setCopiedKeyId] = useState<string | null>(null);
   // 错误详情不再依赖 title 悬浮提示：移动端没有 hover，且 title 文本无法复制。
   // 这里记录展开的 Key 和复制反馈，让每个 Key 的错误可以内联展开、选择并复制，同时保持默认列表简洁。
-  const [expandedErrorKeyIndex, setExpandedErrorKeyIndex] = useState<number | null>(null);
-  const [copiedErrorKeyIndex, setCopiedErrorKeyIndex] = useState<number | null>(null);
+  const [expandedErrorKeyId, setExpandedErrorKeyId] = useState<string | null>(null);
+  const [copiedErrorKeyId, setCopiedErrorKeyId] = useState<string | null>(null);
 
   // 修改原因：模型列表归一化逻辑需要和回归测试共用，避免弹窗重新打开后使用旧渠道模型。
   // 修改方式：改为调用纯 helper 去重、去空白，并保留当前渠道传入列表的顺序。
   // 目的：选择框和自动测试入口都基于同一份当前渠道模型列表。
   const modelOptions = useMemo(() => normalizeApiKeyTestModels(availableModels), [availableModels]);
 
-  // 弹窗打开时初始化
+  // 弹窗每次打开/关闭都切换生命周期代际，并取消上一代的定时器和请求。
   useEffect(() => {
+    lifecycleEpochRef.current += 1;
+    activeBatchRunIdRef.current = null;
+    setIsRunning(false);
+    if (autoTestTimerRef.current) clearTimeout(autoTestTimerRef.current);
+    autoTestTimerRef.current = null;
+    activeRequestsRef.current.forEach(({ controller }) => controller.abort());
+    activeRequestsRef.current.clear();
+    requestVersionsRef.current.clear();
     if (!open) return;
 
     // 修改原因：自动单 Key 测试会在同一个 effect 中触发，不能依赖 setModel 立即同步到闭包。
@@ -113,31 +134,53 @@ export function ApiKeyTestDialog({
     const firstModel = getInitialApiKeyTestModel(availableModels);
     setModel(firstModel);
 
-    const init = new Map<number, KeyTestResult>();
-    apiKeys.forEach((_, idx) => {
-      init.set(idx, { status: 'pending' });
+    const init = new Map<string, KeyTestResult>();
+    apiKeys.forEach(keyObj => {
+      init.set(keyObj._clientId, { status: 'pending' });
     });
     setResults(init);
+    setLastPreviewKeyId(null);
+    setCopiedKeyId(null);
     // 重新打开弹窗时清空旧错误面板，避免用户看到上一次测试的详情。
-    setExpandedErrorKeyIndex(null);
-    setCopiedErrorKeyIndex(null);
+    setExpandedErrorKeyId(null);
+    setCopiedErrorKeyId(null);
 
-    // 如果是单 key 测试入口，自动触发
+    // 如果是单 key 测试入口，先把入口下标转换成稳定身份再自动触发。
     if (typeof initialKeyIndex === 'number' && initialKeyIndex >= 0) {
-      setTimeout(() => {
+      const initialClientId = apiKeys[initialKeyIndex]?._clientId;
+      if (initialClientId) autoTestTimerRef.current = setTimeout(() => {
+        autoTestTimerRef.current = null;
         // 修改原因：这里的 testSingleKey 闭包仍可能读到 setModel 前的旧状态。
         // 修改方式：把当前渠道解析出的 firstModel 作为本次自动测试的显式覆盖值传入。
         // 目的：从 Key 行点击自动测试时，请求始终使用当前渠道模型。
-        void testSingleKey(initialKeyIndex, firstModel);
+        void testSingleKey(initialClientId, firstModel);
       }, 50);
     }
+
+    return () => {
+      if (autoTestTimerRef.current) clearTimeout(autoTestTimerRef.current);
+      autoTestTimerRef.current = null;
+      lifecycleEpochRef.current += 1;
+      activeBatchRunIdRef.current = null;
+        activeRequestsRef.current.forEach(({ controller }) => controller.abort());
+      activeRequestsRef.current.clear();
+    };
   }, [open]);
 
+  // 弹窗打开期间删除或新增 Key 时，只保留仍存在 id 的结果并初始化新增项。
   useEffect(() => {
-    if (!open && isRunning) {
-      stopAll();
-    }
-  }, [open]);
+    if (!open) return;
+    const activeIds = new Set(apiKeys.map(keyObj => keyObj._clientId));
+    setResults(prev => {
+      const next = new Map<string, KeyTestResult>();
+      apiKeys.forEach(keyObj => next.set(keyObj._clientId, prev.get(keyObj._clientId) || { status: 'pending' }));
+      return next;
+    });
+    setLastPreviewKeyId(current => current && activeIds.has(current) ? current : null);
+    setCopiedKeyId(current => current && activeIds.has(current) ? current : null);
+    setExpandedErrorKeyId(current => current && activeIds.has(current) ? current : null);
+    setCopiedErrorKeyId(current => current && activeIds.has(current) ? current : null);
+  }, [open, apiKeys]);
 
   const canRun = () => {
     const hasModel = Boolean(model.trim());
@@ -147,13 +190,27 @@ export function ApiKeyTestDialog({
 
   // 单 key 手动/自动测试增加 allowDisabled 参数（默认放行）；只有"测试全部"批量入口才继续遵守 includeDisabled。
   // 目的：解耦"批量测试范围"与"单个 key 手动测试"，方便用户按需验证任意一把 key。
-  const testSingleKey = async (idx: number, modelOverride?: string, allowDisabled = true) => {
-    const keyObj = apiKeys[idx];
+  const testSingleKey = async (clientId: string, modelOverride?: string, allowDisabled = true, batchRunId: number | null = null) => {
+    const keyObj = apiKeysRef.current.find(item => item._clientId === clientId);
     if (!keyObj) return;
     if (!allowDisabled && !includeDisabled && keyObj.disabled) return;
 
     const apiKey = keyObj.key.trim();
-    if (!apiKey) return;
+    if (!apiKey || !openRef.current) return;
+
+    const requestEpoch = lifecycleEpochRef.current;
+    const requestVersion = (requestVersionsRef.current.get(clientId) || 0) + 1;
+    requestVersionsRef.current.set(clientId, requestVersion);
+    const requestId = `${requestEpoch}:${clientId}:${requestVersion}`;
+    const controller = new AbortController();
+    activeRequestsRef.current.set(requestId, { controller, batchRunId, clientId });
+    const isCurrentRequest = () => {
+      if (!openRef.current || lifecycleEpochRef.current !== requestEpoch) return false;
+      if (requestVersionsRef.current.get(clientId) !== requestVersion) return false;
+      if (batchRunId !== null && activeBatchRunIdRef.current !== batchRunId) return false;
+      const currentKey = apiKeysRef.current.find(item => item._clientId === clientId);
+      return currentKey?.key.trim() === apiKey;
+    };
 
     // 修改原因：自动测试入口需要绕过 React 状态更新延迟，手动测试入口仍应读取当前选择框状态。
     // 修改方式：优先使用调用方传入的 modelOverride，否则回退到组件当前 model 状态。
@@ -162,7 +219,7 @@ export function ApiKeyTestDialog({
 
     setResults(prev => {
       const next = new Map(prev);
-      next.set(idx, { status: 'testing', latency_ms: null, error: null });
+      next.set(clientId, { status: 'testing', latency_ms: null, error: null });
       return next;
     });
 
@@ -178,24 +235,23 @@ export function ApiKeyTestDialog({
           base_url,
           provider_snapshot,
           api_key: apiKey,
-          // 修改原因：请求模型可能来自本次自动测试覆盖值，而不一定来自已同步的 React state。
-          // 修改方式：统一发送前面解析出的 requestModel。
-          // 目的：确保请求体中的 model 与当前渠道弹窗模型一致。
           model: requestModel,
           temperature,
           stream,
           max_tokens: maxTokens,
           timeout: timeoutSec,
         }),
-        signal: abortControllerRef.current?.signal,
+        signal: controller.signal,
       });
 
       const data = await res.json().catch(() => ({} as any));
+      if (!isCurrentRequest()) return;
 
       if (res.ok && data?.success) {
         setResults(prev => {
+          if (!isCurrentRequest()) return prev;
           const next = new Map(prev);
-          next.set(idx, {
+          next.set(clientId, {
             status: 'success',
             latency_ms: data.latency_ms ?? null,
             upstream_status_code: data.upstream_status_code ?? null,
@@ -205,19 +261,16 @@ export function ApiKeyTestDialog({
           });
           return next;
         });
-        if (data.response_preview) setLastPreviewIdx(idx);
+        if (data.response_preview && isCurrentRequest()) setLastPreviewKeyId(clientId);
         return;
       }
 
-      // 修改原因：测试接口失败时 detail/error/message 可能是对象，直接 String 会显示 [object Object]。
-      // 修改方式：统一调用错误格式化 helper，并保留 HTTP 状态作为兜底文案。
-      // 目的：错误摘要、详情和复制内容都能展示实际错误信息。
       const errMsg = formatApiKeyTestError(data, `HTTP ${res.status}`);
       const authFailed = Boolean(data?.auth_failed);
-
       setResults(prev => {
+        if (!isCurrentRequest()) return prev;
         const next = new Map(prev);
-        next.set(idx, {
+        next.set(clientId, {
           status: 'error',
           latency_ms: data?.latency_ms ?? null,
           upstream_status_code: data?.upstream_status_code ?? null,
@@ -228,30 +281,22 @@ export function ApiKeyTestDialog({
         return next;
       });
 
-      if (autoDisableInvalid && authFailed && onDisableKeys) {
-        onDisableKeys([idx]);
+      if (autoDisableInvalidRef.current && authFailed && onDisableKeys && isCurrentRequest()) {
+        const currentIndex = apiKeysRef.current.findIndex(item => item._clientId === clientId && item.key.trim() === apiKey);
+        if (currentIndex >= 0) onDisableKeys([currentIndex]);
       }
     } catch (e: any) {
-      if (e?.name === 'AbortError') {
-        setResults(prev => {
-          const next = new Map(prev);
-          next.set(idx, { status: 'pending' });
-          return next;
-        });
-        return;
-      }
-
-      // 修改原因：网络异常或运行时异常也可能是普通对象，不能直接拼接或 String 化。
-      // 修改方式：复用测试接口错误格式化 helper，把未知对象转换成可读文本。
-      // 目的：保证 catch 分支不会在界面中显示 [object Object]。
+      if (!isCurrentRequest()) return;
       setResults(prev => {
+        if (!isCurrentRequest()) return prev;
         const next = new Map(prev);
-        next.set(idx, {
-          status: 'error',
-          error: formatApiKeyTestError(e, '请求失败'),
-        });
+        next.set(clientId, e?.name === 'AbortError'
+          ? { status: 'pending' }
+          : { status: 'error', error: formatApiKeyTestError(e, '请求失败') });
         return next;
       });
+    } finally {
+      activeRequestsRef.current.delete(requestId);
     }
   };
 
@@ -261,31 +306,30 @@ export function ApiKeyTestDialog({
       return;
     }
 
-    runningRef.current = true;
+    const batchRunId = ++nextBatchRunIdRef.current;
+    activeBatchRunIdRef.current = batchRunId;
     setIsRunning(true);
-    abortControllerRef.current = new AbortController();
 
     // reset
     setResults(prev => {
       const next = new Map(prev);
-      apiKeys.forEach((_, idx) => {
-        next.set(idx, { status: 'pending' });
+      apiKeys.forEach(keyObj => {
+        next.set(keyObj._clientId, { status: 'pending' });
       });
       return next;
     });
 
     const queue = apiKeys
-      .map((k, idx) => ({ k, idx }))
-      .filter(({ k }) => (includeDisabled || !k.disabled) && Boolean(k.key.trim()))
-      .map(({ idx }) => idx);
+      .filter(k => (includeDisabled || !k.disabled) && Boolean(k.key.trim()))
+      .map(k => k._clientId);
 
     const runNext = async () => {
       while (queue.length > 0) {
-        if (!runningRef.current) return;
-        const idx = queue.shift();
-        if (idx === undefined) return;
+        if (activeBatchRunIdRef.current !== batchRunId) return;
+        const clientId = queue.shift();
+        if (clientId === undefined) return;
         // 批量"测试全部"仍遵守 includeDisabled（queue 已按该开关过滤），显式传 allowDisabled=false。
-        await testSingleKey(idx, undefined, false);
+        await testSingleKey(clientId, undefined, false, batchRunId);
       }
     };
 
@@ -295,29 +339,47 @@ export function ApiKeyTestDialog({
     }
 
     await Promise.all(tasks);
-    runningRef.current = false;
-    setIsRunning(false);
+    // 旧批次结束时不能覆盖用户刚启动的新批次运行态。
+    if (activeBatchRunIdRef.current === batchRunId) {
+      activeBatchRunIdRef.current = null;
+        setIsRunning(false);
+    }
   };
 
   const stopAll = () => {
-    runningRef.current = false;
+    const batchRunId = activeBatchRunIdRef.current;
+    activeBatchRunIdRef.current = null;
     setIsRunning(false);
-    abortControllerRef.current?.abort();
+    if (batchRunId === null) return;
+    const stoppedClientIds = new Set<string>();
+    activeRequestsRef.current.forEach(({ controller, batchRunId: ownerRunId, clientId }) => {
+      if (ownerRunId === batchRunId) {
+        stoppedClientIds.add(clientId);
+        controller.abort();
+      }
+    });
+    setResults(prev => {
+      const next = new Map(prev);
+      stoppedClientIds.forEach(clientId => {
+        if (next.get(clientId)?.status === 'testing') next.set(clientId, { status: 'pending' });
+      });
+      return next;
+    });
   };
 
-  const copyKey = (idx: number) => {
-    const apiKey = apiKeys[idx]?.key?.trim();
+  const copyKey = (clientId: string) => {
+    const apiKey = apiKeysRef.current.find(item => item._clientId === clientId)?.key?.trim();
     if (!apiKey) return;
     navigator.clipboard.writeText(apiKey);
-    setCopiedKeyIndex(idx);
-    setTimeout(() => setCopiedKeyIndex(null), 1500);
+    setCopiedKeyId(clientId);
+    setTimeout(() => setCopiedKeyId(null), 1500);
   };
 
-  const copyErrorText = async (idx: number, errorText: string) => {
+  const copyErrorText = async (clientId: string, errorText: string) => {
     try {
       await navigator.clipboard.writeText(errorText);
-      setCopiedErrorKeyIndex(idx);
-      setTimeout(() => setCopiedErrorKeyIndex(null), 1500);
+      setCopiedErrorKeyId(clientId);
+      setTimeout(() => setCopiedErrorKeyId(null), 1500);
     } catch (error) {
       // 复制失败只记录到控制台，避免用弹窗或临时 Toast 打断批量 Key 测试流程。
       console.error('Failed to copy API key test error', error);
@@ -338,9 +400,10 @@ export function ApiKeyTestDialog({
     }
   };
 
-  const successCount = Array.from(results.values()).filter(r => r.status === 'success').length;
-  const errorCount = Array.from(results.values()).filter(r => r.status === 'error').length;
-  const testingCount = Array.from(results.values()).filter(r => r.status === 'testing').length;
+  const currentResults = apiKeys.map(keyObj => results.get(keyObj._clientId)).filter((result): result is KeyTestResult => Boolean(result));
+  const successCount = currentResults.filter(r => r.status === 'success').length;
+  const errorCount = currentResults.filter(r => r.status === 'error').length;
+  const testingCount = currentResults.filter(r => r.status === 'testing').length;
   const totalTestable = apiKeys.filter(k => (includeDisabled || !k.disabled) && k.key.trim()).length;
 
   // 将 key 文本脱敏显示：保留前6后4，中间用 *** 代替
@@ -491,17 +554,18 @@ export function ApiKeyTestDialog({
             ) : (
               <div className="divide-y divide-border">
                 {apiKeys.map((k, idx) => {
-                  const r = results.get(idx) || { status: 'pending' as const };
+                  const clientId = k._clientId;
+                  const r = results.get(clientId) || { status: 'pending' as const };
                   const keyText = k.key?.trim() || '';
                   const isSkipped = !includeDisabled && k.disabled;
 
                   const errorText = r.error || '测试失败';
                   const errorSummary = errorText.length > 36 ? `${errorText.slice(0, 36)}...` : errorText;
-                  const isErrorExpanded = r.status === 'error' && expandedErrorKeyIndex === idx;
+                  const isErrorExpanded = r.status === 'error' && expandedErrorKeyId === clientId;
 
                   return (
                     <div
-                      key={idx}
+                      key={clientId}
                       className={`group transition-colors hover:bg-muted/30 ${isSkipped ? 'opacity-40' : ''}`}
                     >
                       <div className="flex items-center gap-2 px-4 py-2">
@@ -528,12 +592,12 @@ export function ApiKeyTestDialog({
 
                           {/* 复制按钮 */}
                           {keyText && (
-                            copiedKeyIndex === idx ? (
+                            copiedKeyId === clientId ? (
                               <CopyCheck className="w-3 h-3 text-emerald-500 flex-shrink-0" />
                             ) : (
                               <button
                                 className="text-muted-foreground hover:text-foreground opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0"
-                                onClick={() => copyKey(idx)}
+                                onClick={() => copyKey(clientId)}
                                 title="复制 Key"
                               >
                                 <Copy className="w-3 h-3" />
@@ -553,7 +617,7 @@ export function ApiKeyTestDialog({
                           {r.status === 'error' && (
                             <button
                               type="button"
-                              onClick={() => setExpandedErrorKeyIndex(current => current === idx ? null : idx)}
+                              onClick={() => setExpandedErrorKeyId(current => current === clientId ? null : clientId)}
                               className="max-w-full truncate text-left text-[11px] text-red-600 dark:text-red-400 hover:underline"
                             >
                               {isErrorExpanded ? '收起错误详情' : `${r.auth_failed ? '[auth] ' : ''}查看错误：${errorSummary}`}
@@ -568,7 +632,7 @@ export function ApiKeyTestDialog({
                         {/* 未勾选"包含已禁用"时也应能测试单个（包括已禁用）key。
                             按钮不再因 isSkipped 而禁用，testSingleKey 默认 allowDisabled=true。 */}
                         <button
-                          onClick={() => void testSingleKey(idx)}
+                          onClick={() => void testSingleKey(clientId)}
                           disabled={r.status === 'testing' || !keyText}
                           className="p-1.5 rounded-md text-primary hover:bg-primary/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0"
                           title="测试此 Key"
@@ -604,11 +668,11 @@ export function ApiKeyTestDialog({
                             <span>Key #{idx + 1} 错误详情</span>
                             <button
                               type="button"
-                              onClick={() => void copyErrorText(idx, errorText)}
+                              onClick={() => void copyErrorText(clientId, errorText)}
                               className="inline-flex items-center gap-1 rounded-md border border-red-500/20 bg-background px-2 py-1 hover:bg-red-500/10 transition-colors"
                             >
-                              {copiedErrorKeyIndex === idx ? <CopyCheck className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                              {copiedErrorKeyIndex === idx ? '已复制' : '复制'}
+                              {copiedErrorKeyId === clientId ? <CopyCheck className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                              {copiedErrorKeyId === clientId ? '已复制' : '复制'}
                             </button>
                           </div>
                           <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words select-text text-[11px] leading-relaxed text-red-700 dark:text-red-300 font-mono">{errorText}</pre>
@@ -621,11 +685,11 @@ export function ApiKeyTestDialog({
             )}
 
             {/* 响应预览区（仅显示最近一个有 preview 的结果） */}
-            {lastPreviewIdx != null && results.get(lastPreviewIdx)?.response_preview && (
+            {lastPreviewKeyId != null && results.get(lastPreviewKeyId)?.response_preview && (
               <div className="mx-4 my-2 p-2.5 bg-muted/40 border border-border rounded-lg">
-                <div className="text-[10px] text-muted-foreground mb-1">Key #{lastPreviewIdx + 1} 响应预览</div>
+                <div className="text-[10px] text-muted-foreground mb-1">Key #{apiKeys.findIndex(item => item._clientId === lastPreviewKeyId) + 1} 响应预览</div>
                 <pre className="text-[11px] max-h-[100px] overflow-auto whitespace-pre-wrap text-foreground">
-                  {results.get(lastPreviewIdx)!.response_preview}
+                  {results.get(lastPreviewKeyId)!.response_preview}
                 </pre>
               </div>
             )}

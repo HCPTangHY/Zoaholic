@@ -5,6 +5,8 @@
 // 目的：让 hooks 和组件按同一份类型编译，避免迁移过程中出现结构漂移。
 // ========== Types ==========
 export interface ApiKeyObj {
+  /** 仅用于前端列表与异步测试关联；保存渠道时不会写入 payload。 */
+  _clientId: string;
   key: string;
   disabled: boolean;
   label?: string;

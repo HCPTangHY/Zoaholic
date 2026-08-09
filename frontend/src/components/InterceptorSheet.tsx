@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { apiFetch } from '../lib/api';
 import { buildEnabledPluginValue, parseEnabledPluginValue, type EnabledPluginValue } from '../lib/pluginEntries';
-import { toastSuccess, toastError, toastWarning, fmtErr } from '../components/Toast';
-import { PluginParamsForm, type ParamSchema } from './PluginParamsForm';
+import { toastSuccess, toastWarning, fmtErr } from '../components/Toast';
+import { PluginConfigFields, type PluginConfigMetadata } from './PluginConfigFields';
 import { 
   Puzzle, 
   Settings2, 
@@ -25,17 +25,7 @@ interface PluginOption {
   channel_outbound_interceptors?: unknown[];
   key_outbound_interceptors?: unknown[];
   balance_enrichers?: unknown[];
-  metadata?: {
-    params_hint?: string;
-    params_schema?: ParamSchema[];
-    provider_config?: {
-      key: string;
-      type?: 'json' | 'text';
-      title?: string;
-      description?: string;
-      example?: unknown;
-    };
-  };
+  metadata?: PluginConfigMetadata;
 }
 
 interface InterceptorSheetProps {
@@ -261,12 +251,6 @@ export function InterceptorSheet({
     });
   };
 
-  const formatJsonText = (text: string): string => {
-    if (!text.trim()) return '';
-    const obj = JSON.parse(text);
-    return JSON.stringify(obj, null, 2);
-  };
-
   const handleSave = () => {
     const result: EnabledPluginValue[] = [];
     selected.forEach((options, name) => {
@@ -315,7 +299,6 @@ export function InterceptorSheet({
     const hasChannelOutbound = (plugin.channel_outbound_interceptors?.length ?? 0) > 0;
     const hasKeyOutbound = (plugin.key_outbound_interceptors?.length ?? 0) > 0;
     const hasProviderConfig = Boolean(plugin.metadata?.provider_config?.key);
-    const paramsSchema = Array.isArray(plugin.metadata?.params_schema) ? plugin.metadata.params_schema : [];
 
     return (
       <div key={plugin.plugin_name} className={`border rounded-lg transition-colors ${isSelected ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-border bg-card'}`}>
@@ -361,88 +344,19 @@ export function InterceptorSheet({
           <div className="text-muted-foreground flex-shrink-0 ml-2 mt-0.5">{isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}</div>
         </div>
 
-        {/* Details */}
+        {/* Details — 与渠道编辑页复用同一个完整配置组件。 */}
         {isExpanded && (
-          <div className="px-3 pb-3 pt-1 border-t border-border bg-muted/20">
-            <div className="space-y-1.5 mt-2">
-              <label className="text-xs font-medium text-muted-foreground flex items-center gap-1"><Settings2 className="w-3.5 h-3.5" /> 插件参数</label>
-              {/* 修改原因：后端插件已经通过 metadata.params_schema 描述参数，完整配置面板不应再只提供自由文本输入。
-                  修改方式：有 schema 时渲染 select、text、number、toggle、multi-select 等控件；没有 schema 时仍回退原文本输入。
-                  目的：降低插件配置出错率，同时保持旧插件和手写 options 的兼容性。 */}
-              <PluginParamsForm
-                options={options}
-                schema={paramsSchema}
-                onChange={(nextOptions) => updateOptions(plugin.plugin_name, nextOptions)}
-                disabled={!isSelected}
-                paramsHint={plugin.metadata?.params_hint}
-                size="normal"
-              />
-            </div>
-
-            {plugin.metadata?.provider_config?.key && (
-              <div className="space-y-2 mt-4">
-                <label className="text-xs font-medium text-muted-foreground flex items-center gap-1">
-                  <Settings2 className="w-3.5 h-3.5" />
-                  {plugin.metadata?.provider_config?.title || '渠道配置（JSON）'}
-                </label>
-
-                {plugin.metadata?.provider_config?.description && (
-                  <p className="text-xs text-muted-foreground">{plugin.metadata.provider_config.description}</p>
-                )}
-
-                <textarea
-                  value={providerConfigText.get(plugin.plugin_name) || ''}
-                  onChange={(e) => updateProviderConfigText(plugin.plugin_name, e.target.value)}
-                  disabled={!isSelected}
-                  rows={6}
-                  placeholder={
-                    plugin.metadata?.provider_config?.example
-                      ? JSON.stringify(plugin.metadata.provider_config.example, null, 2)
-                      : '请输入 JSON'
-                  }
-                  className="w-full bg-background border border-border text-foreground focus:border-emerald-500 px-3 py-2 rounded-md text-sm font-mono disabled:opacity-50 outline-none"
-                />
-
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={!isSelected}
-                    onClick={() => {
-                      try {
-                        updateProviderConfigText(plugin.plugin_name, formatJsonText(providerConfigText.get(plugin.plugin_name) || ''));
-                      } catch (e: unknown) {
-                        toastError(`格式化失败：${e instanceof Error ? e.message : 'invalid json'}`);
-                      }
-                    }}
-                    className="text-xs font-medium text-muted-foreground hover:text-foreground px-2 py-1 bg-muted rounded disabled:opacity-50"
-                  >
-                    格式化
-                  </button>
-
-                  {plugin.metadata?.provider_config?.example != null && (
-                    <button
-                      type="button"
-                      disabled={!isSelected}
-                      onClick={() => updateProviderConfigText(plugin.plugin_name, JSON.stringify(plugin.metadata?.provider_config?.example, null, 2))}
-                      className="text-xs font-medium text-emerald-600 dark:text-emerald-500 hover:text-emerald-500 px-2 py-1 bg-emerald-500/10 rounded disabled:opacity-50"
-                    >
-                      填入示例
-                    </button>
-                  )}
-
-                  <button
-                    type="button"
-                    disabled={!isSelected}
-                    onClick={() => updateProviderConfigText(plugin.plugin_name, '')}
-                    className="text-xs font-medium text-red-600 dark:text-red-400 hover:text-red-500 px-2 py-1 bg-red-500/10 rounded disabled:opacity-50"
-                  >
-                    清空
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
+          <PluginConfigFields
+            pluginName={plugin.plugin_name}
+            metadata={plugin.metadata}
+            selected={isSelected}
+            options={options}
+            providerConfigText={providerConfigText.get(plugin.plugin_name) || ''}
+            onOptionsChange={(nextOptions) => updateOptions(plugin.plugin_name, nextOptions)}
+            onProviderConfigTextChange={(text) => updateProviderConfigText(plugin.plugin_name, text)}
+          />
         )}
+
       </div>
     );
   };

@@ -9,6 +9,7 @@ import { buildEnabledPluginValue as buildPluginEntryValue, parseEnabledPluginVal
 import { DeferredInput, UiSlot } from './KeyComponents';
 import { hasUiSlot } from '../utils';
 import { PluginParamsForm, type ParamSchema } from '../../../components/PluginParamsForm';
+import { PluginProviderConfigFields, type PluginProviderConfigMetadata } from '../../../components/PluginConfigFields';
 import {
   formatKeyRuleKeywordsInput,
   formatKeyRuleStatusInput,
@@ -31,6 +32,8 @@ interface PipelineViewProps {
   // 修改方式：新增 onPluginsChange，把更新后的 enabled_plugins 数组交回 ChannelEditor 写入 formData。
   // 目的：让常用插件操作可以在 Pipeline 面板内直接完成。
   onPluginsChange: (plugins: EnabledPluginValue[]) => void;
+  onProviderPreferenceChange: (key: string, value: unknown) => void;
+  onProviderPreferenceDelete: (key: string) => void;
   // 修改原因：System Prompt 已从高级设置迁移到 Pipeline 的上游节点，需要由 PipelineView 回写 preferences。
   // 修改方式：新增 onSystemPromptChange，由 ChannelEditor 传入 updatePreference('system_prompt', value)。
   // 目的：保持数据仍由 ChannelEditor 管理，同时让上游节点成为系统提示词入口。
@@ -123,6 +126,8 @@ type EnabledPluginEntry = {
   description?: string;
   paramsSchema?: ParamSchema[];
   paramsHint?: string;
+  providerConfig?: PluginProviderConfigMetadata;
+  providerConfigValue?: unknown;
   entryIndex: number;
 };
 
@@ -134,17 +139,54 @@ function buildEnabledPluginValue(name: string, opts: string): EnabledPluginValue
   return buildPluginEntryValue(name, opts);
 }
 
-function PluginCard({ name, opts, hasOpts, description, paramsSchema, paramsHint, onRemove, onOptsChange }: {
+function PluginCard({
+  name, opts, hasOpts, description, paramsSchema, paramsHint,
+  providerConfig, providerConfigValue, onProviderConfigChange, onProviderConfigDelete,
+  onRemove, onOptsChange,
+}: {
   name: string;
   opts?: string;
   hasOpts: boolean;
   description?: string;
   paramsSchema?: ParamSchema[];
   paramsHint?: string;
+  providerConfig?: PluginProviderConfigMetadata;
+  providerConfigValue?: unknown;
+  onProviderConfigChange: (key: string, value: unknown) => void;
+  onProviderConfigDelete: (key: string) => void;
   onRemove: () => void;
   onOptsChange: (opts: string) => void;
 }) {
   const schema = Array.isArray(paramsSchema) ? paramsSchema : [];
+  const [providerConfigText, setProviderConfigText] = useState(() => {
+    if (providerConfigValue === undefined || providerConfigValue === null) return '';
+    try { return JSON.stringify(providerConfigValue, null, 2); }
+    catch { return String(providerConfigValue); }
+  });
+
+  useEffect(() => {
+    if (providerConfigValue === undefined || providerConfigValue === null) setProviderConfigText('');
+    else {
+      try { setProviderConfigText(JSON.stringify(providerConfigValue, null, 2)); }
+      catch { setProviderConfigText(String(providerConfigValue)); }
+    }
+  }, [providerConfigValue]);
+
+  const updateProviderConfigText = (text: string) => {
+    setProviderConfigText(text);
+    if (!providerConfig?.key) return;
+    if (!text.trim()) {
+      onProviderConfigDelete(providerConfig.key);
+      return;
+    }
+    if (providerConfig.type === 'text') {
+      onProviderConfigChange(providerConfig.key, text);
+      return;
+    }
+    try { onProviderConfigChange(providerConfig.key, JSON.parse(text)); }
+    catch { /* 允许输入中的临时非完整 JSON，格式化按钮会提示错误。 */ }
+  };
+
   // ponytail: 旧插件无 params_schema 时仍需显示文本输入框，PluginParamsForm 已有 schema=[] 回退逻辑
   const shouldShowParams = true;
 
@@ -167,14 +209,20 @@ function PluginCard({ name, opts, hasOpts, description, paramsSchema, paramsHint
           {shouldShowParams && (
             <div className="mt-1.5">
               {/* 修改原因：插件参数已由 metadata.params_schema 描述，继续使用纯文本输入会让常用参数难以理解。
-                  修改方式：有 schema 时渲染紧凑可视化控件；没有 schema 时回退到原 options 文本输入。
-                  目的：让 Pipeline 面板内直接完成大多数插件参数配置，同时保持旧插件兼容。 */}
+                  修改方式：有 schema 时渲染 select、toggle、textarea 等紧凑控件。
+                  目的：保留现有紧凑卡片，并在同一卡片内补齐渠道级高级 JSON。 */}
               <PluginParamsForm
                 options={opts || ''}
                 schema={schema}
                 paramsHint={paramsHint}
                 onChange={onOptsChange}
                 size="compact"
+              />
+              <PluginProviderConfigFields
+                providerConfig={providerConfig}
+                selected
+                providerConfigText={providerConfigText}
+                onProviderConfigTextChange={updateProviderConfigText}
               />
             </div>
           )}
@@ -368,6 +416,7 @@ function KeyRulesPanel({ rules, onKeyRulesChange }: { rules: any[]; onKeyRulesCh
 export function PipelineView({
   formData, allPlugins, overridesJson, setOverridesJson,
   headerEntries, setHeaderEntries, onOpenPluginSheet, onPluginsChange,
+  onProviderPreferenceChange, onProviderPreferenceDelete,
   onSystemPromptChange, keyRules = [], onKeyRulesChange, formatJsonOnBlur,
 }: PipelineViewProps) {
   const [activeNode, setActiveNode] = useState<string | null>(null);
@@ -402,8 +451,19 @@ export function PipelineView({
     // 修改方式：在 enabled_plugins 派生条目中带上 paramsSchema 和 paramsHint，PluginCard 负责渲染。
     // 目的：让卡片保留原 options pill，同时提供可视化参数编辑。
     const paramsSchema = Array.isArray(info?.metadata?.params_schema) ? info.metadata.params_schema : [];
-    return { ...parsed, description: info?.description, paramsSchema, paramsHint: info?.metadata?.params_hint, entryIndex, info };
-  }), [enabledPlugins, allPlugins]);
+    const providerConfig = info?.metadata?.provider_config as PluginProviderConfigMetadata | undefined;
+    const providerConfigValue = providerConfig?.key ? formData.preferences?.[providerConfig.key] : undefined;
+    return {
+      ...parsed,
+      description: info?.description,
+      paramsSchema,
+      paramsHint: info?.metadata?.params_hint,
+      providerConfig,
+      providerConfigValue,
+      entryIndex,
+      info,
+    };
+  }), [enabledPlugins, allPlugins, formData.preferences]);
 
   // 按 interceptor 类型分类已启用插件
   const { channelInboundPlugins, requestPlugins, responsePlugins, channelOutboundPlugins, keyOutboundPlugins } = useMemo(() => {
@@ -552,6 +612,10 @@ export function PipelineView({
                       description={p.description}
                       paramsSchema={p.paramsSchema}
                       paramsHint={p.paramsHint}
+                      providerConfig={p.providerConfig}
+                      providerConfigValue={p.providerConfigValue}
+                      onProviderConfigChange={onProviderPreferenceChange}
+                      onProviderConfigDelete={onProviderPreferenceDelete}
                       onRemove={() => removePluginAt(p.entryIndex)}
                       onOptsChange={(opts) => updatePluginOptsAt(p.entryIndex, p.name, opts)}
                     />
@@ -644,6 +708,10 @@ export function PipelineView({
                       description={p.description}
                       paramsSchema={p.paramsSchema}
                       paramsHint={p.paramsHint}
+                      providerConfig={p.providerConfig}
+                      providerConfigValue={p.providerConfigValue}
+                      onProviderConfigChange={onProviderPreferenceChange}
+                      onProviderConfigDelete={onProviderPreferenceDelete}
                       onRemove={() => removePluginAt(p.entryIndex)}
                       onOptsChange={(opts) => updatePluginOptsAt(p.entryIndex, p.name, opts)}
                     />
@@ -698,6 +766,10 @@ export function PipelineView({
                       description={p.description}
                       paramsSchema={p.paramsSchema}
                       paramsHint={p.paramsHint}
+                      providerConfig={p.providerConfig}
+                      providerConfigValue={p.providerConfigValue}
+                      onProviderConfigChange={onProviderPreferenceChange}
+                      onProviderConfigDelete={onProviderPreferenceDelete}
                       onRemove={() => removePluginAt(p.entryIndex)}
                       onOptsChange={(opts) => updatePluginOptsAt(p.entryIndex, p.name, opts)}
                     />
@@ -740,6 +812,10 @@ export function PipelineView({
                       description={p.description}
                       paramsSchema={p.paramsSchema}
                       paramsHint={p.paramsHint}
+                      providerConfig={p.providerConfig}
+                      providerConfigValue={p.providerConfigValue}
+                      onProviderConfigChange={onProviderPreferenceChange}
+                      onProviderConfigDelete={onProviderPreferenceDelete}
                       onRemove={() => removePluginAt(p.entryIndex)}
                       onOptsChange={(opts) => updatePluginOptsAt(p.entryIndex, p.name, opts)}
                     />
@@ -776,6 +852,10 @@ export function PipelineView({
                       description={p.description}
                       paramsSchema={p.paramsSchema}
                       paramsHint={p.paramsHint}
+                      providerConfig={p.providerConfig}
+                      providerConfigValue={p.providerConfigValue}
+                      onProviderConfigChange={onProviderPreferenceChange}
+                      onProviderConfigDelete={onProviderPreferenceDelete}
                       onRemove={() => removePluginAt(p.entryIndex)}
                       onOptsChange={(opts) => updatePluginOptsAt(p.entryIndex, p.name, opts)}
                     />
