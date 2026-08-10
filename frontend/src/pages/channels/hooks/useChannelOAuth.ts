@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 
 import { apiFetch } from '../../../lib/api';
+import { createApiKeyClientId } from '../../../lib/apiKeyClientId';
 import { toastError, toastWarning, fmtErr } from '../../../components/Toast';
 import type { ChannelOption, ProviderFormData } from '../types';
 import { getOAuthQuota, getQuotaFromSource, normalizeOAuthAccountStateMap } from '../utils';
@@ -120,10 +121,10 @@ export function useChannelOAuth({
           const existingKeys = new Set(prev.api_keys.map(k => k.key.replace(/^!/, '').trim()));
           const newKeyIds = Object.keys(normalized).filter(k => k && !existingKeys.has(k));
           if (newKeyIds.length === 0) return prev;
-          const newEntries = newKeyIds.map(k => ({ key: k, disabled: false, label: '' }));
+          const newEntries = newKeyIds.map(k => ({ _clientId: createApiKeyClientId(), key: k, disabled: false, label: '' }));
           // 移除尾部空 key 后追加新 key，再补回一个空行
           const trimmedKeys = prev.api_keys.filter(k => k.key.trim());
-          return { ...prev, api_keys: [...trimmedKeys, ...newEntries, { key: '', disabled: false, label: '' }] };
+          return { ...prev, api_keys: [...trimmedKeys, ...newEntries, { _clientId: createApiKeyClientId(), key: '', disabled: false, label: '' }] };
         });
       }
     } catch {

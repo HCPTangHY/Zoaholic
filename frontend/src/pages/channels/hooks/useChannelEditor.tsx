@@ -12,6 +12,7 @@ import {
 } from 'react';
 
 import { apiFetch } from '../../../lib/api';
+import { createApiKeyClientId } from '../../../lib/apiKeyClientId';
 import type { EnabledPluginValue } from '../../../lib/pluginEntries';
 import { toastError, toastSuccess, toastWarning, fmtErr } from '../../../components/Toast';
 import { useChannelOAuth } from './useChannelOAuth';
@@ -364,13 +365,13 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
             const [k, v] = entries[0];
             const trimmed = String(k).trim();
             const label = v ? String(v).trim() : undefined;
-            if (trimmed.startsWith('!')) return { key: trimmed.substring(1), disabled: true, label };
-            return { key: trimmed, disabled: false, label };
+            if (trimmed.startsWith('!')) return { _clientId: createApiKeyClientId(), key: trimmed.substring(1), disabled: true, label };
+            return { _clientId: createApiKeyClientId(), key: trimmed, disabled: false, label };
           }
         }
         const trimmed = String(raw).trim();
-        if (trimmed.startsWith('!')) return { key: trimmed.substring(1), disabled: true };
-        return { key: trimmed, disabled: false };
+        if (trimmed.startsWith('!')) return { _clientId: createApiKeyClientId(), key: trimmed.substring(1), disabled: true };
+        return { _clientId: createApiKeyClientId(), key: trimmed, disabled: false };
       };
 
       let parsedKeys: ApiKeyObj[] = [];
@@ -497,7 +498,7 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
   const addEmptyKey = () => {
     if (!formData) return;
     const newIdx = formData.api_keys.length;
-    updateFormData('api_keys', [...formData.api_keys, { key: '', disabled: false }]);
+    updateFormData('api_keys', [...formData.api_keys, { _clientId: createApiKeyClientId(), key: '', disabled: false }]);
     setTimeout(() => {
       setFocusedKeyIdx(newIdx);
       requestAnimationFrame(() => {
@@ -548,6 +549,12 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
         return;
       }
     }
+    // 删除中间项时同步修正聚焦下标，避免后继 Key 顶替被删行的展开/焦点状态。
+    setFocusedKeyIdx(current => {
+      if (current === null) return null;
+      if (current === idx) return null;
+      return current > idx ? current - 1 : current;
+    });
     updateFormData('api_keys', formData.api_keys.filter((_, i) => i !== idx));
   };
 
@@ -559,7 +566,7 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
     const newKeys = [...formData.api_keys];
     newKeys[idx] = { ...newKeys[idx], key: lines[0] };
     const existingSet = new Set(newKeys.map(k => k.key));
-    const newKeyObjs = lines.slice(1).filter(k => !existingSet.has(k)).map(k => ({ key: k, disabled: false }));
+    const newKeyObjs = lines.slice(1).filter(k => !existingSet.has(k)).map(k => ({ _clientId: createApiKeyClientId(), key: k, disabled: false }));
     newKeys.splice(idx + 1, 0, ...newKeyObjs);
     updateFormData('api_keys', newKeys);
   };

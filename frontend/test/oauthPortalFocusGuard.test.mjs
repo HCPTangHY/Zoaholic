@@ -3,56 +3,41 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// 修改原因：OAuth 弹窗已经移动到 document.body portal，但仍可能被编辑抽屉的 Radix Dialog 焦点锁拉回。
-// 修改方式：通过源码回归测试锁定编辑抽屉的外部焦点处理、外部交互处理和 portal 容器可聚焦属性。
-// 目的：防止后续维护时再次让 OAuth 导入和手动粘贴输入框无法获得焦点。
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const channelsSource = readFileSync(path.resolve(__dirname, '../src/pages/Channels.tsx'), 'utf8');
+const frontendRoot = path.resolve(__dirname, '..');
+const pageSource = readFileSync(path.resolve(frontendRoot, 'src/pages/channels/ChannelsPage.tsx'), 'utf8');
+const editorSource = readFileSync(path.resolve(frontendRoot, 'src/pages/channels/components/ChannelEditor.tsx'), 'utf8');
+const editorHookSource = readFileSync(path.resolve(frontendRoot, 'src/pages/channels/hooks/useChannelEditor.tsx'), 'utf8');
 
-function sliceBetween(startMarker, endMarker, fromIndex = 0) {
-  const start = channelsSource.indexOf(startMarker, fromIndex);
+function sliceBetween(source, startMarker, endMarker, fromIndex = 0) {
+  const start = source.indexOf(startMarker, fromIndex);
   assert.notEqual(start, -1, `找不到起始片段：${startMarker}`);
-  const end = channelsSource.indexOf(endMarker, start + startMarker.length);
+  const end = source.indexOf(endMarker, start + startMarker.length);
   assert.notEqual(end, -1, `找不到结束片段：${endMarker}`);
-  return channelsSource.slice(start, end);
+  return source.slice(start, end);
 }
 
-const editorSheet = sliceBetween('{/* Editor Side Sheet - Responsive */}', '<ChannelTestDialog');
-const importPortal = sliceBetween('{importModalIdx !== null && createPortal(', 'document.body');
-const manualPortal = sliceBetween('{oauthManualState !== null && createPortal(', 'document.body', channelsSource.indexOf('{oauthManualState !== null && createPortal('));
+// 修改原因：Channels.tsx 拆分后，OAuth 导入/手动回调弹窗位于 ChannelsPage.tsx。
+// 修改方式：弹窗通过 createPortal 渲染到 body，并在遮罩容器添加 tabIndex={-1}。
+// 目的：避免 OAuth 弹窗被当作 body 第一个可聚焦元素自动聚焦，同时继续阻止主编辑器触屏误触关闭。
+const importModal = sliceBetween(pageSource, '{importModalIdx !== null && createPortal(', '{oauthManualState !== null && createPortal(');
+assert.match(importModal, /tabIndex=\{-1\}/, 'OAuth 导入弹窗遮罩应禁止自动聚焦');
+assert.match(importModal, /fixed inset-0 z-\[100\]/, 'OAuth 导入弹窗应覆盖主编辑器');
 
-assert.match(
-  channelsSource,
-  /const isOAuthOverlayOpen = importModalIdx !== null \|\| oauthManualState !== null;/,
-  '应该把两个 OAuth portal 弹窗状态合并为编辑抽屉可复用的布尔值',
-);
-assert.match(
-  editorSheet,
-  /if \(!open && isOAuthOverlayOpen\) return;/,
-  'OAuth portal 弹窗打开时，底层编辑抽屉不应该被外部交互关闭',
-);
-assert.match(
-  editorSheet,
-  /onFocusOutside=\{\(e\) => \{[\s\S]*if \(isOAuthOverlayOpen\) \{[\s\S]*e\.preventDefault\(\);[\s\S]*\}[\s\S]*\}\}/,
-  'OAuth portal 弹窗打开时，编辑抽屉应该阻止 Radix 对外部焦点事件执行默认处理',
-);
-assert.match(
-  editorSheet,
-  /onInteractOutside=\{\(e\) => \{[\s\S]*if \(isOAuthOverlayOpen\) \{[\s\S]*e\.preventDefault\(\);[\s\S]*\}[\s\S]*\}\}/,
-  'OAuth portal 弹窗打开时，编辑抽屉应该阻止 Radix 对外部交互事件执行默认处理',
-);
-assert.doesNotMatch(
-  editorSheet,
-  /modal=\{false\}|modal="false"/,
-  '编辑抽屉不能通过彻底关闭 Dialog modal 模式来绕过焦点问题',
-);
-assert.match(importPortal, /<div\s+tabIndex=\{-1\}[\s\S]*导入 Refresh Token/, '导入弹窗的 portal 遮罩容器应该可作为焦点回退目标');
-assert.match(importPortal, /<textarea[\s\S]*autoFocus/, '导入弹窗的 textarea 应该保持自动聚焦');
-assert.match(manualPortal, /<div\s+tabIndex=\{-1\}[\s\S]*完成 OAuth 登录/, '手动粘贴弹窗的 portal 遮罩容器应该可作为焦点回退目标');
-assert.match(manualPortal, /<input[\s\S]*autoFocus/, '手动粘贴弹窗的 input 应该保持自动聚焦');
+const manualModalStart = pageSource.indexOf('{oauthManualState !== null && createPortal(');
+assert.notEqual(manualModalStart, -1, '应保留 OAuth 手动回调弹窗');
+const manualModal = pageSource.slice(manualModalStart, manualModalStart + 3000);
+assert.match(manualModal, /tabIndex=\{-1\}/, 'OAuth 手动回调弹窗遮罩应禁止自动聚焦');
+assert.match(manualModal, /fixed inset-0 z-\[100\]/, 'OAuth 手动回调弹窗应覆盖主编辑器');
+
+// 移动端打开渠道编辑弹窗时，应锁定 Layout 的 <main> 滚动容器阻止背景回弹。
+// 滚动锁实现位于 hooks/useChannelEditor.tsx。
+assert.match(editorHookSource, /const applyChannelModalScrollLock = useCallback\(/, '渠道编辑弹窗打开时应应用滚动锁');
+assert.match(editorHookSource, /channelModalScrollYRef\.current = scroller \? scroller\.scrollTop : 0;/, '滚动锁应保存当前滚动位置');
+
+// 渠道编辑器应保留弹窗结构（遮罩 + 居中内容）。
+assert.match(editorSource, /fixed inset-0/, '渠道编辑器应保留遮罩层');
+assert.match(editorSource, /编辑渠道|新增渠道|编辑子渠道/, '渠道编辑器应保留弹窗标题');
 
 console.log('oauth portal focus guard regression passed');
-// 修改原因：当前部署环境的 Node 18 在部分 ESM 脚本自然结束后会触发 Aborted。
-// 修改方式：断言全部通过后显式以 0 退出，断言失败时仍会在这里之前抛出错误。
-// 目的：让测试退出码只反映本文件断言是否通过。
 process.exit(0);

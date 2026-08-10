@@ -14,6 +14,7 @@ import { ProviderLogo } from '../../../components/ProviderLogos';
 import { PipelineView } from './PipelineView';
 import { summarizeVirtualChain } from '../../../lib/virtualModels';
 import { apiFetch } from '../../../lib/api';
+import { createApiKeyClientId } from '../../../lib/apiKeyClientId';
 import { toastError, fmtErr } from '../../../components/Toast';
 import type { ChannelOption } from '../types';
 import { SCHEDULE_ALGORITHMS, getBalancePercent, hasUiSlot } from '../utils';
@@ -363,7 +364,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                         {formData.api_keys.map((keyObj, idx) => {
                           if (focusedKeyIdx === idx) {
                             return (
-                              <div key={`full-${idx}`} style={{ gridColumn: '1 / -1' }}>
+                              <div key={`full-${keyObj._clientId}`} style={{ gridColumn: '1 / -1' }}>
                                 {/* 修改原因：机房模式中被选中的卡片需要展开为原完整行，才能编辑完整 Key、备注和全部操作。
                                     修改方式：在 flex-wrap 网格中用 w-full basis-full 包裹共用完整行渲染，让展开项独占一整行。
                                     目的：其他未选中卡片继续保持紧凑排列，选中项上下自然换行。 */}
@@ -398,7 +399,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
 
                           return (
                             <RackCard
-                              key={idx}
+                              key={keyObj._clientId}
                               idx={idx}
                               keyObj={keyObj}
                               providerName={formData.provider}
@@ -430,7 +431,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                       <>
                         {formData.api_keys.map((keyObj, idx) => (
                           <FullKeyRow
-                            key={idx}
+                            key={keyObj._clientId}
                             keyObj={keyObj}
                             idx={idx}
                             formData={formData}
@@ -477,7 +478,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                           ) : (
                             <button type="button" onClick={() => { setBatchPasteOpen(true); setBatchImportOpen(false); }} className="text-muted-foreground hover:text-primary flex items-center gap-1"><ClipboardPaste className="w-3.5 h-3.5" /> 批量粘贴</button>
                           )}
-                          <button type="button" onClick={() => setFormData(prev => prev ? ({...prev, api_keys: [...prev.api_keys, {key: '*', disabled: false}]}) : prev)} className="text-muted-foreground hover:text-foreground flex items-center gap-1">* BYOK</button>
+                          <button type="button" onClick={() => setFormData(prev => prev ? ({...prev, api_keys: [...prev.api_keys, {_clientId: createApiKeyClientId(), key: '*', disabled: false}]}) : prev)} className="text-muted-foreground hover:text-foreground flex items-center gap-1">* BYOK</button>
                         </div>
                       </div>
                     )}
@@ -717,7 +718,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                               onClick={() => {
                                 setFormData(prev => prev ? ({
                                   ...prev,
-                                  api_keys: [...prev.api_keys, ...newKeys.map(k => ({ key: k, disabled: false }))],
+                                  api_keys: [...prev.api_keys, ...newKeys.map(k => ({ _clientId: createApiKeyClientId(), key: k, disabled: false }))],
                                 }) : prev);
                                 setBatchPasteOpen(false); setBatchPasteText('');
                               }}
