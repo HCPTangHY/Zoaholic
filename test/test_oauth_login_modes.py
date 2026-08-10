@@ -98,7 +98,7 @@ async def test_oauth_authorize_uses_forwarded_host_for_auto_redirect():
 
 
 def test_codex_provider_declares_manual_redirect_mode():
-    from core.oauth.providers.codex import CodexProvider
+    from core.channels.codex_channel import CodexProvider
 
     # 修改原因：authorize 的自动分流依赖 provider 自身声明，Codex 必须固定为 manual。
     # 修改方式：直接断言 CodexProvider 的类属性。

@@ -123,7 +123,7 @@ def test_builtin_oauth_channels_register_import_placeholders():
 
 def test_builtin_oauth_channels_with_real_quota_fetch_register_quota_display():
     from core.channels import get_channel
-    from core.oauth.providers.base import OAuthProvider
+    from core.oauth.base import OAuthProvider
 
     # 修改原因：只有覆盖基类空实现并能返回额度数据的 OAuth provider 才需要 quota_display。
     # 修改方式：把当前内置 provider 的 fetch_quota 覆盖状态和插槽注册结果固定为显式映射。

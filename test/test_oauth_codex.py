@@ -64,7 +64,7 @@ class FakeAsyncClient:
 
 
 def test_codex_provider_resolves_token_url_from_runtime_config():
-    from core.oauth.providers.codex import DEFAULT_TOKEN_URL, CodexProvider
+    from core.channels.codex_channel import DEFAULT_TOKEN_URL, CodexProvider
 
     # 修改原因：CodexProvider 不能在启动时把 token_url 烤进实例属性，否则前端保存的新配置不会生效。
     # 修改方式：直接测试 _resolve_token_url 对当前运行时配置的解析结果，覆盖默认值、反代域名和完整 endpoint 三种情况。
@@ -104,7 +104,7 @@ def test_codex_channel_register_oauth_provider_does_not_bake_token_url():
 
 @pytest.mark.asyncio
 async def test_codex_refresh_token_posts_form_and_handles_rotation(monkeypatch):
-    from core.oauth.providers import codex as codex_module
+    from core.channels import codex_channel as codex_module
 
     id_token = _jwt_with_payload({
         "email": "new@example.com",
@@ -143,7 +143,7 @@ async def test_codex_refresh_token_posts_form_and_handles_rotation(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_codex_refresh_token_uses_runtime_config_token_url(monkeypatch):
-    from core.oauth.providers import codex as codex_module
+    from core.channels import codex_channel as codex_module
 
     # 修改原因：refresh_token 是线上请求最常触发的 OAuth token endpoint 调用，必须读取最新 runtime config。
     # 修改方式：用假的 httpx.AsyncClient 捕获请求 URL，并通过 config 参数传入 codex token_url。
@@ -168,7 +168,7 @@ async def test_codex_refresh_token_uses_runtime_config_token_url(monkeypatch):
 
 
 def test_codex_build_auth_url_returns_pkce_verifier_and_challenge():
-    from core.oauth.providers.codex import CLIENT_ID, SCOPES, CodexProvider
+    from core.channels.codex_channel import CLIENT_ID, SCOPES, CodexProvider
 
     provider = CodexProvider()
     auth_url, verifier = provider.build_auth_url("state-1", "http://localhost:1455/auth/callback")
@@ -191,7 +191,7 @@ def test_codex_build_auth_url_returns_pkce_verifier_and_challenge():
 
 @pytest.mark.asyncio
 async def test_codex_exchange_code_decodes_email_and_account(monkeypatch):
-    from core.oauth.providers import codex as codex_module
+    from core.channels import codex_channel as codex_module
 
     id_token = _jwt_with_payload({
         "email": "dev@example.com",
@@ -703,14 +703,14 @@ async def test_codex_response_wrappers_capture_ratelimit_headers():
     )]
 
 
-def test_codex_oauth_provider_bridge_exports_channel_symbols():
-    from core.channels.codex_channel import CodexProvider as ChannelCodexProvider
-    from core.oauth.providers.codex import CLIENT_ID, DEFAULT_TOKEN_URL, SCOPES, CodexProvider
+def test_codex_oauth_provider_exports_channel_symbols():
+    from core.channels.codex_channel import CLIENT_ID, DEFAULT_TOKEN_URL, SCOPES, CodexProvider
+    from core.oauth.base import OAuthProvider
 
-    # 修改原因：CodexProvider 已迁移到渠道文件，但旧导入路径仍是外部测试和调用方的兼容边界。
-    # 修改方式：断言桥接模块导出的类对象就是渠道文件中的类对象，并保留原常量。
-    # 目的：迁移实现位置时不破坏 from core.oauth.providers.codex import ... 的用法。
-    assert CodexProvider is ChannelCodexProvider
+    # 修改原因：core/oauth/providers/ 目录已扁平化删除，CodexProvider 的唯一实现位于渠道文件。
+    # 修改方式：断言渠道文件直接导出 provider 类和 OAuth 常量，且 provider 继承扁平化后的 OAuthProvider 基类。
+    # 目的：锁定 core.channels.codex_channel 作为 Codex OAuth 的唯一导入来源。
+    assert issubclass(CodexProvider, OAuthProvider)
     assert CLIENT_ID
     assert SCOPES
     assert DEFAULT_TOKEN_URL.endswith("/oauth/token")

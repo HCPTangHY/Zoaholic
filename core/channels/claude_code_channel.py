@@ -28,7 +28,7 @@ from typing import Any
 
 import httpx
 
-from core.oauth.providers.base import OAuthProvider
+from core.oauth.base import OAuthProvider
 from core.channels.claude_channel import (
     fetch_claude_response_stream,
     fetch_claude_response,

@@ -23,7 +23,7 @@ from core.channels.gemini_channel import (
     get_gemini_payload,
 )
 from core.json_utils import json_dumps_text, json_loads
-from core.oauth.providers.base import OAuthProvider
+from core.oauth.base import OAuthProvider
 from core.stream_utils import aiter_decoded_lines
 from core.utils import get_model_dict
 

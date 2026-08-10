@@ -43,7 +43,7 @@ class QuotaFakeAsyncClient:
 
 @pytest.mark.asyncio
 async def test_codex_fetch_quota_reads_rate_limit_headers(monkeypatch):
-    from core.oauth.providers import codex as codex_module
+    from core.channels import codex_channel as codex_module
 
     # 修改原因：Codex 没有独立额度接口，旧的 GET /models 会因 scope 不足返回 403。
     # 修改方式：用假的 httpx.AsyncClient 捕获轻量 POST /chat/completions，并返回可控 ratelimit 响应头。
@@ -102,7 +102,7 @@ async def test_codex_fetch_quota_reads_rate_limit_headers(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_codex_fetch_quota_returns_none_without_access_token():
-    from core.oauth.providers.codex import CodexProvider
+    from core.channels.codex_channel import CodexProvider
 
     # 修改原因：额度查询只能使用 access_token 调用上游 API，缺失凭据时不能发起无效请求。
     # 修改方式：直接传入空凭据并断言返回 None。

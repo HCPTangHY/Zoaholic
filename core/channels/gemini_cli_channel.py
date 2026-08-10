@@ -12,7 +12,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
-from core.oauth.providers.base import OAuthProvider
+from core.oauth.base import OAuthProvider
 from core.channels.gemini_channel import (
     fetch_gemini_response,
     fetch_gemini_response_stream,
