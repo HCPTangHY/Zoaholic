@@ -357,6 +357,11 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
         if msg.role == "assistant":
             msg.role = "model"
         content = []
+        # 修改原因：Gemini 3.7+ 要求多轮对话中 functionCall parts 携带 thoughtSignature，缺失会 400。
+        # 修改方式：从消息的 thoughtSignature 属性和 tool_call 的 extra_content.google.thoughtSignature 提取签名，
+        #   附加到 functionCall part 上；无 tool_call 时附到最后一个 part。逻辑与 gemini_channel.py 一致。
+        # 目的：OpenAI 格式经 vertex_channel 转换后的 payload 保留签名，避免上游校验失败。
+        msg_signature = getattr(msg, "thoughtSignature", None)
         if isinstance(msg.content, list):
             for item in msg.content:
                 if item.type == "text":
@@ -396,24 +401,37 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
         elif msg.content:
             content = [{"text": msg.content}]
 
+        # 处理思维链（与 gemini_channel 对齐）
+        reasoning = getattr(msg, "reasoning_content", None)
+        if reasoning:
+            content.append({"thought": True, "text": reasoning})
+
         if msg.role == "model" and msg.tool_calls:
             # 修改原因：工具调用可能与思维链/文本共存于同一 model 回合。
             # 修改方式：functionCall 追加到已有 content parts 之后，不再要求 content 为空，arguments 解析失败降级为空对象。
             # 目的：保留全部 parts，避免 functionCall 丢失导致后续 functionResponse 无对应调用。
-            for tool_call in msg.tool_calls:
+            for i, tool_call in enumerate(msg.tool_calls):
                 try:
                     args = json.loads(tool_call.function.arguments) if isinstance(tool_call.function.arguments, str) else (tool_call.function.arguments or {})
                 except Exception:
                     args = {}
-                content.append({
+                fc_part = {
                     "functionCall": {
                         "name": tool_call.function.name,
                         "args": args
                     }
-                })
+                }
                 if getattr(tool_call, "id", None):
                     tool_call_name_map[tool_call.id] = tool_call.function.name
                 pending_fc_names.append(tool_call.function.name)
+                # thoughtSignature：优先从 tool_call.extra_content 取，首个 FC 兜底用消息级签名
+                sig = (getattr(tool_call, "extra_content", {}) or {}).get("google", {}).get("thoughtSignature")
+                if not sig and i == 0:
+                    sig = msg_signature
+                if sig:
+                    fc_part["thoughtSignature"] = sig
+                    msg_signature = None
+                content.append(fc_part)
             messages.append(
                 {
                     "role": "model",
@@ -453,6 +471,9 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
                     }
                 )
         elif msg.role != "system" and content:
+            # 无 tool_calls 时若有残余签名，附到最后一个 part
+            if msg_signature:
+                content[-1]["thoughtSignature"] = msg_signature
             messages.append({"role": msg.role, "parts": content})
         elif msg.role == "system" and content:
             system_prompt = system_prompt + "\n\n" + content[0]["text"]
