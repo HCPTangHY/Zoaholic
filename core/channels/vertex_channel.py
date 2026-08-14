@@ -345,14 +345,19 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     messages = []
     systemInstruction = None
     system_prompt = ""
-    function_arguments = None
+    # 修改原因：旧实现用单个 function_arguments 变量给所有 tool 响应命名，且只在 content 为 None 时才收集 tool_calls。
+    #   这导致两类故障：assistant 同时携带文本与工具调用时 functionCall 被静默丢弃，上游 Gemini 报
+    #   function response/call parts 数量不一致；tool 消息前面没有已捕获的 tool_calls 时 function_arguments 为 None 直接 500。
+    # 修改方式：改用 tool_call_id → 函数名映射加 FIFO 兜底配对，assistant 消息始终收集 tool_calls 并与文本 parts 合并。
+    # 目的：保证 functionCall 与 functionResponse 的数量和名称一一对应，孤立 tool 响应按声明的 name/tool_call_id 命名而非崩溃。
+    tool_call_name_map = {}
+    pending_fc_names = []
     request_messages = copy.deepcopy(request.messages)
     for msg in request_messages:
         if msg.role == "assistant":
             msg.role = "model"
-        tool_calls = None
+        content = []
         if isinstance(msg.content, list):
-            content = []
             for item in msg.content:
                 if item.type == "text":
                     text_message = format_gemini_text_message(item.text)
@@ -390,49 +395,66 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
                         })
         elif msg.content:
             content = [{"text": msg.content}]
-        elif msg.content is None:
-            tool_calls = msg.tool_calls
 
-        if tool_calls:
-            parts = []
-            # 修改原因：Vertex Gemini 历史中的工具调用必须完整保留。
-            # 修改方式：直接遍历全部 tool_calls，不再截断。
-            # 目的：避免 functionCall 与后续 functionResponse 不匹配。
-            for tool_call in tool_calls:
-                function_arguments = {
+        if msg.role == "model" and msg.tool_calls:
+            # 修改原因：工具调用可能与思维链/文本共存于同一 model 回合。
+            # 修改方式：functionCall 追加到已有 content parts 之后，不再要求 content 为空，arguments 解析失败降级为空对象。
+            # 目的：保留全部 parts，避免 functionCall 丢失导致后续 functionResponse 无对应调用。
+            for tool_call in msg.tool_calls:
+                try:
+                    args = json.loads(tool_call.function.arguments) if isinstance(tool_call.function.arguments, str) else (tool_call.function.arguments or {})
+                except Exception:
+                    args = {}
+                content.append({
                     "functionCall": {
                         "name": tool_call.function.name,
-                        "args": json.loads(tool_call.function.arguments)
+                        "args": args
                     }
-                }
-                parts.append(function_arguments)
+                })
+                if getattr(tool_call, "id", None):
+                    tool_call_name_map[tool_call.id] = tool_call.function.name
+                pending_fc_names.append(tool_call.function.name)
             messages.append(
                 {
                     "role": "model",
-                    "parts": parts
+                    "parts": content
                 }
             )
         elif msg.role == "tool":
-            function_call_name = function_arguments["functionCall"]["name"]
-            messages.append(
-                {
-                    "role": "function",
-                    "parts": [{
-                    "functionResponse": {
+            if msg.tool_call_id and msg.tool_call_id in tool_call_name_map:
+                function_call_name = tool_call_name_map[msg.tool_call_id]
+            elif msg.name:
+                function_call_name = msg.name
+            elif pending_fc_names:
+                function_call_name = pending_fc_names.pop(0)
+            else:
+                function_call_name = "unknown_function"
+            # 修改原因：OpenAI 格式里每个 tool 响应是独立消息，但 Gemini 要求同一 function call turn 的全部响应合并在一个 function turn 的 parts 里。
+            # 修改方式：上一条输出已是 function 回合时直接追加 part，否则才新开回合。
+            # 目的：并行工具调用产生的多个响应共享同一 turn，满足上游 response/call parts 数量一致的校验。
+            fr_part = {
+                "functionResponse": {
+                    "name": function_call_name,
+                    "response": {
                         "name": function_call_name,
-                        "response": {
-                            "name": function_call_name,
-                            "content": {
-                                "result": msg.content,
-                            }
+                        "content": {
+                            "result": msg.content,
                         }
                     }
-                    }]
                 }
-            )
+            }
+            if messages and messages[-1].get("role") == "function":
+                messages[-1]["parts"].append(fr_part)
+            else:
+                messages.append(
+                    {
+                        "role": "function",
+                        "parts": [fr_part]
+                    }
+                )
         elif msg.role != "system" and content:
             messages.append({"role": msg.role, "parts": content})
-        elif msg.role == "system":
+        elif msg.role == "system" and content:
             system_prompt = system_prompt + "\n\n" + content[0]["text"]
     if system_prompt.strip():
         systemInstruction = {"parts": [{"text": system_prompt}]}
@@ -493,6 +515,50 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     ]
     generation_config = {}
 
+    def inline_schema_refs(parameters, extra_defs=None):
+        # 修改原因：MCP 等客户端的工具 schema 使用 JSON Schema $ref/$defs 共享类型定义，Gemini protobuf Schema 不认识 $ref 字段，直接报 Unknown name "$ref" 400；
+        #   且 RequestModel.model_dump 有意排除 defs 字段（防严格网关报错），dump 结果只剩悬空 $ref，需要从原始 pydantic 对象恢复定义。
+        # 修改方式：defs 优先取 parameters 内联的 $defs/definitions/defs，再用 extra_defs 补齐；无论 defs 是否为空都执行解析，
+        #   可解析的 $ref 原位展开为定义副本（$ref 同层其他属性覆盖定义同名字段），不可解析或展开超过 2 层的降级为宽松 object 并把引用名写入 description。
+        # 目的：保证发往 Gemini 的 schema 一定不含 $ref，递归引用按 Gemini 对 defs 递归深度的限制截断。
+        if not isinstance(parameters, dict):
+            return
+        defs = {}
+        for defs_key in ("$defs", "definitions", "defs"):
+            extracted = parameters.pop(defs_key, None)
+            if isinstance(extracted, dict):
+                defs.update(extracted)
+        if isinstance(extra_defs, dict):
+            for k, v in extra_defs.items():
+                defs.setdefault(k, v)
+
+        def _resolve(node, depth):
+            if isinstance(node, dict):
+                ref = node.get("$ref")
+                if isinstance(ref, str) and ref.startswith("#/"):
+                    name = ref.rsplit("/", 1)[-1]
+                    if depth >= 2 or name not in defs:
+                        node.pop("$ref", None)
+                        node.setdefault("type", "object")
+                        desc = node.get("description", "")
+                        node["description"] = f"{desc}\nSchema ref: {name}".strip()
+                    else:
+                        merged = copy.deepcopy(defs[name])
+                        for k, v in node.items():
+                            if k != "$ref":
+                                merged[k] = v
+                        node.clear()
+                        node.update(merged)
+                        _resolve(node, depth + 1)
+                        return
+                for value in node.values():
+                    _resolve(value, depth)
+            elif isinstance(node, list):
+                for item in node:
+                    _resolve(item, depth)
+
+        _resolve(parameters, 0)
+
     def process_tool_parameters(data):
         if isinstance(data, dict):
             # 0. 处理逻辑组合符 (OpenAI anyOf/oneOf/allOf [..., null] -> Gemini nullable: True)
@@ -552,10 +618,22 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
                 if is_tools_disabled(provider):
                     continue
                 processed_tools = []
-                for tool in value:
+                original_tools = request.tools or []
+                for tool_idx, tool in enumerate(value):
                     f_def = copy.deepcopy(tool["function"])
                     f_def.pop("strict", None)
                     if "parameters" in f_def:
+                        # model_dump 有意排除 defs 字段，从原始 pydantic 对象恢复 $defs 供 $ref 解引用
+                        extra_defs = None
+                        if tool_idx < len(original_tools):
+                            orig = original_tools[tool_idx]
+                            if isinstance(orig, dict):
+                                orig_params = (orig.get("function") or {}).get("parameters") or {}
+                                extra_defs = orig_params.get("$defs") or orig_params.get("defs")
+                            else:
+                                orig_params = getattr(getattr(orig, "function", None), "parameters", None)
+                                extra_defs = getattr(orig_params, "defs", None) if orig_params is not None else None
+                        inline_schema_refs(f_def["parameters"], extra_defs)
                         process_tool_parameters(f_def["parameters"])
                     processed_tools.append(f_def)
 
@@ -1109,6 +1187,7 @@ def register():
     from .gemini_channel import fetch_gemini_response_stream
     
     # 注册 Vertex Gemini
+    from .gemini_channel import patch_passthrough_gemini_payload
     register_channel(
         id="vertex-gemini",
         type_name="vertex-gemini",
@@ -1116,6 +1195,14 @@ def register():
         auth_header="Authorization: Bearer {access_token}",
         description="Google Vertex AI (Gemini)",
         request_adapter=get_vertex_gemini_payload,
+        # 修改原因：Gemini 原生请求透传至 vertex-gemini 时需要渠道级 payload 修饰器。
+        # 修改方式：复用 gemini_channel 的 patch_passthrough_gemini_payload（仅注入 system_prompt），Vertex 格式兼容。
+        # 目的：透传时仍能应用渠道配置的 system_prompt。
+        passthrough_payload_adapter=patch_passthrough_gemini_payload,
+        # 修改原因：vertex-gemini 接受 Gemini 原生格式，透传兼容性应由渠道自身声明。
+        # 修改方式：声明 passthrough_dialects=["gemini"]，detect_passthrough 优先检查此字段。
+        # 目的：Gemini 方言入口的请求发往 vertex-gemini 时走透传，避免双重转换。
+        passthrough_dialects=["gemini"],
         response_adapter=fetch_vertex_gemini_response,
         stream_adapter=fetch_gemini_response_stream,
         models_adapter=fetch_vertex_gemini_models,

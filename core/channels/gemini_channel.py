@@ -168,6 +168,10 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
     systemInstruction = None
     system_prompt = ""
     function_arguments = None
+    # 修改原因：OpenAI tool 消息的 tool_call_id 是调用 ID 而非函数名，直接当 functionResponse.name 发送会与 functionCall 名称不匹配。
+    # 修改方式：在转换 functionCall 时记录 tool_call_id → 函数名映射，生成 functionResponse 时优先查映射。
+    # 目的：让 functionResponse 名称始终与本轮 functionCall 一致，避免上游因名称不匹配拒绝请求。
+    tool_call_name_map = {}
 
     try:
         request_messages = [Message(role="user", content=request.prompt)]
@@ -241,6 +245,8 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
                         "args": args
                     }
                 }
+                if getattr(tc, "id", None):
+                    tool_call_name_map[tc.id] = tc.function.name
                 # 签名逻辑：第一个 FC 必须携带签名
                 sig = (getattr(tc, "extra_content", {}) or {}).get("google", {}).get("thoughtSignature")
                 if not sig and i == 0:
@@ -259,17 +265,29 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
 
         # 5. 处理函数响应 (Tool 角色下)
         if msg.role == "tool":
+            fc_name = None
+            if msg.tool_call_id:
+                fc_name = tool_call_name_map.get(msg.tool_call_id)
+            if not fc_name:
+                fc_name = msg.name or msg.tool_call_id or "unknown_function"
             # Google AI Studio API 要求函数响应的角色为 "user"
             # 它将函数执行结果视为由用户/环境提供的上下文
-            messages.append({
-                "role": "user",
-                "parts": [{
-                    "functionResponse": {
-                        "name": msg.name or msg.tool_call_id,
-                        "response": {"result": msg.content}
-                    }
-                }]
-            })
+            # 修改原因：OpenAI 格式里每个 tool 响应是独立消息，但 Gemini 要求同一 function call turn 的全部响应合并在一个 user turn 的 parts 里。
+            # 修改方式：上一条输出已是 functionResponse 的 user 回合时直接追加 part，否则才新开回合。
+            # 目的：并行工具调用产生的多个响应共享同一 turn，满足上游 response/call parts 数量一致的校验。
+            fr_part = {
+                "functionResponse": {
+                    "name": fc_name,
+                    "response": {"result": msg.content}
+                }
+            }
+            if messages and messages[-1].get("role") == "user" and any("functionResponse" in p for p in messages[-1].get("parts", [])):
+                messages[-1]["parts"].append(fr_part)
+            else:
+                messages.append({
+                    "role": "user",
+                    "parts": [fr_part]
+                })
         elif msg.role != "system" and parts:
             messages.append({"role": msg.role, "parts": parts})
         elif msg.role == "system":
@@ -349,6 +367,50 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
         'stop',
     ]
     generation_config = {}
+
+    def inline_schema_refs(parameters, extra_defs=None):
+        # 修改原因：MCP 等客户端的工具 schema 使用 JSON Schema $ref/$defs 共享类型定义，Gemini protobuf Schema 不认识 $ref 字段，直接报 Unknown name "$ref" 400；
+        #   且 RequestModel.model_dump 有意排除 defs 字段（防严格网关报错），dump 结果只剩悬空 $ref，需要从原始 pydantic 对象恢复定义。
+        # 修改方式：defs 优先取 parameters 内联的 $defs/definitions/defs，再用 extra_defs 补齐；无论 defs 是否为空都执行解析，
+        #   可解析的 $ref 原位展开为定义副本（$ref 同层其他属性覆盖定义同名字段），不可解析或展开超过 2 层的降级为宽松 object 并把引用名写入 description。
+        # 目的：保证发往 Gemini 的 schema 一定不含 $ref，递归引用按 Gemini 对 defs 递归深度的限制截断。
+        if not isinstance(parameters, dict):
+            return
+        defs = {}
+        for defs_key in ("$defs", "definitions", "defs"):
+            extracted = parameters.pop(defs_key, None)
+            if isinstance(extracted, dict):
+                defs.update(extracted)
+        if isinstance(extra_defs, dict):
+            for k, v in extra_defs.items():
+                defs.setdefault(k, v)
+
+        def _resolve(node, depth):
+            if isinstance(node, dict):
+                ref = node.get("$ref")
+                if isinstance(ref, str) and ref.startswith("#/"):
+                    name = ref.rsplit("/", 1)[-1]
+                    if depth >= 2 or name not in defs:
+                        node.pop("$ref", None)
+                        node.setdefault("type", "object")
+                        desc = node.get("description", "")
+                        node["description"] = f"{desc}\nSchema ref: {name}".strip()
+                    else:
+                        merged = copy.deepcopy(defs[name])
+                        for k, v in node.items():
+                            if k != "$ref":
+                                merged[k] = v
+                        node.clear()
+                        node.update(merged)
+                        _resolve(node, depth + 1)
+                        return
+                for value in node.values():
+                    _resolve(value, depth)
+            elif isinstance(node, list):
+                for item in node:
+                    _resolve(item, depth)
+
+        _resolve(parameters, 0)
 
     def process_tool_parameters(data):
         if isinstance(data, dict):
@@ -430,13 +492,25 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
             if field == "tools":
                 # 处理每个工具的 function 定义
                 processed_tools = []
-                for tool in value:
+                original_tools = request.tools or []
+                for tool_idx, tool in enumerate(value):
                     # 深度克隆以避免修改原始请求对象
                     function_def = copy.deepcopy(tool["function"])
                     # 移除 OpenAI 特有的 strict 字段
                     function_def.pop("strict", None)
                     
                     if "parameters" in function_def:
+                        # model_dump 有意排除 defs 字段，从原始 pydantic 对象恢复 $defs 供 $ref 解引用
+                        extra_defs = None
+                        if tool_idx < len(original_tools):
+                            orig = original_tools[tool_idx]
+                            if isinstance(orig, dict):
+                                orig_params = (orig.get("function") or {}).get("parameters") or {}
+                                extra_defs = orig_params.get("$defs") or orig_params.get("defs")
+                            else:
+                                orig_params = getattr(getattr(orig, "function", None), "parameters", None)
+                                extra_defs = getattr(orig_params, "defs", None) if orig_params is not None else None
+                        inline_schema_refs(function_def["parameters"], extra_defs)
                         process_tool_parameters(function_def["parameters"])
 
                     if function_def["name"] not in ["googleSearch", "google_search"]:
