@@ -521,6 +521,13 @@ async def process_request_passthrough(
     elif not upstream_stream and "streamGenerateContent" in url:
         url = url.replace("streamGenerateContent", "generateContent")
 
+    # 修改原因：Vertex AI streamGenerateContent 不带 ?alt=sse 时返回 JSON 数组而非 SSE 流，
+    #   导致 LoggingStreamingResponse 无法按行解析 usage，stream_guard 因 completion_tokens=0 把 200 误判为 502。
+    # 修改方式：透传流式请求的 URL 含 streamGenerateContent 时自动追加 ?alt=sse。
+    # 目的：让 Vertex/Gemini 原生 passthrough 返回标准 SSE 格式，与现有 SSE 解析管道兼容。
+    if upstream_stream and "streamGenerateContent" in url and "alt=sse" not in url:
+        url += "&alt=sse" if "?" in url else "?alt=sse"
+
     try:
         async with app.state.client_manager.get_client(url, proxy) as client:
             last_message_role = safe_get(request, "messages", -1, "role", default=None)

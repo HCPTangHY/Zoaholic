@@ -153,7 +153,12 @@ async def get_responses_payload(request, engine, provider, api_key=None):
             if "o1-mini" in original_model or "o1-preview" in original_model:
                 role = "developer"
             else:
-                instructions_list.append(content or "")
+                # content 可能是 str 或 list[ContentPart]，统一提取文本
+                if isinstance(content, list):
+                    text_parts = [getattr(item, 'text', '') or '' for item in content if getattr(item, 'type', None) == 'text']
+                    instructions_list.append("\n".join(text_parts))
+                else:
+                    instructions_list.append(content or "")
                 continue
 
         # content(list) -> message(content=[input_text/input_image...])

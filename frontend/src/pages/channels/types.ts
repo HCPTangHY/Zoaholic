@@ -164,7 +164,7 @@ export interface RowQuota {
 export interface BalanceResult {
   supported: boolean;
   status?: string | null;
-  value_type?: 'amount' | 'percent' | 'quota';
+  value_type?: 'amount' | 'percent' | 'quota' | 'plan';
   total?: number | null;
   used?: number | null;
   available?: number | null;
@@ -183,6 +183,10 @@ export interface BalanceResult {
   // 目的：让同一条渲染路径同时服务 OAuth 账号和普通 Key 的双弧展示。
   quota_inner?: number | null;
   quota_outer?: number | null;
+  // 修改原因：plan 类型余额需要携带套餐层级标签（如 Kimi 的 BASIC/PRO），供 badge 和双弧 title 显示。
+  // 修改方式：在通用 BalanceResult 中保留后端 plan 分支提取的 level 字符串。
+  // 目的：让 plan 渠道不写插件也能展示层级，字段语义与 quota_inner/quota_outer 平级。
+  level?: string | null;
   results?: Record<string, BalanceResult>;
   // 修改原因：oai_tier 会通过 balance_enricher 在普通余额结果中补充被动检测到的 OpenAI Tier 信息。
   // 修改方式：在通用 BalanceResult 类型中保留 tier、tpm、rpm 和检测元数据字段，并只交给 slot 脚本展示。

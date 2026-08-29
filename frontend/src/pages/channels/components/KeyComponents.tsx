@@ -433,7 +433,7 @@ export function RackCard({ idx, keyObj, providerName, engine, enabledPlugins, ru
   const hasQuotaDisplaySlot = hasUiSlot(engine, 'quota_display', enabledPlugins);
   const isOAuthEmpty = isOAuthEngine && !keyObj.key.trim();
   const labelText = formatRackKeyLabel(keyObj);
-  const title = `${idx + 1}. ${keyObj.label || keyObj.key || '空账号'}${isCooling ? ` · 冷却 ${formatCountdown(remainSec)}` : ''}`;
+  const title = `${idx + 1}. ${keyObj.label || keyObj.key || '空账号'}${bal?.level ? ` · ${bal.level}` : ''}${isCooling ? ` · 冷却 ${formatCountdown(remainSec)}` : ''}`;
   // 修改原因：冷却状态已经由圆环倒计时表达，继续显示黄色状态灯会让小卡片颜色过于集中。
   // 修改方式：状态灯只保留启用和禁用两类静态状态，冷却时不再渲染右上角黄色灯。
   // 目的：让用户主要通过中心倒计时和圆环进度识别冷却状态。
@@ -488,7 +488,10 @@ export function RackCard({ idx, keyObj, providerName, engine, enabledPlugins, ru
           {/* 修改原因：机房卡片不能再按 OAuth 与普通 Key 分支选择 RackOAuthRings 或 RackSingleRing。
               修改方式：统一把 rowQuota.gauges 交给 QuotaRings，由组件内部按数量决定空环、单环或双环。
               目的：新增 quota 类型时不需要继续修改卡片渲染分支。 */}
-          <QuotaRings gauges={rackGauges} hideText={hasQuotaDisplaySlot && slotPayloadAvailable} />
+          {/* 修改原因：plan 类型双环圆心改为层级文本后，机房卡片需要把 balance 结果中的 level 传给 QuotaRings。
+              修改方式：仅在双环数据源为 plan 类型时传 centerLabel，其他渠道不传保持百分比圆心不变。
+              目的：套餐层级在卡片表面常显，百分比继续由 title 悬浮和完整行展示。 */}
+          <QuotaRings gauges={rackGauges} hideText={hasQuotaDisplaySlot && slotPayloadAvailable} centerLabel={bal?.value_type === 'plan' ? bal.level : undefined} />
           {/* 修改原因：冷却圆环中心必须显示倒计时，quota_display 再覆盖上去会遮挡剩余秒数；OAuth 渠道完整行标签在圆环中心会溢出。
               修改方式：quota_display 仍挂载在非冷却卡片的圆环中心，并透传 mode: 'rack'，外层容器增加 overflow-hidden 和 max-w-full。
               目的：同时保证普通额度插槽可用、冷却状态倒计时清晰可见，并限制机房卡片中心文字宽度。 */}

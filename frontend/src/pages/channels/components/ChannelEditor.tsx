@@ -1444,9 +1444,9 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                                 <div>
                                   <label className="text-xs font-medium text-muted-foreground mb-1 block">值类型</label>
                                   <select
-                                    value={bal.mapping?.value_type === "'percent'" ? 'percent' : bal.mapping?.value_type === "'quota'" ? 'quota' : 'amount'}
+                                    value={bal.mapping?.value_type === "'percent'" ? 'percent' : bal.mapping?.value_type === "'quota'" ? 'quota' : bal.mapping?.value_type === "'plan'" ? 'plan' : 'amount'}
                                     onChange={e => {
-                                      const vtMap: Record<string, string> = { percent: "'percent'", quota: "'quota'", amount: "'amount'" };
+                                      const vtMap: Record<string, string> = { percent: "'percent'", quota: "'quota'", plan: "'plan'", amount: "'amount'" };
                                       const vt = vtMap[e.target.value] || "'amount'";
                                       updatePreference('balance', { ...bal, mapping: { ...(bal.mapping || {}), value_type: vt } });
                                     }}
@@ -1455,6 +1455,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                                     <option value="amount">数额（total / used / available）</option>
                                     <option value="percent">百分比（percent）</option>
                                     <option value="quota">纯额度（以 100 为基准显示颜色）</option>
+                                    <option value="plan">套餐（5h / 7d 双环 + 等级）</option>
                                   </select>
                                 </div>
                                 <div>
@@ -1465,6 +1466,12 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                                     ] : bal.mapping?.value_type === "'quota'" ? [
                                       { key: 'available', label: 'available', placeholder: 'balance_infos.0.total_balance' },
                                       { key: 'currency', label: 'currency (可选)', placeholder: 'balance_infos.0.currency' },
+                                    ] : bal.mapping?.value_type === "'plan'" ? [
+                                      { key: 'quota_inner', label: '5h 窗口', placeholder: 'eval:limits.0.detail.remaining/limits.0.detail.limit*100' },
+                                      { key: 'quota_outer', label: '7d 配额', placeholder: 'eval:usage.remaining/usage.limit*100' },
+                                      { key: 'level', label: '等级 (可选)', placeholder: 'user.membership.level' },
+                                      { key: 'total', label: 'total (可选)', placeholder: 'usage.limit' },
+                                      { key: 'used', label: 'used (可选)', placeholder: 'usage.used' },
                                     ] : [
                                       { key: 'total', label: 'total', placeholder: 'data.totalQuota' },
                                       { key: 'used', label: 'used', placeholder: 'data.usedQuota' },

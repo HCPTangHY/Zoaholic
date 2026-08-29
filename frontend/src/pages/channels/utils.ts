@@ -53,6 +53,10 @@ export function getBalancePercent(b: BalanceResult): number | null {
   // 修改方式：amount 且 percent 已存在时直接返回 percent，旧数据仍保留 available/total 兜底计算。
   // 目的：让前后端对剩余额度百分比使用一致口径。
   if (b.value_type === 'amount' && b.percent != null) return b.percent;
+  // 修改原因：plan 类型后端已算好周期配额百分比，badge 颜色分档应直接复用，不重新拼接计算。
+  // 修改方式：plan 且 percent 已存在时返回 percent，兜底仍走 available/total。
+  // 目的：保持 plan 与 amount 的百分比口径一致。
+  if (b.value_type === 'plan' && b.percent != null) return b.percent;
   if (b.value_type === 'quota' && b.available != null) return Math.min(b.available, 100);
   if (b.total != null && b.total > 0 && b.available != null) return (b.available / b.total) * 100;
   return null;
@@ -71,6 +75,16 @@ export function getBalanceLabel(b: BalanceResult): string | null {
   // 目的：让列表模式继续展示 178.8M / 250.0M 这类可读明细。
   if (!b.supported || b.error) return null;
   if (b.value_type === 'percent' && b.percent != null) return `${b.percent.toFixed(1)}%`;
+  // 修改原因：plan 类型 badge 需要同时展示层级和周期配额剩余，不能落入 amount 的纯金额标签。
+  // 修改方式：plan 分支拼接 level + available/total 短文本，缺失字段自动省略。
+  // 目的：让套餐渠道不写插槽也能看到 BASIC 5.0/100.0 这类完整状态。
+  if (b.value_type === 'plan') {
+    const parts: string[] = [];
+    if (b.level) parts.push(b.level);
+    if (b.available != null && b.total != null) parts.push(`${formatCompactNumber(b.available)}/${formatCompactNumber(b.total)}`);
+    else if (b.available != null) parts.push(formatCompactNumber(b.available));
+    return parts.length > 0 ? parts.join(' ') : null;
+  }
   if (b.available != null && b.total != null) return `${formatCompactNumber(b.available)} / ${formatCompactNumber(b.total)}`;
   if (b.available != null) {
     const prefix = getCurrencySymbol((b as any).currency);
@@ -168,15 +182,15 @@ export function buildRowQuota(bal: BalanceResult | undefined, oauthAccount: any,
 
   const gauges: QuotaGauge[] = [];
 
-  if (isOAuthEngine) {
+  if (isOAuthEngine || bal?.value_type === 'plan') {
     // 修改原因：getOAuthQuota 会为了插槽保留 raw-only 对象，但 raw-only 不能遮蔽 balance 结果中的旧 quota_inner/quota_outer。
     // 修改方式：只有账号 quota 含有实际百分比时才优先使用账号数据，否则回退到 balance 旧字段。
     // 目的：保持 API 未返回 gauges 时，OAuth 行仍能从旧 balance quota 构建双环。
     const accountQuota = getOAuthQuota(oauthAccount);
     const balanceQuota = getBalanceQuota(bal);
     const quota = (accountQuota?.quota_inner != null || accountQuota?.quota_outer != null) ? accountQuota : balanceQuota;
-    if (quota?.quota_inner != null) gauges.push({ id: 'inner', label: 'inner', role: 'short_window', percent: quota.quota_inner });
-    if (quota?.quota_outer != null) gauges.push({ id: 'outer', label: 'outer', role: 'long_window', percent: quota.quota_outer });
+    if (quota?.quota_inner != null) gauges.push({ id: 'inner', label: '5h', role: 'short_window', percent: quota.quota_inner });
+    if (quota?.quota_outer != null) gauges.push({ id: 'outer', label: '7d', role: 'long_window', percent: quota.quota_outer });
   } else if (bal) {
     const mode = bal.value_type === 'quota' ? 'quota' : bal.value_type === 'amount' ? 'amount' : 'percent';
     if (mode === 'quota' && bal.available != null) {
