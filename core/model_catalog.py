@@ -5,6 +5,7 @@
 # 修改原因：该模块承载业务逻辑，不应继续放在 utils_pkg 这种通用工具包中。
 # 修改方式：按照 Scout 的归位方案迁移到 core 对应业务模块，并只调整必要的内部导入路径。
 # 目的：让业务代码按领域归属维护，同时保留根 utils.py 和 utils_pkg shim 的旧导入兼容性。
+from core.api_key_access import is_admin_api_key
 from core.utils import get_model_dict, is_local_api_key, safe_get
 
 
@@ -44,7 +45,8 @@ def _append_authorized_virtual_models(all_models, unique_models, config, api_ind
     allow_all = "all" in normalized_rules
     allowed_names = set(normalized_rules)
 
-    # 当前 API Key 允许的分组
+    # Admin keys can reach every enabled provider; ordinary keys retain group isolation.
+    admin_access = is_admin_api_key(config, api_index)
     api_key_groups = safe_get(config, 'api_keys', api_index, 'groups', default=['default'])
     if isinstance(api_key_groups, str):
         api_key_groups = [api_key_groups]
@@ -90,7 +92,7 @@ def _append_authorized_virtual_models(all_models, unique_models, config, api_ind
                 if node_type == "channel":
                     target_provider = target.get("value", "")
                     target_groups = provider_groups_map.get(target_provider)
-                    if target_groups and allowed_groups.intersection(target_groups):
+                    if target_groups and (admin_access or allowed_groups.intersection(target_groups)):
                         has_accessible_provider = True
                         break
                 elif node_type == "model":
@@ -101,7 +103,7 @@ def _append_authorized_virtual_models(all_models, unique_models, config, api_ind
                             p_model_dict = p.get("_model_dict_cache") or {}
                             if model_value in p_model_dict:
                                 p_grps = provider_groups_map.get(pname)
-                                if p_grps and allowed_groups.intersection(p_grps):
+                                if p_grps and (admin_access or allowed_groups.intersection(p_grps)):
                                     has_accessible_provider = True
                                     break
                     if has_accessible_provider:
@@ -114,7 +116,7 @@ def _append_authorized_virtual_models(all_models, unique_models, config, api_ind
                     p_model_dict = p.get("_model_dict_cache") or {}
                     if virtual_name in p_model_dict:
                         p_grps = provider_groups_map.get(pname)
-                        if p_grps and allowed_groups.intersection(p_grps):
+                        if p_grps and (admin_access or allowed_groups.intersection(p_grps)):
                             has_accessible_provider = True
                             break
             if not has_accessible_provider:
@@ -142,7 +144,8 @@ def post_all_models(api_index, config, api_list, models_list):
     all_models = []
     unique_models = set()
 
-    # 允许分组集合：仅返回与当前 API Key 分组有交集的渠道模型
+    # Admin keys list every enabled provider; ordinary keys are restricted by groups.
+    admin_access = is_admin_api_key(config, api_index)
     api_key_groups = safe_get(config, 'api_keys', api_index, 'groups', default=['default'])
     if isinstance(api_key_groups, str):
         api_key_groups = [api_key_groups]
@@ -155,7 +158,7 @@ def post_all_models(api_index, config, api_list, models_list):
             configured_model = model
             if model == "all":
                 # 如果模型名为 all，则返回所有模型并去重，按分组过滤
-                all_models = get_all_models(config, allowed_groups)
+                all_models = get_all_models(config, None if admin_access else allowed_groups)
                 unique_models = {item["id"] for item in all_models}
                 _append_authorized_virtual_models(all_models, unique_models, config, api_index)
                 all_models.sort(key=lambda x: x["id"])

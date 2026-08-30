@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from core.byok import get_byok_real_key, is_byok_provider
+from core.api_key_access import is_admin_api_key
 from core.channels import get_channel
 from core.http import proxy_context
 from core.log_config import logger
@@ -97,6 +98,7 @@ async def build_models_for_request(api_index: int, app=None) -> List[Dict[str, A
     if not isinstance(api_key_groups, list) or not api_key_groups:
         api_key_groups = ["default"]
     allowed_groups = set(api_key_groups)
+    admin_access = is_admin_api_key(app.state.config, api_index)
 
     api_models = safe_get(app.state.config, "api_keys", api_index, "model", default=[]) or []
     authorized_byok_providers = set()
@@ -120,7 +122,7 @@ async def build_models_for_request(api_index: int, app=None) -> List[Dict[str, A
             continue
         if is_local_api_key(provider.get("provider", "")):
             continue
-        if not _provider_groups_allowed(provider, allowed_groups):
+        if not admin_access and not _provider_groups_allowed(provider, allowed_groups):
             continue
         provider_name = provider.get("provider")
         if not allow_all and provider_name not in authorized_byok_providers:

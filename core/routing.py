@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Any, TYPE_CHECKING
 
 from fastapi import HTTPException
 
+from core.api_key_access import is_admin_api_key
 from core.log_config import logger
 from core.utils import (
     get_model_dict,
@@ -118,6 +119,11 @@ def _filter_provider_list(
     api_index: int,
 ) -> List[Dict[str, Any]]:
     """复用黑名单和分组过滤逻辑。"""
+    # Administrator keys intentionally bypass user-configurable model/channel/group filters.
+    # Disabled providers have already been removed while building the candidate list.
+    if is_admin_api_key(config, api_index):
+        return provider_list
+
     # 修改原因：虚拟模型候选池和普通模型候选池都必须经过同一套 API Key 过滤。
     # 修改方式：把 get_matching_providers 中的过滤逻辑抽成独立函数。
     # 目的：让虚拟模型注入点只替换候选池生成，不改变黑名单与分组语义。
