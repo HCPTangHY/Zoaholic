@@ -87,11 +87,15 @@ def _get_session_id(api_key: str) -> str:
 
 
 def _parse_version_from_ua(ua: str) -> str:
-    """从 User-Agent 解析 CC 版本号，如 'claude-code/2.1.97' → '2.1.97'。"""
+    """从 User-Agent 解析 CC 版本号，如 'claude-cli/2.1.161' → '2.1.161'。"""
+    # 修改原因：渠道自身下发的 User-Agent 是 claude-cli/ 前缀，旧实现只认 claude-code/，
+    #   导致 billing 头里的 cc_version 永远回退到硬编码默认值。
+    # 修改方式：同时接受 claude-code/ 与 claude-cli/ 两种前缀。
+    # 目的：让 UA 中的版本号与 billing 头 cc_version 保持一致。
     if not ua:
         return _BILLING_CC_VERSION
     for part in ua.split():
-        if part.startswith("claude-code/"):
+        if part.startswith("claude-code/") or part.startswith("claude-cli/"):
             ver = part.split("/", 1)[1].split(" ")[0]
             if ver:
                 return ver
@@ -110,6 +114,18 @@ def _parse_entrypoint_from_ua(ua: str) -> str:
             if ep in ("cli", "vscode", "local-agent", "jetbrains", "emacs", "vim"):
                 return ep
     return _BILLING_ENTRYPOINT
+
+
+def _resolve_cc_version(provider) -> str:
+    """读取渠道级 CC 版本号伪装覆盖（preferences.cc_version）。"""
+    # 修改原因：claude_code_compat 插件支持按参数指定 CC 版本，而 claude-code 渠道的版本号
+    #   是硬编码常量，渠道无法像插件一样修改版本。
+    # 修改方式：从 provider.preferences.cc_version 读取覆盖值，空值回退内置默认。
+    # 目的：让 CC 渠道也能按渠道配置伪装任意 CLI 版本，同时作用于 User-Agent 和 billing 头。
+    prefs = provider.get("preferences") if isinstance(provider, dict) else None
+    value = prefs.get("cc_version") if isinstance(prefs, dict) else None
+    value = str(value or "").strip()
+    return value or CLAUDE_CODE_CLI_VERSION
 
 
 def _strip_gateway_headers(headers: dict) -> dict:
@@ -911,7 +927,7 @@ def _has_billing_header(system) -> bool:
     return False
 
 
-def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None) -> dict:
+def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None, version_override: str = "") -> dict:
     """清洗 payload 绕过 Anthropic 第三方检测，使请求走 plan limits 而非 extra usage。
 
     Layer 1: 确保 system prompt 存在
@@ -939,9 +955,12 @@ def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None) -> di
     if headers:
         _ua_key, _ua_val = _get_header_case_insensitive(headers, "User-Agent")
         _ua = str(_ua_val or "")
+    # 修改原因：billing 头的 cc_version 需要与渠道级版本覆盖保持一致。
+    # 修改方式：显式 version_override 优先，未配置时从 UA 解析（回退内置默认）。
+    # 目的：让渠道编辑页的 cc_version 偏好同时作用于 UA 与 billing 头。
     billing_text = _build_billing_header(
         payload.get("messages", []),
-        version=_parse_version_from_ua(_ua),
+        version=version_override or _parse_version_from_ua(_ua),
         entrypoint=_parse_entrypoint_from_ua(_ua),
     )
     billing_block = {"type": "text", "text": billing_text}
@@ -1157,8 +1176,12 @@ def _merge_anthropic_beta(headers: dict) -> None:
     headers["anthropic-beta"] = ",".join(beta_values)
 
 
-def _apply_claude_code_headers(headers: dict, api_key: str | None) -> None:
+def _apply_claude_code_headers(headers: dict, api_key: str | None, version: str = "") -> None:
     """把普通 Claude 请求头改成完整的 Claude Code OAuth 请求头。"""
+    # 修改原因：User-Agent 中的 CLI 版本号需要支持渠道级覆盖。
+    # 修改方式：新增可选 version 参数，未传时保持内置默认 CLAUDE_CODE_CLI_VERSION。
+    # 目的：让渠道编辑页的 cc_version 偏好能算到伪装 UA 上。
+    cc_version = str(version or "").strip() or CLAUDE_CODE_CLI_VERSION
     _pop_header_case_insensitive(headers, "x-api-key")
     _set_header_case_insensitive(headers, "Authorization", f"Bearer {api_key}")
     _merge_anthropic_beta(headers)
@@ -1166,7 +1189,7 @@ def _apply_claude_code_headers(headers: dict, api_key: str | None) -> None:
     if _get_header_case_insensitive(headers, "X-App")[0] is None:
         headers["X-App"] = "cli"
     if _get_header_case_insensitive(headers, "User-Agent")[0] is None:
-        headers["User-Agent"] = CLAUDE_CODE_USER_AGENT
+        headers["User-Agent"] = f"claude-cli/{cc_version} (external, cli)"
 
     # X-Claude-Code-Session-Id — per apiKey stable UUID (TTL=1h)
     if api_key and _get_header_case_insensitive(headers, "X-Claude-Code-Session-Id")[0] is None:
@@ -1204,9 +1227,10 @@ def _apply_claude_code_headers(headers: dict, api_key: str | None) -> None:
 
 async def get_claude_code_payload(request, engine, provider, api_key=None):
     """复用 Claude adapter 构建 payload，覆盖为 Bearer 认证 + plan billing 清洗。"""
+    cc_version = _resolve_cc_version(provider)
     url, headers, payload = await get_claude_payload(request, "claude", provider, api_key)
-    _apply_claude_code_headers(headers, api_key)
-    payload = _sanitize_for_plan_billing(payload, headers=headers)
+    _apply_claude_code_headers(headers, api_key, version=cc_version)
+    payload = _sanitize_for_plan_billing(payload, headers=headers, version_override=cc_version)
     return url, headers, payload
 
 
@@ -1222,7 +1246,7 @@ async def get_claude_code_passthrough_meta(request, engine, provider, api_key=No
     # 完整 CC 伪装（Bearer + Session-Id + request-id + Stainless + beta flags）
     # 第三方客户端：这些默认值保留
     # 真 CC 客户端：后续 original_headers 覆盖为真实值
-    _apply_claude_code_headers(headers, api_key)
+    _apply_claude_code_headers(headers, api_key, version=_resolve_cc_version(provider))
 
     return url, headers, payload
 
@@ -1288,7 +1312,14 @@ async def _passthrough_sanitize(payload, modifications, request, engine, provide
     original_headers = {}
     if hasattr(request, '_passthrough_headers'):
         original_headers = request._passthrough_headers or {}
-    return _sanitize_for_plan_billing(payload, headers=original_headers)
+    # 修改原因：透传路径的 billing 头版本也需要遵循渠道级 cc_version 覆盖。
+    # 修改方式：从 provider 解析覆盖值传入 sanitize。
+    # 目的：与转换路径的版本伪装行为保持一致。
+    return _sanitize_for_plan_billing(
+        payload,
+        headers=original_headers,
+        version_override=_resolve_cc_version(provider),
+    )
 
 
 async def _passthrough_stream_with_reverse_map(client, url, headers, payload, model, timeout):
@@ -1491,6 +1522,18 @@ def register():
         response_adapter=fetch_claude_code_response,
         stream_adapter=fetch_claude_code_response_stream,
         is_oauth=True,
+        # 修改原因：CC 渠道的 CLI 版本号此前硬编码，无法像 claude_code_compat 插件那样按渠道指定。
+        # 修改方式：声明 cc_version 文本偏好项，前端按 preference_toggles 元数据渲染输入框，写入 provider.preferences。
+        # 目的：渠道编辑页可直接修改伪装的 User-Agent / billing 头版本。
+        preference_toggles=[
+            {
+                "key": "cc_version",
+                "label": "CC 版本号",
+                "tip": "伪装的 Claude Code CLI 版本，同时作用于 User-Agent 与 billing 头；留空使用内置默认 2.1.161",
+                "type": "text",
+                "placeholder": "2.1.161",
+            },
+        ],
         # 修改原因：Claude Code 的 extra_usage 背景、金额标签、按钮汇总和订阅 tier 标签都属于渠道专属 UI。
         # 修改方式：注册 key_background、balance_summary 和合并后的 quota_display 三个展示插槽，不注册 key_border。
         # 目的：让前端通用挂载点加载 CC 专属脚本，同时继续使用默认 QuotaBorderOverlay 绘制 5h/7d 弧线。

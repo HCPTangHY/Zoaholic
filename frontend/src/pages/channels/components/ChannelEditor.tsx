@@ -636,8 +636,52 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
                                 body: JSON.stringify({ provider: formData.provider, type: formData.engine, data }),
                               });
-                              const json = await res.json();
-                              if (!res.ok) { setBatchImportError(json?.error || '导入失败'); } else { setBatchImportResult(json); refreshOAuthAccounts?.({ syncFormKeys: true }); }
+                              if (!res.ok) {
+                                const json = await res.json().catch(() => null);
+                                setBatchImportError(json?.error || '导入失败');
+                              } else if (!res.body) {
+                                setBatchImportError('当前浏览器不支持流式读取');
+                              } else {
+                                // 后端 NDJSON 流式返回：逐行解析 progress/item/summary 事件，实时更新结果列表
+                                const agg = { total: 0, success: 0, failed: 0, skipped: 0, results: [] as any[] };
+                                const rows: any[] = [];
+                                let buf = '';
+                                let sawSummary = false;
+                                const reader = res.body.getReader();
+                                const decoder = new TextDecoder();
+                                for (;;) {
+                                  const { done, value } = await reader.read();
+                                  if (done) break;
+                                  buf += decoder.decode(value, { stream: true });
+                                  let nl: number;
+                                  while ((nl = buf.indexOf('\n')) >= 0) {
+                                    const line = buf.slice(0, nl).trim();
+                                    buf = buf.slice(nl + 1);
+                                    if (!line) continue;
+                                    let ev: any;
+                                    try { ev = JSON.parse(line); } catch { continue; }
+                                    if (ev.type === 'item') {
+                                      agg.total = ev.total ?? agg.total;
+                                      if (ev.status === 'success') { agg.success++; rows.push({ key_id: ev.key_id, status: ev.status, already_exists: ev.already_exists }); }
+                                      else if (ev.status === 'failed') { agg.failed++; rows.push({ key_id: ev.key_id, status: ev.status, error: ev.error }); }
+                                      else { agg.skipped++; rows.push({ key_id: ev.key_id, status: ev.status, error: ev.error }); }
+                                      setBatchImportResult({ ...agg, results: [...rows] });
+                                    } else if (ev.type === 'progress') {
+                                      agg.total = ev.total ?? agg.total;
+                                      setBatchImportResult({ ...agg, results: [...rows] });
+                                    } else if (ev.type === 'summary') {
+                                      sawSummary = true;
+                                      agg.total = ev.total ?? agg.total;
+                                      agg.success = ev.success; agg.failed = ev.failed; agg.skipped = ev.skipped;
+                                      setBatchImportResult({ ...agg, results: [...rows] });
+                                    } else if (ev.type === 'error') {
+                                      setBatchImportError(ev.error || '导入中断');
+                                    }
+                                  }
+                                }
+                                if (!sawSummary) setBatchImportError('导入中断：连接提前结束');
+                                refreshOAuthAccounts?.({ syncFormKeys: true });
+                              }
                             } catch (err: any) { setBatchImportError(err.message || '请求失败'); }
                             setBatchImportLoading(false);
                           }}
@@ -646,6 +690,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                       </div>
                       {batchImportResult && (
                         <div className="space-y-2">
+                          {batchImportLoading && <p className="text-xs text-muted-foreground">进度：{batchImportResult.results?.length ?? 0} / {batchImportResult.total}</p>}
                           <p className="text-xs font-medium">结果：✅ {batchImportResult.success} 成功 {batchImportResult.failed > 0 ? `❌ ${batchImportResult.failed} 失败` : ''} {batchImportResult.skipped > 0 ? `⚠️ ${batchImportResult.skipped} 跳过` : ''}</p>
                           <div className="max-h-40 overflow-y-auto text-xs space-y-1">
                             {batchImportResult.results?.map((r: any, i: number) => (
@@ -1263,11 +1308,21 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                         修改方式：按渠道注册声明的 preference_toggles 元数据动态渲染，写入 provider.preferences[toggle.key]。
                         目的：后端渠道声明开关即自动出现（如 openai-responses/codex 的 WebSocket 传输），无需改前端。 */}
                     {(channelTypes.find(c => c.id === formData.engine)?.preference_toggles || []).map(toggle => (
-                      <div key={toggle.key} className="flex items-center justify-between p-3 bg-muted/50 rounded-lg border border-border">
-                        <span className="text-sm text-foreground" title={toggle.tip || ''}>{toggle.label}</span>
-                        <Switch.Root checked={!!formData.preferences[toggle.key]} onCheckedChange={val => updatePreference(toggle.key, val)} className="w-11 h-6 bg-muted rounded-full data-[state=checked]:bg-primary">
-                          <Switch.Thumb className="block w-5 h-5 bg-white rounded-full transition-transform data-[state=checked]:translate-x-[22px]" />
-                        </Switch.Root>
+                      <div key={toggle.key} className="flex items-center justify-between gap-3 p-3 bg-muted/50 rounded-lg border border-border">
+                        <span className="text-sm text-foreground shrink-0" title={toggle.tip || ''}>{toggle.label}</span>
+                        {toggle.type === 'text' ? (
+                          <input
+                            type="text"
+                            value={formData.preferences[toggle.key] ?? ''}
+                            placeholder={toggle.placeholder || ''}
+                            onChange={e => updatePreference(toggle.key, e.target.value)}
+                            className="w-40 shrink-0 rounded-md border border-border bg-background px-2 py-1 text-sm font-mono text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                          />
+                        ) : (
+                          <Switch.Root checked={!!formData.preferences[toggle.key]} onCheckedChange={val => updatePreference(toggle.key, val)} className="w-11 h-6 bg-muted rounded-full data-[state=checked]:bg-primary">
+                            <Switch.Thumb className="block w-5 h-5 bg-white rounded-full transition-transform data-[state=checked]:translate-x-[22px]" />
+                          </Switch.Root>
+                        )}
                       </div>
                     ))}
 

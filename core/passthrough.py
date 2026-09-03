@@ -33,19 +33,150 @@ if TYPE_CHECKING:
 DEFAULT_TIMEOUT = 600
 
 
-def _filter_passthrough_headers(original_headers: Optional[Dict[str, str]]) -> Dict[str, Any]:
-    """过滤入口请求头中的认证字段和需要移除的头，避免透传错误信息到上游"""
-    drop_names = {
-        "authorization", "x-api-key", "api-key", "x-goog-api-key",  # 认证相关
-        "host",  # 必须移除，否则上游服务（如 Deno Deploy）会路由错误
-        "content-length",  # 由 httpx 自动计算
-        "accept-encoding",  # 移除压缩请求，避免返回 gzip 压缩的响应导致乱码
+# ── 透传入站头隐私清洗（内置原 header_scrubber 插件）──
+
+# ⑤ 隐私/泄露头：客户端链路注入的 IP、地理位置、追踪、隐私与浏览器指纹
+_PASSTHROUGH_STRIP_EXACT = frozenset({
+    # 客户端真实 IP（CDN / LB / 应用框架变体）
+    "via", "forwarded", "x-forwarded", "cdn-loop",
+    "true-client-ip", "fastly-client-ip", "client-ip",
+    "x-client-ip", "x-cluster-client-ip", "x-originating-ip",
+    "proxy-client-ip", "wl-proxy-client-ip",
+    "x-proxyuser-ip", "x-remote-addr", "remote-addr",
+    "x-coming-from", "x-from-ip", "x-host", "x-scheme",
+    # 地理位置（CF 会把国家/城市塞进 cf-* 前缀头，accept-language 是最强地区信号）
+    "x-country-code", "x-timezone", "accept-language",
+    # 个人隐私 / 反代域名泄露
+    "cookie", "origin", "referer", "from",
+    # 浏览器指纹（暴露 Web UI 而非 SDK）
+    "dnt", "upgrade-insecure-requests", "priority", "pragma",
+    "purpose", "sec-purpose", "sec-gpc",
+    "device-memory", "viewport-width", "rtt", "downlink", "ect",
+    # 分布式追踪（可能含内网服务名）
+    "traceparent", "tracestate", "baggage", "b3",
+    "x-request-id", "x-correlation-id", "x-trace-id", "x-span-id",
+    "x-cloud-trace-context",
+    # hop-by-hop 残留（RFC 9110 §7.6.1 规定不得转发）
+    # 故意不删 connection / keep-alive：值只有 keep-alive|close，零隐私价值，
+    # 而部分逆向渠道的出站白名单保留了 connection。需要时用 strip_passthrough_headers 手动删。
+    "proxy-connection", "proxy-authorization",
+    "te", "trailer", "upgrade", "expect",
+})
+
+_PASSTHROUGH_STRIP_PREFIXES = (
+    "x-forwarded-",   # -for / -host / -proto / -port / 未来变体
+    "x-original-", "x-real-",
+    # cf-*：connecting-ip / ray / visitor 以及 ipcountry / ipcity / region / timezone /
+    # iplatitude / iplongitude 等整套地理头；未来新增的 cf 地理头自动覆盖。cf-aig-* 由 PROTECTED 救回。
+    "cf-",
+    "cloudfront-",    # AWS CloudFront viewer-country / -city / -latitude
+    "x-azure-",       # Azure Front Door clientip（与受保护的 azure- 不同）
+    "x-akamai-",      # Akamai edgescape country / region / lat
+    "fly-", "x-geo-",
+    "sec-ch-", "sec-fetch-",
+    "x-envoy-", "x-b3-", "x-datadog-", "x-newrelic",
+    "x-amzn-trace",   # ALB 追踪（与受保护的 x-amz- 不冲突：第 5 字符 'n' ≠ '-'）
+    "x-appengine-", "x-vercel-", "x-nf-", "x-render-", "x-railway-",
+)
+
+# ④ SDK / 云签名功能头：命中即保留
+_PASSTHROUGH_PROTECTED_EXACT = frozenset({
+    "accept",
+    # Codex / 各家 CLI 的身份头
+    "session_id", "originator", "x-session-id", "x-client-name", "x-client-version",
+    "x-request-timeout", "x-portkey-provider",
+})
+
+_PASSTHROUGH_PROTECTED_PREFIXES = (
+    "x-amz-",         # AWS SigV4 签名集合 —— 删任何一个都会 403
+    "x-goog-",        # Vertex / Google
+    "x-ms-", "azure-",
+    "anthropic-",     # anthropic-version / -beta / -dangerous-direct-browser-access
+    "openai-",        # openai-beta / -organization / -project
+    "x-stainless-",   # 官方 SDK 自洽伴生头；删了会让 UA 与伴生头不匹配，反而更可疑
+    "cf-aig-",        # CF AI Gateway 功能头（会被 cf- 前缀命中，靠本行救回）
+    "grpc-",
+)
+
+# 该渠道在本清洗之后会把出站头裁剪到自己的极小出站白名单，且对请求头极其敏感，直接跳过隐私清洗
+_PASSTHROUGH_SCRUB_SKIP_ENGINES = frozenset({"antigravity"})
+
+
+def _passthrough_scrub_preferences(provider: Optional[Dict[str, Any]]) -> tuple:
+    """读取渠道级 keep/strip 逃生舱配置（preferences.keep/strip_passthrough_headers）。
+
+    支持列表或分号/逗号分隔的字符串；返回两个小写头名集合。
+    keep 用于救回隐私集合里的头（如 Cookie 认证渠道），strip 用于额外删除（可突破 PROTECTED）。
+    域前置场景不需要 keep=host：preferences.headers 在本过滤之后合并，显式设置即生效。
+    """
+    prefs = provider.get("preferences") if isinstance(provider, dict) else None
+    prefs = prefs if isinstance(prefs, dict) else {}
+
+    def _names(key: str) -> set:
+        raw = prefs.get(key) or []
+        if isinstance(raw, str):
+            raw = [p.strip() for p in raw.replace(";", ",").split(",")]
+        return {str(n).strip().lower() for n in raw if str(n).strip()}
+
+    return _names("keep_passthrough_headers"), _names("strip_passthrough_headers")
+
+
+def _filter_passthrough_headers(original_headers: Optional[Dict[str, str]],
+                                provider: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """过滤入口请求头，避免透传错误信息到上游。
+
+    修改原因：旧实现只删 7 个认证/传输头，nginx/CF 注入的客户端真实 IP（x-forwarded-for、
+    x-real-ip、cf-connecting-ip）、地理位置（cf-ipcountry、accept-language）、反代域名
+    （origin/referer）与面板 session（cookie）会全量透传给上游，属于默认即存在的隐私泄露。
+    修改方式：把 header_scrubber 插件的清洗规则内置到透传头过滤器，在 preferences.headers
+    合并之前执行（管理员显式配置的头天然不受影响，无需插件那套保护逻辑）。
+    匹配顺序（命中即停）：
+      ① DROP_ALWAYS   认证替换/传输完整性头，无条件删除，keep 也救不回
+      ② strip_passthrough_headers  管理员显式额外删除（可突破 PROTECTED）
+      ③ keep_passthrough_headers   管理员显式保留（从隐私清洗集合救回）
+      ④ PROTECTED     SDK/云签名功能头，命中即保留
+      ⑤ STRIP         IP/地理/追踪/隐私/浏览器指纹，删除
+      ⑥ 默认放行       未知头一律保留（保守，新客户端功能头不受影响）
+    目的：透传出站请求默认不再携带客户端链路泄露头；openrouter 的 http-referer/x-title
+    等客户端主动设置的头默认保留（比插件版保守一档）；user-agent 不碰（渠道身份的一部分）。
+    """
+    # ① 认证替换 / 传输完整性：删了必须删，不可通过 keep 恢复
+    #    host：残留的入站 Host（= 面板域名）既泄露反代域名又造成上游路由错配，
+    #          需要域前置时用 preferences.headers 显式设置（在本过滤之后合并）。
+    #    content-length / accept-encoding / transfer-encoding：由 httpx 重算。
+    drop_always = {
+        "authorization", "x-api-key", "api-key", "x-goog-api-key",
+        "host", "content-length", "accept-encoding", "transfer-encoding",
     }
-    return {
-        k: v
-        for k, v in (original_headers or {}).items()
-        if k.lower() not in drop_names
-    }
+
+    # 该渠道在本清洗之后会把出站头裁剪到自己的极小白名单，此处清洗对它是纯开销，跳过隐私集合
+    engine = str((provider or {}).get("engine") or "") if isinstance(provider, dict) else ""
+    if engine in _PASSTHROUGH_SCRUB_SKIP_ENGINES:
+        return {
+            k: v
+            for k, v in (original_headers or {}).items()
+            if str(k).lower() not in drop_always
+        }
+
+    keep_extra, strip_extra = _passthrough_scrub_preferences(provider)
+
+    result: Dict[str, Any] = {}
+    for k, v in (original_headers or {}).items():
+        name = str(k).lower()
+        if name in drop_always:
+            continue
+        if name in strip_extra:
+            continue
+        if name in keep_extra:
+            result[k] = v
+            continue
+        if name in _PASSTHROUGH_PROTECTED_EXACT or name.startswith(_PASSTHROUGH_PROTECTED_PREFIXES):
+            result[k] = v
+            continue
+        if name in _PASSTHROUGH_STRIP_EXACT or name.startswith(_PASSTHROUGH_STRIP_PREFIXES):
+            continue
+        result[k] = v
+    return result
 
 
 async def _fetch_passthrough_stream(
@@ -415,7 +546,7 @@ async def process_request_passthrough(
                 url = url.rstrip("/") + _suffix
 
     headers: Dict[str, Any] = dict(adapter_headers or {})
-    apply_custom_headers(headers, _filter_passthrough_headers(passthrough_ctx.original_headers))
+    apply_custom_headers(headers, _filter_passthrough_headers(passthrough_ctx.original_headers, provider))
     apply_custom_headers(headers, safe_get(provider, "preferences", "headers", default={}))
     if not has_header_case_insensitive(headers, "Content-Type"):
         headers["Content-Type"] = "application/json"

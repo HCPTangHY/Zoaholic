@@ -154,15 +154,29 @@ async def test_batch_import_continues_after_refresh_failure_and_marks_existing_a
             }
 
     request = Request()
-    result = await batch_import(request)
+    response = await batch_import(request)
 
-    assert result["total"] == 3
-    assert result["success"] == 1
-    assert result["failed"] == 1
-    assert result["skipped"] == 1
-    assert result["results"][0] == {"key_id": "ok@example.com", "status": "success", "already_exists": True}
-    assert result["results"][1] == {"key_id": "bad@example.com", "status": "failed", "error": "refresh_token expired"}
-    assert result["results"][2] == {"key_id": "missing-access@example.com", "status": "skipped", "error": "missing access_token"}
+    # 修改原因：batch_import 改为 NDJSON 流式返回逐条进度，测试需要解析事件流而不是读取最终 dict。
+    # 修改方式：直接迭代 StreamingResponse.body_iterator，逐行 json.loads，还原 progress/item/summary 事件序列。
+    # 目的：固定流式协议的行为（事件类型、字段、计数汇总）供前端消费。
+    assert response.media_type == "application/x-ndjson"
+    events = []
+    async for chunk in response.body_iterator:
+        for line in chunk.splitlines():
+            if line.strip():
+                events.append(json.loads(line))
+
+    assert [e["type"] for e in events] == [
+        "progress", "item",
+        "progress", "item",
+        "progress", "item",
+        "summary",
+    ]
+    items = [e for e in events if e["type"] == "item"]
+    assert items[0] == {"type": "item", "index": 0, "total": 3, "key_id": "ok@example.com", "status": "success", "already_exists": True}
+    assert items[1] == {"type": "item", "index": 1, "total": 3, "key_id": "bad@example.com", "status": "failed", "error": "refresh_token expired"}
+    assert items[2] == {"type": "item", "index": 2, "total": 3, "key_id": "missing-access@example.com", "status": "skipped", "error": "missing access_token"}
+    assert events[-1] == {"type": "summary", "total": 3, "success": 1, "failed": 1, "skipped": 1}
     assert request.app.state.oauth_manager.register_calls == [
         (
             "Codex-Main",

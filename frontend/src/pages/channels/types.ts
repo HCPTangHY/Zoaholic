@@ -82,7 +82,8 @@ export interface ChannelOption {
   // 修改原因：渠道级布尔配置开关（如 WebSocket 传输）由后端渠道注册声明，前端不再硬编码 engine 白名单。
   // 修改方式：ChannelOption 增加 preference_toggles 元数据数组。
   // 目的：渠道编辑器按当前 engine 的声明动态渲染开关。
-  preference_toggles?: { key: string; label: string; tip?: string }[];
+  // 修改方式：preference_toggles 增加 type/placeholder 字段，type='text' 时渲染文本输入（如 CC 渠道的版本号伪装）。
+  preference_toggles?: { key: string; label: string; tip?: string; type?: 'boolean' | 'text'; placeholder?: string }[];
   source?: string;
 }
 
