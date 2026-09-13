@@ -125,6 +125,10 @@ export function KeyLabelOverlay({ label, hasTag, isFocused, children }: { label?
 export const UiSlot = ({ engine, slot, data, context, className, element = 'span', fallbackText, enabledPlugins }: { engine: string; slot: string; data: any; context?: Record<string, any>; className?: string; element?: 'span' | 'div'; fallbackText?: string; enabledPlugins?: EnabledPluginValue[] }) => {
   const ref = useRef<HTMLElement | null>(null);
   const [loaded, setLoaded] = useState(false);
+  // 修改原因：额度查询前后的 slot effect 可能并发加载同一个动态模块，较早启动的空数据任务反而更晚完成，覆盖新额度并把标签隐藏。
+  // 修改方式：为每次 effect 执行分配递增版本号，所有异步分支在写 DOM 前确认自己仍是最新任务。
+  // 目的：Codex 等 OAuth 渠道点击余额后，最新额度不会被旧的异步渲染在约一秒后清掉。
+  const renderVersionRef = useRef(0);
   const dataRef = useRef(data);
   const contextRef = useRef(context);
   dataRef.current = data;
@@ -144,13 +148,15 @@ export const UiSlot = ({ engine, slot, data, context, className, element = 'span
     if (!ref.current) return;
     const el = ref.current;
     const cacheKey = `${engine}:${slot}`;
+    const renderVersion = ++renderVersionRef.current;
+    const isCurrentRender = () => renderVersionRef.current === renderVersion && ref.current === el;
 
     const run = async () => {
       try {
         // 修改原因：同一渠道的同一插槽会被多个 Key 行重复使用，重复 import 会浪费资源并增加闪烁概率。
         // 修改方式：按 `${engine}:${slot}` 缓存模块函数，命中时直接复用已加载的 render 函数。
         // 目的：保持列表渲染轻量，同时支持同一渠道注册多个彼此独立的插槽。
-        if (fallbackText !== undefined) el.textContent = fallbackText;
+        if (fallbackText !== undefined && isCurrentRender()) el.textContent = fallbackText;
         // 修改原因：后端可能返回 {script, requires_plugin}，且同一个 engine 的不同 provider 插件开关不同。
         // 修改方式：先按 enabledPlugins 提取可执行脚本，再决定是否使用缓存或动态 import。
         // 目的：避免未启用插件的 provider 误用已经缓存的同 engine slot 脚本。
@@ -158,7 +164,7 @@ export const UiSlot = ({ engine, slot, data, context, className, element = 'span
         const jsSrc = getUiSlotScript(engine, slot, enabledPlugins);
         if (!jsSrc) {
           if (!slotValue || typeof slotValue === 'string' || !slotValue.requires_plugin) uiSlotCache[cacheKey] = null;
-          setLoaded(true);
+          if (isCurrentRender()) setLoaded(true);
           return;
         }
         if (cacheKey in uiSlotCache) {
@@ -166,8 +172,8 @@ export const UiSlot = ({ engine, slot, data, context, className, element = 'span
           // 修改原因：新插槽脚本通过 ctx.context?.mode 区分完整行和机房卡片，但旧脚本仍直接读取 ctx.account 等扁平字段。
           // 修改方式：调用脚本时同时保留扁平展开字段，并额外传入原始 context 对象。
           // 目的：让 mode 分支生效，同时保持已有渠道和插件脚本兼容。
-          if (fn) fn({ el, data: dataRef.current, ...(contextRef.current ?? {}), context: contextRef.current });
-          setLoaded(true);
+          if (fn && isCurrentRender()) fn({ el, data: dataRef.current, ...(contextRef.current ?? {}), context: contextRef.current });
+          if (isCurrentRender()) setLoaded(true);
           return;
         }
 
@@ -184,12 +190,14 @@ export const UiSlot = ({ engine, slot, data, context, className, element = 'span
           // 修改原因：首次动态加载插槽脚本时也必须提供 nested context，否则新加载路径和缓存命中路径行为不一致。
           // 修改方式：与缓存命中分支一样传入 data、展开后的 context 字段，以及完整 context 对象。
           // 目的：保证 quota_display、key_background 和 key_border 都能稳定读取 ctx.context?.mode。
-          if (uiSlotCache[cacheKey]) uiSlotCache[cacheKey]!({ el, data: dataRef.current, ...(contextRef.current ?? {}), context: contextRef.current });
+          if (uiSlotCache[cacheKey] && isCurrentRender()) uiSlotCache[cacheKey]!({ el, data: dataRef.current, ...(contextRef.current ?? {}), context: contextRef.current });
         } finally {
           URL.revokeObjectURL(url);
         }
-        setLoaded(true);
+        if (isCurrentRender()) setLoaded(true);
       } catch (e) {
+        // 旧任务失败不应污染新任务的缓存或清空新任务已经画出的额度。
+        if (!isCurrentRender()) return;
         console.warn(`[UiSlot] Failed to load UI slot ${slot} for ${engine}:`, e);
         uiSlotCache[cacheKey] = null;
         // 修改原因：插槽脚本失败时继续显示旧 DOM 会误导用户，以为渠道仍在正常渲染。
@@ -201,7 +209,11 @@ export const UiSlot = ({ engine, slot, data, context, className, element = 'span
       }
     };
 
-    run();
+    void run();
+    return () => {
+      // 仅使当前 effect 失效；后续 effect 已递增版本时不再重复修改。
+      if (renderVersionRef.current === renderVersion) renderVersionRef.current += 1;
+    };
   }, [engine, slot, dataKey, contextKey, fallbackText, enabledPluginsKey]);
 
   if (element === 'div') {
