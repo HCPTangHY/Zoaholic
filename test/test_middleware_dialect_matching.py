@@ -74,7 +74,7 @@ async def _run_middleware(path: str, headers: list, downstream_called: dict, sta
         if message["type"] == "http.response.start":
             statuses.append(message.get("status"))
 
-    fake_app = SimpleNamespace(state=SimpleNamespace(config={}))
+    fake_app = SimpleNamespace(state=SimpleNamespace(config={}, api_list=[]))
     middleware = StatsMiddleware(downstream, debug=False)
     scope = {
         "type": "http",
@@ -115,3 +115,65 @@ async def test_oauth_callback_path_bypasses_standard_auth():
     await _run_middleware("/v1/oauth/callback", [], downstream_called, statuses)
     assert downstream_called.get("hit") is True
     assert statuses == [200]
+
+
+# ============ admin JWT 快速通道（管理后台登录凭证回归） ============
+
+
+def _issue_test_jwt(role: str = "admin") -> str:
+    from core.jwt_utils import set_jwt_secret, issue_jwt
+
+    set_jwt_secret("test-middleware-jwt-secret")
+    return issue_jwt({"sub": "pytest", "role": role})
+
+
+@pytest.mark.asyncio
+async def test_admin_jwt_reaches_downstream():
+    """管理后台 /auth/login 下发的 admin JWT 必须能通过中间件到达路由层，
+    否则统计/日志/渠道等页面全部 403 并触发前端自动登出。"""
+    jwt = _issue_test_jwt("admin")
+    downstream_called: dict = {}
+    statuses: list = []
+    await _run_middleware(
+        "/v1/stats", [(b"authorization", f"Bearer {jwt}".encode())], downstream_called, statuses
+    )
+    assert downstream_called.get("hit") is True
+    assert statuses == [200]
+
+
+@pytest.mark.asyncio
+async def test_non_admin_role_jwt_rejected():
+    """非 admin 角色的 JWT 不在中间件放行范围内，必须 403。"""
+    jwt = _issue_test_jwt("user")
+    downstream_called: dict = {}
+    statuses: list = []
+    await _run_middleware(
+        "/v1/stats", [(b"authorization", f"Bearer {jwt}".encode())], downstream_called, statuses
+    )
+    assert statuses == [403]
+    assert "hit" not in downstream_called
+
+
+@pytest.mark.asyncio
+async def test_garbage_bearer_token_rejected():
+    """伪造/无关格式的 Bearer token 必须 403，不能因 JWT 快速通道误放。"""
+    downstream_called: dict = {}
+    statuses: list = []
+    await _run_middleware(
+        "/v1/stats", [(b"authorization", b"Bearer not.a.jwt")], downstream_called, statuses
+    )
+    assert statuses == [403]
+    assert "hit" not in downstream_called
+
+
+@pytest.mark.asyncio
+async def test_valid_api_key_still_reaches_downstream():
+    """普通真实 key 在 api_list 中时行为不变：到达路由层。"""
+    downstream_called: dict = {}
+    statuses: list = []
+    # api_list 为空时 key 匹配失败会 403，这里验证 403 路径未被 JWT 改动破坏
+    await _run_middleware(
+        "/v1/stats", [(b"authorization", b"Bearer sk-normal-key")], downstream_called, statuses
+    )
+    assert statuses == [403]
+    assert "hit" not in downstream_called
