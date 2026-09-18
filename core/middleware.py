@@ -287,6 +287,20 @@ class StatsMiddleware:
             # 修改原因：BYOK token 由“本地模板前缀 + 用户真实上游 key”组成，不会出现在 api_list 中。
             # 修改方式：精确匹配失败后按 app.state.byok_prefixes 做最长前缀匹配，并把统计 token 改为模板 key。
             # 目的：本地鉴权仍按 api_keys 条目计费/限速，真实上游 key 只放入请求上下文供上游调用。
+            # 修改原因：管理后台 /auth/login 下发的是 JWT，不在 api_list 中；方言端点精确匹配修复生效后，
+            #           标准鉴权分支把携带 JWT 的管理页面请求全部 403，统计/日志/渠道等页面不可用。
+            # 修改方式：key 匹配前先校验 JWT 签名与 admin 角色，命中则跳过 key 匹配与配额/余额检查，
+            #           完整校验（含 admin IP 黑名单）由路由层 verify_admin_api_key 执行。
+            # 目的：恢复管理后台访问；无凭证、伪造、过期或非 admin 角色的 JWT 仍被中间件拒绝。
+            _admin_jwt_ok = False
+            if token.count(".") == 2:
+                try:
+                    from core.jwt_utils import is_admin_jwt
+
+                    _admin_jwt_ok = is_admin_jwt(token)
+                except Exception:
+                    _admin_jwt_ok = False
+
             byok_real_key = None
             byok_template_key = None
             try:
@@ -376,6 +390,10 @@ class StatsMiddleware:
                         await response(scope, receive, send)
                         reset_byok_context(byok_context_tokens)
                         return
+            elif _admin_jwt_ok:
+                # admin JWT：签名与角色已验证；统计 token 改记为固定标识，
+                # 避免原始 JWT 被写入统计库。后续权限由路由层 verify_admin_api_key 判定。
+                token = "admin-jwt"
             else:
                 response = openai_error_response("Invalid or missing API Key", 403)
                 await response(scope, receive, send)

@@ -17,7 +17,11 @@ from pydantic import BaseModel
 
 from routes.deps import rate_limit_dependency, verify_admin_api_key
 
-router = APIRouter()
+# 修改原因：本文件全部端点（浏览/读/写/删/下载后端文件）都是管理面能力，
+# 但 router 一直未挂鉴权，只靠已失效的中间件兜底，属于鉴权缺口。
+# 修改方式：router 级统一挂 admin 鉴权依赖。
+# 目的：工作区文件操作仅限管理员访问。
+router = APIRouter(dependencies=[Depends(verify_admin_api_key)])
 
 # ==================== 配置 ====================
 
