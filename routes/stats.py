@@ -2692,18 +2692,26 @@ async def warm_provider_activity():
 # 每日活跃度刷新已移至 main.py 统一 daily_maintenance 循环
 
 @router.get("/v1/stats/provider_activity", dependencies=[Depends(rate_limit_dependency)])
-async def provider_activity():
+async def provider_activity(token: str = Depends(verify_admin_api_key)):
     """
     返回每个 provider 的最后活跃时间（从内存缓存读取，秒回）。
+
+    修改原因：该接口无鉴权时会泄露全部上游渠道名与活跃时间。
+    修改方式：补挂 admin 鉴权依赖。
+    目的：与 /v1/logs 等管理端点保持一致的访问边界。
     Returns: {"activity": {"provider_name": 1714567890.123, ...}, "warmed": true}
     """
     return JSONResponse(content={"activity": _provider_last_seen, "warmed": _activity_warmed})
 
 
 @router.post("/v1/stats/resolve_prices", dependencies=[Depends(rate_limit_dependency)])
-async def resolve_prices(request: Request):
+async def resolve_prices(request: Request, token: str = Depends(verify_admin_api_key)):
     """
     批量查询模型价格。走完整 6 层级联（渠道 > 全局 > 外部库 > default > 0）。
+
+    修改原因：该接口无鉴权时会泄露全部模型价格配置。
+    修改方式：补挂 admin 鉴权依赖。
+    目的：价格信息仅限管理面查看。
     
     Body: {"models": [{"model": "gpt-4o", "provider": "openai"}, ...]}
     Returns: {"prices": {"gpt-4o": {"prompt": 2.5, "completion": 10.0}, ...}}

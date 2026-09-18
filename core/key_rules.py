@@ -192,6 +192,18 @@ def resolve_key_rules(preferences: Dict[str, Any]) -> List[dict]:
     ])
 
 
+async def apply_key_rule(pool, api_key, rule, *, allow_temporary=True):
+    """Apply the same duration semantics before retries and after stream commitment."""
+    if not pool or not api_key or not rule:
+        return False
+    duration = rule.get("duration", 0)
+    if duration == -1 or (duration > 0 and allow_temporary):
+        await pool.set_auto_disabled(api_key, duration=0 if duration == -1 else duration,
+                                     reason=rule.get("reason", "key_rule"))
+        return True
+    return False
+
+
 def apply_key_rule_retry_override(
     rule_result: Optional[Dict[str, Any]],
     retry_enabled: bool,

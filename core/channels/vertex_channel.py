@@ -35,7 +35,7 @@ from ..response_context import mark_adapter_metrics_managed, mark_content_start,
 from ..stream_utils import aiter_decoded_lines
 from ..usage import extract_cache_usage
 from ..file_utils import extract_base64_data
-from .claude_channel import gpt2claude_tools_json, fetch_claude_response_stream
+from .claude_channel import gpt2claude_tools_json, fetch_claude_response_stream, claude_stream_classifier
 from core.oauth.base import OAuthProvider
 
 
@@ -1206,6 +1206,7 @@ def register():
     """注册 Vertex AI 渠道到注册中心"""
     from .registry import register_channel
     from .gemini_channel import fetch_gemini_response_stream
+    from .gemini_channel import gemini_stream_classifier
     
     # 注册 Vertex Gemini
     from .gemini_channel import patch_passthrough_gemini_payload
@@ -1226,6 +1227,7 @@ def register():
         passthrough_dialects=["gemini"],
         response_adapter=fetch_vertex_gemini_response,
         stream_adapter=fetch_gemini_response_stream,
+        stream_event_classifier=gemini_stream_classifier,
         models_adapter=fetch_vertex_gemini_models,
         oauth_provider=VertexProvider(),
         ui_slots={
@@ -1250,6 +1252,7 @@ def register():
         # 修改方式：注册时直接复用 claude_channel.fetch_claude_response_stream；旧函数保留但不再作为适配器使用。
         # 目的：正确解析 message_start、content_block_delta、message_delta 等 Claude SSE 事件。
         stream_adapter=fetch_claude_response_stream,
+        stream_event_classifier=claude_stream_classifier,
         models_adapter=fetch_vertex_claude_models,
         oauth_provider=VertexProvider(),
         ui_slots={

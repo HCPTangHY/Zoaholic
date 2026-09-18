@@ -7,6 +7,7 @@ Base URL 格式: https://firebasevertexai.googleapis.com/v1beta/projects/{key}/l
 
 import json
 import asyncio
+from contextlib import aclosing
 from datetime import datetime
 from typing import TYPE_CHECKING, Dict, Any, Optional
 
@@ -81,15 +82,17 @@ async def get_firebase_vertex_payload(request, engine, provider, api_key=None):
 async def fetch_firebase_vertex_response_stream(client, url, headers, payload, model, timeout):
     """复用 Gemini 的流式处理逻辑"""
     from core.channels.gemini_channel import fetch_gemini_response_stream
-    async for chunk in fetch_gemini_response_stream(client, url, headers, payload, model, timeout):
-        yield chunk
+    async with aclosing(fetch_gemini_response_stream(client, url, headers, payload, model, timeout)) as source:
+        async for chunk in source:
+            yield chunk
 
 
 async def fetch_firebase_vertex_response(client, url, headers, payload, model, timeout):
     """复用 Gemini 的非流式处理逻辑"""
     from core.channels.gemini_channel import fetch_gemini_response
-    async for chunk in fetch_gemini_response(client, url, headers, payload, model, timeout):
-        yield chunk
+    async with aclosing(fetch_gemini_response(client, url, headers, payload, model, timeout)) as source:
+        async for chunk in source:
+            yield chunk
 
 
 class FirebaseVertexChannelAdapter:

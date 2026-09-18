@@ -13,6 +13,10 @@ from starlette.responses import Response
 from starlette.types import Scope, Receive, Send
 
 from core.log_config import logger
+from core.stream_utils import close_async_iterator
+from core.stream_errors import (
+    StreamInspector, UpstreamStreamError, record_stream_failure, stream_error_from_exception,
+)
 from core.stats import enqueue_stats
 from core.utils import truncate_for_logging
 from utils import safe_get
@@ -40,7 +44,7 @@ class LoggingStreamingResponse(Response):
         super().__init__(content=None, status_code=status_code, headers=headers, media_type=media_type)
         self.body_iterator = content
         self._closed = False
-        self.current_info = current_info or {}
+        self.current_info = current_info if current_info is not None else {}
         # 修改原因：流式 Response 持有 FastAPI app 强引用会把 app.state 上的注册表一并留在引用链中。
         # 修改方式：仅保存 weakref.ref，使用时再解引用，避免 Response → app → state 的循环引用。
         # 目的：让每个流式请求完成后可以更快释放响应对象和相关请求上下文。
@@ -55,196 +59,111 @@ class LoggingStreamingResponse(Response):
         self.headers["transfer-encoding"] = "chunked"
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        await send(
-            {
-                "type": "http.response.start",
-                "status": self.status_code,
-                "headers": self.raw_headers,
-            }
-        )
-
+        current_info = self.current_info
+        logging_iterator = self._logging_iterator()
+        response_chunks = []
+        remaining = 100 * 1024
+        should_save = current_info.get("raw_data_expires_at") is not None
         try:
-            async for chunk in self._logging_iterator():
-                await send(
-                    {
-                        "type": "http.response.body",
-                        "body": chunk,
-                        "more_body": True,
-                    }
-                )
-        except Exception as e:
-            # 记录异常但不重新抛出，避免"Task exception was never retrieved"
-            logger.error(f"Error in streaming response: {type(e).__name__}: {str(e)}")
-            if self.debug:
-                import traceback
-
-                traceback.print_exc()
-            # 发送错误消息给客户端（如果可能）
-            try:
-                error_data = json.dumps({"error": f"Streaming error: {str(e)}"})
-                await send(
-                    {
-                        "type": "http.response.body",
-                        "body": f"data: {error_data}\n\n".encode("utf-8"),
-                        "more_body": True,
-                    }
-                )
-            except Exception as send_err:
-                logger.error(f"Error sending error message: {str(send_err)}")
+            await send({
+                "type": "http.response.start", "status": self.status_code,
+                "headers": self.raw_headers,
+            })
+            # 心跳也会提交 HTTP 200；内部预读和非流式组装则不能设置此标记。
+            current_info["_stream_committed"] = True
+            async for chunk in logging_iterator:
+                await send({
+                    "type": "http.response.body", "body": chunk, "more_body": True,
+                })
+                # 正常帧和错误帧走同一记录入口，只保存 send 成功返回的字节。
+                if should_save and remaining:
+                    prefix = chunk[:remaining]
+                    response_chunks.append(prefix)
+                    remaining -= len(prefix)
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        except asyncio.CancelledError:
+            if not current_info.get("_stream_error"):
+                current_info.update(success=False, status_code=499)
+            raise
+        except Exception as exc:
+            # 上游异常由迭代器转换为错误帧；发送失败不再尝试向断开的客户端发送错误。
+            if not current_info.get("_stream_error"):
+                current_info.update(success=False, status_code=499)
+            logger.warning("Error sending streaming response: %s", type(exc).__name__)
         finally:
             try:
                 try:
-                    await send(
-                        {
-                            "type": "http.response.body",
-                            "body": b"",
-                            "more_body": False,
-                        }
-                    )
-                except Exception as send_err:
-                    logger.debug(f"Error sending final streaming frame: {str(send_err)}")
-
-                iterator = self.body_iterator
-                if iterator is not None and hasattr(iterator, "aclose") and not self._closed:
-                    await iterator.aclose()
-                    self._closed = True
-
-                current_info = self.current_info or {}
-                # 修改原因：self.app 现在保存的是弱引用，直接把 weakref 传给统计逻辑会丢失 app.state。
-                # 修改方式：在请求收尾处只解引用一次，并把解引用后的 app 传给后续统计和守卫逻辑。
-                # 目的：既保留原有统计能力，又避免 Response 长期强持有 FastAPI app。
-                app = self.app() if self.app else None
-
-                # 记录处理时间并写入统计
-                if "start_time" in current_info:
-                    process_time = time() - current_info["start_time"]
-                    current_info["process_time"] = process_time
-                # sticky_ip: 200 + 0 completion_tokens = 流内报错/空响应，清 session 让下次 round_robin 重新分配
-                try:
-
-                    if (
-                        current_info.get("status_code") == 200
-                        and current_info.get("completion_tokens", 0) == 0
-                        and current_info.get("success")
-                        and app
-                    ):
-                        # 从流内容提取错误信息（精确解析给日志展示用）
-                        # 优先用 upstream_response_body（上游原始返回体），fallback 到 response_body（转换后）
-                        stream_error_msg = self._extract_stream_error(prefer_upstream=True)
-                        # raw body 给 key_rules 关键词匹配用（不依赖硬编码解析）
-                        raw_body = current_info.get("upstream_response_body", "") or current_info.get("response_body", "") or ""
-                        if isinstance(raw_body, bytes):
-                            raw_body = raw_body.decode("utf-8", errors="replace")
-
-                        # 标记为 "假200" — 流建立但无有效输出
-                        current_info["status_code"] = 502
-                        current_info["success"] = False
-                        current_info["error_message"] = stream_error_msg or "Stream completed with 0 output tokens (possible in-stream error)"
-                        logger.warning(
-                            f"[stream_guard] {current_info.get('provider', '?')} "
-                            f"200→502: 0 completion_tokens, error={stream_error_msg!r}"
-                        )
-
-                        from core.utils import provider_api_circular_list
-                        channel_id = current_info.get("provider", "")
-
-                        # key_rules 匹配用 raw body（关键词在任何层级 JSON 里都能命中）
-                        try:
-                            from core.key_rules import resolve_key_rules, match_key_rules
-                            provider_cfg = current_info.get("_provider_cfg")
-                            if provider_cfg and channel_id:
-                                _key_rules = resolve_key_rules(provider_cfg.get("preferences") or {})
-                                if _key_rules:
-                                    _rule = match_key_rules(_key_rules, 502, raw_body)
-                                    if _rule:
-                                        current_api = current_info.get("_used_api_key", "")
-                                        clist = provider_api_circular_list.get(channel_id)
-                                        if clist and current_api:
-                                            _duration = _rule.get("duration", 0)
-                                            _reason = f"stream_guard:{_rule.get('reason', 'key_rule')}"
-                                            if _duration == -1:
-                                                await clist.set_auto_disabled(current_api, duration=0, reason=_reason)
-                                            elif _duration > 0:
-                                                await clist.set_auto_disabled(current_api, duration=_duration, reason=_reason)
-                                            logger.info(f"[stream_guard] key_rule matched: {_reason}, duration={_duration}, key={current_api[:12]}...")
-                        except Exception as e:
-                            logger.debug(f"[stream_guard] key_rules failed: {e}")
-
-                        # sticky_ip: 清 session
-                        clist = provider_api_circular_list.get(channel_id)
-                        if clist and clist.schedule_algorithm == "sticky_ip":
-                            client_ip = current_info.get("client_ip", "")
-                            if client_ip and client_ip in clist._sticky_sessions:
-                                clist._sticky_sessions.pop(client_ip, None)
-                except Exception:
-                    pass
-
-                try:
-                    # 修改原因：流式响应结束时直接 await update_stats 会让请求协程等待 SQLite 串行写入。
-                    # 修改方式：改为同步 enqueue_stats 保存 current_info 快照，后续由常驻 consumer 批量落库。
-                    # 目的：释放流式请求上下文，避免统计写入和 db_semaphore 等待造成协程堆积。
-                    enqueue_stats(current_info, app=app)
-                except Exception as e:
-                    logger.error(f"Error enqueueing stats in LoggingStreamingResponse: {str(e)}")
+                    await close_async_iterator(logging_iterator)
+                finally:
+                    await self.close()
             finally:
-                # 修改原因：current_info 和 body_iterator 会连接 provider、api_key、上游响应迭代器等请求级对象。
-                # 修改方式：无论流式发送、关闭迭代器或统计写入是否异常，最终都断开这些强引用。
-                # 目的：让 Response 生命周期结束后及时释放请求上下文，降低 GC 处理循环引用的压力。
-                self.current_info = None
-                self.body_iterator = None
+                try:
+                    app = self.app() if self.app else None
+                    if should_save and response_chunks:
+                        current_info["response_body"] = truncate_for_logging(b"".join(response_chunks))
+                    if "start_time" in current_info:
+                        current_info["process_time"] = time() - current_info["start_time"]
+                    # 渠道统计必须等待真实流结束，不能在创建 Response 时提前记成功。
+                    channel_stats = current_info.pop("_channel_stats_call", None)
+                    if channel_stats:
+                        from core.handler import _fire_and_forget_channel_stats
+                        func, args, kwargs = channel_stats
+                        _fire_and_forget_channel_stats(func, *args,
+                                                      success=bool(current_info.get("success")), **kwargs)
+                    enqueue_stats(current_info, app=app)
+                except Exception as exc:
+                    logger.error("Error enqueueing streaming stats: %s", type(exc).__name__)
+                finally:
+                    self.current_info = None
+                    self.body_iterator = None
 
-    def _extract_stream_error(self, prefer_upstream: bool = False) -> str:
-        """从 current_info 的响应体中提取错误信息。
-        
-        尝试解析 SSE error event 和 JSON error 对象。
-        返回错误消息字符串，没找到则返回空字符串。
-        
-        Args:
-            prefer_upstream: 优先从 upstream_response_body（上游原始返回体）提取，
-                           fallback 到 response_body（转换后的返回体）。
-        """
-        ci = self.current_info or {}
-        if prefer_upstream:
-            body = ci.get("upstream_response_body", "") or ci.get("response_body", "")
-        else:
-            body = ci.get("response_body", "")
-        if not body:
-            return ""
-        if isinstance(body, bytes):
-            body = body.decode("utf-8", errors="replace")
-        
-        # 尝试从 SSE 事件中提取 error
-        import re
-        for match in re.finditer(r'data:\s*({.+?})\s*(?:\n|$)', body):
-            try:
-                obj = json.loads(match.group(1))
-                if isinstance(obj, dict):
-                    # OpenAI Responses API: {"type":"error","error":{"type":"...","message":"..."}}
-                    err = obj.get("error")
-                    if isinstance(err, dict) and err.get("message"):
-                        return err["message"]
-                    # Standard SSE error
-                    if obj.get("type") == "error" and obj.get("message"):
-                        return obj["message"]
-            except (json.JSONDecodeError, TypeError):
-                continue
-        
-        # 尝试整体 JSON
+    async def _render_stream_error(self, error):
+        """协议字段由入口方言生成；核心只提供统一错误对象。"""
+        from core.dialects.registry import get_dialect
+
+        payload = {"error": {"message": error["message"], "type": error["type"],
+                             "param": None, "code": error.get("code")},
+                   "status_code": error["status_code"]}
+        text = json.dumps(payload, ensure_ascii=False)
+        if self.media_type != "text/event-stream":
+            return text
+        canonical = f"data: {text}\n\n"
+        dialect = get_dialect(self.dialect_id or "openai")
+        if dialect:
+            render = dialect.render_stream_factory() if dialect.render_stream_factory else dialect.render_stream
+            if render:
+                return await render(canonical) or canonical
+        return canonical
+
+    async def _iterate_with_errors(self):
+        """先处理实际 Key，再交付原生错误帧或按方言生成的异常帧。"""
+        inspector = StreamInspector()
         try:
-            obj = json.loads(body)
-            if isinstance(obj, dict):
-                err = obj.get("error")
-                if isinstance(err, dict) and err.get("message"):
-                    return err["message"]
-                if isinstance(err, str):
-                    return err
-        except (json.JSONDecodeError, TypeError):
-            pass
-        
-        # 截取前 200 字符作为兜底
-        if len(body) < 500:
-            return body[:200]
-        return ""
+            async for chunk in self.body_iterator:
+                inspector.feed(chunk)
+                if inspector.has_output:
+                    self.current_info["_stream_has_output"] = True
+                if inspector.error:
+                    await record_stream_failure(self.current_info, inspector.error)
+                yield chunk
+            inspector.finish()
+            if inspector.error:
+                await record_stream_failure(self.current_info, inspector.error)
+            elif self.current_info.get("_stream_error"):
+                # 转换器或插件过滤了错误帧时，也不能以正常空流结束。
+                raise UpstreamStreamError(self.current_info["_stream_error"])
+            elif (self.media_type == "text/event-stream" and not inspector.terminal
+                  and not self.current_info.get("_stream_has_output")):
+                raise RuntimeError("Upstream stream ended before output")
+        except (GeneratorExit, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            error = self.current_info.get("_stream_error") or stream_error_from_exception(exc)
+            await record_stream_failure(self.current_info, error)
+            logger.error("Error in streaming response: %s: %s", type(exc).__name__, error["message"])
+            yield await self._render_stream_error(error)
+        finally:
+            await close_async_iterator(self.body_iterator)
 
     def _try_extract_usage(self, resp: dict) -> None:
         """从已解析的 JSON 对象中提取 usage 并合并到 current_info。
@@ -325,64 +244,67 @@ class LoggingStreamingResponse(Response):
         return content_start_recorded
 
     async def _logging_iterator(self):
-        # 用于收集响应体的缓冲区（仅在配置了保留时间时使用）
-        # response_chunks 用于收集返回给用户的响应（即经过转换后的）
+        # 非流式 JSON 可能被分块，保留有界缓冲用于 usage 解析，不依赖原始日志开关。
         response_chunks = []
-        max_response_size = 100 * 1024  # 100KB
+        max_response_size = 100 * 1024
         total_response_size = 0
-        should_save_response = self.current_info.get("raw_data_expires_at") is not None
         adapter_metrics_managed = bool(self.current_info.get("adapter_metrics_managed"))
         content_start_recorded = False  # 标记是否已记录正文开始时间
         # 跨 chunk 行缓冲：上游 HTTP chunk 边界与 SSE 行边界不一定对齐，
         # 一个 data: 行可能被拆到相邻两个 chunk 中。
         # 保留上一个 chunk 末尾的不完整行，拼接到下一个 chunk 开头。
         _line_buffer = ""
-        
-        async for chunk in self.body_iterator:
-            if isinstance(chunk, str):
-                chunk = chunk.encode("utf-8")
 
-            # 收集响应体（限制大小）
-            if should_save_response and total_response_size < max_response_size:
-                response_chunks.append(chunk)
-                total_response_size += len(chunk)
+        iterator = self._iterate_with_errors()
+        try:
+            async for chunk in iterator:
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
 
-            # 若 usage / content_start_time 已由适配器直接管理，
-            # 这里不再对已经转换过的下游响应做二次 JSON 解析。
-            if adapter_metrics_managed:
+                if self.media_type != "text/event-stream" and total_response_size < max_response_size:
+                    prefix = chunk[:max_response_size - total_response_size]
+                    response_chunks.append(prefix)
+                    total_response_size += len(prefix)
+
+                # 若 usage / content_start_time 已由适配器直接管理，
+                # 这里不再对已经转换过的下游响应做二次 JSON 解析。
+                if adapter_metrics_managed:
+                    yield chunk
+                    continue
+
+                # 音频流不解析 usage，直接透传
+                if self.current_info.get("endpoint", "").endswith("/v1/audio/speech"):
+                    yield chunk
+                    continue
+
+                # 使用 errors="replace" 避免解码错误导致流终止
+                chunk_text = chunk.decode("utf-8", errors="replace")
+                if self.debug:
+                    logger.info(chunk_text.encode("utf-8").decode("unicode_escape"))
+
+                # 拼接上一个 chunk 的残留行
+                chunk_text = _line_buffer + chunk_text
+                _line_buffer = ""
+
+                # 按行分割；最后一个元素可能是不完整行，需要缓冲
+                lines = chunk_text.split("\n")
+                # 如果 chunk 不以换行结尾，末尾元素是不完整行，留到下个 chunk
+                if not chunk_text.endswith("\n"):
+                    _line_buffer = lines.pop()
+
+                for line in lines:
+                    try:
+                        content_start_recorded = self._try_parse_line(line, content_start_recorded)
+                    except Exception as e:
+                        if self.debug:
+                            logger.error(f"Error parsing streaming response: {str(e)}, line: {repr(line)}")
+
+                # 透传原始 chunk
                 yield chunk
-                continue
 
-            # 音频流不解析 usage，直接透传
-            if self.current_info.get("endpoint", "").endswith("/v1/audio/speech"):
-                yield chunk
-                continue
+        finally:
+            await close_async_iterator(iterator)
 
-            # 使用 errors="replace" 避免解码错误导致流终止
-            chunk_text = chunk.decode("utf-8", errors="replace")
-            if self.debug:
-                logger.info(chunk_text.encode("utf-8").decode("unicode_escape"))
-
-            # 拼接上一个 chunk 的残留行
-            chunk_text = _line_buffer + chunk_text
-            _line_buffer = ""
-
-            # 按行分割；最后一个元素可能是不完整行，需要缓冲
-            lines = chunk_text.split("\n")
-            # 如果 chunk 不以换行结尾，末尾元素是不完整行，留到下个 chunk
-            if not chunk_text.endswith("\n"):
-                _line_buffer = lines.pop()
-
-            for line in lines:
-                try:
-                    content_start_recorded = self._try_parse_line(line, content_start_recorded)
-                except Exception as e:
-                    if self.debug:
-                        logger.error(f"Error parsing streaming response: {str(e)}, line: {repr(line)}")
-            
-            # 透传原始 chunk
-            yield chunk
-        
         # 处理 _line_buffer 中的残留数据
         # 流的最后一个 chunk 可能不以换行结尾，此时最后一行 data 会留在缓冲区中
         if _line_buffer:
@@ -391,15 +313,6 @@ class LoggingStreamingResponse(Response):
             except Exception as e:
                 if self.debug:
                     logger.error(f"Error parsing remaining buffer: {str(e)}, line: {repr(_line_buffer)}")
-
-        # 保存返回给用户的响应体（使用深度截断，保留结构同时限制大小）
-        # 使用 asyncio.to_thread 避免大响应体阻塞事件循环
-        if should_save_response and response_chunks:
-            try:
-                response_body = b"".join(response_chunks)
-                self.current_info["response_body"] = await asyncio.to_thread(truncate_for_logging, response_body)
-            except Exception as e:
-                logger.error(f"Error saving response body: {str(e)}")
 
         # 非 SSE 响应（如 Gemini 非流式透传）的 usage 提取：
         # _try_parse_line 只能解析 SSE 格式（按行 data: {json}），
@@ -422,4 +335,4 @@ class LoggingStreamingResponse(Response):
             # 修改方式：先取局部 iterator，并在存在 aclose 方法时才关闭。
             # 目的：保持 close 幂等，避免清理引用后再次关闭触发 AttributeError。
             if iterator is not None and hasattr(iterator, "aclose"):
-                await iterator.aclose()
+                await close_async_iterator(iterator)

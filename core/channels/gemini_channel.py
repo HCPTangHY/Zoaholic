@@ -23,9 +23,10 @@ from ..utils import (
     upload_image_to_0x0st,
 )
 from ..response import check_response
-from ..json_utils import json_loads, json_dumps_text
+from ..json_utils import json_loads, json_dumps_text, json_dumps_bytes
 from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..stream_errors import extract_stream_error
 from ..usage import extract_cache_usage
 from ..file_utils import extract_base64_data
 from urllib.parse import urlparse
@@ -799,7 +800,7 @@ def gemini_json_process(response_json):
 async def fetch_gemini_response(client, url, headers, payload, model, timeout):
     """处理 Gemini 非流式响应"""
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json_dumps_text, payload)
+    json_payload = await asyncio.to_thread(json_dumps_bytes, payload)
     response = await client.post(url, headers=headers, content=json_payload, timeout=timeout)
     
     error_message = await check_response(response, "fetch_gemini_response")
@@ -965,7 +966,7 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
 async def fetch_gemini_response_stream(client, url, headers, payload, model, timeout):
     """处理 Gemini 流式响应"""
     timestamp = int(datetime.timestamp(datetime.now()))
-    json_payload = await asyncio.to_thread(json_dumps_text, payload)
+    json_payload = await asyncio.to_thread(json_dumps_bytes, payload)
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
         error_message = await check_response(response, "fetch_gemini_response_stream")
         if error_message:
@@ -1007,6 +1008,16 @@ async def fetch_gemini_response_stream(client, url, headers, payload, model, tim
                     response_json = json_loads(parts_json)
                 except json.JSONDecodeError:
                     continue
+
+            # 修改原因：Gemini 流内错误（如 RESOURCE_EXHAUSTED 429）不走 candidates 结构，
+            # gemini_json_process 会静默吞掉该信封，导致客户端看到一个正常结束的假流。
+            # 修改方式：在内容解析前优先识别错误信封，产出结构化错误块交给上游 guard 决定重试或记录。
+            # 目的：转换路径与透传路径对 Gemini 流内错误的处理保持一致。
+            stream_error = extract_stream_error(response_json)
+            if stream_error:
+                yield {"error": {k: stream_error[k] for k in ("message", "type", "code")},
+                       "status_code": stream_error["status_code"]}
+                return
 
             # https://ai.google.dev/api/generate-content?hl=zh-cn#FinishReason
             is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature, function_calls_list = gemini_json_process(response_json)
@@ -1279,8 +1290,30 @@ async def fetch_gemini_models(client, provider):
     return models
 
 
+def gemini_stream_classifier(event):
+    """Gemini 协议事件分类：True=可暂存，False=携带输出，None=不表态。
+
+    candidates 帧只含角色/空 parts/usage 时可暂存；
+    出现文本、函数调用或内联图片即视为已输出。
+    """
+    if not isinstance(event, dict) or "candidates" not in event:
+        return None
+    for candidate in event.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            return False
+        parts = (candidate.get("content") or {}).get("parts") or []
+        for part in parts:
+            if not isinstance(part, dict):
+                return False
+            if any(part.get(field) for field in (
+                "text", "functionCall", "function_call", "inlineData", "inline_data",
+                "executableCode", "executable_code", "codeExecutionResult",
+            )):
+                return False
+    return True
+
+
 def register():
-    """注册 Gemini 渠道到注册中心"""
     from .registry import register_channel
     
     register_channel(
@@ -1293,6 +1326,7 @@ def register():
         passthrough_payload_adapter=patch_passthrough_gemini_payload,
         response_adapter=fetch_gemini_response,
         stream_adapter=fetch_gemini_response_stream,
+        stream_event_classifier=gemini_stream_classifier,
         models_adapter=fetch_gemini_models,
         source="builtin",
     )

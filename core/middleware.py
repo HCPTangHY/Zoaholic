@@ -26,7 +26,7 @@ from starlette.types import ASGIApp, Receive, Send, Scope, Message
 
 from core.log_config import logger
 from core.models import ModerationRequest, UnifiedRequest
-from core.metrics import on_request_start, on_request_end
+from core.metrics import on_request_start, on_request_end, on_request_model
 from core.stats import enqueue_stats
 from core.utils import truncate_for_logging
 from core.error_response import openai_error_response
@@ -44,6 +44,11 @@ from db import DISABLE_DATABASE
 
 # 请求级统计信息上下文
 request_info = contextvars.ContextVar("request_info", default={})
+
+# 修改原因：OAuth 回调是浏览器 302 跳转入口，无法携带 API Key，必须保持公开。
+# 修改方式：标准 /v1 鉴权前先匹配公开路径白名单。
+# 目的：让中间件鉴权覆盖所有非方言 /v1 端点的同时，不破坏 OAuth 登录回跳。
+_PUBLIC_V1_PATHS = frozenset({"/v1/oauth/callback"})
 
 
 def get_api_key_from_headers(headers: list) -> Optional[str]:
@@ -118,30 +123,46 @@ class StatsMiddleware:
         else:
             self.debug = debug
         
-        # 缓存方言端点前缀列表
-        self._dialect_prefixes = self._get_dialect_prefixes()
-    
-    def _get_dialect_prefixes(self) -> list:
-        """获取所有方言端点前缀"""
-        prefixes = set()
+        # 缓存方言端点路径匹配器（精确匹配，避免前缀误伤其他 /v1 端点）
+        self._dialect_path_regexes = self._build_dialect_path_regexes()
+
+    def _build_dialect_path_regexes(self) -> list:
+        """把已注册方言端点的完整路径模板编译为精确匹配正则。
+
+        修改原因：原来按前缀 startswith 判断方言端点，Gemini 方言注册 /v1 前缀后
+        所有 /v1/* 管理端点都被误判为方言，中间件标准 API Key 鉴权分支成为死代码。
+        修改方式：对每个方言端点的 prefix+path 模板做精确匹配，
+        {param} 匹配 [^/]+，{param:path} 匹配 .+。
+        目的：只有真正注册的方言端点跳过标准鉴权，其余 /v1 端点恢复中间件统一鉴权。
+        """
+        import re
+        regexes = []
         try:
             from core.dialects import list_dialects
             for dialect in list_dialects():
                 for endpoint in dialect.endpoints:
-                    # 提取端点前缀（如 /v1beta）
-                    prefix = endpoint.prefix or ""
-                    if prefix:
-                        prefixes.add(prefix)
+                    full_path = f"{endpoint.prefix or ''}{endpoint.path}"
+                    pattern = ""
+                    for part in re.split(r"(\{[^{}]+\})", full_path):
+                        if not part:
+                            continue
+                        if part.startswith("{") and part.endswith("}"):
+                            inner = part[1:-1]
+                            if ":" in inner:
+                                _, conv = inner.split(":", 1)
+                                pattern += ".+" if conv == "path" else "[^/]+"
+                            else:
+                                pattern += "[^/]+"
+                        else:
+                            pattern += re.escape(part)
+                    regexes.append(re.compile(f"^{pattern}$"))
         except Exception:
             pass
-        return list(prefixes)
-    
+        return regexes
+
     def _is_dialect_endpoint(self, path: str) -> bool:
-        """检查路径是否是方言端点"""
-        for prefix in self._dialect_prefixes:
-            if path.startswith(prefix):
-                return True
-        return False
+        """检查路径是否精确匹配某个已注册的方言端点。"""
+        return any(rx.match(path) for rx in self._dialect_path_regexes)
 
     @staticmethod
     def _get_client_ip(scope: Scope, headers: list) -> str:
@@ -215,6 +236,13 @@ class StatsMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # 修改原因：OAuth 回调等浏览器重定向入口无法携带 API Key。
+        # 修改方式：在方言判定和标准鉴权之前放行公开路径白名单。
+        # 目的：中间件统一鉴权不阻断 OAuth 登录回跳。
+        if path in _PUBLIC_V1_PATHS:
+            await self.app(scope, receive, send)
+            return
+
         # 方言端点使用自己的认证逻辑，跳过中间件认证但仍初始化 request_info
         # 方言路由处理器会使用 DialectDefinition.extract_token 进行认证
         is_dialect = self._is_dialect_endpoint(path)
@@ -236,7 +264,6 @@ class StatsMiddleware:
 
         # ── 运行时指标：标记请求开始 ──
         _metrics_model: Optional[str] = None
-        _metrics_tracked = False
 
         # 方言端点跳过中间件认证，但仍需初始化基础上下文
         token = None
@@ -401,6 +428,9 @@ class StatsMiddleware:
         }
 
         current_request_info = request_info.set(request_info_data)
+        on_request_start()
+        response_completed = False
+        response_status = 500
         # 修改原因：request_info 是请求级 ContextVar，body 读取或下游处理异常时也必须恢复旧值。
         # 修改方式：将 set 之后的请求处理全部放入外层 try/finally，并在 finally 中 reset token。
         # 目的：避免客户端断连等异常路径让 ContextVar 残留到同一个异步上下文。
@@ -418,10 +448,14 @@ class StatsMiddleware:
                 body_chunks = []
                 while True:
                     message = await receive()
+                    if message["type"] == "http.disconnect":
+                        return
                     body_chunks.append(message.get("body", b""))
                     if not message.get("more_body", False):
                         break
                 body_bytes = b"".join(body_chunks)
+                body_chunks.clear()
+                del message
 
                 if body_bytes:
                     try:
@@ -429,6 +463,16 @@ class StatsMiddleware:
                         parsed_body = json_loads(body_bytes)
                     except json.JSONDecodeError:
                         parsed_body = None
+
+            if isinstance(parsed_body, dict):
+                _metrics_model = parsed_body.get("model")
+                if not isinstance(_metrics_model, str):
+                    _metrics_model = None
+            if _metrics_model is None and "/models/" in path:
+                _metrics_model = path.split("/models/", 1)[1].split(":", 1)[0]
+            on_request_model(_metrics_model)
+            if is_dialect and isinstance(parsed_body, dict):
+                scope["_zoaholic_parsed_json"] = parsed_body
 
             # 获取原始数据保留时间配置（小时），默认为24小时
             raw_data_retention_hours = safe_get(
@@ -447,7 +491,9 @@ class StatsMiddleware:
                 # 保存请求体（使用深度截断，保留结构同时限制大小）
                 # 使用 asyncio.to_thread 避免大请求体阻塞事件循环
                 if body_bytes:
-                    current_info["request_body"] = await asyncio.to_thread(truncate_for_logging, body_bytes)
+                    current_info["request_body"] = await asyncio.to_thread(
+                        truncate_for_logging, parsed_body if parsed_body is not None else body_bytes
+                    )
             
                 # 设置过期时间
                 current_info["raw_data_expires_at"] = datetime.now(timezone.utc) + timedelta(hours=raw_data_retention_hours)
@@ -455,11 +501,13 @@ class StatsMiddleware:
             # 创建新的 receive 函数，重放已读取的 body
             body_sent = False
             async def receive_wrapper() -> Message:
-                nonlocal body_sent
+                nonlocal body_sent, body_bytes
                 if method == "POST" and "application/json" in content_type:
                     if not body_sent:
                         body_sent = True
-                        return {"type": "http.request", "body": body_bytes, "more_body": False}
+                        message = {"type": "http.request", "body": body_bytes, "more_body": False}
+                        body_bytes = b""
+                        return message
                     # 等待真正的 disconnect 消息，而不是返回空 body
                     # 这对于 StreamingResponse 的正确迭代很重要
                     return await receive()
@@ -484,11 +532,6 @@ class StatsMiddleware:
                             pass
                         model = request_model.model
                         current_info["model"] = model
-
-                        # ── 运行时指标：带模型名开始追踪 ──
-                        _metrics_model = model
-                        on_request_start(model=_metrics_model)
-                        _metrics_tracked = True
 
 
                         moderated_content = None
@@ -537,14 +580,18 @@ class StatsMiddleware:
                 response_headers = []
 
                 async def send_wrapper(message: Message) -> None:
-                    nonlocal response_started, response_status, response_headers
+                    nonlocal response_started, response_status, response_headers, response_completed
                     if message["type"] == "http.response.start":
                         response_started = True
                         response_status = message.get("status", 200)
                         response_headers = message.get("headers", [])
                     await send(message)
+                    if message["type"] == "http.response.body" and not message.get("more_body", False):
+                        response_completed = True
 
-                # 调用下游应用
+                # Dialect routes take ownership of the parsed object via scope.
+                if is_dialect:
+                    parsed_body = None
                 await self.app(scope, receive_wrapper, send_wrapper)
 
             except ValidationError as e:
@@ -567,16 +614,10 @@ class StatsMiddleware:
                 logger.error("Error processing request: %s\n%s", str(e), _tb.format_exc())
                 response = openai_error_response(f"Internal server error: {str(e)}", 500)
                 await response(scope, receive_wrapper, send)
-            finally:
-                # ── 运行时指标：标记请求结束 ──
-                if not _metrics_tracked:
-                    # 未进入 UnifiedRequest 解析的请求也要追踪
-                    on_request_start(model=None)
-                    _metrics_tracked = True
-                is_success = response_started and 200 <= response_status < 500
-                on_request_end(model=_metrics_model, success=is_success)
-
         finally:
+            scope.pop("_zoaholic_parsed_json", None)
+            status = request_info_data.get("status_code") or response_status
+            on_request_end(model=_metrics_model, success=response_completed and 200 <= status < 400)
             request_info.reset(current_request_info)
             reset_byok_context(byok_context_tokens)
 

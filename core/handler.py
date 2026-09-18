@@ -666,18 +666,18 @@ class ModelRequestHandler:
         status_code = 500
         error_message = ""
 
-        index = 0
-        # 获取配置的最大重试次数上限，默认为 10
-        # [已废弃] max_retry_count 机制已移除，重试终止完全靠 is_all_rate_limited 兜底
-        # max_retry_limit = safe_get(config, 'preferences', 'max_retry_count', default=0)
+        index = 0  # 渠道游标，可在同优先级组内回退。
+        attempts = 0  # 请求级计数只增不减，不能随游标或候选列表重置。
 
         # 计算最大尝试次数（包含首轮 + 自动重试）。
         # 修复：
         # - 使用 get_enabled_items_count 排除禁用 key。
         #   容易在“只有 1 个可用 key，但配置里堆了大量禁用 key”时触发 1000+ 次重试。
-        # - 统一按“启用的 key 数量”计算。
+        # - 每个渠道首次进入本次请求时固定预算，不能随失败 Key 冷却而缩减。
+        provider_key_budgets: Dict[str, int] = {}
+
         def _provider_key_slots(p: Dict[str, Any]) -> int:
-            """返回该 provider 可用于重试的 key 数量（至少为 1）。
+            """返回该 provider 在本次请求中固定的尝试预算（至少为 1）。
 
             注意：没有配置 api（例如无需 key 的渠道）也按 1 计。
             """
@@ -686,6 +686,9 @@ class ModelRequestHandler:
                 # 修改方式：重试槽位固定按 1 计算，不读取 provider_api_circular_list。
                 # 目的：避免 "*" 被视作本地 key，也避免缺失 key pool 影响重试次数计算。
                 return 1
+            name = p["provider"]
+            if name in provider_key_budgets:
+                return provider_key_budgets[name]
             try:
                 # 修改原因：provider_api_circular_list 已改为普通 dict，读取缺失 provider 时不能再隐式创建空 key 池。
                 # 修改方式：使用 get 读取现有循环列表，缺失时按 0 个启用 key 处理。
@@ -698,14 +701,15 @@ class ModelRequestHandler:
                 enabled_int = int(enabled)
             except (TypeError, ValueError):
                 enabled_int = 0
-            return max(1, enabled_int)
+            provider_key_budgets[name] = max(1, enabled_int)
+            return provider_key_budgets[name]
 
         def _calc_retry_count(providers: List[Dict[str, Any]]) -> int:
             """计算“额外重试次数”。
 
             设计目标：
             - 保持原有语义：总尝试次数 ≈ num_matching_providers + retry_count
-            不设人为上限，终止靠 is_all_rate_limited 兜底
+            最终仍受请求级 500 次上限约束，限流检查不能代替退出条件。
             - 仅按“启用的 key 数量”估算，避免禁用 key 造成 retry_count 虚高
             """
             n = len(providers)
@@ -760,37 +764,63 @@ class ModelRequestHandler:
         # 目的：达到可用 key 数后强制视为耗尽，不再被 cooldown 过期欺骗。
         _provider_attempt_counts: Dict[str, int] = {}
 
-        # ── 虚拟路由优先级分组索引 ──
-        # matching_providers 已按 _virtual_priority 升序排列（0,0,0,1,1,2...）
-        # 构建 priority_group_ranges: [(start, end, priority), ...]
-        # 用于重试循环中强制在同一 priority group 内走到黑，再降级
+        # matching_providers 按 _virtual_priority 升序排列；同组重试后再降级。
         _is_virtual_route = any(
             p.get("_virtual_route_provider") and "_virtual_priority" in p
             for p in matching_providers
         )
-        _priority_group_ranges: list = []  # [(start_idx, end_idx_exclusive, priority)]
-        if _is_virtual_route:
-            _cur_priority = None
-            _group_start = 0
-            for _i, _p in enumerate(matching_providers):
-                _pp = int(_p.get("_virtual_priority", 0) or 0)
-                if _cur_priority is not None and _pp != _cur_priority:
-                    _priority_group_ranges.append((_group_start, _i, _cur_priority))
-                    _group_start = _i
-                _cur_priority = _pp
-            if _cur_priority is not None:
-                _priority_group_ranges.append((_group_start, len(matching_providers), _cur_priority))
+        _left_virtual_route = False
+
+        def _accept_regular_route():
+            nonlocal _is_virtual_route, _left_virtual_route, max_attempts
+            if _is_virtual_route and not any(p.get("_virtual_route_provider") for p in matching_providers):
+                _is_virtual_route = False
+                _left_virtual_route = True
+                # 仅一次转出可增加预算；全请求计数和渠道失败计数不清零。
+                max_attempts = min(500, attempts + len(matching_providers) + _calc_retry_count(matching_providers))
+
+        async def _leave_virtual_route():
+            nonlocal matching_providers, num_matching_providers, index, _left_virtual_route
+            if not _is_virtual_route or _left_virtual_route or override_providers or attempts >= 500:
+                return False
+            _left_virtual_route = True
+            try:
+                regular = await get_right_order_providers(
+                    request_model_name, config, api_index, scheduling_algorithm,
+                    self.app, request_total_tokens=request_total_tokens, skip_virtual=True,
+                )
+            except HTTPException as exc:
+                if exc.status_code in (404, 503):
+                    return False
+                raise
+            # 防御：转出后不允许重新进入链路。
+            regular = [p for p in regular if not p.get("_virtual_route_provider")]
+            matching_providers = await self._build_attempt_providers(
+                regular, request_model_name, scheduling_algorithm, advance_cursor=False,
+            )
+            num_matching_providers = len(matching_providers)
+            index = 0
+            _accept_regular_route()
+            return bool(matching_providers)
 
         def _get_priority_group_range(idx: int):
-            """返回 idx 所在 priority group 的 (start, end) 范围"""
-            for start, end, _ in _priority_group_ranges:
-                if start <= idx < end:
-                    return start, end
-            return 0, num_matching_providers
+            """按当前候选列表取分组边界，避免渠道冷却后使用旧索引。"""
+            priority = int(matching_providers[idx].get("_virtual_priority", 0) or 0)
+            start, end = idx, idx + 1
+            while start > 0 and int(matching_providers[start - 1].get("_virtual_priority", 0) or 0) == priority:
+                start -= 1
+            while end < num_matching_providers and int(matching_providers[end].get("_virtual_priority", 0) or 0) == priority:
+                end += 1
+            return start, end
 
-        while True:
-            if index >= max_attempts:
+        while attempts < 500:
+            if not num_matching_providers or attempts >= max_attempts:
+                if await _leave_virtual_route():
+                    continue
                 break
+            # 即使候选全被跳过，也让取消请求和其他任务有机会执行。
+            await asyncio.sleep(0)
+            attempts += 1
             current_index = index % num_matching_providers
             index += 1
             provider = matching_providers[current_index]
@@ -806,21 +836,6 @@ class ModelRequestHandler:
             if not provider_is_byok and _provider_attempt_counts.get(provider_name, 0) >= _provider_key_slots(provider):
                 continue
 
-            attempt_request_data = _clone_request_data_for_channel_attempt(request_data)
-
-            # ── 渠道入站拦截器：provider 已选定、channel adapter 转格式前 ──
-            try:
-                from core.plugins.interceptors import apply_channel_inbound_interceptors
-                provider_enabled_plugins = safe_get(provider, 'preferences', 'enabled_plugins', default=None)
-                # 修改原因：channel_inbound 阶段必须使用渠道级 enabled_plugins，而不是 Key 级 enabled_plugins。
-                # 修改方式：在每次 provider 尝试开始处基于 attempt_request_data 调用，并把 provider 与 api_key_info 一并传入。
-                # 目的：让渠道级插件可以在 get_payload 前按当前 provider 修改请求对象，同时不污染后续重试渠道。
-                attempt_request_data = await apply_channel_inbound_interceptors(
-                    attempt_request_data, None, provider, _interceptor_api_key_info, provider_enabled_plugins
-                )
-            except Exception as _channel_inbound_err:
-                logger.warning(f"Channel inbound interceptors error for provider {provider_name}: {_channel_inbound_err}")
-
             # 检查是否所有 API 密钥都被速率限制
             model_dict = provider["_model_dict_cache"]
             original_model = model_dict[request_model_name]
@@ -835,15 +850,12 @@ class ModelRequestHandler:
                 if await provider_circular_list.is_all_rate_limited(original_model):
                     error_message = "All API keys are rate limited and stop auto retry!"
                     if num_matching_providers == 1:
+                        if await _leave_virtual_route():
+                            continue
                         break
                     # 虚拟路由：检查同 priority group 是否全部耗尽
                     if _is_virtual_route:
                         grp_start, grp_end = _get_priority_group_range(current_index)
-                        # 修改原因：matching_providers 在分组构建后可能因运行时过滤发生变化，
-                        # grp_end 可能越界导致 IndexError。
-                        # 修改方式：以 min(grp_end, len(matching_providers)) 做运行时边界保护。
-                        # 目的：避免虚拟路由分组检查因索引越界返回 500。
-                        grp_end = min(grp_end, len(matching_providers))
                         group_all_exhausted = True
                         for gi in range(grp_start, grp_end):
                             gi_provider = matching_providers[gi]
@@ -855,15 +867,31 @@ class ModelRequestHandler:
                             if _provider_attempt_counts.get(gi_provider_name, 0) >= _provider_key_slots(gi_provider):
                                 continue
                             gi_circular_list = provider_api_circular_list.get(gi_provider_name)
-                            if gi_circular_list and not await gi_circular_list.is_all_rate_limited(original_model):
+                            gi_model = gi_provider["_model_dict_cache"][request_model_name]
+                            if not gi_circular_list or not await gi_circular_list.is_all_rate_limited(gi_model):
                                 group_all_exhausted = False
                                 break
                         if not group_all_exhausted:
                             # 同组还有可用渠道 → 跳到组内下一个，不降级
                             continue
                         # 同组全耗尽 → 跳过整个组，直接到下一个 priority group
-                        index = (grp_end % num_matching_providers) if grp_end < num_matching_providers else grp_end
+                        if grp_end >= num_matching_providers:
+                            if await _leave_virtual_route():
+                                continue
+                            break
+                        index = grp_end
                     continue
+
+            # 不可用渠道不复制请求体，也不执行渠道入站插件。
+            attempt_request_data = _clone_request_data_for_channel_attempt(request_data)
+            try:
+                from core.plugins.interceptors import apply_channel_inbound_interceptors
+                provider_enabled_plugins = safe_get(provider, 'preferences', 'enabled_plugins', default=None)
+                attempt_request_data = await apply_channel_inbound_interceptors(
+                    attempt_request_data, None, provider, _interceptor_api_key_info, provider_enabled_plugins
+                )
+            except Exception as _channel_inbound_err:
+                logger.warning(f"Channel inbound interceptors error for provider {provider_name}: {_channel_inbound_err}")
 
             original_request_model = (original_model, attempt_request_data.model)
             
@@ -1040,6 +1068,19 @@ class ModelRequestHandler:
                 else:
                     status_code = 500  # Internal Server Error
                     error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
+                    # 修改原因：该分支此前完全静默，尝试期抛出的非 HTTP/非网络异常（如转换器
+                    # RecursionError、payload 解析错误）只把 str(e) 写进 500 响应体，不落任何日志，
+                    # 下游反馈 500 时无法定位是哪个渠道哪次尝试抛的什么异常。
+                    # 修改方式：补记渠道、模型、异常类型与消息，附带完整堆栈。
+                    # 目的：任何尝试期异常 500 都可以从日志追溯到具体渠道与异常源头。
+                    logger.error(
+                        "[attempt_error] provider=%s model=%s exception=%s: %s",
+                        provider.get('provider', '?'),
+                        request_model_name,
+                        type(e).__name__,
+                        error_message[:300],
+                        exc_info=True,
+                    )
 
                 # ── CDN/WAF 误判修正 ──
                 # 修改原因：Cloudflare Workers 等反代被 WAF 拦截时返回 HTTP 403 + HTML 页面，
@@ -1120,9 +1161,11 @@ class ModelRequestHandler:
                 else:
                     api_key_count_before_rule = 0
 
-                key_rule_disabled_current = False
+                # 已提交流的中途错误已由 record_stream_failure 按同一规则处理实际 key，这里不再重复禁用；
+                # 置位后渠道级重建仍按“禁用后剩余 key 数”判断。
+                key_rule_disabled_current = bool(_current_info_for_key.get("_stream_error_handled"))
                 # ── 应用 Key Rules 规则：冷却 / 禁用 ──
-                if _rule_result and current_api and channel_circular_list and not is_current_byok_request:
+                if _rule_result and current_api and channel_circular_list and not is_current_byok_request and not key_rule_disabled_current:
                     _duration = _rule_result.get("duration", 0)
                     _reason = _rule_result.get("reason", "key_rule")
                     if _duration == -1:
@@ -1168,7 +1211,8 @@ class ModelRequestHandler:
                     await self.app.state.channel_manager.exclude_model(channel_id, request_model_name)
                     matching_providers = await get_right_order_providers(
                         request_model_name, config, api_index, scheduling_algorithm,
-                        self.app, request_total_tokens=request_total_tokens
+                        self.app, request_total_tokens=request_total_tokens,
+                        **({"skip_virtual": True} if _left_virtual_route else {}),
                     )
                     matching_providers = await self._build_attempt_providers(
                         matching_providers,
@@ -1176,16 +1220,11 @@ class ModelRequestHandler:
                         scheduling_algorithm=scheduling_algorithm,
                         advance_cursor=False,
                     )
-                    last_num_matching_providers = num_matching_providers
                     num_matching_providers = len(matching_providers)
-                    # provider 列表发生变化（或重新排序）时，重算最大尝试次数
-                    retry_count = _calc_retry_count(matching_providers)
-                    max_attempts = min(num_matching_providers + retry_count, 500)  # 绝对上限防死循环
-                    if num_matching_providers != last_num_matching_providers:
-                        index = 0
-                # 当 key 被冷却但渠道仍有可用 key 时：不做 exclude_model，也不回退 index。
-                # index 正常前进，通过 max_attempts 的 modulo 循环回来时 circular_list 自动取下一个 key。
-                # 不能 index = current_index，否则 index 永远到不了 max_attempts，死循环。
+                    _accept_regular_route()
+                    # 重建后不清除已用次数；普通路由不重新进入虚拟链路。
+                    index = 0
+                # 未重建时游标正常前进，再次命中渠道时由 key pool 轮换 key。
 
                 # 有些错误并没有请求成功，所以需要删除请求记录
                 # 修改原因：直接访问 requests[current_api][original_model] 会在没有记录时创建空 deque。
@@ -1268,19 +1307,15 @@ class ModelRequestHandler:
                     retry_enabled = False
 
                 # 若还有剩余尝试次数，则进行自动重试
-                if retry_enabled and index < max_attempts:
+                if retry_enabled and attempts < max_attempts and num_matching_providers:
                     if status_code in {429, 500, 502, 503, 504}:
                         base_delay = 0.5 if status_code == 429 else 0.2
                         # current_retry_count 从 1 开始；最多指数到 2^5，再封顶 5 秒
                         delay = min(5.0, base_delay * (2 ** min(max(current_retry_count - 1, 0), 5)))
                         await asyncio.sleep(delay)
                     # 虚拟路由：重试时强制留在同一 priority group 内
-                    if _is_virtual_route and _priority_group_ranges:
+                    if _is_virtual_route and not should_rebuild_after_channel_cooldown:
                         grp_start, grp_end = _get_priority_group_range(current_index)
-                        # 修改原因：与限流耗尽检查相同的越界风险。
-                        # 修改方式：grp_end 做运行时边界保护。
-                        # 目的：避免虚拟路由重试阶段因索引越界返回 500。
-                        grp_end = min(grp_end, len(matching_providers))
                         next_idx = index % num_matching_providers
                         if next_idx >= grp_end or next_idx < grp_start:
                             # 即将越过当前 group → 检查组内是否还有可用 key
@@ -1295,16 +1330,18 @@ class ModelRequestHandler:
                                 if _provider_attempt_counts.get(gi_name, 0) >= _provider_key_slots(gi_provider):
                                     continue
                                 gi_circular_list = provider_api_circular_list.get(gi_name)
-                                if gi_circular_list:
-                                    if not await gi_circular_list.is_all_rate_limited(original_model):
-                                        group_has_available = True
-                                        break
+                                gi_model = gi_provider["_model_dict_cache"][request_model_name]
+                                if not gi_circular_list or not await gi_circular_list.is_all_rate_limited(gi_model):
+                                    group_has_available = True
+                                    break
                             if group_has_available:
                                 index = grp_start  # 回到组头继续试
                     continue
 
                 # retry_enabled 但已无重试额度：跳出循环，走统一的“所有重试失败”出口
-                if retry_enabled and index >= max_attempts:
+                if retry_enabled and (attempts >= max_attempts or not num_matching_providers):
+                    if await _leave_virtual_route():
+                        continue
                     break
 
                 # 不重试：直接返回本次错误

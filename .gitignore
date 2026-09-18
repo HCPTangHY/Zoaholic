@@ -13,6 +13,10 @@ formatted.yaml
 api.json
 api.*.json
 
+# local config backups (contain real credentials)
+api.yaml.stale_*.bak
+api.yaml.*.bak
+
 # runtime data / volumes
 data/
 postgres_data/

@@ -492,6 +492,13 @@ class ClaudeStreamRenderer:
         except json.JSONDecodeError:
             return canonical_sse_chunk
 
+        error = canonical.get("error")
+        if error:
+            if not isinstance(error, dict):
+                error = {"type": "api_error", "message": str(error)}
+            event = {"type": "error", "error": error}
+            return f"event: error\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
+
         usage = canonical.get("usage")
         choices = canonical.get("choices") or []
         if not choices:

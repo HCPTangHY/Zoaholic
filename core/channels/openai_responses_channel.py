@@ -29,6 +29,7 @@ from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text
 from ..response_context import mark_adapter_metrics_managed, mark_content_start, merge_usage
 from ..stream_utils import aiter_decoded_lines
+from ..stream_errors import extract_stream_error, record_stream_failure
 from ..usage import extract_cache_usage
 
 
@@ -404,6 +405,10 @@ async def fetch_responses_response(client, url, headers, payload, model, timeout
     response_bytes = await response.aread()
     response_json = await asyncio.to_thread(json_loads, response_bytes)
 
+    error = extract_stream_error(response_json)
+    if error:
+        yield {"error": {k: error[k] for k in ("message", "type", "code")}, "status_code": error["status_code"]}
+        return
     # 将 Responses API 响应转换为 Chat Completions 格式
     converted = await convert_responses_to_chat_completions(response_json, model)
     mark_adapter_metrics_managed()
@@ -618,6 +623,15 @@ async def _responses_events_to_sse(events, model):
             current_output_index_to_index[output_index] = index
 
     async for data in events:
+        event_error = extract_stream_error(data)
+        if event_error:
+            from ..middleware import request_info
+            info = request_info.get()
+            if info:
+                await record_stream_failure(info, event_error)
+            yield {"error": {k: event_error[k] for k in ("message", "type", "code")},
+                   "status_code": event_error["status_code"]}
+            return  # Never turn a failed response into a normal [DONE].
         event_type = data.get("type", "")
 
         # 发送角色信息（仅首次）
@@ -910,6 +924,29 @@ async def fetch_responses_models(client, provider):
 # ============================================================
 
 
+def responses_stream_classifier(event):
+    """Responses 协议事件分类：True=可暂存的生命周期帧，False=携带输出，None=不表态。
+
+    暂存窗口只允许真正无内容的生命周期事件；
+    response.completed/incomplete 若已携带 output 则视为已提交。
+    """
+    if not isinstance(event, dict):
+        return None
+    kind = event.get("type", "")
+    if kind in {"response.created", "response.queued", "response.in_progress"}:
+        return not (event.get("response") or {}).get("output")
+    if kind == "response.output_item.added":
+        item = event.get("item") or {}
+        return item.get("type") in {"message", "reasoning"} and not (item.get("content") or item.get("summary"))
+    if kind in {"response.content_part.added", "response.reasoning_summary_part.added"}:
+        return not (event.get("part") or {}).get("text")
+    if kind in {"response.completed", "response.incomplete"}:
+        return not (event.get("response") or {}).get("output")
+    if kind.startswith("response."):
+        return False
+    return None
+
+
 def register():
     """注册 OpenAI Responses API 渠道到注册中心"""
     from .registry import register_channel
@@ -928,6 +965,7 @@ def register():
         # 修改方式：stream_adapter 改为传输选择入口，provider.preferences.websocket 开启时走 WS，失败自动回退 HTTP SSE。
         # 目的：可选启用更低延迟的上游传输，同时保持默认行为不变。
         stream_adapter=fetch_responses_stream_transport,
+        stream_event_classifier=responses_stream_classifier,
         models_adapter=fetch_responses_models,
         preference_toggles=[WS_PREFERENCE_TOGGLE],
         source="builtin",

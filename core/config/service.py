@@ -102,6 +102,10 @@ def _expand_sub_channels(providers: list) -> list:
             if isinstance(sub_prefs, dict):
                 merged_prefs.update(sub_prefs)
 
+            # 修改原因：主渠道禁用后子渠道若带显式 enabled=true（前端子渠道启停开关写入），会覆盖继承值继续被路由。
+            # 修改方式：子渠道 enabled 改为父渠道总闸 AND 子渠道自身开关，主渠道禁用时子渠道一律禁用。
+            # 目的：主渠道作为子渠道的配置载体（key pool/base_url），禁用即整套下线，子渠道开关仅在主渠道启用时生效。
+            sub_enabled = sub.get("enabled") if sub.get("enabled") is not None else True
             sub_provider = {
                 "provider": sub_name,
                 "engine": sub_engine,
@@ -110,7 +114,7 @@ def _expand_sub_channels(providers: list) -> list:
                 "model": sub.get("model") or [],
                 "preferences": merged_prefs,
                 "groups": sub.get("groups") or parent_groups,
-                "enabled": sub.get("enabled") if sub.get("enabled") is not None else parent_enabled,
+                "enabled": parent_enabled and sub_enabled,
                 "remark": sub.get("remark") or f"[子渠道] {parent_name} → {sub_engine}",
                 # 标记为子渠道（前端/API 可用来识别）
                 "_parent_provider": parent_name,

@@ -16,6 +16,7 @@ from core.oauth.base import OAuthProvider
 from core.channels.gemini_channel import (
     fetch_gemini_response,
     fetch_gemini_response_stream,
+    gemini_stream_classifier,
     get_gemini_payload,
 )
 from core.json_utils import json_dumps_text, json_loads
@@ -619,6 +620,7 @@ def register():
         passthrough_payload_adapter=patch_gemini_cli_passthrough_payload,
         response_adapter=fetch_gemini_cli_response,
         stream_adapter=fetch_gemini_cli_response_stream,
+        stream_event_classifier=gemini_stream_classifier,
         is_oauth=True,
         # 修改原因：Gemini CLI OAuth provider 不应再由 main.py 通过硬编码导入注册。
         # 修改方式：在渠道注册时直接传入 GeminiCLIProvider 实例，交给 registry 保存。

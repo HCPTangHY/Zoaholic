@@ -7,6 +7,8 @@
 
 import json
 import asyncio
+from weakref import WeakMethod
+from core.stream_utils import close_async_iterator
 from datetime import datetime
 from typing import Optional, List, Any, Dict
 
@@ -89,7 +91,12 @@ def _save_upstream_response_headers(response, captured_info):
 
 
 def _wrap_response_iterators(response):
+    if getattr(response, "_zoaholic_capture_wrapped", False):
+        return
     captured_info, should_save = _get_response_capture_state()
+    if not should_save:
+        return
+    response._zoaholic_capture_wrapped = True
     if should_save:
         # 修改原因：流式响应的响应体要等迭代结束才能保存，但响应头在 response 对象创建后已经可用。
         # 修改方式：包装迭代器前先从 response.headers 保存已脱敏响应头。
@@ -104,24 +111,28 @@ def _wrap_response_aiter_text(response):
     """
     包装 httpx response 的 aiter_text 方法，自动记录上游原始响应
     """
-    original_aiter_text = response.aiter_text
+    original_aiter_text = WeakMethod(response.aiter_text)
     
     captured_info, should_save = _get_response_capture_state()
 
     if not should_save:
         return
     
-    async def logging_aiter_text():
+    async def logging_aiter_text(*args, **kwargs):
         """包装后的 aiter_text，自动记录数据"""
         upstream_chunks = []
         max_size = 100 * 1024  # 100KB
         total_size = 0
         
+        iterator = original_aiter_text()(*args, **kwargs)
         try:
-            async for chunk in original_aiter_text():
+            async for chunk in iterator:
                 if total_size < max_size:
-                    upstream_chunks.append(chunk)
-                    total_size += len(chunk.encode('utf-8'))
+                    remaining = max_size - total_size
+                    # Slice characters first to avoid encoding a whole image-sized string.
+                    prefix = chunk[:remaining].encode('utf-8')[:remaining]
+                    upstream_chunks.append(prefix)
+                    total_size += len(prefix)
                 
                 yield chunk
         except GeneratorExit:
@@ -135,10 +146,11 @@ def _wrap_response_aiter_text(response):
         finally:
             if upstream_chunks and captured_info:
                 try:
-                    upstream_response = "".join(upstream_chunks)
+                    upstream_response = b"".join(upstream_chunks).decode('utf-8', errors='ignore')
                     captured_info["upstream_response_body"] = truncate_for_logging(upstream_response)
                 except Exception as e:
                     logger.error(f"Error saving upstream response body: {str(e)}")
+            await close_async_iterator(iterator)
     
     try:
         response.aiter_text = logging_aiter_text
@@ -156,22 +168,24 @@ def _wrap_response_aiter_bytes(response):
     if not hasattr(response, "aiter_bytes"):
         return
 
-    original_aiter_bytes = response.aiter_bytes
+    original_aiter_bytes = WeakMethod(response.aiter_bytes)
     captured_info, should_save = _get_response_capture_state()
 
     if not should_save:
         return
 
-    async def logging_aiter_bytes():
+    async def logging_aiter_bytes(*args, **kwargs):
         upstream_chunks = []
         max_size = 100 * 1024  # 100KB
         total_size = 0
 
+        iterator = original_aiter_bytes()(*args, **kwargs)
         try:
-            async for chunk in original_aiter_bytes():
+            async for chunk in iterator:
                 if total_size < max_size:
-                    upstream_chunks.append(chunk)
-                    total_size += len(chunk)
+                    prefix = chunk[:max_size - total_size]
+                    upstream_chunks.append(prefix)
+                    total_size += len(prefix)
 
                 yield chunk
         except GeneratorExit:
@@ -187,6 +201,7 @@ def _wrap_response_aiter_bytes(response):
                     captured_info["upstream_response_body"] = truncate_for_logging(upstream_response)
                 except Exception as e:
                     logger.error(f"Error saving upstream byte response body: {str(e)}")
+            await close_async_iterator(iterator)
 
     try:
         response.aiter_bytes = logging_aiter_bytes
@@ -208,15 +223,15 @@ def _wrap_response_aread(response):
     if not hasattr(response, "aread"):
         return
 
-    original_aread = response.aread
+    original_aread = WeakMethod(response.aread)
     captured_info, should_save = _get_response_capture_state()
 
     if not should_save:
         return
 
-    async def logging_aread():
-        """包装后的 aread，自动记录数据"""
-        result = await original_aread()
+    async def logging_aread(*args, **kwargs):
+        """包装后的 aread，自动记录数据，不持有 response 强引用。"""
+        result = await original_aread()(*args, **kwargs)
         if captured_info:
             try:
                 captured_info["upstream_response_body"] = truncate_for_logging(result)
@@ -286,6 +301,13 @@ async def _apply_response_path_interceptors(
         apply_key_outbound_interceptors,
     )
 
+    # Inspect upstream errors before masking/rewriting plugins lose type/code information.
+    if is_stream:
+        from core.stream_errors import observe_stream_chunk
+        info = request_info.get()
+        if info:
+            await observe_stream_chunk(info, response_chunk)
+
     # 修改原因：新增出站阶段必须接在既有 response_interceptors 之后，并区分渠道级和 Key 级 enabled_plugins。
     # 修改方式：统一封装响应返回路径，先执行旧响应拦截器，再执行 channel_outbound，最后执行 key_outbound。
     # 目的：保证流式和非流式成功/错误 chunk 都走同一顺序，避免各 fetch 分支遗漏新阶段。
@@ -328,18 +350,23 @@ async def fetch_response(
     
     channel = get_channel(engine)
     if channel and channel.response_adapter:
-        async for chunk in channel.response_adapter(client, url, headers, payload, model, timeout):
-            # 如果适配器返回的是字典且包含 error，则它是一个预处理过的错误
-            chunk = await _apply_response_path_interceptors(
-                chunk, engine, model, is_stream=False,
-                enabled_plugins=enabled_plugins,
-                provider=provider,
-                api_key_info=api_key_info,
-                key_enabled_plugins=key_enabled_plugins,
-            )
-            yield chunk
-            if isinstance(chunk, dict) and "error" in chunk:
-                return
+        chunk_iter = channel.response_adapter(client, url, headers, payload, model, timeout)
+        try:
+            async for chunk in chunk_iter:
+                # 如果适配器返回的是字典且包含 error，则它是一个预处理过的错误
+                chunk = await _apply_response_path_interceptors(
+                    chunk, engine, model, is_stream=False,
+                    enabled_plugins=enabled_plugins,
+                    provider=provider,
+                    api_key_info=api_key_info,
+                    key_enabled_plugins=key_enabled_plugins,
+                )
+                yield chunk
+                if isinstance(chunk, dict) and "error" in chunk:
+                    return
+        finally:
+            await close_async_iterator(chunk_iter)
+
         return
 
     # 回退逻辑：如果渠道没有适配器，执行默认的 OpenAI 兼容逻辑
@@ -425,20 +452,23 @@ async def fetch_response_stream(
             chunk_iter = adapter(client, url, headers, payload, model, timeout, provider=provider)
         else:
             chunk_iter = adapter(client, url, headers, payload, model, timeout)
-        async for chunk in chunk_iter:
-            # 应用响应拦截器和新增出站阶段
-            chunk = await _apply_response_path_interceptors(
-                chunk, engine, model, is_stream=True,
-                enabled_plugins=enabled_plugins,
-                provider=provider,
-                api_key_info=api_key_info,
-                key_enabled_plugins=key_enabled_plugins,
-            )
-            yield chunk
-            # 如果适配器返回的是字典且包含 error，则它是一个预处理过的错误
-            if isinstance(chunk, dict) and "error" in chunk:
-                return
-        
+        try:
+            async for chunk in chunk_iter:
+                # 应用响应拦截器和新增出站阶段
+                chunk = await _apply_response_path_interceptors(
+                    chunk, engine, model, is_stream=True,
+                    enabled_plugins=enabled_plugins,
+                    provider=provider,
+                    api_key_info=api_key_info,
+                    key_enabled_plugins=key_enabled_plugins,
+                )
+                yield chunk
+                # 如果适配器返回的是字典且包含 error，则它是一个预处理过的错误
+                if isinstance(chunk, dict) and "error" in chunk:
+                    return
+        finally:
+            await close_async_iterator(chunk_iter)
+
         return
     
     raise ValueError(f"Unknown engine: {engine}")

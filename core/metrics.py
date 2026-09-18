@@ -51,6 +51,13 @@ def on_request_start(model: Optional[str] = None) -> None:
             _active_by_model[model] += 1
 
 
+def on_request_model(model: Optional[str]) -> None:
+    """Attach the parsed model to an already-counted request."""
+    if model:
+        with _active_lock:
+            _active_by_model[model] += 1
+
+
 def on_request_end(model: Optional[str] = None, success: bool = True) -> None:
     """请求结束时调用。"""
     global _active_requests, _total_success, _total_errors
@@ -162,44 +169,29 @@ def _extract_pool_info(client) -> Dict[str, Any]:
         "closed_connections": 0,
     }
 
-    try:
-        transport = getattr(client, "_transport", None)
+    # Explicit proxies and environment proxies live in mounts, not necessarily _transport.
+    transports = [getattr(client, "_transport", None)]
+    transports.extend((getattr(client, "_mounts", {}) or {}).values())
+    seen = set()
+    for transport in transports:
         if transport is None:
-            return info
-
-        # httpx 使用 httpcore 作为底层 transport
-        pool = getattr(transport, "_pool", None)
-        if pool is None:
-            # 直接是 pool（某些版本）
-            pool = transport
-
-        connections = getattr(pool, "_connections", None)
-        if connections is None:
-            return info
-
-        active = 0
-        idle = 0
-        closed = 0
-        for conn in list(connections):
+            continue
+        pool = getattr(transport, "_pool", transport)
+        if id(pool) in seen:
+            continue
+        seen.add(id(pool))
+        for conn in list(getattr(pool, "_connections", []) or []):
             try:
-                if getattr(conn, "is_closed", False):
-                    closed += 1
-                elif getattr(conn, "is_idle", False):
-                    idle += 1
-                elif getattr(conn, "is_available", False):
-                    # available but not idle = in use but can multiplex (HTTP/2)
-                    active += 1
+                closed = getattr(conn, "is_closed", False)
+                idle = getattr(conn, "is_idle", False)
+                if closed() if callable(closed) else closed:
+                    info["closed_connections"] += 1
+                elif idle() if callable(idle) else idle:
+                    info["idle_connections"] += 1
                 else:
-                    active += 1
+                    info["active_connections"] += 1
             except Exception:
-                active += 1
-
-        info["active_connections"] = active
-        info["idle_connections"] = idle
-        info["closed_connections"] = closed
-
-    except Exception:
-        pass
+                info["active_connections"] += 1
 
     return info
 
