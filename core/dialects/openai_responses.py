@@ -53,6 +53,21 @@ def convert_responses_input_to_messages(input_data: Union[str, List[Dict[str, An
                 # 字符串直接作为 user 消息
                 messages.append({"role": "user", "content": item})
             elif isinstance(item, dict):
+                # Responses represents calls/results as separate input items, not messages.
+                if item.get("type") == "function_call":
+                    call = {"id": item.get("call_id") or item.get("id"), "type": "function",
+                            "function": {"name": item.get("name", ""),
+                                         "arguments": item.get("arguments", "{}")}}
+                    if messages and messages[-1].get("role") == "assistant":
+                        messages[-1].setdefault("tool_calls", []).append(call)
+                    else:
+                        messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
+                    continue
+                if item.get("type") == "function_call_output":
+                    output = item.get("output", "")
+                    messages.append({"role": "tool", "tool_call_id": item.get("call_id"),
+                                     "content": output if isinstance(output, str) else json_dumps_text(output)})
+                    continue
                 role = item.get("role", "user")
                 content = item.get("content")
 
@@ -73,7 +88,7 @@ def convert_responses_input_to_messages(input_data: Union[str, List[Dict[str, An
                             item_type = content_item.get("type", "")
 
                             # input_text -> text
-                            if item_type == "input_text":
+                            if item_type in ("input_text", "output_text"):
                                 converted_content.append({
                                     "type": "text",
                                     "text": content_item.get("text", "")
@@ -182,6 +197,9 @@ def convert_responses_tools(tools: Optional[List[Dict[str, Any]]]) -> Optional[L
             # 其他类型原样传递
             converted_tools.append(tool)
 
+    for source, converted in zip(tools, converted_tools):
+        if "strict" in source and isinstance(converted.get("function"), dict):
+            converted["function"]["strict"] = source["strict"]
     return converted_tools if converted_tools else None
 
 
@@ -231,7 +249,7 @@ async def parse_responses_request(
 
     # 可选参数映射
     optional_fields = [
-        "temperature", "top_p", "max_tokens", "max_completion_tokens",
+        "temperature", "top_p", "max_tokens", "max_completion_tokens", "max_output_tokens",
         "presence_penalty", "frequency_penalty", "n", "user",
         "tool_choice", "response_format", "stream_options"
     ]
@@ -243,6 +261,11 @@ async def parse_responses_request(
                 request_data["max_tokens"] = native_body[field]
             else:
                 request_data[field] = native_body[field]
+
+    if isinstance(request_data.get("tool_choice"), dict):
+        choice = request_data["tool_choice"]
+        if choice.get("type") == "function" and "name" in choice:
+            request_data["tool_choice"] = {"type": "function", "function": {"name": choice["name"]}}
 
     # text.format -> response_format
     text_format = native_body.get("text", {}).get("format")
@@ -271,6 +294,9 @@ def _responses_usage_from_canonical(usage: Any) -> Dict[str, Any]:
     cache_usage = extract_cache_usage(usage)
     if cache_usage["cached_tokens"] > 0:
         response_usage["input_tokens_details"] = {"cached_tokens": cache_usage["cached_tokens"]}
+    details = usage.get("completion_tokens_details") or {}
+    if "reasoning_tokens" in details:
+        response_usage["output_tokens_details"] = {"reasoning_tokens": details["reasoning_tokens"]}
     return response_usage
 
 
@@ -297,118 +323,32 @@ async def render_responses_response(
         ]
     }
     """
-    import random
-    import string
-    from datetime import datetime
-
-    timestamp = int(datetime.timestamp(datetime.now()))
-    random.seed(timestamp)
-
-    # 生成响应 ID
-    resp_id = "resp_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=32))
-
-    output = []
-
-    # 检查是否有 reasoning 内容
-    choices = canonical_response.get("choices", [])
-    if choices:
-        message = choices[0].get("message", {})
-        content = message.get("content", "")
-        reasoning_content = message.get("reasoning_content", "")
-        tool_calls = message.get("tool_calls", [])
-
-        # 如果有 reasoning_content，添加 reasoning item
-        if reasoning_content:
-            reasoning_id = "rs_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=32))
-            output.append({
-                "id": reasoning_id,
-                "type": "reasoning",
-                "content": [],
-                "summary": [{"type": "summary_text", "text": reasoning_content}]
-            })
-
-        # 添加 message item
-        msg_id = "msg_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=32))
-        message_item = {
-            "id": msg_id,
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": []
-        }
-
-        if content:
-            if isinstance(content, list):
-                # 结构化 content list → Responses output items
-                for ci in content:
-                    if not isinstance(ci, dict):
-                        continue
-                    ci_type = ci.get("type", "")
-                    if ci_type == "text":
-                        text_val = ci.get("text", "")
-                        if text_val:
-                            message_item["content"].append({
-                                "type": "output_text",
-                                "text": text_val,
-                                "annotations": []
-                            })
-                    elif ci_type == "image_url":
-                        image_url = ci.get("image_url")
-                        url = ""
-                        if isinstance(image_url, dict):
-                            url = image_url.get("url", "")
-                        elif isinstance(image_url, str):
-                            url = image_url
-                        if url:
-                            # Responses API 没有标准的 image output，
-                            # 降级为 markdown 文本
-                            message_item["content"].append({
-                                "type": "output_text",
-                                "text": f"![image]({url})",
-                                "annotations": []
-                            })
-            else:
-                message_item["content"].append({
-                    "type": "output_text",
-                    "text": content,
-                    "annotations": []
-                })
-
-        # 处理 tool_calls
-        if tool_calls:
-            for tc in tool_calls:
-                tc_id = "call_" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=24))
-                message_item["content"].append({
-                    "type": "tool_use",
-                    "id": tc.get("id", tc_id),
-                    "name": tc.get("function", {}).get("name", ""),
-                    "arguments": tc.get("function", {}).get("arguments", "{}")
-                })
-
-        if message_item["content"]:
-            output.append(message_item)
-
-    # 构建响应
-    response = {
-        "id": resp_id,
-        "object": "response",
-        "created_at": timestamp,
-        "model": model,
-        "output": output,
-        "status": "completed"
-    }
-
-    # 添加 usage
-    usage = canonical_response.get("usage")
-    if usage:
-        # Responses 方言出口需要把 OAI 缓存命中字段转为 input_tokens_details.cached_tokens。
-        response["usage"] = _responses_usage_from_canonical(usage)
-
-    return response
+    # Make explicit re-rendering safe, including native failed Responses objects.
+    if canonical_response.get("object") == "response" or canonical_response.get("error"):
+        return canonical_response
+    from .responses_stream import ResponsesStreamRenderer
+    renderer = ResponsesStreamRenderer(model)
+    choices = canonical_response.get("choices") or []
+    if not choices:
+        renderer.finish(error={"code": "empty_response", "message": "Upstream returned no choices"})
+        return renderer.response
+    choice = choices[0]
+    message = dict(choice.get("message") or {})
+    message["tool_calls"] = [dict(call, index=index)
+                             for index, call in enumerate(message.get("tool_calls") or [])]
+    renderer.feed({"choices": [{"index": 0, "delta": message,
+                                "finish_reason": choice.get("finish_reason") or "stop"}],
+                   "usage": canonical_response.get("usage")})
+    renderer.finish()
+    return renderer.response
 
 
 async def render_responses_stream(canonical_sse_chunk: str) -> str:
     """
+    Legacy single-chunk callback. Production HTTP/WS Responses routes use
+    responses_stream.render_responses_iterator with request-scoped state; this
+    compatibility callback cannot reconstruct tool calls across chunks.
+
     将 Canonical SSE 流转换为 Responses API 流格式
 
     Chat Completions 流事件:

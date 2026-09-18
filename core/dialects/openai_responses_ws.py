@@ -99,8 +99,8 @@ def _authenticate(websocket: WebSocket) -> tuple[Optional[int], Optional[str], O
 def _chat_chunk_to_responses_events(chunk: dict) -> list[dict]:
     """把 Chat Completions SSE chunk 转换为 Responses API 事件列表。
 
-    handler 返回的 Response body 是 Chat Completions SSE（方言渲染层在 HTTP 路由层，
-    WS 端点不经过）。需要在此转换为客户端期望的 Responses API 事件格式。
+    process_request 已按请求方言渲染 Responses SSE，HTTP 与 WS 共用同一转换层。
+    Chat Completions 分支仅兼容旧的或自定义 handler；Responses 事件不得再次转换。
 
     已经是 Responses 格式（有 type 字段）的 chunk 原样返回。
     """

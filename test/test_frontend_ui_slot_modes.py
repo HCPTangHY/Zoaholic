@@ -19,4 +19,3 @@ def _slice_between(source: str, start_marker: str, end_marker: str) -> str:
     start = source.index(start_marker)
     end = source.index(end_marker, start)
     return source[start:end]
-

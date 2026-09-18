@@ -27,8 +27,10 @@ assert.ok(formSource.includes('positional'), '应保留 positional 模式说明'
 
 assert.ok(pipelineSource.includes('PluginParamsForm'), 'PipelineView 应使用可视化参数表单');
 assert.ok(pipelineSource.includes('metadata?.params_schema'), 'PipelineView 应读取 metadata.params_schema');
-assert.ok(sheetSource.includes('PluginParamsForm'), 'InterceptorSheet 应使用可视化参数表单');
-assert.ok(sheetSource.includes('metadata?.params_schema'), 'InterceptorSheet 应读取 metadata.params_schema');
+const sharedSource = readFileSync(path.resolve(frontendRoot, 'src/components/PluginConfigFields.tsx'), 'utf8');
+assert.ok(sheetSource.includes('<PluginConfigFields'), 'InterceptorSheet 应连接共享配置组件');
+assert.ok(sharedSource.includes('<PluginParamsForm'), 'InterceptorSheet 应使用可视化参数表单');
+assert.ok(sharedSource.includes('metadata?.params_schema'), 'InterceptorSheet 应读取 metadata.params_schema');
 
 console.log('plugin params form source checks passed');
 process.exit(0);

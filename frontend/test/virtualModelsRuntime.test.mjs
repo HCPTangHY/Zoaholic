@@ -14,8 +14,8 @@ const frontendRoot = path.resolve(__dirname, '..');
 const tempDir = mkdtempSync(path.join(os.tmpdir(), 'zoaholic-virtual-models-'));
 writeFileSync(path.join(tempDir, 'package.json'), '{"type":"module"}\n');
 
-execFileSync('npx', [
-  'tsc',
+execFileSync(process.execPath, [
+  path.join(frontendRoot, 'node_modules/typescript/bin/tsc'),
   '--target', 'ES2020',
   '--module', 'ES2020',
   '--moduleResolution', 'Bundler',

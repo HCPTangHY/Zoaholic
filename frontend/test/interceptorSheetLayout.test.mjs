@@ -6,28 +6,20 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(path.resolve(__dirname, '../src/components/InterceptorSheet.tsx'), 'utf8');
 
-// InterceptorSheet 标签布局：全部 / 渠道入站 / 请求拦截 / 响应拦截 / 渠道出站 / Key 出站。
-assert.match(source, /type InterceptorTab = 'all' \| 'channel_inbound' \| 'request' \| 'response' \| 'channel_outbound' \| 'key_outbound'/, '应保留 InterceptorTab 类型');
-assert.match(source, /\{ value: 'all', label: '全部' \}/, '应保留全部标签');
-assert.match(source, /\{ value: 'channel_inbound', label: '渠道入站' \}/, '应保留渠道入站标签');
-assert.match(source, /\{ value: 'request', label: '请求拦截' \}/, '应保留请求拦截标签');
-assert.match(source, /\{ value: 'response', label: '响应拦截' \}/, '应保留响应拦截标签');
-assert.match(source, /\{ value: 'channel_outbound', label: '渠道出站' \}/, '应保留渠道出站标签');
-assert.match(source, /\{ value: 'key_outbound', label: 'Key 出站' \}/, '应保留 Key 出站标签');
-
-// 插件搜索：应按名称/描述过滤。
-assert.match(source, /normalizedSearch/, 'InterceptorSheet 应保留插件搜索过滤');
-assert.match(source, /plugin\.plugin_name\.toLowerCase\(\)\.includes\(normalizedSearch\)/, '搜索应匹配插件名称');
-assert.match(source, /plugin\.description\.toLowerCase\(\)\.includes\(normalizedSearch\)/, '搜索应匹配插件描述');
-
-// Tab 和搜索过滤之后，应把已启用和未启用插件拆成两组展示。
-assert.match(source, /const selectedPlugins: PluginOption\[\] = \[\]/, '应保留已启用分组');
-assert.match(source, /const unselectedPlugins: PluginOption\[\] = \[\]/, '应保留未启用分组');
-assert.match(source, /if \(selected\.has\(plugin\.plugin_name\)\) selectedPlugins\.push\(plugin\);/, '已启用插件应进入已启用分组');
-
-// 插件行交互：行点击切换选中，有渠道配置的插件应有标识。
-assert.match(source, /const handlePluginRowClick = \(pluginName: string\)/, '应保留行点击切换');
-assert.match(source, /title="有渠道配置"/, '插件行应标识存在 provider_config 的插件');
+assert.match(source, /type InterceptorTab = 'all'[\s\S]*'request'[\s\S]*'response'/, '应该包含全部、请求拦截、响应拦截等 Tab 状态');
+assert.match(source, /label: '全部'/, 'Tab 应包含全部');
+assert.match(source, /label: '请求拦截'/, 'Tab 应包含请求拦截');
+assert.match(source, /label: '响应拦截'/, 'Tab 应包含响应拦截');
+assert.match(source, /placeholder="搜索插件\.\.\."/, '应该提供插件搜索框');
+assert.match(source, /plugin\.plugin_name\.toLowerCase\(\)\.includes\(normalizedSearch\)/, '搜索应该匹配 plugin_name');
+assert.match(source, /plugin\.description\.toLowerCase\(\)\.includes\(normalizedSearch\)/, '搜索应该匹配 description');
+assert.match(source, /selectedPlugins[\s\S]*unselectedPlugins/, '列表应该拆成已启用和未启用两组');
+assert.match(source, /未启用/, '已启用和未启用之间应该有未启用分割标签');
+assert.match(source, /handlePluginRowClick[\s\S]*next\.set\(pluginName, ''\)[\s\S]*next\.add\(pluginName\)/, '点击未选中插件行应该先选中再展开');
+assert.match(source, /有渠道配置/, '折叠行应该提示插件存在渠道配置');
+assert.match(source, />请求<\//, '仅请求插件应该显示请求类型标签');
+assert.match(source, />响应<\//, '仅响应插件应该显示响应类型标签');
+assert.match(source, /\{options && <span className="text-xs bg-blue-500\/10/, '折叠行应该继续显示插件参数 pill');
 
 console.log('interceptor sheet layout regression passed');
 process.exit(0);

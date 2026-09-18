@@ -39,7 +39,7 @@ async def get_firebase_vertex_payload(request, engine, provider, api_key=None):
     """
     from core.channels.gemini_channel import get_gemini_payload
     from core.utils import get_model_dict
-    
+
     # 解析 key 格式: project_id:api_key
     if api_key and ":" in api_key:
         project_id, actual_api_key = api_key.split(":", 1)
@@ -52,13 +52,13 @@ async def get_firebase_vertex_payload(request, engine, provider, api_key=None):
     temp_provider = provider.copy()
     if 'base_url' not in temp_provider or not temp_provider['base_url']:
         temp_provider['base_url'] = "https://firebasevertexai.googleapis.com/v1beta"
-        
+
     _, headers, payload = await get_gemini_payload(request, engine, temp_provider, actual_api_key)
-    
+
     # 2. 获取映射后的实际模型 ID
     model_dict = get_model_dict(provider)
     original_model = model_dict.get(request.model, request.model)
-    
+
     # 3. 构建符合要求的 URL
     # 用户要求的结构: projects 部分用 project_id 填充
     if request.stream:
@@ -67,15 +67,15 @@ async def get_firebase_vertex_payload(request, engine, provider, api_key=None):
     else:
         method = "generateContent"
         params = ""
-        
+
     # 构建完整 URL: https://firebasevertexai.googleapis.com/v1beta/projects/{project_id}/locations/global/publishers/google/models/{model}:{method}
     url = f"https://firebasevertexai.googleapis.com/v1beta/projects/{project_id}/locations/global/publishers/google/models/{original_model}:{method}{params}"
-    
+
     # 4. 确保认证头存在，使用真实的 api_key，伪装成真实请求
     headers['x-goog-api-key'] = actual_api_key
     # 移除可能存在的 authorization 头以避免冲突（Firebase 通常只用 x-goog-api-key）
     headers.pop('Authorization', None)
-    
+
     return url, headers, payload
 
 
@@ -101,7 +101,7 @@ class FirebaseVertexChannelAdapter:
     """
     id = "firebaseVertex"
     type_name = "firebaseVertex"
-    
+
     request_adapter = staticmethod(get_firebase_vertex_payload)
     stream_adapter = staticmethod(fetch_firebase_vertex_response_stream)
     response_adapter = staticmethod(fetch_firebase_vertex_response)
@@ -122,7 +122,7 @@ def setup(manager: "PluginManager"):
         },
         plugin_name=PLUGIN_INFO["name"],
     )
-    
+
     # 2. 注册到核心渠道注册表，使其在界面可选
     from core.channels.registry import register_channel
     try:
@@ -146,7 +146,7 @@ def teardown(manager: "PluginManager"):
     """插件清理"""
     # 1. 从插件管理器注销
     manager.unregister_extension("channels", "firebaseVertex")
-    
+
     # 2. 从核心渠道注册表注销
     from core.channels.registry import unregister_channel
     try:

@@ -21,4 +21,3 @@ def _json_response_payload(response) -> dict:
     # 修改方式：解码 JSONResponse.body 并用 json.loads 还原为 dict。
     # 目的：让测试只验证端点返回结构，不额外引入 HTTP 调用层。
     return json.loads(response.body.decode())
-

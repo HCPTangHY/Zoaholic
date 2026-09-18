@@ -33,4 +33,3 @@ def test_sanitize_payload_injects_identity_when_system_is_empty():
 
     assert payload["system"][0]["text"].startswith("x-anthropic-billing-header:")
     assert payload["system"][1]["text"] == "You are Claude Code, Anthropic's official CLI for Claude."
-

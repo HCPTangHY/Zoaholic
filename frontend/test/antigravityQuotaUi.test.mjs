@@ -34,7 +34,7 @@ assert.match(antigravitySource, /model\.startswith\(\("tab_", "chat_"\)\)/, '后
 assert.match(fullRowSource, /const rowQuota = buildRowQuota\(bal, oauthAccount, isOAuthEngine\);/, 'Key 行应该通过统一 RowQuota 构建 OAuth 与普通 balance 数据');
 assert.match(fullRowSource, /const rowQuotaPair = getQuotaPairFromGauges\(rowQuota\.gauges\);/, 'Key 行默认边框应从 gauges 派生 inner 和 outer');
 const overlayBlock = sliceBetween(fullRowSource, '{showRowDecorations && rowQuotaPair && (', '{!hasKeyBackgroundSlot');
-assert.match(overlayBlock, /hasKeyBorderSlot[\s\S]*<UiSlot engine=\{formData\.engine\} slot="key_border"[\s\S]*data=\{slotData\}[\s\S]*<QuotaBorderOverlay quotaInner=\{rowQuotaPair\.quota_inner\} quotaOuter=\{rowQuotaPair\.quota_outer\} \/>/, '只有 key_border 插槽才能替代 QuotaBorderOverlay，quota_display 不应该替代边框');
+assert.match(overlayBlock, /hasKeyBorderSlot[\s\S]*<UiSlot engine=\{formData\.engine\} slot="key_border"[\s\S]*data=\{slotData\}[\s\S]*<QuotaBorderOverlay quotaInner=\{rowQuotaPair\.quota_inner\} quotaOuter=\{rowQuotaPair\.quota_outer\} label=\{bal\?\.level\} \/>/, '只有 key_border 插槽才能替代 QuotaBorderOverlay，quota_display 不应该替代边框');
 assert.doesNotMatch(overlayBlock, /quota_display/, 'QuotaBorderOverlay 不应该因为 ui_slots.quota_display 存在而跳过');
 assert.match(fullRowSource, /<UiSlot engine=\{formData\.engine\} slot="quota_display" data=\{slotData\}/, '自定义 QUOTA_UI 仍应只负责标签和气泡插槽');
 

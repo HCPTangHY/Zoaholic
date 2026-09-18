@@ -185,4 +185,3 @@ async def test_query_channel_balance_applies_enricher_to_normal_result(monkeypat
     payload = _json_response_payload(response)
     assert payload["available"] == 12.5
     assert payload["tier"] == "Tier 3"
-

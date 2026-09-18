@@ -20,6 +20,8 @@ import type { ChannelOption } from '../types';
 import { SCHEDULE_ALGORITHMS, getBalancePercent, hasUiSlot } from '../utils';
 import { RackCard, RackGrid, UiSlot } from './KeyComponents';
 import { FullKeyRow } from './FullKeyRow';
+import { inspectKeyDuplicates } from '../lib/keyDuplicates';
+import { buildSubChannelModelsRequest } from '../lib/subChannelModels';
 
 import type { UseChannelEditorResult } from '../hooks/useChannelEditor';
 
@@ -44,13 +46,22 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
     filteredFetchedModels, selectAllVisible, deselectAllVisible, confirmFetchModels, copyAllModels, getAliasMap, getModelDisplayName,
     formatJsonOnBlur, handleMappingChange, handleDeleteProvider, handleToggleProvider, handleCopyProvider, handleToggleSubChannel,
     handleDeleteSubChannel, openSubChannelEdit, buildSubChannelProvider, handleUpdateWeight, openTestDialog, openKeyTestDialog,
-    buildProviderSnapshotForTest, getProviderModelNameListForUi, disableKeysInForm, handleSave, refreshOAuthAccounts, getProviderModelNames,
+    buildProviderSnapshotForTest, disableKeysInForm, handleSave, refreshOAuthAccounts, getProviderModelNames,
     getProviderAnalyticsName, queryAllBalances, balanceResults, setBalanceResults, balanceLoading, focusedKeyIdx, setFocusedKeyIdx, forceListMode,
     setForceListMode, runtimeKeyStatus, localCountdowns, globalModelPrice, token, importPlaceholder, setImportModalIdx, setImportToken,
     setOauthManualState, setManualUrl, refreshKeyStatus,
   } = state;
 
   const [keyMoreMenuOpen, setKeyMoreMenuOpen] = useState(false);
+  const [showKeyDuplicates, setShowKeyDuplicates] = useState(false);
+  // Keep only visibility in state so edits, additions, removals and reorders refresh the report.
+  const keyDuplicateResult = showKeyDuplicates && isModalOpen && !editingSubChannel && formData
+    ? inspectKeyDuplicates(formData.api_keys)
+    : null;
+
+  useEffect(() => {
+    setShowKeyDuplicates(false);
+  }, [isModalOpen, originalIndex, editingSubChannel?.parentIdx, editingSubChannel?.subIdx]);
   const [batchImportOpen, setBatchImportOpen] = useState(false);
   const [batchPasteOpen, setBatchPasteOpen] = useState(false);
   const [batchJsonText, setBatchJsonText] = useState('');
@@ -331,6 +342,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                         </button>
                         {keyMoreMenuOpen && (
                           <div className="absolute right-0 top-full z-20 mt-1 min-w-[120px] bg-card border border-border rounded-lg shadow-lg p-1">
+                            <button type="button" onClick={() => { setShowKeyDuplicates(true); setKeyMoreMenuOpen(false); }} className="w-full px-3 py-1.5 hover:bg-muted rounded text-xs flex items-center gap-2 text-left text-foreground"><CopyCheck className="w-3 h-3" /> 检查重复 Key</button>
                             <button type="button" onClick={() => { copyAllKeys(); setKeyMoreMenuOpen(false); }} className="w-full px-3 py-1.5 hover:bg-muted rounded text-xs flex items-center gap-2 text-left text-foreground"><Copy className="w-3 h-3" /> 复制全部</button>
                             <button type="button" onClick={() => { clearAllKeys(); setKeyMoreMenuOpen(false); }} disabled={formData.api_keys.length === 0} className="w-full px-3 py-1.5 hover:bg-muted rounded text-xs flex items-center gap-2 text-left text-red-600 dark:text-red-500 disabled:opacity-50"><Trash2 className="w-3 h-3" /> 清空</button>
                           </div>
@@ -347,6 +359,29 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                       )}
                     </div>
                   </div>
+                  {keyDuplicateResult && (
+                    <section aria-label="Key 查重结果" className="rounded-lg border border-border bg-muted/30 p-3 space-y-2 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <h3 className="font-medium text-foreground">Key 查重结果</h3>
+                        <button type="button" onClick={() => setShowKeyDuplicates(false)} aria-label="关闭 Key 查重结果" className="rounded p-1 text-muted-foreground hover:text-foreground"><X className="w-3.5 h-3.5" /></button>
+                      </div>
+                      <p role="status" className="text-foreground">
+                        重复组数：{keyDuplicateResult.duplicateGroupCount} · 涉及行数：{keyDuplicateResult.duplicateRowCount} · 可检查数：{keyDuplicateResult.checkableCount} · 空行数：{keyDuplicateResult.emptyCount}
+                      </p>
+                      {keyDuplicateResult.groups.length > 0 ? (
+                        <ul className="max-h-40 overflow-y-auto space-y-1 text-foreground">
+                          {keyDuplicateResult.groups.map((group, index) => (
+                            <li key={index}>重复组 {index + 1}：第 {group.rows.join('、')} 行</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="text-muted-foreground">未发现重复的非空配置值。</p>
+                      )}
+                      <p className="text-muted-foreground">基于当前未保存表单实时检查，仅忽略 Key 首尾空白，区分大小写，保留内部空格；空行忽略，禁用行仍参与。行号从 1 开始，按原始列表计数（含空行和禁用行）。</p>
+                      <p className="text-muted-foreground">仅检查配置值是否重复，不验证有效性，不修改、删除、保存或复制 Key，不发送网络请求。</p>
+                      {isOAuthEngine && <p className="text-muted-foreground">OAuth key_id 只是标识符，不是背后的 token；此处仅比较标识符，不读取或检查背后的 token。</p>}
+                    </section>
+                  )}
                   {hasUiSlot(formData.engine, 'key_hint', formData.preferences.enabled_plugins) && (
                     <>
                       {/* 修改原因：Key 列表附近的充值或使用提示属于渠道专属信息，通用前端不能硬编码具体链接或说明。 */}
@@ -364,7 +399,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                         {formData.api_keys.map((keyObj, idx) => {
                           if (focusedKeyIdx === idx) {
                             return (
-                              <div key={`full-${keyObj._clientId}`} style={{ gridColumn: '1 / -1' }}>
+                              <div key={`full-${keyObj._clientId}`} className="w-full basis-full">
                                 {/* 修改原因：机房模式中被选中的卡片需要展开为原完整行，才能编辑完整 Key、备注和全部操作。
                                     修改方式：在 flex-wrap 网格中用 w-full basis-full 包裹共用完整行渲染，让展开项独占一整行。
                                     目的：其他未选中卡片继续保持紧凑排列，选中项上下自然换行。 */}
@@ -981,14 +1016,13 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                                   <label className="text-xs font-medium text-foreground">模型列表 ({sub.models.length})</label>
                                   <button
                                     onClick={async () => {
-                                      const firstKey = formData.api_keys.find(k => k.key.trim() && !k.disabled);
-                                      const baseUrl = sub.base_url || formData.base_url;
-                                      if (!baseUrl || !firstKey) { toastError('需要 Base URL 和至少一个启用的 API Key'); return; }
+                                      const request = buildSubChannelModelsRequest(formData, sub);
+                                      if (!request) { toastError('需要 Base URL 和至少一个启用的 API Key'); return; }
                                       try {
                                         const res = await apiFetch('/v1/channels/fetch_models', {
                                           method: 'POST',
                                           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-                                          body: JSON.stringify({ engine: sub.engine, base_url: baseUrl, api_key: firstKey.key, preferences: sub.preferences }),
+                                          body: JSON.stringify(request),
                                         });
                                         if (!res.ok) { const err = await res.json().catch(() => ({})); toastError(`获取失败: ${fmtErr(err, res.status)}`); return; }
                                         const data = (await res.json()) as any;
@@ -1225,8 +1259,22 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
 
                 {/* 6. 高级设置 */}
                 <section>
-                  <div className="flex items-center gap-2 text-sm font-semibold text-foreground mb-4 border-b border-border pb-2">
-                    <Settings2 className="w-4 h-4 text-muted-foreground" /> 高级设置
+                  <div className="flex items-center justify-between gap-3 text-sm font-semibold text-foreground mb-4 border-b border-border pb-2">
+                    <span className="flex items-center gap-2">
+                      <Settings2 className="w-4 h-4 text-muted-foreground" /> 高级设置
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setShowPluginSheet(true)}
+                      className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-600 transition-colors hover:bg-emerald-500/20 dark:text-emerald-400"
+                      title="打开完整插件配置"
+                    >
+                      <Puzzle className="w-3.5 h-3.5" />
+                      插件配置
+                      <span className="rounded-full bg-emerald-500 px-1.5 text-[10px] leading-4 text-white">
+                        {formData.preferences.enabled_plugins?.length || 0}
+                      </span>
+                    </button>
                   </div>
                   <div className="space-y-4">
                     {/* 请求处理流水线 — 可视化 Pipeline */}
@@ -1245,6 +1293,15 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                         setFormData(prev => {
                           if (!prev) return prev;
                           return { ...prev, preferences: { ...prev.preferences, enabled_plugins: plugins } };
+                        });
+                      }}
+                      onProviderPreferenceChange={(key, value) => updatePreference(key, value)}
+                      onProviderPreferenceDelete={(key) => {
+                        setFormData(prev => {
+                          if (!prev) return prev;
+                          const preferences = { ...prev.preferences };
+                          delete preferences[key];
+                          return { ...prev, preferences };
                         });
                       }}
                       onSystemPromptChange={(v) => updatePreference('system_prompt', v)}

@@ -285,7 +285,8 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
         if "_zoaholic_parsed_json" not in scope and hasattr(request, "_body"):
             request._body = b""
 
-        if resp.headers.get("x-zoaholic-passthrough") or resp.status_code != 200:
+        if (resp.headers.get("x-zoaholic-passthrough") or resp.status_code != 200
+                or getattr(resp, "rendered_dialect_id", None) == dialect_id):
             return resp
 
         if resp.media_type == "text/event-stream" and hasattr(resp, "body_iterator"):

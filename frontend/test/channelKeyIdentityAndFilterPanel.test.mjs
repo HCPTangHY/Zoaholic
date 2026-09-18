@@ -10,6 +10,7 @@ const hookSource = readFileSync(path.resolve(frontendRoot, 'src/pages/channels/h
 const typesSource = readFileSync(path.resolve(frontendRoot, 'src/pages/channels/types.ts'), 'utf8');
 const interceptorSource = readFileSync(path.resolve(frontendRoot, 'src/components/InterceptorSheet.tsx'), 'utf8');
 const pipelineSource = readFileSync(path.resolve(frontendRoot, 'src/pages/channels/components/PipelineView.tsx'), 'utf8');
+const sharedFieldsSource = readFileSync(path.resolve(frontendRoot, 'src/components/PluginConfigFields.tsx'), 'utf8');
 
 // Key 行身份必须独立于数组下标，防止删除中间项后复用被删项的 DeferredInput/交互状态。
 assert.match(typesSource, /_clientId: string;/, 'ApiKeyObj 应包含仅前端稳定身份');
@@ -20,23 +21,20 @@ assert.doesNotMatch(editorSource, /<FullKeyRow\s+key=\{idx\}/, '完整 Key 行�
 assert.doesNotMatch(editorSource, /<RackCard\s+key=\{idx\}/, '机房 Key 卡片不应继续使用数组下标作为 React key');
 assert.match(hookSource, /current > idx \? current - 1 : current/, '删除中间 Key 后应同步修正聚焦/展开下标');
 
-// 编辑面板应保留插件配置入口（Pipeline 完整配置按钮 + 侧边凸出插件按钮），并复用现有 Sheet。
-assert.match(editorSource, /onOpenPluginSheet=\{\(\) => setShowPluginSheet\(true\)\}/, 'Pipeline 应保留完整插件配置入口');
-assert.match(editorSource, /onClick=\{\(\) => setShowPluginSheet\(true\)\}/, '编辑面板应保留插件配置按钮');
+// 高级设置标题旁应有移动端也可见的插件配置入口，并复用现有 Sheet。
+assert.match(editorSource, /高级设置[\s\S]*插件配置[\s\S]*setShowPluginSheet\(true\)|setShowPluginSheet\(true\)[\s\S]*插件配置/, '高级设置标题旁应能打开插件配置');
 
-// 渠道级插件配置（provider_config）应在 InterceptorSheet 中按 metadata.provider_config 渲染 JSON 编辑区。
-assert.match(interceptorSource, /metadata\?\.provider_config\?\.key/, 'InterceptorSheet 应读取插件 metadata.provider_config');
-assert.match(interceptorSource, /渠道配置（JSON）/, 'InterceptorSheet 应渲染渠道配置 JSON 编辑区');
-assert.match(interceptorSource, /providerConfigText/, 'InterceptorSheet 应维护渠道配置文本状态');
-assert.match(interceptorSource, /preferences_patch\[meta\.key\] = JSON\.parse\(t\)/, '渠道配置保存时应解析 JSON 写入 preferences_patch');
-
-// Pipeline 应保留紧凑插件卡片和可视化参数表单。
+// 高级 JSON 应补在 Pipeline 原有紧凑 PluginCard 内，并与“插件配置”复用同一 provider_config 子区域。
+assert.match(interceptorSource, /<PluginConfigFields[\s\S]*pluginName=\{plugin\.plugin_name\}/, '插件配置 Sheet 应继续使用共享完整面板');
 assert.match(pipelineSource, /className="bg-card border border-border rounded-md px-3 py-2"/, 'Pipeline 应保留原有紧凑插件卡片');
-assert.match(pipelineSource, /<PluginParamsForm/, 'Pipeline 应使用可视化参数表单');
-assert.match(pipelineSource, /params_schema/, 'Pipeline 应读取插件 metadata.params_schema');
+assert.match(pipelineSource, /<PluginParamsForm[\s\S]*<PluginProviderConfigFields/, '高级 JSON 应紧跟在原有插件参数表单下方');
+assert.match(pipelineSource, /providerConfig = info\?\.metadata\?\.provider_config/, 'Pipeline 应读取插件 metadata.provider_config');
+assert.match(editorSource, /onProviderPreferenceChange[\s\S]*onProviderPreferenceDelete/, '渠道编辑器应接入高级 JSON 的更新与清空');
+assert.match(sharedFieldsSource, /export function PluginProviderConfigFields/, '两处应复用同一个高级 JSON 子区域');
+assert.match(sharedFieldsSource, /格式化/, '共享高级 JSON 应保留格式化按钮');
+assert.match(sharedFieldsSource, /填入示例/, '共享高级 JSON 应保留填入示例按钮');
+assert.match(sharedFieldsSource, /清空/, '共享高级 JSON 应保留清空按钮');
+assert.doesNotMatch(editorSource, /<PluginConfigFields|ParameterFilterEditorDialog|打开完整面板/, '高级设置下不应再额外塞独立完整大卡片');
 
-// ChannelEditor 应把 Pipeline 的插件变更接回 formData.preferences.enabled_plugins。
-assert.match(editorSource, /onPluginsChange=\{\(plugins\) => \{[\s\S]*enabled_plugins: plugins/, '渠道编辑器应接入插件列表变更');
-
-console.log('channel key identity and plugin panel regression passed');
+console.log('channel key identity and shared plugin panel regression passed');
 process.exit(0);

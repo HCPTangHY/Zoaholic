@@ -16,4 +16,3 @@ def _read_doc(name: str) -> str:
     # 修改方式：封装统一读取函数，并在缺失时让 Path.read_text 抛出明确路径错误。
     # 目的：保持各测试只描述对应文档必须包含的开发要点。
     return (ROOT / "docs" / name).read_text(encoding="utf-8")
-

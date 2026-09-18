@@ -12,7 +12,6 @@ import string
 import time
 
 from .log_config import logger
-from .utils import generate_sse_response, end_of_line
 
 
 async def assemble_stream_to_json(stream_generator):
@@ -217,9 +216,15 @@ async def convert_json_to_sse(json_response, model=""):
     finish_reason = choice.get("finish_reason", "stop")
     usage = json_response.get("usage")
 
-    # 发送 role delta
-    yield generate_sse_response(msg_id, msg_model, content=None, role=role, created=created)
-    yield end_of_line
+    # Build canonical chunks directly: generate_sse_response is async and accepts
+    # a timestamp, not a Chat response ID or a created keyword.
+    def content_chunk(delta):
+        return "data: " + json.dumps({
+            "id": msg_id, "object": "chat.completion.chunk", "created": created,
+            "model": msg_model, "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+        }, ensure_ascii=False) + "\n\n"
+
+    yield content_chunk({"role": role})
 
     # 发送 reasoning_content（如果有）
     if reasoning_content:
@@ -240,8 +245,10 @@ async def convert_json_to_sse(json_response, model=""):
         chunk_size = 200
         for i in range(0, len(content), chunk_size):
             chunk = content[i:i + chunk_size]
-            yield generate_sse_response(msg_id, msg_model, content=chunk, created=created)
-            yield end_of_line
+            yield content_chunk({"content": chunk})
+
+    if message.get("refusal"):
+        yield content_chunk({"refusal": message["refusal"]})
 
     # 发送 tool_calls（如果有）
     if tool_calls:
