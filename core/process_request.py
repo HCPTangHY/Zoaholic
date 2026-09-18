@@ -25,6 +25,7 @@ from core.models import (
 from core.request import get_payload
 from core.response import fetch_response, fetch_response_stream
 from core.streaming import LoggingStreamingResponse
+from core.stream_errors import reset_stream_state, UpstreamStreamError, extract_stream_error
 from core.byok import get_byok_real_key, is_byok_provider
 from core.utils import get_engine, is_local_api_key, provider_api_circular_list
 from utils import apply_custom_headers, error_handling_wrapper, safe_get
@@ -86,6 +87,9 @@ async def process_request(
     
     channel_id = f"{provider['provider']}"
     current_info_early = request_info_getter()
+    reset_stream_state(current_info_early)
+    current_info_early["_provider_cfg"] = provider
+    current_info_early["provider_id"] = channel_id
     byok_context_key = (
         current_info_early.get("_byok_real_key")
         or current_info_early.get("byok_real_key")
@@ -119,6 +123,7 @@ async def process_request(
 
     # 将实际使用的 api_key 提前存入 request_info，供重试循环精确定位出错的 key
     current_info_early["_used_api_key"] = original_api_key
+    current_info_early["_is_byok_request"] = byok_provider_request
     # 修改原因：OAuth 凭据现在按 provider name 分层，响应 wrapper 的被动 quota 采集也需要知道当前渠道。
     # 修改方式：在请求早期写入 _oauth_channel_id，并把同一 channel_id 传给 OAuthManager.resolve。
     # 目的：让 access_token 解析和 quota 回写都只作用于当前渠道。
@@ -246,6 +251,7 @@ async def process_request(
                     last_message_role=last_message_role,
                     request_url=url,
                     app=app,
+                    current_info=current_info,
                 )
 
                 if client_wants_stream:
@@ -261,6 +267,9 @@ async def process_request(
                     # force_stream：上游流式 → 拼装成非流式 JSON 返回客户端
                     from .stream_convert import assemble_stream_to_json
                     assembled = await assemble_stream_to_json(wrapped_generator)
+                    error = current_info.get("_stream_error") or extract_stream_error(assembled)
+                    if error:
+                        raise UpstreamStreamError(error)
 
                     async def force_stream_iter():
                         yield json.dumps(assembled, ensure_ascii=False)
@@ -286,6 +295,7 @@ async def process_request(
                     last_message_role=last_message_role,
                     request_url=url,
                     app=app,
+                    current_info=current_info,
                 )
 
                 if not client_wants_stream:
@@ -294,14 +304,8 @@ async def process_request(
                         if isinstance(wrapped_generator, bytes):
                             response = Response(content=wrapped_generator, media_type="audio/mpeg")
                     else:
-                        async def non_stream_iter():
-                            first_element = await anext(wrapped_generator)
-                            yield first_element
-                            async for item in wrapped_generator:
-                                yield item
-
                         response = LoggingStreamingResponse(
-                            non_stream_iter(),
+                            wrapped_generator,
                             media_type="application/json",
                             current_info=current_info,
                             app=app,
@@ -336,16 +340,17 @@ async def process_request(
                 )
                 response.dialect_id = dialect_id
 
-            # 更新成功计数和首次响应时间
-            _fire_and_forget_channel_stats(
-                update_channel_stats_func,
-                current_info["request_id"],
-                channel_id,
-                request.model,
-                current_info["api_key"],
-                success=True,
-                provider_api_key=original_api_key,
-            )
+            # 流式渠道结果等待发送结束；非流式内部消费者不经过 ASGI，保持原有统计入口。
+            stats_args = (current_info["request_id"], channel_id, request.model, current_info["api_key"])
+            if isinstance(response, LoggingStreamingResponse) and response.media_type == "text/event-stream":
+                current_info["_channel_stats_call"] = (
+                    update_channel_stats_func, stats_args, {"provider_api_key": original_api_key},
+                )
+            else:
+                _fire_and_forget_channel_stats(
+                    update_channel_stats_func, *stats_args, success=True,
+                    provider_api_key=original_api_key,
+                )
             current_info["first_response_time"] = first_response_time
             current_info["success"] = True
             current_info["status_code"] = 200

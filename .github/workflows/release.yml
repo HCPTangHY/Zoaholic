@@ -70,7 +70,9 @@ jobs:
       - name: Export dependencies (requirements.txt)
         shell: bash
         run: |
-          uv export --format requirements-txt --no-dev -o requirements.txt
+          # 修改原因：uv export 默认把项目自身导出为可编辑依赖 "-e ."，pex 无法解析该条目，导致 v1.7.5 起所有 tag 的 PEX 构建失败。
+          # 修改方式：导出时加 --no-emit-project 跳过项目自身，pex 已通过 -D . 打包仓库目录，无需在 requirements 中重复声明。
+          uv export --format requirements-txt --no-dev --no-emit-project -o requirements.txt
           echo "Exported requirements.txt:"
           head -n 50 requirements.txt
 

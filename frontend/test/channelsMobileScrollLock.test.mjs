@@ -3,46 +3,30 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// 修改原因：移动端打开渠道编辑抽屉时，Radix Dialog 的 body overflow:hidden 会让部分浏览器把页面滚动位置重置到顶部。
-// 修改方式：通过源码回归测试锁定 Channels 组件内的 body fixed scroll lock、滚动位置 ref 保存和关闭恢复逻辑。
-// 目的：防止后续维护时移除移动端滚动锁，或把 scrollY 改成 state 导致关闭时恢复到错误位置。
+// 修改原因：移动端打开编辑/测试弹窗时页面滚动锁不能跟随内部列表滚动，也不能在测试弹窗关闭时被提前移除。
+// 修改方式：滚动锁实现位于 hooks/useChannelEditor.tsx，锁定 Layout 的 <main> 滚动容器并保存滚动位置。
+// 目的：固定移动端弹窗滚动锁行为，避免未来改动重新引入背景跳动。
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(path.resolve(__dirname, '../src/pages/Channels.tsx'), 'utf8');
+const frontendRoot = path.resolve(__dirname, '..');
+const source = readFileSync(path.resolve(frontendRoot, 'src/pages/channels/hooks/useChannelEditor.tsx'), 'utf8');
 
-function sliceBetween(startMarker, endMarker, fromIndex = 0) {
-  const start = source.indexOf(startMarker, fromIndex);
-  assert.notEqual(start, -1, `找不到起始片段：${startMarker}`);
-  const end = source.indexOf(endMarker, start + startMarker.length);
-  assert.notEqual(end, -1, `找不到结束片段：${endMarker}`);
-  return source.slice(start, end);
-}
+assert.match(source, /const channelModalScrollYRef = useRef\(0\);/, '应保留弹窗滚动位置 ref');
 
-const componentSetup = sliceBetween('export default function Channels() {', 'const applyApiConfigData');
-const editorSheet = sliceBetween('{/* Editor Side Sheet - Responsive */}', '<ChannelTestDialog');
+const restoreStart = source.indexOf('const restoreChannelModalScrollLock = useCallback(');
+assert.notEqual(restoreStart, -1, '应保留 restoreChannelModalScrollLock');
+const restoreBlock = source.slice(restoreStart, restoreStart + 800);
+assert.match(restoreBlock, /const savedTop = channelModalScrollYRef\.current;/, '解锁前应读取保存的滚动位置');
+assert.match(restoreBlock, /document\.querySelector\('main'\)/, '页面实际滚动容器是 Layout 的 <main>');
+assert.match(restoreBlock, /scroller\.scrollTop = savedTop;/, '解锁后应恢复原页面滚动位置');
 
-assert.match(
-  componentSetup,
-  /const channelModalScrollYRef = useRef\(0\);/,
-  '渠道编辑抽屉应该用 ref 保存打开前的 scrollY，不能用 state 保存',
-);
-assert.match(
-  componentSetup,
-  /const channelModalBodyStyleRef = useRef<\{ position: string; top: string; width: string \} \| null>\(null\);/,
-  '渠道编辑抽屉应该用 ref 保存 body 原有内联样式，关闭时才能恢复',
-);
+const applyStart = source.indexOf('const applyChannelModalScrollLock = useCallback(');
+assert.notEqual(applyStart, -1, '应保留 applyChannelModalScrollLock');
+const applyBlock = source.slice(applyStart, applyStart + 600);
+assert.match(applyBlock, /channelModalScrollYRef\.current = scroller \? scroller\.scrollTop : 0;/, '锁定前应保存当前页面滚动位置');
 
-const scrollLockEffect = sliceBetween('const restoreChannelModalScrollLock = useCallback', 'const applyApiConfigData');
-assert.match(scrollLockEffect, /body\.style\.position = previousStyle\.position;/, '关闭抽屉时应该恢复 body 原有 position');
-assert.match(scrollLockEffect, /body\.style\.top = previousStyle\.top;/, '关闭抽屉时应该恢复 body 原有 top');
-assert.match(scrollLockEffect, /body\.style\.width = previousStyle\.width;/, '关闭抽屉时应该恢复 body 原有 width');
-assert.match(scrollLockEffect, /window\.scrollTo\(0, scrollY\);/, '关闭抽屉或组件卸载时应该回到打开前的滚动位置');
-assert.match(scrollLockEffect, /useEffect\(\(\) => \{[\s\S]*if \(!isModalOpen\) \{[\s\S]*restoreChannelModalScrollLock\(\);[\s\S]*return;[\s\S]*\}[\s\S]*const currentScrollY = window\.scrollY \|\| window\.pageYOffset \|\| document\.documentElement\.scrollTop \|\| 0;[\s\S]*channelModalScrollYRef\.current = currentScrollY;[\s\S]*body\.style\.position = 'fixed';[\s\S]*body\.style\.top = `-\$\{currentScrollY\}px`;[\s\S]*body\.style\.width = '100%';[\s\S]*return restoreChannelModalScrollLock;[\s\S]*\}, \[isModalOpen, restoreChannelModalScrollLock\]\);/, '打开抽屉时应该固定 body，并在关闭或清理函数中恢复滚动');
-
-assert.match(
-  editorSheet,
-  /<Dialog\.Root open=\{isModalOpen\} modal=\{!isOAuthOverlayOpen\}/,
-  '修复滚动问题时不能改掉编辑抽屉的 Radix modal 条件，OAuth overlay 依赖这个行为',
-);
+assert.match(source, /const isChannelScrollLockedDialogOpen = isModalOpen \|\| testDialogOpen \|\| keyTestDialogOpen \|\| analyticsOpen;/, '滚动锁应同时覆盖编辑、渠道测试、Key 测试和分析弹窗');
+assert.match(source, /if \(!isChannelScrollLockedDialogOpen\) restoreChannelModalScrollLock\(\);/, '所有受保护弹窗关闭后才应恢复滚动锁');
+assert.match(source, /return restoreChannelModalScrollLock;/, '组件卸载时应兜底恢复滚动锁');
 
 console.log('channels mobile scroll lock regression passed');
 process.exit(0);

@@ -9,6 +9,43 @@ from __future__ import annotations
 import asyncio
 from typing import AsyncIterable, AsyncIterator
 
+from anyio import CancelScope
+
+
+async def close_async_iterator(iterator, pending_task=None):
+    """Cancel a pending read before closing its iterator, including in ASGI cancel scopes."""
+    with CancelScope(shield=True):
+        try:
+            if pending_task is not None:
+                if not pending_task.done():
+                    pending_task.cancel()
+                await asyncio.gather(pending_task, return_exceptions=True)
+        finally:
+            if hasattr(iterator, "aclose"):
+                await iterator.aclose()
+
+
+class OwnedAsyncIterator:
+    """Keep cleanup available even before a response generator's first iteration."""
+
+    def __init__(self, iterator, source, pending_task=None):
+        self.iterator = iterator
+        self.source = source
+        self.pending_task = pending_task
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await anext(self.iterator)
+
+    async def aclose(self):
+        try:
+            await close_async_iterator(self.iterator)
+        finally:
+            await close_async_iterator(self.source, self.pending_task)
+            self.pending_task = None
+
 
 async def aiter_decoded_lines(
     source: AsyncIterable[bytes | bytearray | str],

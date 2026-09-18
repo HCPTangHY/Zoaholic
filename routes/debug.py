@@ -6,9 +6,14 @@ import sys
 from collections import Counter
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
-router = APIRouter()
+from routes.deps import verify_admin_api_key
+
+# 修改原因：/debug/* 端点会暴露进程内存细节，tracemalloc 开关还构成外部性能攻击面。
+# 修改方式：路由级统一挂 admin 鉴权。
+# 目的：内存排查工具仅限管理员使用。
+router = APIRouter(dependencies=[Depends(verify_admin_api_key)])
 
 _baseline: dict[str, int] | None = None
 

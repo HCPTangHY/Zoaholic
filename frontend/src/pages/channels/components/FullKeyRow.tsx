@@ -136,7 +136,7 @@ export function FullKeyRow({
       {showRowDecorations && rowQuotaPair && (
         hasKeyBorderSlot
           ? <UiSlot engine={formData.engine} slot="key_border" data={slotData} context={{ ...slotContext, mode: 'row' }} element="div" className="absolute inset-0 pointer-events-none z-[1]" enabledPlugins={enabledPlugins} />
-          : <QuotaBorderOverlay quotaInner={rowQuotaPair.quota_inner} quotaOuter={rowQuotaPair.quota_outer} />
+          : <QuotaBorderOverlay quotaInner={rowQuotaPair.quota_inner} quotaOuter={rowQuotaPair.quota_outer} label={bal?.level} />
       )}
       {showRowDecorations && slotPayloadAvailable && hasKeyBackgroundSlot && (
         <UiSlot engine={formData.engine} slot="key_background" data={slotData} context={{ ...slotContext, mode: 'row' }} element="div" className="absolute inset-0 pointer-events-none rounded-[7px] z-0 transition-all duration-500" enabledPlugins={enabledPlugins} />

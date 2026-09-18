@@ -367,8 +367,11 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
                         cache_creation_tokens = _cache_usage["cache_creation_tokens"]
 
                 # 检查返回的 JSON 是否包含错误信息
-                if 'error' in line:
-                    yield {"error": "OpenAI Stream Error", "status_code": 400, "details": line}
+                from ..stream_errors import extract_stream_error
+                stream_error = extract_stream_error(line)
+                if stream_error:
+                    yield {"error": {k: stream_error[k] for k in ("message", "type", "code")},
+                           "status_code": stream_error["status_code"], "details": line}
                     return
 
                 line['id'] = f"chatcmpl-{random_str}"

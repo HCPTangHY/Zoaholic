@@ -3,9 +3,6 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// 修改原因：InterceptorSheet 插件数量变多后，列表筛选、分组和行点击行为容易在后续重构中退回旧状态。
-// 修改方式：直接读取组件源码，断言本轮新增的 Tab、搜索、已启用置顶、渠道配置标记和行点击选择逻辑存在。
-// 目的：在不新增浏览器测试依赖的前提下，固定插件配置面板的大列表交互约束。
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(path.resolve(__dirname, '../src/components/InterceptorSheet.tsx'), 'utf8');
 
@@ -25,7 +22,4 @@ assert.match(source, />响应<\//, '仅响应插件应该显示响应类型标�
 assert.match(source, /\{options && <span className="text-xs bg-blue-500\/10/, '折叠行应该继续显示插件参数 pill');
 
 console.log('interceptor sheet layout regression passed');
-// 修改原因：当前部署环境的 Node 18 在部分 ESM 脚本自然结束后会触发 Aborted。
-// 修改方式：断言全部通过后显式以 0 退出，断言失败时仍会在这里之前抛出错误。
-// 目的：让测试退出码只反映本文件断言是否通过。
 process.exit(0);

@@ -13,7 +13,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from core.oauth.providers.base import OAuthProvider
+from core.oauth.base import OAuthProvider
 from core.channels.openai_responses_channel import (
     fetch_responses_stream,
     fetch_responses_response,

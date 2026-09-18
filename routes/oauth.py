@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from routes.deps import verify_admin_api_key
 
@@ -778,7 +778,7 @@ async def import_account(request: Request):
 
 @router.post("/v1/oauth/batch_import", dependencies=[Depends(verify_admin_api_key)])
 async def batch_import(request: Request):
-    """批量导入 OAuth 账号，兼容 sub2api 和 CPA 导出格式。"""
+    """批量导入 OAuth 账号（NDJSON 流式），兼容 sub2api 和 CPA 导出格式。"""
     # 修改原因：现有 /v1/oauth/import 只能导入单个账号，CPA/sub2api 迁移时需要手动拆分大量凭据。
     # 修改方式：新增批量端点，先自动 normalize 三种导出格式，再逐条刷新、注册和记录结果。
     # 目的：让管理员可以一次导入多账号，同时单个账号失败不会中断整批处理。
@@ -799,63 +799,75 @@ async def batch_import(request: Request):
 
     oauth_mgr = request.app.state.oauth_manager
     oauth_provider = oauth_mgr._providers.get(type_name)
-    results = []
-    success = 0
-    failed = 0
-    skipped = 0
+    total = len(normalized_items)
 
-    for item in normalized_items:
-        # 修改原因：批量导入中的任一条数据都可能缺字段或刷新失败，不能影响其他账号继续导入。
-        # 修改方式：每个账号独立 try/except，逐条生成 status、already_exists 或 error。
-        # 目的：返回完整的导入报告，方便前端或管理员定位具体失败账号。
-        key_id = _first_non_empty_string(item.get("key_id")) or "unknown"
-        token_data = item.get("token_data") if isinstance(item.get("token_data"), dict) else {}
-        token_data = dict(token_data)
+    def _event(obj: dict) -> str:
+        return json.dumps(obj, ensure_ascii=False) + "\n"
 
+    async def stream():
+        success = 0
+        failed = 0
+        skipped = 0
         try:
-            if token_data.get("refresh_token") and oauth_provider:
-                # 修改原因：CPA/sub2api 导出中的 access_token 可能已经临近过期，refresh_token 可用时应先刷新再落库。
-                # 修改方式：优先走 OAuthManager.refresh_provider 以继承运行时配置注入；旧 manager 或测试替身缺失该方法时回退到 provider.refresh_token。
-                # 目的：保存更新后的 access_token 和可能轮换后的 refresh_token，减少导入后首次请求失败概率。
-                if hasattr(oauth_mgr, "refresh_provider"):
-                    token_data = await oauth_mgr.refresh_provider(type_name, token_data)
-                else:
-                    token_data = await oauth_provider.refresh_token(token_data)
+            for idx, item in enumerate(normalized_items):
+                # 修改原因：批量导入耗时集中在逐个 refresh，同步返回最终 JSON 会让前端长时间无反馈。
+                # 修改方式：每个账号处理前输出 progress 事件，处理完输出 item 事件（status/already_exists/error）。
+                # 目的：NDJSON 流式返回让前端实时渲染每个账号结果，单条失败仍不中断整批。
+                key_id = _first_non_empty_string(item.get("key_id")) or "unknown"
+                token_data = item.get("token_data") if isinstance(item.get("token_data"), dict) else {}
+                token_data = dict(token_data)
 
-            if not token_data.get("access_token"):
-                skipped += 1
-                results.append({"key_id": key_id, "status": "skipped", "error": "missing access_token"})
-                continue
+                yield _event({"type": "progress", "index": idx, "total": total, "key_id": key_id})
 
-            if not token_data.get("refresh_token") and _batch_token_is_expired(token_data):
-                skipped += 1
-                results.append({"key_id": key_id, "status": "skipped", "error": "token expired"})
-                continue
+                try:
+                    if token_data.get("refresh_token") and oauth_provider:
+                        # 修改原因：CPA/sub2api 导出中的 access_token 可能已经临近过期，refresh_token 可用时应先刷新再落库。
+                        # 修改方式：优先走 OAuthManager.refresh_provider 以继承运行时配置注入；旧 manager 或测试替身缺失该方法时回退到 provider.refresh_token。
+                        # 目的：保存更新后的 access_token 和可能轮换后的 refresh_token，减少导入后首次请求失败概率。
+                        if hasattr(oauth_mgr, "refresh_provider"):
+                            token_data = await oauth_mgr.refresh_provider(type_name, token_data)
+                        else:
+                            token_data = await oauth_provider.refresh_token(token_data)
 
-            if token_data.get("refresh_token") and not oauth_provider and _batch_token_is_expired(token_data):
-                skipped += 1
-                results.append({"key_id": key_id, "status": "skipped", "error": "token expired and refresh unavailable"})
-                continue
+                    if not token_data.get("access_token"):
+                        skipped += 1
+                        item_ev = {"key_id": key_id, "status": "skipped", "error": "missing access_token"}
+                    elif not token_data.get("refresh_token") and _batch_token_is_expired(token_data):
+                        skipped += 1
+                        item_ev = {"key_id": key_id, "status": "skipped", "error": "token expired"}
+                    elif token_data.get("refresh_token") and not oauth_provider and _batch_token_is_expired(token_data):
+                        skipped += 1
+                        item_ev = {"key_id": key_id, "status": "skipped", "error": "token expired and refresh unavailable"}
+                    else:
+                        email = _first_non_empty_string(token_data.get("email"))
+                        final_key_id = email or key_id
+                        already_exists = _key_exists_in_provider(request.app, channel_id, final_key_id)
+                        await oauth_mgr.register(channel_id, final_key_id, type_name, token_data)
+                        if not already_exists:
+                            await _sync_provider_api_key_add(request.app, channel_id, final_key_id)
+                        success += 1
+                        item_ev = {"key_id": final_key_id, "status": "success", "already_exists": already_exists}
+                except Exception as exc:
+                    failed += 1
+                    item_ev = {"key_id": key_id, "status": "failed", "error": str(exc)}
 
-            email = _first_non_empty_string(token_data.get("email"))
-            final_key_id = email or key_id
-            already_exists = _key_exists_in_provider(request.app, channel_id, final_key_id)
-            await oauth_mgr.register(channel_id, final_key_id, type_name, token_data)
-            if not already_exists:
-                await _sync_provider_api_key_add(request.app, channel_id, final_key_id)
-            success += 1
-            results.append({"key_id": final_key_id, "status": "success", "already_exists": already_exists})
+                yield _event({"type": "item", "index": idx, "total": total, **item_ev})
+
+            yield _event({"type": "summary", "total": total, "success": success, "failed": failed, "skipped": skipped})
         except Exception as exc:
-            failed += 1
-            results.append({"key_id": key_id, "status": "failed", "error": str(exc)})
+            # 修改原因：流式响应开始后无法再改状态码，生成器内的意外异常只能以事件形式下发。
+            # 修改方式：捕获后输出 error 事件并结束流，前端据此提示导入中断。
+            # 目的：避免连接被静默斯断导致前端停留在导入中状态。
+            yield _event({"type": "error", "error": str(exc)})
 
-    return {
-        "total": len(normalized_items),
-        "success": success,
-        "failed": failed,
-        "skipped": skipped,
-        "results": results,
-    }
+    # 修改原因：nginx 默认缓冲代理响应，会把逐条事件攒在一起再下发，流式进度会失效。
+    # 修改方式：返回 NDJSON StreamingResponse，并用 X-Accel-Buffering: no 关闭 nginx 对该响应的缓冲。
+    # 目的：每个账号的进度事件立即到达浏览器。
+    return StreamingResponse(
+        stream(),
+        media_type="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 @router.get("/v1/oauth/accounts", dependencies=[Depends(verify_admin_api_key)])

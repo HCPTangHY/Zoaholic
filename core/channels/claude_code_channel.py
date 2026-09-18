@@ -28,7 +28,7 @@ from typing import Any
 
 import httpx
 
-from core.oauth.providers.base import OAuthProvider
+from core.oauth.base import OAuthProvider
 from core.channels.claude_channel import (
     fetch_claude_response_stream,
     fetch_claude_response,
@@ -87,11 +87,15 @@ def _get_session_id(api_key: str) -> str:
 
 
 def _parse_version_from_ua(ua: str) -> str:
-    """从 User-Agent 解析 CC 版本号，如 'claude-code/2.1.97' → '2.1.97'。"""
+    """从 User-Agent 解析 CC 版本号，如 'claude-cli/2.1.161' → '2.1.161'。"""
+    # 修改原因：渠道自身下发的 User-Agent 是 claude-cli/ 前缀，旧实现只认 claude-code/，
+    #   导致 billing 头里的 cc_version 永远回退到硬编码默认值。
+    # 修改方式：同时接受 claude-code/ 与 claude-cli/ 两种前缀。
+    # 目的：让 UA 中的版本号与 billing 头 cc_version 保持一致。
     if not ua:
         return _BILLING_CC_VERSION
     for part in ua.split():
-        if part.startswith("claude-code/"):
+        if part.startswith("claude-code/") or part.startswith("claude-cli/"):
             ver = part.split("/", 1)[1].split(" ")[0]
             if ver:
                 return ver
@@ -110,6 +114,18 @@ def _parse_entrypoint_from_ua(ua: str) -> str:
             if ep in ("cli", "vscode", "local-agent", "jetbrains", "emacs", "vim"):
                 return ep
     return _BILLING_ENTRYPOINT
+
+
+def _resolve_cc_version(provider) -> str:
+    """读取渠道级 CC 版本号伪装覆盖（preferences.cc_version）。"""
+    # 修改原因：claude_code_compat 插件支持按参数指定 CC 版本，而 claude-code 渠道的版本号
+    #   是硬编码常量，渠道无法像插件一样修改版本。
+    # 修改方式：从 provider.preferences.cc_version 读取覆盖值，空值回退内置默认。
+    # 目的：让 CC 渠道也能按渠道配置伪装任意 CLI 版本，同时作用于 User-Agent 和 billing 头。
+    prefs = provider.get("preferences") if isinstance(provider, dict) else None
+    value = prefs.get("cc_version") if isinstance(prefs, dict) else None
+    value = str(value or "").strip()
+    return value or CLAUDE_CODE_CLI_VERSION
 
 
 def _strip_gateway_headers(headers: dict) -> dict:
@@ -420,22 +436,33 @@ class ClaudeCodeProvider(OAuthProvider):
             "Content-Type": "application/json",
             "User-Agent": CLAUDE_CODE_USER_AGENT,
         }
+        # 推导 profile 端点（与 usage 同域）
+        profile_url = usage_url.replace("/api/oauth/usage", "/api/oauth/profile")
+
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(
-                    usage_url,
-                    headers=headers,
+                import asyncio as _asyncio
+                usage_task = client.get(usage_url, headers=headers)
+                profile_task = client.get(profile_url, headers=headers)
+                usage_resp, profile_resp = await _asyncio.gather(
+                    usage_task, profile_task, return_exceptions=True
                 )
-                if resp.status_code != 200:
-                    # 修改原因：此前上游 HTTP 错误被转成 None，路由层无法把具体失败原因返回给前端。
-                    # 修改方式：非 200 响应直接抛出包含状态码和响应正文片段的 ValueError。
-                    # 目的：让 Claude Code usage 接口失败时，管理员能在前端控制台看到可排查的上游错误。
-                    raise ValueError(f"upstream {resp.status_code}: {resp.text[:500]}")
-                data = resp.json()
+
+                # usage 是必须的
+                if isinstance(usage_resp, Exception):
+                    raise usage_resp
+                if usage_resp.status_code != 200:
+                    raise ValueError(f"upstream {usage_resp.status_code}: {usage_resp.text[:500]}")
+                data = usage_resp.json()
+
+                # profile 是可选的（Free 账号会 429）
+                profile_data = None
+                if not isinstance(profile_resp, Exception) and profile_resp.status_code == 200:
+                    try:
+                        profile_data = profile_resp.json()
+                    except Exception:
+                        pass
         except Exception:
-            # 修改原因：此前异常被静默吞掉，导致上层只能得到 Quota not available。
-            # 修改方式：保留异常原样向上抛出，不在 provider 层改写为 None。
-            # 目的：让路由层统一生成带错误详情的 JSON 响应。
             raise
 
         result = {}
@@ -455,19 +482,60 @@ class ClaudeCodeProvider(OAuthProvider):
                 model_tag = key[len("seven_day_"):]
                 result[f"quota_outer_{model_tag}"] = round(100 - (val.get("utilization") or 0), 1)
                 result[f"quota_outer_{model_tag}_resets_at"] = val.get("resets_at")
+        # limits 数组中的 scoped 限额（如 Fable）
+        limits = data.get("limits")
+        if isinstance(limits, list):
+            for lim in limits:
+                if not isinstance(lim, dict):
+                    continue
+                if lim.get("kind") != "weekly_scoped":
+                    continue
+                scope = lim.get("scope") or {}
+                model = (scope.get("model") or {}).get("display_name", "")
+                if not model:
+                    continue
+                tag = model.lower().replace(" ", "_")
+                pct = lim.get("percent")
+                if pct is not None:
+                    result[f"quota_outer_{tag}"] = round(100 - pct, 1)
+                    result[f"quota_outer_{tag}_resets_at"] = lim.get("resets_at")
+                    result[f"quota_outer_{tag}_active"] = lim.get("is_active", False)
         # extra_usage
         eu = data.get("extra_usage")
-        if eu and isinstance(eu, dict) and eu.get("is_enabled"):
-            result["extra_usage_enabled"] = True
+        if eu and isinstance(eu, dict):
+            result["extra_usage_enabled"] = bool(eu.get("is_enabled"))
             result["extra_usage_monthly_limit"] = eu.get("monthly_limit")
             result["extra_usage_used"] = eu.get("used_credits")
             result["extra_usage_utilization"] = eu.get("utilization")
+            result["extra_usage_ever"] = eu.get("credits_ever_enabled")
+            result["extra_usage_user_disabled"] = eu.get("user_disabled")
 
-        # 修改原因：usage 接口未必返回订阅类型，但前端刷新 quota 后仍需要在 raw 数据中读到 tier。
-        # 修改方式：从已保存 credential 中取 subscription_type 并补入 fetch_quota 结果。
-        # 目的：让 quota_display 既能从 account 读 tier，也能从 data.raw 读到同一字段。
+        # profile 数据：计划类型和 rate_limit_tier
+        if profile_data and isinstance(profile_data, dict):
+            acct = profile_data.get("account") or {}
+            org = profile_data.get("organization") or {}
+            # 判定计划类型
+            if acct.get("has_claude_max"):
+                plan = "Max"
+            elif acct.get("has_claude_pro"):
+                plan = "Pro"
+            elif org.get("organization_type") == "claude_team" and org.get("subscription_status") == "active":
+                plan = "Team"
+            else:
+                plan = "Free"
+            result["plan_type"] = plan
+            result["rate_limit_tier"] = org.get("rate_limit_tier")
+            result["subscription_status"] = org.get("subscription_status")
+            result["has_extra_usage_org"] = org.get("has_extra_usage_enabled")
+
+        # fallback：从已保存 credential 中取 subscription_type
         if credential.get("subscription_type"):
-            result["subscription_type"] = credential["subscription_type"]
+            result.setdefault("subscription_type", credential["subscription_type"])
+
+        # 把 quota_inner/quota_outer 之外的所有字段打包进 raw，供前端 ui_slots 读取
+        raw = {k: v for k, v in result.items() if k not in ("quota_inner", "quota_outer")}
+        if raw:
+            result["raw"] = raw
 
         return result if result else None
 
@@ -859,7 +927,7 @@ def _has_billing_header(system) -> bool:
     return False
 
 
-def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None) -> dict:
+def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None, version_override: str = "") -> dict:
     """清洗 payload 绕过 Anthropic 第三方检测，使请求走 plan limits 而非 extra usage。
 
     Layer 1: 确保 system prompt 存在
@@ -887,9 +955,12 @@ def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None) -> di
     if headers:
         _ua_key, _ua_val = _get_header_case_insensitive(headers, "User-Agent")
         _ua = str(_ua_val or "")
+    # 修改原因：billing 头的 cc_version 需要与渠道级版本覆盖保持一致。
+    # 修改方式：显式 version_override 优先，未配置时从 UA 解析（回退内置默认）。
+    # 目的：让渠道编辑页的 cc_version 偏好同时作用于 UA 与 billing 头。
     billing_text = _build_billing_header(
         payload.get("messages", []),
-        version=_parse_version_from_ua(_ua),
+        version=version_override or _parse_version_from_ua(_ua),
         entrypoint=_parse_entrypoint_from_ua(_ua),
     )
     billing_block = {"type": "text", "text": billing_text}
@@ -1105,8 +1176,12 @@ def _merge_anthropic_beta(headers: dict) -> None:
     headers["anthropic-beta"] = ",".join(beta_values)
 
 
-def _apply_claude_code_headers(headers: dict, api_key: str | None) -> None:
+def _apply_claude_code_headers(headers: dict, api_key: str | None, version: str = "") -> None:
     """把普通 Claude 请求头改成完整的 Claude Code OAuth 请求头。"""
+    # 修改原因：User-Agent 中的 CLI 版本号需要支持渠道级覆盖。
+    # 修改方式：新增可选 version 参数，未传时保持内置默认 CLAUDE_CODE_CLI_VERSION。
+    # 目的：让渠道编辑页的 cc_version 偏好能算到伪装 UA 上。
+    cc_version = str(version or "").strip() or CLAUDE_CODE_CLI_VERSION
     _pop_header_case_insensitive(headers, "x-api-key")
     _set_header_case_insensitive(headers, "Authorization", f"Bearer {api_key}")
     _merge_anthropic_beta(headers)
@@ -1114,7 +1189,7 @@ def _apply_claude_code_headers(headers: dict, api_key: str | None) -> None:
     if _get_header_case_insensitive(headers, "X-App")[0] is None:
         headers["X-App"] = "cli"
     if _get_header_case_insensitive(headers, "User-Agent")[0] is None:
-        headers["User-Agent"] = CLAUDE_CODE_USER_AGENT
+        headers["User-Agent"] = f"claude-cli/{cc_version} (external, cli)"
 
     # X-Claude-Code-Session-Id — per apiKey stable UUID (TTL=1h)
     if api_key and _get_header_case_insensitive(headers, "X-Claude-Code-Session-Id")[0] is None:
@@ -1152,9 +1227,10 @@ def _apply_claude_code_headers(headers: dict, api_key: str | None) -> None:
 
 async def get_claude_code_payload(request, engine, provider, api_key=None):
     """复用 Claude adapter 构建 payload，覆盖为 Bearer 认证 + plan billing 清洗。"""
+    cc_version = _resolve_cc_version(provider)
     url, headers, payload = await get_claude_payload(request, "claude", provider, api_key)
-    _apply_claude_code_headers(headers, api_key)
-    payload = _sanitize_for_plan_billing(payload, headers=headers)
+    _apply_claude_code_headers(headers, api_key, version=cc_version)
+    payload = _sanitize_for_plan_billing(payload, headers=headers, version_override=cc_version)
     return url, headers, payload
 
 
@@ -1170,7 +1246,7 @@ async def get_claude_code_passthrough_meta(request, engine, provider, api_key=No
     # 完整 CC 伪装（Bearer + Session-Id + request-id + Stainless + beta flags）
     # 第三方客户端：这些默认值保留
     # 真 CC 客户端：后续 original_headers 覆盖为真实值
-    _apply_claude_code_headers(headers, api_key)
+    _apply_claude_code_headers(headers, api_key, version=_resolve_cc_version(provider))
 
     return url, headers, payload
 
@@ -1236,7 +1312,40 @@ async def _passthrough_sanitize(payload, modifications, request, engine, provide
     original_headers = {}
     if hasattr(request, '_passthrough_headers'):
         original_headers = request._passthrough_headers or {}
-    return _sanitize_for_plan_billing(payload, headers=original_headers)
+    # 修改原因：透传路径的 billing 头版本也需要遵循渠道级 cc_version 覆盖。
+    # 修改方式：从 provider 解析覆盖值传入 sanitize。
+    # 目的：与转换路径的版本伪装行为保持一致。
+    return _sanitize_for_plan_billing(
+        payload,
+        headers=original_headers,
+        version_override=_resolve_cc_version(provider),
+    )
+
+
+async def _passthrough_stream_with_reverse_map(client, url, headers, payload, model, timeout):
+    """透传流式响应：对每个 chunk 执行反向工具名映射。"""
+    from core.passthrough import _fetch_passthrough_stream
+    try:
+        async for chunk in _fetch_passthrough_stream(client, url, headers, payload, timeout):
+            if isinstance(chunk, str):
+                yield _reverse_map_chunk(chunk)
+            else:
+                yield chunk
+    finally:
+        _reset_reverse_maps()
+
+
+async def _passthrough_response_with_reverse_map(client, url, headers, payload, model, timeout):
+    """透传非流式响应：对每个 chunk 执行反向工具名映射。"""
+    from core.passthrough import _fetch_passthrough_response
+    try:
+        async for chunk in _fetch_passthrough_response(client, url, headers, payload, timeout):
+            if isinstance(chunk, str):
+                yield _reverse_map_chunk(chunk)
+            else:
+                yield chunk
+    finally:
+        _reset_reverse_maps()
 
 
 # 修改原因：Claude Code 的 extra_usage 可视化属于渠道专属 UI，不能继续由 Channels.tsx 写死计算和样式。
@@ -1311,26 +1420,33 @@ export default function render(ctx) {
     // 修改原因：合并后单一 quota_display 同时服务完整行和机房卡片，extra_usage 金额在圆环中心会溢出。
     // 修改方式：rack 模式只输出百分比或 tier 缩写；row 模式继续组合 tier、百分比和 extra_usage 金额。
     // 目的：完整行保留 Claude Code 的完整额度信息，机房卡片中心只保留可读的短文本。
-    const subType = account?.subscription_type || account?.subscriptionType || data?.raw?.subscription_type || '';
-    const tierMap = { 'pro': 'Pro', 'max': 'Max', 'team': 'Team', 'enterprise': 'Enterprise' };
+    const planType = data?.raw?.plan_type || data?.plan_type || '';
+    const subType = planType || account?.subscription_type || account?.subscriptionType || data?.raw?.subscription_type || '';
+    const tierMap = { 'pro': 'Pro', 'max': 'Max', 'team': 'Team', 'enterprise': 'Enterprise', 'free': 'Free' };
     const tierLabel = tierMap[subType.toLowerCase()] || (subType ? subType.charAt(0).toUpperCase() + subType.slice(1) : '');
     const shortTierLabel = tierLabel === 'Enterprise' ? 'Ent' : tierLabel;
+    const rateTier = data?.raw?.rate_limit_tier || '';
+    const is20x = rateTier.includes('20x');
+    const tierSuffix = is20x ? '⁺' : '';
     const q5 = typeof data?.quota_inner === 'number' ? data.quota_inner : null;
     const q7 = typeof data?.quota_outer === 'number' ? data.quota_outer : null;
     const pcts = [q5, q7].filter(v => v != null);
     const minPct = pcts.length ? Math.round(Math.min(...pcts)) : null;
 
+    const fullTier = tierLabel ? tierLabel + tierSuffix : '';
+    const shortTier = shortTierLabel ? shortTierLabel + tierSuffix : '';
+
     if (mode === 'rack') {
         if (minPct != null) {
             el.style.display = '';
-            el.textContent = minPct + '%';
+            el.textContent = (shortTier ? shortTier + ' ' : '') + minPct + '%';
             el.removeAttribute('title');
             const colorCls = minPct >= 50 ? 'text-emerald-600' : minPct >= 20 ? 'text-amber-600' : 'text-red-500';
             el.className = 'text-[9px] font-bold font-mono leading-none ' + colorCls;
-        } else if (shortTierLabel) {
+        } else if (shortTier) {
             el.style.display = '';
-            el.textContent = shortTierLabel;
-            el.title = tierLabel;
+            el.textContent = shortTier;
+            el.title = fullTier;
             el.className = 'text-[8px] font-semibold leading-none text-blue-500 truncate max-w-[50px]';
         } else {
             el.textContent = '';
@@ -1340,7 +1456,7 @@ export default function render(ctx) {
         return;
     }
 
-    const quotaLabel = minPct != null ? (tierLabel ? tierLabel + ' ' + minPct + '%' : minPct + '%') : tierLabel;
+    const quotaLabel = minPct != null ? (fullTier ? fullTier + ' ' + minPct + '%' : minPct + '%') : fullTier;
     const limit = account?.extra_usage_enabled ? (account.extra_usage_limit ?? account.extra_usage_monthly_limit ?? 0) : 0;
     const used = account?.extra_usage_enabled ? (account.extra_usage_used ?? 0) : 0;
     const remaining = Math.max(0, limit - used);
@@ -1401,9 +1517,23 @@ def register():
         request_adapter=get_claude_code_payload,
         passthrough_adapter=get_claude_code_passthrough_meta,
         passthrough_payload_adapter=_passthrough_sanitize,
+        passthrough_stream_adapter=_passthrough_stream_with_reverse_map,
+        passthrough_response_adapter=_passthrough_response_with_reverse_map,
         response_adapter=fetch_claude_code_response,
         stream_adapter=fetch_claude_code_response_stream,
         is_oauth=True,
+        # 修改原因：CC 渠道的 CLI 版本号此前硬编码，无法像 claude_code_compat 插件那样按渠道指定。
+        # 修改方式：声明 cc_version 文本偏好项，前端按 preference_toggles 元数据渲染输入框，写入 provider.preferences。
+        # 目的：渠道编辑页可直接修改伪装的 User-Agent / billing 头版本。
+        preference_toggles=[
+            {
+                "key": "cc_version",
+                "label": "CC 版本号",
+                "tip": "伪装的 Claude Code CLI 版本，同时作用于 User-Agent 与 billing 头；留空使用内置默认 2.1.161",
+                "type": "text",
+                "placeholder": "2.1.161",
+            },
+        ],
         # 修改原因：Claude Code 的 extra_usage 背景、金额标签、按钮汇总和订阅 tier 标签都属于渠道专属 UI。
         # 修改方式：注册 key_background、balance_summary 和合并后的 quota_display 三个展示插槽，不注册 key_border。
         # 目的：让前端通用挂载点加载 CC 专属脚本，同时继续使用默认 QuotaBorderOverlay 绘制 5h/7d 弧线。

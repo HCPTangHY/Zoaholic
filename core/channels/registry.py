@@ -58,6 +58,11 @@ PassthroughPayloadAdapter = Callable[
     Awaitable[Dict[str, Any]],
 ]
 
+# StreamEventClassifier: 渠道声明的流式事件分类器。
+# 返回 True 表示事件无语义内容、可暂存；False 表示已携带输出、必须提交；
+# None 表示渠道不表态，交给 core 的通用结构判断。
+StreamEventClassifier = Callable[[Dict[str, Any]], Optional[bool]]
+
 
 @dataclass
 class ChannelDefinition:
@@ -111,6 +116,14 @@ class ChannelDefinition:
     # 修改方式：在 ChannelDefinition 上保存运行时使用的 OAuthProvider 实例，但不在 to_dict API 输出中暴露。
     # 目的：启动时扫描注册表即可统一注册内置和外置 OAuth 渠道，同时避免把 provider 对象返回给前端。
     oauth_provider: Any = None
+    # 修改原因：透传兼容性应由渠道声明（"我接受哪些方言的原生格式"），而非方言枚举兼容引擎。
+    # 修改方式：渠道注册时声明 passthrough_dialects 列表，detect_passthrough 优先检查该字段。
+    # 目的：新增渠道只需在 register_channel 时声明一次，方言侧无需任何改动。
+    passthrough_dialects: Optional[List[str]] = None
+    # 修改原因：流式暂存的“无语义内容事件”分类是协议知识，应由渠道声明而非 core 硬编码事件名。
+    # 修改方式：渠道注册时可选传入 stream_event_classifier(dict) -> Optional[bool]。
+    # 目的：新协议渠道（含插件渠道）声明自己的可暂存事件，core 通用判断降级为兜底。
+    stream_event_classifier: Optional[StreamEventClassifier] = None
     source: str = "plugin"
     
     def to_dict(self) -> Dict[str, Any]:
@@ -228,6 +241,11 @@ def register_channel(
     # 修改方式：新增可选 oauth_provider 参数；传入 provider 时会自动把渠道标记为 OAuth 渠道。
     # 目的：让内置渠道和插件渠道都通过同一个注册入口完成 OAuth provider 暴露。
     oauth_provider: Any = None,
+    # 修改原因：透传兼容性应由渠道声明，而非方言枚举兼容引擎。
+    # 修改方式：渠道注册时传入 passthrough_dialects 列表，写入 ChannelDefinition。
+    # 目的：detect_passthrough 优先检查渠道声明，新渠道只需声明一次即可被透传。
+    passthrough_dialects: Optional[List[str]] = None,
+    stream_event_classifier: Optional[StreamEventClassifier] = None,
     source: str = "plugin",
 ) -> None:
     """
@@ -286,6 +304,8 @@ def register_channel(
         # 修改方式：把 register_channel 的 oauth_provider 参数写入 ChannelDefinition，但不改变 to_dict 输出。
         # 目的：消除启动期硬编码注册清单，并让外置插件可以复用同一条注册路径。
         oauth_provider=oauth_provider,
+        passthrough_dialects=passthrough_dialects,
+        stream_event_classifier=stream_event_classifier,
         source=source,
     )
     # 修改原因：渠道可能在 OAuthManager 初始化之后由插件或热重载流程注册，不能只依赖启动期扫描。

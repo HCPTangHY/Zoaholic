@@ -381,6 +381,18 @@ async def render_gemini_stream(canonical_sse_chunk: str) -> str:
     except json.JSONDecodeError:
         return canonical_sse_chunk
 
+    error = canonical.get("error")
+    if error:
+        if not isinstance(error, dict):
+            error = {"message": str(error)}
+        status_code = canonical.get("status_code") or 502
+        status = {400: "INVALID_ARGUMENT", 401: "UNAUTHENTICATED", 403: "PERMISSION_DENIED",
+                  404: "NOT_FOUND", 429: "RESOURCE_EXHAUSTED", 503: "UNAVAILABLE",
+                  504: "DEADLINE_EXCEEDED"}.get(status_code, "INTERNAL")
+        event = {"error": {"code": status_code, "status": status,
+                           "message": error.get("message", "Upstream stream failed")}}
+        return f"data: {json_dumps_text(event, ensure_ascii=False)}\n\n"
+
     usage = canonical.get("usage")
     choices = canonical.get("choices") or []
     if not choices:

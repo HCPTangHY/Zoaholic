@@ -6,6 +6,7 @@
 # 修改方式：按照 Scout 的归位方案迁移到 core 对应业务模块，并只调整必要的内部导入路径。
 # 目的：让业务代码按领域归属维护，同时保留根 utils.py 和 utils_pkg shim 的旧导入兼容性。
 import asyncio
+import json
 import time as time_module
 from typing import Optional
 
@@ -16,6 +17,8 @@ from fastapi import HTTPException
 from core.json_utils import json_dumps_text, json_loads
 from core.log_config import logger
 from core.utils import safe_get
+from core.stream_utils import close_async_iterator, OwnedAsyncIterator
+from core.stream_errors import guard_stream, extract_stream_error, UpstreamStreamError
 
 
 async def ensure_string(item, as_sse: bool = True):
@@ -75,29 +78,21 @@ async def wait_for_timeout(wait_for_thing, timeout = 3, wait_task=None):
     else:
         first_response_task = wait_task
 
-    # 创建一个超时任务
-    timeout_task = asyncio.create_task(asyncio.sleep(timeout))
-
-    # 等待任意一个任务完成
-    done, pending = await asyncio.wait(
-        [first_response_task, timeout_task],
-        return_when=asyncio.FIRST_COMPLETED
-    )
-
-    # 成功返回
-    if first_response_task in done:
-        # 取消超时任务
-        timeout_task.cancel()
+    try:
+        # asyncio.wait's timeout doesn't cancel the read and needs no separate sleep task.
+        done, _ = await asyncio.wait({first_response_task}, timeout=timeout)
+        if not done:
+            return first_response_task, "timeout"
         try:
             return first_response_task.result(), "success"
         except RuntimeError as e:
             if "asynchronous generator is already running" in str(e):
                 return None, "reentrant"
             raise
-
-    # 超时返回
-    else:
-        return first_response_task, "timeout"
+    except BaseException:
+        # The caller has not yet received ownership of a newly created read task.
+        await close_async_iterator(wait_for_thing, first_response_task)
+        raise
 
 
 SSE_KEEPALIVE_COMMENT = ": keepalive\n\n"
@@ -133,9 +128,9 @@ async def iter_sse_with_keepalive(
     - transform: 可选 async 转换器，仅作用于真实 item（不作用于注释帧）；普通流式传入
       ensure_string 包装，透传流式不传以保持「不解析/不改写协议内容」。
     """
-    if emit_initial:
-        yield SSE_KEEPALIVE_COMMENT
     try:
+        if emit_initial:
+            yield SSE_KEEPALIVE_COMMENT
         while True:
             try:
                 item, status = await wait_for_timeout(generator, timeout=interval, wait_task=wait_task)
@@ -164,17 +159,80 @@ async def iter_sse_with_keepalive(
             wait_task = None
             yield (await transform(item)) if transform is not None else item
     finally:
-        # 无论因 EOF、异常还是被消费者关闭（GeneratorExit）退出，都取消仍挂起的
-        # 单飞 __anext__ 任务，并等待取消清理完成后再退出。
-        if wait_task is not None and not wait_task.done():
-            wait_task.cancel()
+        await close_async_iterator(generator, wait_task)
+
+
+async def prepare_stream(generator, *, current_info=None, keepalive_interval=None, error_triggers=(), request_url=None, app=None, engine=None):
+    """Inspect before returning to handler; only then allow downstream headers/keepalives."""
+    from core.response_context import get_current_request_info
+
+    info = current_info if current_info is not None else (get_current_request_info() or {})
+    if not isinstance(info, dict):
+        info = {}
+    # 每次尝试都是新的首段：清掉可能残留的上一次提交标记，避免共享上下文污染。
+    for key in ("_stream_committed", "_stream_error", "_stream_error_handled", "_stream_has_output", "_stream_raw_inspector"):
+        info.pop(key, None)
+    start = time_module.monotonic()
+    # 优先使用渠道注册表声明的事件分类器，未声明时由 guard_stream 内部走通用结构判断。
+    classifier = None
+    if engine:
+        try:
+            from core.channels import get_channel
+            channel = get_channel(engine)
+            classifier = getattr(channel, "stream_event_classifier", None)
+        except Exception:
+            classifier = None
+    guarded = OwnedAsyncIterator(guard_stream(generator, info=info, classifier=classifier, error_triggers=error_triggers), generator)
+    pending = None
+    first = None
+    try:
+        # 首包等待沿用旧语义：有 keepalive 配置时等满一个心跳间隔，未配置时无限等待。
+        # 上游错误响应头几乎总在心跳间隔内到达，能在此窗口内抛回 handler 换取正确的 HTTP 状态码。
+        # 修复：旧实现用 min(3s, keepalive) 且超时后立即标记已提交，导致慢到的 400 退化为 200+流内错误帧。
+        if keepalive_interval:
+            first, status = await wait_for_timeout(guarded, timeout=keepalive_interval)
+            if status == "timeout":
+                pending, first = first, None
+            elif status == "reentrant":
+                raise RuntimeError("stream read reentrant before response")
+        else:
+            first = await guarded.__anext__()
+    except BaseException:
+        await close_async_iterator(guarded, pending)
+        raise
+
+    async def replay():
+        iterator = guarded
+        try:
+            if first is not None:
+                yield first if isinstance(first, (str, bytes)) else await ensure_string(first)
+            if keepalive_interval:
+                iterator = iter_sse_with_keepalive(
+                    guarded, interval=keepalive_interval,
+                    wait_task=pending, emit_initial=(pending is not None),
+                )
+                async for item in iterator:
+                    yield item if isinstance(item, (str, bytes)) else await ensure_string(item)
+            else:
+                # 未配置 keepalive 的渠道保持原有纯转发，不注入注释帧。
+                async for item in guarded:
+                    yield item if isinstance(item, (str, bytes)) else await ensure_string(item)
+        except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout,
+                httpx.WriteError, httpx.ProtocolError, h2.exceptions.ProtocolError) as exc:
+            # 保留原有 HTTP/2 StreamReset 自动重建连接行为。
+            if request_url and app and ("StreamReset" in str(exc) or "stream_id" in str(exc)):
+                from urllib.parse import urlparse
+                host = urlparse(request_url).netloc
+                if host and hasattr(app, "state") and hasattr(app.state, "client_manager"):
+                    asyncio.create_task(app.state.client_manager.reset_client(host))
+            raise
+        finally:
             try:
-                await wait_task
-            except (asyncio.CancelledError, StopAsyncIteration):
-                pass
-            except Exception:
-                # 任务异常已由 done callback 读取；清理阶段不应覆盖原始流异常。
-                pass
+                await close_async_iterator(iterator)
+            finally:
+                await close_async_iterator(guarded, pending)
+
+    return OwnedAsyncIterator(replay(), guarded, pending), time_module.monotonic() - start
 
 
 async def error_handling_wrapper(
@@ -189,7 +247,12 @@ async def error_handling_wrapper(
     *,
     request_url: Optional[str] = None,
     app: Optional[object] = None,
+    current_info=None,
 ):
+    if stream:
+        return await prepare_stream(generator, current_info=current_info, keepalive_interval=keepalive_interval,
+                                    error_triggers=error_triggers,
+                                    request_url=request_url, app=app, engine=engine)
 
     def _log_stream_end(reason: str, *, level: str = "info", detail: Optional[str] = None):
         msg = f"provider: {channel_id:<11} stream_end reason={reason}"
@@ -205,126 +268,66 @@ async def error_handling_wrapper(
             logger.info(msg)
 
     async def new_generator(first_item=None, with_keepalive=False, wait_task=None, timeout=3):
-        stream_end_logged = False
+        iterator = generator
+        try:
+            if first_item is not None:
+                yield await ensure_string(first_item, as_sse=stream)
+                first_item = None
+            if with_keepalive:
+                async def transform(item):
+                    return await ensure_string(item, as_sse=stream)
 
-        if first_item:
-            yield await ensure_string(first_item, as_sse=stream)
-
-        # 如果需要心跳机制但不使用嵌套生成器方式
-        if with_keepalive:
-            # 修改原因：此前 keepalive pump 在本函数与 core/passthrough 各复制了一份，
-            #   keepalive 帧样式、重入退避和挂起任务清理容易改一处漏一处。
-            # 修改方式：统一改调 iter_sse_with_keepalive，本分支只保留普通流式特有的业务收尾
-            #   （网络错误发 done、reset_client、stream_end 日志）；用 ensure_string 作为 transform
-            #   注入协议转换，首包尚未到达时通过 emit_initial 补发首帧。挂起的 __anext__ 任务由
-            #   iter_sse_with_keepalive 的 finally 统一清理，本分支不再各自 cancel。
-            # 目的：与透传路径共用同一套 keepalive 帧与保活语义，消除重复实现。
-            async def _keepalive_transform(item):
-                return await ensure_string(item, as_sse=stream)
-
-            try:
-                async for chunk in iter_sse_with_keepalive(
-                    generator,
-                    interval=timeout,
-                    wait_task=wait_task,
-                    emit_initial=(first_item is None),
-                    transform=_keepalive_transform,
-                ):
+                iterator = iter_sse_with_keepalive(
+                    generator, timeout, wait_task=wait_task,
+                    emit_initial=(wait_task is not None), transform=transform,
+                )
+                async for chunk in iterator:
                     yield chunk
-                _log_stream_end("upstream_eof")
-                stream_end_logged = True
-            except asyncio.CancelledError:
-                logger.debug(f"provider: {channel_id:<11} Stream cancelled by client in main loop")
-                _log_stream_end("client_cancelled", level="debug")
-                stream_end_logged = True
-            except (
-                httpx.ReadError,
-                httpx.RemoteProtocolError,
-                httpx.ReadTimeout,
-                httpx.WriteError,
-                httpx.ProtocolError,
-                h2.exceptions.ProtocolError,
-            ) as e:
-                logger.error(f"provider: {channel_id:<11} Network error in keepalive loop: {e}")
-
-                try:
-                    err_str = str(e)
-                    if request_url and app and ("StreamReset" in err_str or "stream_id" in err_str):
-                        from urllib.parse import urlparse
-                        host = urlparse(request_url).netloc
-                        if host and hasattr(app, "state") and hasattr(app.state, "client_manager"):
-                            asyncio.create_task(app.state.client_manager.reset_client(host))
-                except Exception:
-                    pass
-
-                # 发送 OAI 格式 error event，让客户端知道流异常结束
-                try:
-                    import json as _json
-                    err_payload = _json.dumps({
-                        "error": {
-                            "message": f"Upstream network error: {type(e).__name__}",
-                            "type": "upstream_network_error",
-                            "param": None,
-                            "code": "upstream_network_error",
-                        }
-                    })
-                    yield f"data: {err_payload}\n\n"
-                except Exception:
-                    pass
-
-                done = "data: [DONE]\n\n" if done_message is None else done_message
-                if done:
-                    yield done
-                _log_stream_end("upstream_network_error", level="warning", detail=type(e).__name__)
-                stream_end_logged = True
-            except Exception as e:
-                logger.error(f"provider: {channel_id:<11} Error in keepalive loop: {e}")
-                done = "data: [DONE]\n\n" if done_message is None else done_message
-                if done:
-                    yield done
-                _log_stream_end("wrapper_exception", level="error", detail=type(e).__name__)
-                stream_end_logged = True
-        else:
-            # 原始逻辑：不需要心跳
-            try:
+            else:
                 async for item in generator:
                     yield await ensure_string(item, as_sse=stream)
-                _log_stream_end("upstream_eof")
-                stream_end_logged = True
-            except asyncio.CancelledError:
-                logger.debug(f"provider: {channel_id:<11} Stream cancelled by client")
-                _log_stream_end("client_cancelled", level="debug")
-                stream_end_logged = True
-                return
-            except (
-                httpx.ReadError,
-                httpx.RemoteProtocolError,
-                httpx.ReadTimeout,
-                httpx.WriteError,
-                httpx.ProtocolError,
-                h2.exceptions.ProtocolError,
-            ) as e:
-                logger.error(f"provider: {channel_id:<11} Network error in new_generator: {e}")
-
-                try:
-                    err_str = str(e)
-                    if request_url and app and ("StreamReset" in err_str or "stream_id" in err_str):
-                        from urllib.parse import urlparse
-                        host = urlparse(request_url).netloc
-                        if host and hasattr(app, "state") and hasattr(app.state, "client_manager"):
-                            asyncio.create_task(app.state.client_manager.reset_client(host))
-                except Exception:
-                    pass
-
-                done = "data: [DONE]\n\n" if done_message is None else done_message
-                if done:
-                    yield done
-                _log_stream_end("upstream_network_error", level="warning", detail=type(e).__name__)
-                stream_end_logged = True
-                return
+            _log_stream_end("upstream_eof")
+        except asyncio.CancelledError:
+            _log_stream_end("client_cancelled", level="debug")
+            raise
+        except UpstreamStreamError:
+            # 必须回到 handler 的路由重试循环，不能在流式响应中吞掉该异常。
+            _log_stream_end("upstream_stream_error", level="warning")
+            raise
+        except (
+            httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout,
+            httpx.WriteError, httpx.ProtocolError, h2.exceptions.ProtocolError,
+        ) as exc:
+            logger.error(f"provider: {channel_id:<11} Network error in stream: {exc}")
+            if request_url and app and ("StreamReset" in str(exc) or "stream_id" in str(exc)):
+                from urllib.parse import urlparse
+                host = urlparse(request_url).netloc
+                if host and hasattr(app, "state") and hasattr(app.state, "client_manager"):
+                    asyncio.create_task(app.state.client_manager.reset_client(host))
+            if with_keepalive:
+                yield await ensure_string({"error": {
+                    "message": f"Upstream network error: {type(exc).__name__}",
+                    "type": "upstream_network_error", "param": None,
+                    "code": "upstream_network_error",
+                }})
+            done = "data: [DONE]\n\n" if done_message is None else done_message
+            if done:
+                yield done
+            _log_stream_end("upstream_network_error", level="warning", detail=type(exc).__name__)
+        except Exception as exc:
+            if not with_keepalive:
+                raise
+            logger.error(f"provider: {channel_id:<11} Error in keepalive loop: {exc}")
+            done = "data: [DONE]\n\n" if done_message is None else done_message
+            if done:
+                yield done
+            _log_stream_end("wrapper_exception", level="error", detail=type(exc).__name__)
+        finally:
+            try:
+                await close_async_iterator(iterator, wait_task)
             finally:
-                if not stream_end_logged:
-                    _log_stream_end("unknown")
+                if iterator is not generator:
+                    await close_async_iterator(generator)
 
     def _extract_first_json_candidate(text: str) -> Optional[str]:
         """
@@ -365,17 +368,21 @@ async def error_handling_wrapper(
         return None
 
     start_time = time_module.time()
+    first_item_str = None
     try:
         # 创建一个任务来获取第一个响应，但不直接中断生成器
         if keepalive_interval and stream:
             first_item, status = await wait_for_timeout(generator, timeout=keepalive_interval)
             if status == "timeout":
-                return new_generator(None, with_keepalive=True, wait_task=first_item, timeout=keepalive_interval), 3.1415
+                return OwnedAsyncIterator(
+                    new_generator(None, with_keepalive=True, wait_task=first_item, timeout=keepalive_interval),
+                    generator, first_item,
+                ), 3.1415
         else:
             first_item = await generator.__anext__()
 
         first_response_time = time_module.time() - start_time
-        # 对第一个响应项进行原有的处理逻辑
+        # 非流式响应沿用首包校验。
         first_item_str = first_item
         # logger.info("first_item_str: %s :%s", type(first_item_str), first_item_str)
         if isinstance(first_item_str, (bytes, bytearray)):
@@ -404,6 +411,9 @@ async def error_handling_wrapper(
                 encode_first_item_str = parse_target
                 logger.error(f"provider: {channel_id:<11} error UnicodeDecodeError: %s", parse_target)
 
+            first_error = extract_stream_error(first_item)
+            if first_error:
+                raise UpstreamStreamError(first_error)
             if any(x in encode_first_item_str for x in error_triggers):
                 logger.error(f"provider: {channel_id:<11} error const string: %s", encode_first_item_str)
                 raise StopAsyncIteration
@@ -515,13 +525,18 @@ async def error_handling_wrapper(
             if (content == "" or content is None) and (tool_calls == "" or tool_calls is None) and (reasoning_content == "" or reasoning_content is None) and b64_json is None:
                 raise StopAsyncIteration
 
-        return new_generator(
+        return OwnedAsyncIterator(new_generator(
             first_item,
             with_keepalive=bool(keepalive_interval and stream),
             timeout=keepalive_interval or 3,
-        ), first_response_time
+        ), generator), first_response_time
 
     except StopAsyncIteration:
+        await close_async_iterator(generator)
         # 502 Bad Gateway 是一个更合适的状态码，因为它表明作为代理或网关的服务器从上游服务器收到了无效的响应。
         logger.warning(f"provider: {channel_id:<11} empty response [{type(first_item_str)}]: {first_item_str}")
         raise HTTPException(status_code=502, detail="Upstream server returned an empty response.")
+
+    except BaseException:
+        await close_async_iterator(generator)
+        raise

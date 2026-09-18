@@ -40,8 +40,32 @@ async def _on_request(request: httpx.Request):
     request.extensions["_trace_start"] = monotonic()
 
 
+class _ReleaseOnCloseStream(httpx.AsyncByteStream):
+    """Drop the closed transport stream, breaking httpx's response/stream cycle."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    async def __aiter__(self):
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self):
+        stream = self._stream
+        if stream is not None:
+            # Retain the stream if close fails; callers must still be able to clean it up.
+            await stream.aclose()
+            self._stream = None
+
+
 async def _on_response(response: httpx.Response):
     """收到响应后：记录到缓冲区"""
+    if response.is_closed:
+        # Cached responses may be closed before hooks run (e.g. a custom transport).
+        # Their body stays in Response._content; no transport needs retaining.
+        response.stream = httpx.ByteStream(b"")
+    elif not isinstance(response.stream, _ReleaseOnCloseStream):
+        response.stream = _ReleaseOnCloseStream(response.stream)
     global _outbound_log_next_id
 
     start = response.request.extensions.get("_trace_start")

@@ -369,6 +369,15 @@ async def render_responses_stream(canonical_sse_chunk: str) -> str:
     except Exception:
         return canonical_sse_chunk
 
+    error = canonical.get("error")
+    if error:
+        if not isinstance(error, dict):
+            error = {"message": str(error)}
+        event = {"type": "error", "message": error.get("message", "Upstream stream failed"),
+                 "code": error.get("code") or error.get("type") or "server_error",
+                 "param": error.get("param")}
+        return f"event: error\ndata: {json_dumps_text(event, ensure_ascii=False)}\n\n"
+
     usage = canonical.get("usage")
     if isinstance(usage, dict):
         # 经过内核重组的 usage-only chunk 在 Responses API 中用 response.completed 表达。

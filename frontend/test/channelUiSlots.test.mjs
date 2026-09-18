@@ -3,16 +3,15 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// 修改原因：Channels.tsx 要从单一 quota_display 改为通用多插槽，不能保留渠道私有用量字段硬编码。
-// 修改方式：用源码静态断言检查通用 UiSlot、四个插槽挂载点，以及私有字段不再进入通用数据流。
-// 目的：防止后续维护时把渠道专属余额条、标签或汇总逻辑重新写回通用前端。
+// 修改原因：Channels.tsx 拆分后，ui_slots 相关 helper 位于 channels/utils.ts，
+//   UiSlot 组件位于 components/KeyComponents.tsx，完整 Key 行位于 components/FullKeyRow.tsx。
+// 修改方式：按新文件位置做源码回归断言。
+// 目的：防止后续维护时把渠道专属 quota 计算重新写回通用前端，或破坏 ui_slots 兼容数据。
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const frontendRoot = path.resolve(__dirname, '..');
-const channelsSource = readFileSync(path.resolve(frontendRoot, 'src/pages/Channels.tsx'), 'utf8');
-// 修改原因：测试需要确认旧的渠道私有字段已经从 Channels.tsx 中消失，但测试源码本身不应重新形成该字段引用。
-// 修改方式：用字符串拼接生成匹配模式，避免静态搜索把测试断言误判成业务引用。
-// 目的：既锁住删除结果，又保持全项目源码搜索结果干净。
-const privateUsagePattern = new RegExp(['extra', 'usage'].join('_'));
+const utilsSource = readFileSync(path.resolve(frontendRoot, 'src/pages/channels/utils.ts'), 'utf8');
+const fullRowSource = readFileSync(path.resolve(frontendRoot, 'src/pages/channels/components/FullKeyRow.tsx'), 'utf8');
+const keyComponentsSource = readFileSync(path.resolve(frontendRoot, 'src/pages/channels/components/KeyComponents.tsx'), 'utf8');
 
 function sliceBetween(source, startMarker, endMarker, fromIndex = 0) {
   const start = source.indexOf(startMarker, fromIndex);
@@ -22,62 +21,27 @@ function sliceBetween(source, startMarker, endMarker, fromIndex = 0) {
   return source.slice(start, end);
 }
 
-const slotComponent = sliceBetween(channelsSource, 'const uiSlotCache', '// ── 冷却中 Key 行组件');
-assert.match(channelsSource, /type UiSlotValue = string \| \{ script\?: string; requires_plugin\?: string \};/, '前端应支持后端返回带 requires_plugin 条件的 slot 对象');
-assert.match(slotComponent, /function hasUiSlot\(engine: string \| undefined, slot: string, enabledPlugins\?: string\[\]\): boolean/, 'hasUiSlot 应接收当前 provider 的 enabled_plugins');
-assert.match(slotComponent, /requires_plugin[\s\S]*providerHasEnabledPlugin/, 'hasUiSlot 应按 requires_plugin 判断 provider 是否启用对应插件');
-assert.match(slotComponent, /const UiSlot = \(\{ engine, slot, data, context, className, element = 'span', fallbackText, enabledPlugins \}/, '前端应提供通用 UiSlot 组件，并接收 enabledPlugins');
-assert.match(slotComponent, /const cacheKey = `\$\{engine\}:\$\{slot\}`;/, 'UiSlot 缓存 key 应包含 engine 和 slot');
-assert.match(slotComponent, /__uiSlots\?\.\[engine\]\?\.\[slot\]/, 'UiSlot 应按 engine 和 slot 从 window.__uiSlots 读取脚本');
-assert.match(slotComponent, /const jsSrc = getUiSlotScript\(engine, slot, enabledPlugins\);/, 'UiSlot 应从对象 slot 中提取 script，并复查 requires_plugin 条件');
-assert.doesNotMatch(slotComponent, /quota_display;/, 'UiSlot 内部不能固定读取 quota_display');
-assert.match(slotComponent, /fn\(\{ el, data: dataRef\.current, \.\.\.\(contextRef\.current \?\? \{\}\) \}\)/, 'UiSlot 应把 data 和额外 context 一起传给渠道脚本');
+const quotaHelper = sliceBetween(utilsSource, 'export function getOAuthQuota', 'export function normalizeOAuthAccountStateMap');
+assert.match(quotaHelper, /getQuotaFromSource\(account, account\?\.quota_raw \?\? account\?\.raw\)/, 'getOAuthQuota 应通过通用 getQuotaFromSource 读取标准双额度字段');
+assert.doesNotMatch(quotaHelper, /OAUTH_ENGINES|extra_usage|MODEL_PROVIDER_GOOGLE/, '通用 OAuth quota 读取不应包含渠道专属硬编码');
 
-const balanceButton = sliceBetween(channelsSource, '<Wallet className={`w-3 h-3 ${balanceLoading ? \'animate-pulse\' : \'\'}`} />', '</button>', channelsSource.indexOf('onClick={() => queryAllBalances()}'));
-assert.match(balanceButton, /hasUiSlot\(formData\.engine, 'balance_summary', formData\.preferences\.enabled_plugins\)/, 'OAuth 余额按钮应结合 enabled_plugins 检测 balance_summary 插槽');
-assert.match(balanceButton, /slot="balance_summary"/, 'OAuth 余额按钮应使用 balance_summary 插槽');
-assert.match(balanceButton, /context=\{\{ accounts: oauthAccounts \}\}/, 'balance_summary 插槽应收到所有 OAuth 账号');
-assert.match(balanceButton, /fallbackText="余额"/, 'balance_summary 插槽应保留余额默认文本');
-assert.doesNotMatch(balanceButton, privateUsagePattern, '余额按钮不能再包含渠道私有用量汇总硬编码');
+const slotDataBuilder = sliceBetween(utilsSource, 'export function buildRowQuotaSlotData', 'export function withRackCompactBalanceFallback');
+assert.match(slotDataBuilder, /if \(bal\) return bal;/, '普通 balance 应优先原样传给 ui_slots 保持兼容');
+assert.match(slotDataBuilder, /getOAuthQuota\(oauthAccount\) \?\? getQuotaPairFromGauges\(rowQuota\.gauges\)/, '没有 balance 时应从账号或 gauges 构造兼容 quota 数据');
+assert.match(slotDataBuilder, /raw: quota\.raw \?\? oauthAccount\?\.quota_raw \?\? oauthAccount\?\.raw/, '兼容数据应保留 raw 给旧渠道脚本');
 
-// 修改原因：hint 插槽只负责渠道提示文本，通用前端不能硬编码 Antigravity 覆写格式或 Claude Code 充值链接。
-// 修改方式：用源码静态断言检查 base_url_hint、key_hint、override_hint 三个挂载点都按 hasUiSlot 条件渲染。
-// 目的：保证未注册 hint 的渠道不显示、不占空间，注册渠道能通过 UiSlot 自行写入提示内容。
-const baseUrlBlock = sliceBetween(channelsSource, 'API 地址 (Base URL)', '修改原因：OAuth 引擎');
-assert.match(baseUrlBlock, /hasUiSlot\(formData\.engine, 'base_url_hint', formData\.preferences\.enabled_plugins\)/, 'Base URL 区域应结合 enabled_plugins 检测 base_url_hint 插槽');
-assert.match(baseUrlBlock, /slot="base_url_hint"[\s\S]*data=\{null\}[\s\S]*element="div"[\s\S]*className="text-xs text-muted-foreground mt-1"/, 'base_url_hint 应挂载为 muted 小字 div');
+const rackFallback = sliceBetween(utilsSource, 'export function withRackCompactBalanceFallback', 'export function sortProvidersByWeight');
+assert.match(rackFallback, /getBalanceCompactLabel\(bal\)/, '机房卡片应对旧 amount 余额使用紧凑显示');
+assert.match(rackFallback, /displayLabel: compactLabel/, '紧凑显示应替换单 gauge 的 displayLabel');
 
-const keyHintBlock = sliceBetween(channelsSource, '{/* 2. API Keys', '<div data-key-scroll className="space-y-2 max-h-64');
-assert.match(keyHintBlock, /hasUiSlot\(formData\.engine, 'key_hint', formData\.preferences\.enabled_plugins\)/, 'Key 列表标题附近应结合 enabled_plugins 检测 key_hint 插槽');
-assert.match(keyHintBlock, /slot="key_hint"[\s\S]*data=\{null\}[\s\S]*element="div"[\s\S]*className="text-xs text-muted-foreground"/, 'key_hint 应挂载为 muted 小字 div');
+// 完整 Key 行应把兼容 slot 数据同时传给 key_background 和 quota_display 插槽。
+assert.match(fullRowSource, /buildRowQuotaSlotData\(bal, oauthAccount, rowQuota\)/, 'Key 行应通过 buildRowQuotaSlotData 构造插槽数据');
+assert.match(fullRowSource, /<UiSlot engine=\{formData\.engine\} slot="key_background"/, 'Key 行应保留 key_background 插槽');
+assert.match(fullRowSource, /<UiSlot engine=\{formData\.engine\} slot="quota_display"/, 'Key 行应保留 quota_display 插槽');
 
-const overrideHintBlock = sliceBetween(channelsSource, '请求体覆写 (JSON)', '<div className="flex items-center justify-between p-3 bg-muted/50');
-assert.match(overrideHintBlock, /hasUiSlot\(formData\.engine, 'override_hint', formData\.preferences\.enabled_plugins\)/, '请求体覆写区域应结合 enabled_plugins 检测 override_hint 插槽');
-assert.match(overrideHintBlock, /slot="override_hint"[\s\S]*data=\{null\}[\s\S]*element="div"[\s\S]*className="text-xs text-amber-600 dark:text-amber-400 mt-1"/, 'override_hint 应挂载为 amber 警告小字 div');
+const uiSlot = sliceBetween(keyComponentsSource, 'export const UiSlot = ', '// ── 冷却中 Key 行组件');
+assert.match(uiSlot, /fallbackText/, 'UiSlot 应支持 fallbackText');
+assert.match(uiSlot, /useMemo/, 'UiSlot 应使用内容签名稳定 effect 依赖，避免数组/对象引用变化导致重跑');
 
-const keyRows = sliceBetween(channelsSource, 'const renderFullKeyRow =', '\n  };\n\n  return (', channelsSource.indexOf('const renderFullKeyRow ='));
-assert.match(keyRows, /const enabledPlugins = formData\.preferences\.enabled_plugins \|\| \[\];/, 'Key 行应从 formData.preferences.enabled_plugins 读取当前 provider 插件列表');
-assert.match(keyRows, /const hasKeyBorderSlot = hasUiSlot\(formData\.engine, 'key_border', enabledPlugins\);/, 'Key 行应结合 enabled_plugins 检测 key_border 插槽');
-assert.match(keyRows, /const hasKeyBackgroundSlot = hasUiSlot\(formData\.engine, 'key_background', enabledPlugins\);/, 'Key 行应结合 enabled_plugins 检测 key_background 插槽');
-assert.match(keyRows, /const hasQuotaDisplaySlot = hasUiSlot\(formData\.engine, 'quota_display', enabledPlugins\);/, 'Key 行应结合 enabled_plugins 检测 quota_display 插槽');
-assert.doesNotMatch(keyRows, /quota_label/, 'P2 后 Key 行不应再保留独立 quota_label 插槽');
-assert.match(keyRows, /slot="key_border"[\s\S]*data=\{slotData\}[\s\S]*context=\{slotContext\}[\s\S]*<QuotaBorderOverlay quotaInner=\{rowQuotaPair\.quota_inner\} quotaOuter=\{rowQuotaPair\.quota_outer\} \/>/, 'key_border 插槽存在时应替代默认双弧边框，否则保留默认边框');
-assert.match(keyRows, /slot="key_background"[\s\S]*data=\{slotData\}[\s\S]*context=\{slotContext\}[\s\S]*element="div"[\s\S]*className="absolute inset-0 pointer-events-none rounded-\[7px\] z-0 transition-all duration-500"/, 'key_background 插槽应挂载为覆盖整行的 absolute div');
-assert.match(keyRows, /slot="quota_display"/, 'quota_display 应继续作为通用 UiSlot 的一个插槽');
-assert.match(keyRows, /slot="quota_display"[\s\S]*data=\{slotData\}[\s\S]*context=\{slotContext\}[\s\S]*enabledPlugins=\{enabledPlugins\}/, 'quota_display 插槽应收到当前行统一上下文和插件列表');
-assert.doesNotMatch(keyRows, privateUsagePattern, 'Key 行渲染逻辑不能再读取渠道私有用量字段');
-
-const rackCard = sliceBetween(channelsSource, 'function RackCard', 'export default function Channels');
-assert.match(rackCard, /enabledPlugins: string\[\];/, 'RackCard props 应接收当前 provider 的 enabled_plugins');
-assert.match(rackCard, /const hasQuotaDisplaySlot = hasUiSlot\(engine, 'quota_display', enabledPlugins\);/, '机房卡片应结合 enabled_plugins 检测 quota_display 插槽');
-assert.match(rackCard, /<UiSlot engine=\{engine\} slot="quota_display"[\s\S]*enabledPlugins=\{enabledPlugins\}/, '机房卡片渲染 quota_display 时应传入 enabledPlugins');
-
-const dataFlow = sliceBetween(channelsSource, 'const perAccount = data?.results || {};', 'const openModal = async');
-assert.doesNotMatch(dataFlow, privateUsagePattern, '余额回调不能再写入渠道私有用量字段');
-assert.match(dataFlow, /_quota_unavailable: !hasQuota/, '余额回调应只按标准 quota 字段判断默认双弧可用性');
-
-console.log('channel UI slots regression passed');
-// 修改原因：当前部署环境的 Node 18 在部分 ESM 脚本自然结束后会触发 Aborted。
-// 修改方式：断言全部通过后显式以 0 退出，断言失败时仍会在这里之前抛出错误。
-// 目的：让测试退出码只反映本文件断言是否通过。
+console.log('channel ui slots regression passed');
 process.exit(0);

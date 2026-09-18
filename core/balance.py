@@ -59,17 +59,6 @@ BALANCE_TEMPLATES: Dict[str, Dict[str, Any]] = {
             "value_type": "'quota'",
         },
     },
-    "kimi-plan": {
-        "endpoint": "https://api.kimi.com/coding/v1/usages",
-        "method": "GET",
-        "auth": "bearer",
-        "mapping": {
-            "total": "usage.limit",
-            "used": "usage.used",
-            "available": "usage.remaining",
-            "value_type": "'amount'",
-        },
-    },
     "kimi": {
         "endpoint": "https://api.moonshot.cn/v1/users/me/balance",
         "method": "GET",
@@ -240,7 +229,6 @@ _URL_TEMPLATE_MAP: list[tuple[str, str]] = [
     ("deepseek.com", "deepseek"),
     ("deepseek.ai", "deepseek"),
     ("moonshot.cn", "kimi"),
-    ("kimi.com", "kimi-plan"),
     ("siliconflow.cn", "siliconflow"),
     ("siliconcloud.cn", "siliconflow"),
     ("openrouter.ai", "openrouter"),
@@ -425,6 +413,9 @@ async def query_provider_balance(client, provider: Dict[str, Any]) -> Dict[str, 
         "used": None,
         "available": None,
         "percent": None,
+        "quota_inner": None,
+        "quota_outer": None,
+        "level": None,
         "expires_at": None,
         "raw": raw_data,
         "error": None,
@@ -442,6 +433,24 @@ async def query_provider_balance(client, provider: Dict[str, Any]) -> Dict[str, 
         # 纯额度模式：只有 available，以 100 为基准算百分比色彩
         result["available"] = _to_float(extract_value(raw_data, mapping.get("available")))
         result["currency"] = extract_value(raw_data, mapping.get("currency"))
+    elif value_type == "plan":
+        # 修改原因：套餐类渠道（如 Kimi Coding）返回滚动窗口 + 周期配额 + 会员层级，固定枚举字段装不下。
+        # 修改方式：新增 plan 类型，提取双窗口百分比（quota_inner/quota_outer）和 level 标签，同时保留周期配额明细。
+        # 目的：让普通 Key 渠道复用前端 OAuth 双弧渲染，层级文本进 badge，不引入新概念。
+        result["quota_inner"] = _to_float(extract_value(raw_data, mapping.get("quota_inner")))
+        result["quota_outer"] = _to_float(extract_value(raw_data, mapping.get("quota_outer")))
+        level_raw = extract_value(raw_data, mapping.get("level"))
+        if isinstance(level_raw, str) and level_raw.startswith("LEVEL_"):
+            level_raw = level_raw[len("LEVEL_"):]
+        result["level"] = level_raw
+        result["total"] = _to_float(extract_value(raw_data, mapping.get("total")))
+        result["used"] = _to_float(extract_value(raw_data, mapping.get("used")))
+        result["available"] = _to_float(extract_value(raw_data, mapping.get("available")))
+        if result["total"] is not None and result["total"] > 0:
+            if result["available"] is not None:
+                result["percent"] = round(result["available"] / result["total"] * 100, 2)
+            elif result["used"] is not None:
+                result["percent"] = round((result["total"] - result["used"]) / result["total"] * 100, 2)
     else:
         result["total"] = _to_float(extract_value(raw_data, mapping.get("total")))
         result["used"] = _to_float(extract_value(raw_data, mapping.get("used")))

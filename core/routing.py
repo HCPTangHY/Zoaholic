@@ -436,7 +436,7 @@ def get_provider_list(
     provider_rules: List[str],
     config: Dict[str, Any],
     request_model: str,
-    app: "FastAPI"
+    app: "FastAPI",
 ) -> List[Dict[str, Any]]:
     """
     根据 provider 规则列表生成 provider 配置列表
@@ -576,7 +576,9 @@ async def get_matching_providers(
     request_model: str,
     config: Dict[str, Any],
     api_index: int,
-    app: "FastAPI"
+    app: "FastAPI",
+    _skip_virtual: bool = False,
+    skip_virtual: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     获取与请求模型匹配的所有 provider
@@ -594,14 +596,22 @@ async def get_matching_providers(
     # 修改方式：命中 preferences.virtual_models 后，先校验 API Key model 授权，再复用普通过滤逻辑。
     # 目的：让虚拟模型只替换“候选渠道生成”阶段，不改变黑名单、分组和后续调度行为。
     from core.virtual_routing import resolve_virtual_model
-    virtual_providers = resolve_virtual_model(request_model, config, api_index, app)
+    virtual_providers = None if (_skip_virtual or skip_virtual) else resolve_virtual_model(request_model, config, api_index, app)
+    # 即使显式转出链路，也不能绕过虚拟模型入口授权。
     if virtual_providers is not None:
         if not _is_virtual_model_authorized(request_model, config, api_index):
             return []
         filtered = _filter_provider_list(virtual_providers, request_model, config, api_index)
         if filtered:
-            return filtered
+            manager = getattr(app.state, "channel_manager", None)
+            if manager is not None and hasattr(manager, "get_available_providers"):
+                filtered = await manager.get_available_providers(filtered)
+            if filtered:
+                return filtered
         # chain 全挂 → fallthrough 到常规路由
+
+    if (skip_virtual or _skip_virtual) and not _is_virtual_model_authorized(request_model, config, api_index):
+        return []
 
     provider_rules = []
 
@@ -618,7 +628,8 @@ async def get_right_order_providers(
     api_index: int,
     scheduling_algorithm: str,
     app: "FastAPI",
-    request_total_tokens: Optional[int] = None
+    request_total_tokens: Optional[int] = None,
+    *, skip_virtual: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     获取按正确顺序排列的 provider 列表（应用调度算法和过滤）
@@ -637,7 +648,13 @@ async def get_right_order_providers(
     Raises:
         HTTPException: 当没有可用的 provider 时
     """
-    matching_providers = await get_matching_providers(request_model, config, api_index, app)
+    # 修改原因：skip_virtual 形参之前没有传给首个 get_matching_providers 调用，
+    # 导致 handler 的 _leave_virtual_route 重新拿到虚拟链候选，随后被 regular 过滤清零，
+    # 普通池回落在线上永远不可达（表现为 All API keys are rate limited）。
+    # 修改方式：首个候选查询即透传 skip_virtual。
+    # 目的：调用方要求跳过虚拟路由时，直接返回普通池候选。
+    matching_providers = await get_matching_providers(request_model, config, api_index, app, skip_virtual=skip_virtual)
+    is_virtual_candidates = any(p.get("_virtual_route_provider") for p in matching_providers)
 
     # 筛查是否该请求token数量超过渠道tpr
     if request_total_tokens and matching_providers:
@@ -683,6 +700,16 @@ async def get_right_order_providers(
     if app.state.channel_manager.cooldown_period > 0 and num_matching_providers > 1:
         matching_providers = await app.state.channel_manager.get_available_providers(matching_providers)
         num_matching_providers = len(matching_providers)
+        if not matching_providers and is_virtual_candidates:
+            # 虚拟链路全部 cooldown 后，转入原模型的普通候选池。
+            matching_providers = await get_matching_providers(
+                request_model, config, api_index, app, skip_virtual=True
+            )
+            num_matching_providers = len(matching_providers)
+            if num_matching_providers > 1:
+                # 普通池回落同样过滤冷却，链上刚被冷却的渠道不应在回落时被立刻重试。
+                matching_providers = await app.state.channel_manager.get_available_providers(matching_providers)
+                num_matching_providers = len(matching_providers)
         if not matching_providers:
             raise HTTPException(status_code=503, detail="No available providers at the moment")
 

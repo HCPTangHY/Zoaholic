@@ -827,6 +827,21 @@ async def fetch_claude_models(client, provider):
     return models
 
 
+def claude_stream_classifier(event):
+    """Anthropic 协议事件分类：True=可暂存，False=携带输出，None=不表态。"""
+    if not isinstance(event, dict):
+        return None
+    kind = event.get("type", "")
+    if kind == "ping":
+        return True
+    if kind == "message_start":
+        return not (event.get("message") or {}).get("content")
+    if kind == "content_block_start":
+        block = event.get("content_block") or {}
+        return block.get("type") in {"text", "thinking"} and not (block.get("text") or block.get("thinking"))
+    return None
+
+
 def register():
     """注册 Claude 渠道到注册中心"""
     from .registry import register_channel
@@ -842,6 +857,7 @@ def register():
         passthrough_adapter=get_claude_passthrough_meta,
         response_adapter=fetch_claude_response,
         stream_adapter=fetch_claude_response_stream,
+        stream_event_classifier=claude_stream_classifier,
         models_adapter=fetch_claude_models,
         source="builtin",
     )

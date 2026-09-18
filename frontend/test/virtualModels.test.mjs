@@ -1,21 +1,36 @@
 import assert from 'node:assert/strict';
-import {
+import { buildSync } from 'esbuild';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+// 修改原因：本测试断言 src/lib/virtualModels.ts 的运行时行为，但项目没有 TS 测试 runner，原 .ts 测试文件从未能执行。
+// 修改方式：用前端自带的 esbuild 把源码编译到临时目录，再动态 import；测试本体保持 .mjs，无需新增依赖。
+// 目的：让虚拟模型排序、测试快照和链条摘要的行为级回归检查真实可运行。
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const outDir = mkdtempSync(path.join(tmpdir(), 'virtualmodels-test-'));
+buildSync({
+  entryPoints: [path.resolve(__dirname, '../src/lib/virtualModels.ts')],
+  outfile: path.join(outDir, 'virtualModels.mjs'),
+  bundle: true,
+  format: 'esm',
+  platform: 'node',
+});
+const {
   buildProviderListItems,
   buildVirtualProviderEntries,
   buildVirtualProviderPanelItems,
   buildVirtualRouteTestProvider,
   summarizeVirtualChain,
-} from '../src/lib/virtualModels.js';
+} = await import(pathToFileURL(path.join(outDir, 'virtualModels.mjs')).href);
 
-// 修改原因：虚拟模型从混入渠道列表改为独立手风琴后，排序、测试快照和展示摘要都需要独立规则。
-// 修改方式：用 Node 原生 assert 覆盖虚拟伪渠道、真实渠道权重排序、测试 provider 构造和 chain 摘要。
-// 目的：在不新增 npm 依赖的前提下，为本次 UI 重构保留可执行的回归检查。
 const virtualModels = {
   'deepseek-chat': {
     enabled: true,
     chain: [
-      { type: 'model' as const, value: 'deepseek-chat' },
-      { type: 'channel' as const, value: '打野硅基', model: 'deepseek-v4' },
+      { type: 'model', value: 'deepseek-chat' },
+      { type: 'channel', value: '打野硅基', model: 'deepseek-v4' },
     ],
   },
   'disabled-route': {
@@ -83,3 +98,4 @@ assert.deepEqual(
 );
 
 console.log('virtual model list helpers passed');
+process.exit(0);
