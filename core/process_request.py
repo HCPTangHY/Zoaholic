@@ -52,6 +52,7 @@ async def process_request(
     force_api_key: Optional[str] = None,
     api_key_info: Optional[Dict[str, Any]] = None,
     key_enabled_plugins: Optional[List[str]] = None,
+    dialect_id: Optional[str] = None,
 ) -> Response:
     """
     向单个 provider 发送请求并处理响应
@@ -325,6 +326,15 @@ async def process_request(
                         app=app,
                         debug=is_debug
                     )
+
+            # Native passthrough never enters this function. Render the client dialect
+            # after stream-mode adaptation, but before logging consumes the body.
+            if dialect_id == "openai-responses" and isinstance(response, LoggingStreamingResponse):
+                from core.dialects.responses_stream import render_responses_iterator
+                response.body_iterator = render_responses_iterator(
+                    response.body_iterator, request.model, stream=client_wants_stream,
+                )
+                response.dialect_id = dialect_id
 
             # 更新成功计数和首次响应时间
             _fire_and_forget_channel_stats(

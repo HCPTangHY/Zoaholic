@@ -934,6 +934,8 @@ class ModelRequestHandler:
                 if _callable_accepts_keyword(process_fn, "key_enabled_plugins"):
                     process_extra_kwargs["key_enabled_plugins"] = _key_enabled_plugins
 
+                if process_fn is process_request and _callable_accepts_keyword(process_fn, "dialect_id"):
+                    process_extra_kwargs["dialect_id"] = dialect_id
                 if process_fn is process_request_passthrough:
                     response = await process_fn(
                         attempt_request_data, provider, background_tasks, self.app,

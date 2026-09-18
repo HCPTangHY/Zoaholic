@@ -16,7 +16,7 @@ import asyncio
 import contextvars
 from time import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Any
+from typing import Optional
 
 from pydantic import ValidationError
 from fastapi import Request, BackgroundTasks
@@ -422,18 +422,31 @@ class StatsMiddleware:
                     if not message.get("more_body", False):
                         break
                 body_bytes = b"".join(body_chunks)
+                # The replay buffer owns the bytes now. Keeping the original chunks
+                # (and the last ASGI message) doubles large bodies for the whole stream.
+                body_chunks.clear()
+                del message
 
                 if body_bytes:
                     try:
-                        # 使用 asyncio.to_thread 避免大请求体阻塞事件循环
-                        parsed_body = json_loads(body_bytes)
-                    except json.JSONDecodeError:
+                        # orjson's scratch allocation scales with the input length;
+                        # multi-megabyte inline images can create a very large peak.
+                        # This parse is only for middleware metadata/moderation; the
+                        # downstream app still receives the exact original bytes.
+                        if len(body_bytes) >= 8 * 1024 * 1024:
+                            parsed_body = await asyncio.to_thread(json.loads, body_bytes)
+                        else:
+                            parsed_body = json_loads(body_bytes)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
                         parsed_body = None
 
             # 获取原始数据保留时间配置（小时），默认为24小时
-            raw_data_retention_hours = safe_get(
-                config, "preferences", "log_raw_data_retention_hours", default=24
+            # 不用 safe_get 读取最终数值：它会把显式 0 当作缺省值，导致无法关闭原始日志。
+            raw_data_retention_hours = safe_get(config, "preferences", default={}).get(
+                "log_raw_data_retention_hours", 24
             )
+            if raw_data_retention_hours is None:
+                raw_data_retention_hours = 24
         
             # 如果配置了保留时间，保存请求头和请求体
             if raw_data_retention_hours > 0:
@@ -447,7 +460,12 @@ class StatsMiddleware:
                 # 保存请求体（使用深度截断，保留结构同时限制大小）
                 # 使用 asyncio.to_thread 避免大请求体阻塞事件循环
                 if body_bytes:
-                    current_info["request_body"] = await asyncio.to_thread(truncate_for_logging, body_bytes)
+                    # Reuse parsed containers instead of decoding/parsing the same
+                    # large JSON again just to produce a bounded diagnostic log.
+                    current_info["request_body"] = await asyncio.to_thread(
+                        truncate_for_logging,
+                        parsed_body if isinstance(parsed_body, (dict, list)) else body_bytes,
+                    )
             
                 # 设置过期时间
                 current_info["raw_data_expires_at"] = datetime.now(timezone.utc) + timedelta(hours=raw_data_retention_hours)
@@ -455,11 +473,13 @@ class StatsMiddleware:
             # 创建新的 receive 函数，重放已读取的 body
             body_sent = False
             async def receive_wrapper() -> Message:
-                nonlocal body_sent
+                nonlocal body_sent, body_bytes
                 if method == "POST" and "application/json" in content_type:
                     if not body_sent:
                         body_sent = True
-                        return {"type": "http.request", "body": body_bytes, "more_body": False}
+                        replay_body = body_bytes
+                        body_bytes = b""  # Ownership passes to the downstream receiver.
+                        return {"type": "http.request", "body": replay_body, "more_body": False}
                     # 等待真正的 disconnect 消息，而不是返回空 body
                     # 这对于 StreamingResponse 的正确迭代很重要
                     return await receive()
@@ -510,7 +530,12 @@ class StatsMiddleware:
 
                         if enable_moderation and moderated_content:
                             background_tasks_for_moderation = BackgroundTasks()
-                            moderation_response = await self._moderate_content(moderated_content, api_index, background_tasks_for_moderation, app)
+                            moderation_response = await self._moderate_content(
+                                moderated_content,
+                                api_index,
+                                background_tasks_for_moderation,
+                                Request(scope, receive=receive_wrapper),
+                            )
                             is_flagged = moderation_response.get("results", [{}])[0].get("flagged", False)
 
                             if is_flagged:
@@ -544,14 +569,20 @@ class StatsMiddleware:
                         response_headers = message.get("headers", [])
                     await send(message)
 
+                # Validation/moderation is finished. These temporary objects must
+                # not pin another full JSON tree while the downstream SSE is open.
+                # Downstream validation still receives the original, unchanged bytes.
+                parsed_body = None
+                request_model = None
+                moderated_content = None
+
                 # 调用下游应用
                 await self.app(scope, receive_wrapper, send_wrapper)
 
             except ValidationError as e:
                 logger.error(
-                    "Invalid request body: %s, errors: %s",
-                    json.dumps(parsed_body, indent=2, ensure_ascii=False) if parsed_body else "None",
-                    e.errors(),
+                    "Invalid request body, errors: %s",
+                    e.errors(include_input=False),
                 )
                 # 将 validation 错误信息格式化为可读字符串
                 error_details = "; ".join([f"{err['loc'][-1]}: {err['msg']}" for err in e.errors()[:3]])
@@ -581,7 +612,7 @@ class StatsMiddleware:
             reset_byok_context(byok_context_tokens)
 
     async def _moderate_content(
-        self, content: str, api_index: int, background_tasks: BackgroundTasks, app: Any
+        self, content: str, api_index: int, background_tasks: BackgroundTasks, http_request: Request
     ):
         """
         调用 /v1/moderations 路由进行道德审查。
@@ -590,7 +621,13 @@ class StatsMiddleware:
         from routes.moderations import moderations  # 延迟导入避免循环
 
         moderation_request = ModerationRequest(input=content)
-        response = await moderations(moderation_request, background_tasks, api_index)
+        # 路由首参是当前 HTTP 请求；显式关键字传参，避免审核请求和 key 索引错位。
+        response = await moderations(
+            http_request=http_request,
+            request=moderation_request,
+            background_tasks=background_tasks,
+            api_index=api_index,
+        )
 
         # 读取流式响应的内容
         moderation_result = b""

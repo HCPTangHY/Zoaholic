@@ -1155,6 +1155,16 @@ async def fetch_gemini_models(client, provider):
         'x-goog-api-key': api_key,
     }
 
+    # 第三方网关的推理端点可能使用 Gemini 认证，而共用 /models 入口只收 Bearer。
+    # 保持首次请求的 Gemini 行为；仅在非 Google 上游明确拒绝认证时，在同一 URL 重试一次。
+    host = (urlparse(url).hostname or '').lower()
+    allow_bearer_fallback = bool(api_key) and bool(host) and not (
+        host == 'googleapis.com' or host.endswith('.googleapis.com')
+    )
+    bearer_fallback_used = False
+    custom_headers = (provider.get('preferences') or {}).get('headers') or {}
+    has_auth_override = any(str(name).lower() == 'authorization' for name in custom_headers)
+
     # 尽量减少请求次数：优先用更大的 pageSize；同时加上上限防止异常循环
     page_size = 1000
     max_pages = 20
@@ -1170,22 +1180,34 @@ async def fetch_gemini_models(client, provider):
             params['pageToken'] = page_token
 
         response = await client.get(url, headers=headers, params=params)
+        if (
+            response.status_code in (401, 403)
+            and allow_bearer_fallback
+            and not bearer_fallback_used
+            and not has_auth_override
+        ):
+            # 不改地址/引擎，不替换 x-goog-api-key，也不反复尝试无效凭据。
+            bearer_fallback_used = True
+            headers = {**headers, 'Authorization': f'Bearer {api_key}'}
+            response = await client.get(url, headers=headers, params=params)
         response.raise_for_status()
 
         data = response.json()
         if not isinstance(data, dict):
             break
 
-        # Gemini 返回格式: {"models": [{"name": "models/gemini-pro", ...}], "nextPageToken": "..."}
-        for m in data.get('models', []) or []:
+        # Gemini: models[].name；兼容网关的共用入口也可能返回 OpenAI 的 data[].id。
+        openai_format = not isinstance(data.get('models'), list) and isinstance(data.get('data'), list)
+        entries = data.get('data', []) if openai_format else data.get('models', [])
+        for m in entries or []:
             if not isinstance(m, dict):
                 continue
-            name = m.get('name', '')
+            name = m.get('id' if openai_format else 'name', '')
             if not isinstance(name, str):
                 continue
 
-            # 移除 "models/" 前缀
-            if name.startswith('models/'):
+            # 仅移除 Gemini 资源前缀；OpenAI id 中的 models/ 可能是模型名本身。
+            if not openai_format and name.startswith('models/'):
                 name = name[7:]
 
             name = name.strip()
@@ -1198,6 +1220,8 @@ async def fetch_gemini_models(client, provider):
                 logger.warning(f"[Gemini] models list truncated at {max_total} items")
                 return models
 
+        if openai_format:
+            break
         page_token = data.get('nextPageToken') or data.get('next_page_token')
         if not page_token:
             break
