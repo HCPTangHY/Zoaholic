@@ -17,10 +17,10 @@ writeFileSync(path.join(tempDir, 'package.json'), '{"type":"module"}\n');
 // 修改原因：临时编译目录不在 frontend 下，Node ESM 默认无法从那里解析 react 和 react-dom。
 // 修改方式：把 frontend/node_modules 软链接到临时目录，只改变测试沙箱内的模块解析路径。
 // 目的：让测试渲染真实 React 组件，同时不改动项目依赖。
-symlinkSync(path.join(frontendRoot, 'node_modules'), path.join(tempDir, 'node_modules'), 'dir');
+symlinkSync(path.join(frontendRoot, 'node_modules'), path.join(tempDir, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
 
-execFileSync('npx', [
-  'tsc',
+execFileSync(process.execPath, [
+  path.join(frontendRoot, 'node_modules/typescript/bin/tsc'),
   '--target', 'ES2020',
   '--module', 'ES2020',
   '--moduleResolution', 'Bundler',

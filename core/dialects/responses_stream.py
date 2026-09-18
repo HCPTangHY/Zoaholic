@@ -12,6 +12,9 @@ import logging
 import time
 import uuid
 
+from core.stream_utils import close_async_iterator
+from core.stream_errors import UpstreamStreamError
+
 logger = logging.getLogger(__name__)
 
 
@@ -192,7 +195,7 @@ async def render_responses_iterator(source, model: str, *, stream: bool):
                 yield json.dumps(await render_responses_response(value, model), ensure_ascii=False)
         finally:
             if hasattr(source, "aclose"):
-                await source.aclose()
+                await close_async_iterator(source)
         return
     renderer = ResponsesStreamRenderer(model)
     decoder = codecs.getincrementaldecoder("utf-8")()
@@ -225,6 +228,11 @@ async def render_responses_iterator(source, model: str, *, stream: bool):
                 yield event
         for event in renderer.finish():
             yield event
+    except UpstreamStreamError as exc:
+        # Preserve upstream status/code for LoggingStreamingResponse and key rules.
+        # Do not turn a 429/503 into a generic conversion error.
+        for event in renderer.finish(error=exc.error):
+            yield event
     except Exception:
         logger.exception("Failed to convert upstream stream to Responses events")
         for event in renderer.finish(error={"code": "upstream_stream_error",
@@ -232,4 +240,4 @@ async def render_responses_iterator(source, model: str, *, stream: bool):
             yield event
     finally:
         if hasattr(source, "aclose"):
-            await source.aclose()
+            await close_async_iterator(source)

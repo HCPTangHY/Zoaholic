@@ -21,6 +21,7 @@ function WeightInput({
   onClick?: (e: React.MouseEvent) => void;
 }) {
   const [draft, setDraft] = useState<string>(String(value));
+  const cancelCommitRef = useRef(false);
 
   // 外部权重变化（例如保存成功后刷新）时，同步回本地草稿，避免显示陈旧值。
   useEffect(() => {
@@ -28,6 +29,11 @@ function WeightInput({
   }, [value]);
 
   const commit = () => {
+    if (cancelCommitRef.current) {
+      cancelCommitRef.current = false;
+      setDraft(String(value));
+      return;
+    }
     const parsed = parseInt(draft, 10);
     const next = Number.isNaN(parsed) ? 0 : parsed;
     if (next !== value) {
@@ -49,6 +55,7 @@ function WeightInput({
           e.preventDefault();
           (e.target as HTMLInputElement).blur();
         } else if (e.key === 'Escape') {
+          cancelCommitRef.current = true;
           setDraft(String(value));
           (e.target as HTMLInputElement).blur();
         }

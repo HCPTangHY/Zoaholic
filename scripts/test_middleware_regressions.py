@@ -158,7 +158,8 @@ class MiddlewareRegressions(unittest.IsolatedAsyncioTestCase):
             await send({'type': 'http.response.body', 'body': b'data: two\n\n', 'more_body': False})
 
         middleware = m.StatsMiddleware(downstream, debug=False)
-        middleware._dialect_prefixes = []
+        # Force the standard-auth moderation branch, not a dialect route.
+        middleware._dialect_path_regexes = []
         sentinel = {'sentinel': True}
         token = m.request_info.set(sentinel)
         try:
@@ -166,7 +167,7 @@ class MiddlewareRegressions(unittest.IsolatedAsyncioTestCase):
                  patch.object(m, 'DISABLE_DATABASE', True), \
                  patch.object(m, 'is_global_ip_blocked', return_value=False), \
                  patch.object(m, 'is_key_ip_blocked', return_value=False), \
-                 patch.object(m, 'on_request_start'), patch.object(m, 'on_request_end'), \
+                 patch.object(m, 'on_request_model'), patch.object(m, 'on_request_start'), patch.object(m, 'on_request_end'), \
                  patch.object(m, 'enqueue_stats') as stats, \
                  patch.object(m, 'logger') as logger, \
                  patch.object(m, 'truncate_for_logging', side_effect=truncate), \

@@ -29,7 +29,7 @@ assert.match(buildRowQuota, /id: 'balance', label: '余额'/, '普通余额模�
 assert.match(fullRowSource, /const rowQuota = buildRowQuota\(bal, oauthAccount, isOAuthEngine\);/, 'Key 行应该通过统一 RowQuota 构建 OAuth 与普通 balance 数据');
 assert.match(fullRowSource, /const rowQuotaPair = getQuotaPairFromGauges\(rowQuota\.gauges\);/, 'Key 行默认边框应从 gauges 派生 inner 和 outer');
 const overlayBlock = sliceBetween(fullRowSource, '{showRowDecorations && rowQuotaPair && (', '{showRowDecorations && slotPayloadAvailable && hasKeyBackgroundSlot');
-assert.match(overlayBlock, /<QuotaBorderOverlay quotaInner=\{rowQuotaPair\.quota_inner\} quotaOuter=\{rowQuotaPair\.quota_outer\} \/>/, 'QuotaBorderOverlay 应该接收统一的 quota pair');
+assert.match(overlayBlock, /<QuotaBorderOverlay quotaInner=\{rowQuotaPair\.quota_inner\} quotaOuter=\{rowQuotaPair\.quota_outer\} label=\{bal\?\.level\} \/>/, 'QuotaBorderOverlay 应该接收统一的 quota pair');
 assert.match(overlayBlock, /hasKeyBorderSlot[\s\S]*<UiSlot engine=\{formData\.engine\} slot="key_border"/, 'key_border 插槽应替代默认边框');
 assert.match(fullRowSource, /oauthAccount\.status === 'active' \? '已连接' : oauthAccount\.status === 'error' \? '刷新失败' : '冷却中'/, 'OAuth Key 行应保留账号状态标识');
 assert.match(fullRowSource, /key_status\/re_enable/, '冷却 Key 行应保留恢复按钮');

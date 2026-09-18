@@ -323,7 +323,8 @@ async def render_responses_response(
         ]
     }
     """
-    if canonical_response.get("error"):
+    # Make explicit re-rendering safe, including native failed Responses objects.
+    if canonical_response.get("object") == "response" or canonical_response.get("error"):
         return canonical_response
     from .responses_stream import ResponsesStreamRenderer
     renderer = ResponsesStreamRenderer(model)

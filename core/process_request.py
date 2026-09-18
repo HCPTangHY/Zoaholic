@@ -335,10 +335,15 @@ async def process_request(
             # after stream-mode adaptation, but before logging consumes the body.
             if dialect_id == "openai-responses" and isinstance(response, LoggingStreamingResponse):
                 from core.dialects.responses_stream import render_responses_iterator
-                response.body_iterator = render_responses_iterator(
-                    response.body_iterator, request.model, stream=client_wants_stream,
+                from core.stream_utils import OwnedAsyncIterator
+                source = response.body_iterator
+                response.body_iterator = OwnedAsyncIterator(
+                    render_responses_iterator(source, request.model, stream=client_wants_stream),
+                    source,
                 )
                 response.dialect_id = dialect_id
+                # Protocol metadata alone is not proof that conversion ran.
+                response.rendered_dialect_id = dialect_id
 
             # 流式渠道结果等待发送结束；非流式内部消费者不经过 ASGI，保持原有统计入口。
             stats_args = (current_info["request_id"], channel_id, request.model, current_info["api_key"])
