@@ -49,6 +49,10 @@ htmlcov/
 **/dist/
 **/.vite/
 **/.cache/
+*.tsbuildinfo
+
+# Runtime/test logs are local output, not source files.
+*.log
 
 npm-debug.log*
 yarn-debug.log*
@@ -91,10 +95,41 @@ plugins/secret_plugins/
 # alembic.ini
 
 .limcode/
-test/*
-# 修改原因：根级 test/ 已清理为纯回归测试目录，test_*.py 文件需要纳入版本控制，脚本和数据文件仍忽略。
-# 修改方式：对 test/ 下的 test_*.py 追加例外；frontend/test 保持原有例外，并修正此前例外规则的拼写错误。
-# 目的：新增回归测试无需 force-add，同时避免本地脚本、缓存和数据文件进入仓库。
-!test/test_*.py
-!frontend/test/
-!frontend/test/**
+# Only root test/ has a restricted allowlist; do not match frontend/test/.
+/test/*
+!/test/test_*.py
+# frontend/test/ and tests/ source files are tracked normally.
+# Do not add !frontend/test/**: it would re-include caches and logs.
+
+# Packaging / isolated test environments
+build/
+.eggs/
+.tox/
+.nox/
+pip-wheel-metadata/
+.hypothesis/
+
+# Local operational scripts and scratch output
+.tmp/
+.temp/
+/tmp/
+/temp/
+
+# Test reports (keep source tests and dependency lockfiles versioned)
+.coverage.*
+/coverage.xml
+/junit.xml
+/junit-*.xml
+test-results/
+test-reports/
+playwright-report/
+blob-report/
+.nyc_output/
+yarn-error.log*
+
+# New root-level ad-hoc tests and explicitly local suites are not project tests.
+/test_*.py
+/tests/local/
+/tests/scratch/
+/test/local/
+/test/scratch/

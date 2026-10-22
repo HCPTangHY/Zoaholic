@@ -55,6 +55,8 @@ DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 600))
 DEFAULT_KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", 15))
 # DEBUG 环境变量支持 true/false/1/0/yes/no
 is_debug = env_bool("DEBUG", False)
+# API 文档（/docs /redoc /openapi.json /docs/markdown）默认关闭，需显式开启
+ENABLE_API_DOCS = env_bool("ENABLE_API_DOCS", False)
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
 
 # 从 pyproject.toml 读取版本号
@@ -973,7 +975,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to close shared fetch client: {e}")
 
-app = FastAPI(lifespan=lifespan, debug=is_debug)
+app = FastAPI(
+    lifespan=lifespan,
+    debug=is_debug,
+    # 修改原因：/docs /redoc /openapi.json 默认公开会把全部端点结构暴露给匿名访问者。
+    # 修改方式：默认关闭，仅当 ENABLE_API_DOCS=true 时开启（开发/内网环境显式声明）。
+    # 目的：生产环境收敛信息面；开发体验可通过环境变量恢复。
+    docs_url="/docs" if ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
+)
 app.include_router(api_router)
 app.include_router(oauth_router)
 
@@ -1009,13 +1020,18 @@ def generate_markdown_docs():
 
     return markdown
 
-@app.get("/docs/markdown")
-async def get_markdown_docs():
-    markdown = generate_markdown_docs()
-    return Response(
-        content=markdown,
-        media_type="text/markdown"
-    )
+if ENABLE_API_DOCS:
+    # 修改原因：/docs/markdown 同样基于 app.openapi() 生成完整接口清单，
+    # 仅关闭 FastAPI 默认文档 URL 无法覆盖这个自定义入口。
+    # 修改方式：与 /docs 等共用 ENABLE_API_DOCS 开关，默认不注册。
+    # 目的：避免留下文档旁路。
+    @app.get("/docs/markdown")
+    async def get_markdown_docs():
+        markdown = generate_markdown_docs()
+        return Response(
+            content=markdown,
+            media_type="text/markdown"
+        )
 
 @app.get("/-/health")
 async def health_check():
@@ -1027,8 +1043,8 @@ async def health_check():
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     if exc.status_code == 404:
-        token = await get_api_key(request)
-        logger.error(f"404 Error: {exc.detail} api_key: {token}")
+        # 404 也可能来自管理 API，不应将管理员 JWT 或 API Key 写入日志。
+        logger.error(f"404 Error: {exc.detail}")
     if isinstance(exc.detail, dict) and exc.detail.get("type") == "ip_blocked":
         # 修改原因：IP 黑名单命中需要返回需求指定的 error.type，而默认 403 会变成 permission_denied_error。
         # 修改方式：当依赖鉴权抛出的 detail 带有 type=ip_blocked 时，显式传入 error_type。
@@ -1153,10 +1169,18 @@ if __name__ == '__main__':
     RELOAD = os.getenv("RELOAD", "false").lower() in ("true", "1", "yes")
     
     uvicorn_config = {
-        "host": "0.0.0.0",
+        # 修改原因：直接监听 0.0.0.0 会让外部绕过反向代理直连源站。
+        # 修改方式：监听地址改为 HOST 环境变量可配置，默认保持 0.0.0.0 兼容容器部署；
+        # 裸机反代场景由 systemd 设置 HOST=127.0.0.1。
+        # 目的：收敛源站直连暴露面。
+        "host": os.getenv("HOST", "0.0.0.0"),
         "port": PORT,
         "proxy_headers": True,
-        "forwarded_allow_ips": "*",
+        # 修改原因：forwarded_allow_ips="*" 会让任意直连对端伪造来源 IP。
+        # 修改方式：默认仅信任回环，可通过 FORWARDED_ALLOW_IPS 环境变量覆盖；
+        # 应用层 core/client_ip.py 另有 TRUSTED_PROXIES 控制转发头信任。
+        # 目的：与反向代理拓扑对齐，防止外部直连伪造 X-Forwarded-For。
+        "forwarded_allow_ips": os.getenv("FORWARDED_ALLOW_IPS", "127.0.0.1"),
         # 修改原因：/v1/responses 新增 WebSocket 透传端点，原配置 ws="none" 会让 WS 握手落到 SPA fallback 返回 HTML。
         # 修改方式：启用 websockets 实现（依赖已存在）。
         # 目的：让客户端 WS 连接正常完成 101 升级。

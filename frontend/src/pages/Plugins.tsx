@@ -149,7 +149,7 @@ export default function Plugins() {
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        toastSuccess(data?.detail || `操作失败: HTTP ${res.status}`);
+        toastError(fmtErr({ ...data, error: data?.error?.message ?? data?.error }, `HTTP ${res.status}`), '操作失败');
         return;
       }
 
@@ -157,7 +157,7 @@ export default function Plugins() {
       if (refreshAfter) await fetchAll();
     } catch (e) {
       console.error(e);
-      toastSuccess('操作失败（网络错误）');
+      toastError('操作失败（网络错误）');
     }
   };
 
@@ -180,7 +180,7 @@ export default function Plugins() {
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        toastSuccess(data?.detail || `上传失败: HTTP ${res.status}`);
+        toastError(fmtErr({ ...data, error: data?.error?.message ?? data?.error }, `HTTP ${res.status}`), '上传失败');
         return;
       }
 
@@ -188,7 +188,7 @@ export default function Plugins() {
       await fetchAll();
     } catch (e) {
       console.error(e);
-      toastSuccess('上传失败（网络错误）');
+      toastError('上传失败（网络错误）');
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = '';

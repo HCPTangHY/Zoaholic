@@ -68,12 +68,12 @@ def call(app, token=None, path='/v1/test-admin'):
     return asyncio.run(run())
 
 
-def test_valid_admin_jwt_reaches_management_and_key_routes(gateway):
+def test_valid_admin_jwt_maps_to_admin_not_first_key(gateway):
     token = jwt.issue_jwt({'sub': 'fixture-admin', 'role': 'admin'})
     for path in ['/v1/test-admin', '/v1/test-key']:
         response = call(gateway, token, path)
         assert response.status_code == 200
-        assert response.json()['stats_key'] == ('admin-jwt' if path == '/v1/test-admin' else 'fixture-admin-key')
+        assert response.json()['stats_key'] == 'fixture-admin-key'
         assert token not in response.text
 
 
@@ -118,9 +118,16 @@ def test_admin_jwt_cannot_bypass_ip_blacklists(gateway, monkeypatch, scope):
             seen.append(index)
             return index == 1
         monkeypatch.setattr(middleware, 'is_key_ip_blocked', blocked)
-        monkeypatch.setattr(auth, 'is_key_ip_blocked', blocked)
     assert call(gateway, token).status_code == 403
     if scope == 'key': assert seen == [1]
+
+
+@pytest.mark.parametrize('entries', [[], [{'api': 'a', 'role': 'user'}, {'api': 'b', 'role': 'user'}]])
+def test_missing_admin_mapping_fails_closed(gateway, entries):
+    gateway.state.api_keys_db = entries
+    gateway.state.config['api_keys'] = entries
+    gateway.state.api_list = [entry['api'] for entry in entries]
+    assert call(gateway, jwt.issue_jwt({'role': 'admin'})).status_code == 403
 
 
 def test_single_key_admin_fallback_matches_existing_auth_contract(gateway):
@@ -130,7 +137,7 @@ def test_single_key_admin_fallback_matches_existing_auth_contract(gateway):
     gateway.state.api_list = ['single-fixture-key']
     response = call(gateway, jwt.issue_jwt({'role': 'admin'}))
     assert response.status_code == 200
-    assert response.json()['stats_key'] == 'admin-jwt'
+    assert response.json()['stats_key'] == 'single-fixture-key'
 
 
 def test_login_token_reaches_protected_management_route(gateway, monkeypatch):
@@ -155,8 +162,7 @@ def test_login_token_reaches_protected_management_route(gateway, monkeypatch):
             assert me.status_code == 200
             admin = await client.get('/v1/test-admin', headers=headers)
             assert admin.status_code == 200
-            assert admin.json()['stats_key'] == 'admin-jwt'
-            assert token not in admin.text
+            assert admin.json()['stats_key'] == 'fixture-admin-key'
     asyncio.run(run())
 
 
@@ -173,23 +179,6 @@ def test_byok_identity_still_uses_template_and_rejects_bare_template(gateway):
     assert call(gateway, 'fixture-byok-upstream-secret').status_code == 403
 
 
-
-def test_admin_console_does_not_require_an_api_key_mapping(gateway):
-    # Upstream v1.7.17 deliberately permits admin JWT management independently
-    # of gateway key availability; route-level admin checks still apply.
-    gateway.state.api_keys_db = []
-    gateway.state.config['api_keys'] = []
-    gateway.state.api_list = []
-    response = call(gateway, jwt.issue_jwt({'role': 'admin'}))
-    assert response.status_code == 200
-    assert response.json()['stats_key'] == 'admin-jwt'
-
-
-def test_admin_console_ignores_gateway_quota_exhaustion(gateway, monkeypatch):
-    monkeypatch.setattr(middleware, 'DISABLE_DATABASE', False)
-    gateway.state.quota_registry = SimpleNamespace(
-        has_quota=lambda key: key == 'fixture-admin-key',
-        is_exhausted=lambda key: True,
-    )
-    assert call(gateway, jwt.issue_jwt({'role': 'admin'})).status_code == 200
-    assert call(gateway, 'fixture-admin-key').status_code == 429
+def test_out_of_bounds_admin_mapping_fails_closed(gateway):
+    gateway.state.api_list = ['fixture-user-key']
+    assert call(gateway, jwt.issue_jwt({'role': 'admin'})).status_code == 403

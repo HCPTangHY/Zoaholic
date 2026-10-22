@@ -58,7 +58,7 @@ async def _get_shared_fetch_client() -> httpx.AsyncClient:
         if _shared_fetch_client is not None:
             return _shared_fetch_client
 
-        transport = httpx.AsyncHTTPTransport(http2=True, verify=False, retries=1)
+        transport = httpx.AsyncHTTPTransport(http2=True, verify=True, retries=1)
         limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
         timeout = httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=10.0)
         _shared_fetch_client = httpx.AsyncClient(

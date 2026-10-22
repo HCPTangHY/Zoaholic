@@ -535,6 +535,12 @@ class InterceptorRegistry:
                     result = await interceptor.callback(request_data, request, provider, api_key_info, enabled_plugins)
                     if result is not None:
                         request_data = result
+                # 修改原因：渠道级插件抛出的 HTTPException（如屏蔽词 reject）原先被当成普通错误吞掉，请求照常发往上游。
+                # 修改方式：与 apply_inbound_interceptors 保持一致，HTTPException 记录后原样上抛，其它异常仍只记日志。
+                # 目的：让 Key 级与渠道级拦截器的拒绝语义对齐，渠道级插件也能真正拒绝请求。
+                except HTTPException:
+                    logger.warning(f"Channel inbound interceptor '{interceptor.id}' rejected request")
+                    raise
                 except Exception as e:
                     logger.error(f"Channel inbound interceptor '{interceptor.id}' error: {e}")
         finally:

@@ -12,5 +12,13 @@ services:
       - DB_TYPE=sqlite
       - DB_PATH=/home/data/stats.db
       - CONFIG_STORAGE=db
+      # 安全：以下默认已收紧，按需调整
+      # - TRUSTED_PROXIES=172.16.0.0/12          # 可信反代（默认回环+私网；宿主机 nginx 走网桥时默认即可）
+      # - FORWARDED_ALLOW_IPS=172.17.0.1         # uvicorn 信任的代理地址（默认仅 127.0.0.1）
+      # - ENABLE_API_DOCS=true                   # 开发环境才开放 /docs
+      # - ENABLE_DEBUG_ENDPOINTS=true            # 临时内存排查才开启
+      # - ENABLE_PLUGIN_UPLOAD=false             # 不需要插件上传时关闭
+      # - ENABLE_WORKSPACE_API=false             # 不需要文件读写接口时关闭
+      # - ENABLE_OAUTH_EXPORT=false              # 不需要凭证导出时关闭
       # - DATABASE_URL=postgresql://user:pass@host:5432/dbname
       # - CONFIG_URL=http://file_url/api.yaml  # 可选：远程配置

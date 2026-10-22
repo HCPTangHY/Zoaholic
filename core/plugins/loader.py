@@ -150,8 +150,15 @@ class PluginLoader:
         
         plugin_name = path.stem
         
-        # 检查是否已加载
-        if plugin_name in self._plugins:
+        # 文件名可能带版本号，管理 API 则使用 PLUGIN_INFO.name。
+        # 按路径检测重复加载，注册时统一使用声明的名称。
+        existing = next(
+            (info for info in self._plugins.values()
+             if info.source == "directory" and Path(info.path).resolve() == path.resolve()),
+            None,
+        )
+        if existing is not None:
+            plugin_name = existing.name
             if not overwrite:
                 logger.warning(f"Plugin already loaded: {plugin_name}")
                 return self._plugins[plugin_name]
@@ -176,8 +183,14 @@ class PluginLoader:
             # 提取插件信息
             info = self._extract_plugin_info(module, plugin_name, str(path), "directory")
             
-            self._plugins[plugin_name] = info
-            logger.info(f"Loaded plugin: {plugin_name}")
+            # 与列表、拦截器和管理 API 使用同一个标识，避免声明名与文件名不同导致 404。
+            if info.name in self._plugins:
+                if not overwrite:
+                    logger.warning(f"Plugin already loaded: {info.name}")
+                    return self._plugins[info.name]
+                self.unload_plugin(info.name)
+            self._plugins[info.name] = info
+            logger.info(f"Loaded plugin: {info.name}")
             
             return info
             
@@ -288,9 +301,12 @@ class PluginLoader:
                 
                 info = self._extract_plugin_info(module, plugin_name, str(ep.value), "entry_point")
                 
-                self._plugins[plugin_name] = info
+                if info.name in self._plugins:
+                    logger.warning(f"Plugin already loaded: {info.name}")
+                    continue
+                self._plugins[info.name] = info
                 loaded_plugins.append(info)
-                logger.info(f"Loaded plugin from entry point: {plugin_name}")
+                logger.info(f"Loaded plugin from entry point: {info.name}")
                 
             except Exception as e:
                 error_msg = f"Failed to load entry point {plugin_name}: {e}"
@@ -337,8 +353,12 @@ class PluginLoader:
             
             info = self._extract_plugin_info(module, name, module_path, "dynamic")
             
-            self._plugins[name] = info
-            logger.info(f"Loaded dynamic plugin: {name}")
+            if info.name in self._plugins:
+                if not overwrite:
+                    return self._plugins[info.name]
+                self.unload_plugin(info.name)
+            self._plugins[info.name] = info
+            logger.info(f"Loaded dynamic plugin: {info.name}")
             
             return info
             

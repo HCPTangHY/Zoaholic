@@ -136,6 +136,22 @@ docker run --rm -p 8000:8000 \
 | `ADMIN_API_KEY` / `ADMIN_API_KEYS` | `zk-...` | 当没有任何配置来源时，生成一个“最小可启动配置”（只含管理员 key），便于先启动再进控制台完善配置。 |
 | `DEBUG` | `true/false` | 开启调试日志。 |
 
+### 安全相关（默认已收紧，按需调整）
+
+| 变量 | 默认 | 说明 |
+|---|---:|---|
+| `HOST` | `0.0.0.0` | 监听地址。裸机 + 本机反代（nginx/caddy）部署建议设为 `127.0.0.1`，避免外部绕过反代直连源站；容器部署保持默认。 |
+| `TRUSTED_PROXIES` | 回环 + 私网段 | 可信反向代理列表（逗号分隔的 IP/CIDR）。只有直连对端在此列表内时才信任 `X-Forwarded-For`/`X-Real-IP`；`*` 恢复旧版全信任（不推荐）。 |
+| `FORWARDED_ALLOW_IPS` | `127.0.0.1` | 传给 uvicorn 的可信代理列表。反代不在本机（如 Docker 宿主机 nginx）时设为网桥/代理地址。 |
+| `ENABLE_API_DOCS` | `false` | 是否开放 `/docs` `/redoc` `/openapi.json` `/docs/markdown`。生产环境建议保持关闭。 |
+| `ENABLE_DEBUG_ENDPOINTS` | `false` | 是否注册 `/debug/memory*` 内存诊断端点（开启后仍需管理员凭证，且有调用间隔限制）。 |
+| `ENABLE_PLUGIN_UPLOAD` | `true` | 设为 `false` 可在部署级禁用插件上传。 |
+| `ENABLE_WORKSPACE_API` | `true` | 设为 `false` 可在部署级禁用后端文件读写接口。 |
+| `ENABLE_OAUTH_EXPORT` | `true` | 设为 `false` 可在部署级禁用 OAuth 凭证导出。 |
+| `DEBUG_MEMORY_MIN_INTERVAL` | `2` | debug 内存诊断端点的最小调用间隔（秒）。 |
+
+> 公开探针 `/healthz` `/readyz` 现在只返回最小状态（状态码语义不变）；完整诊断迁移到需管理员凭证的 `GET /v1/health/details`。
+
 ---
 
 ## 配置与持久化（重点：配置入库）

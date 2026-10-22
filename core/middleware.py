@@ -168,23 +168,23 @@ class StatsMiddleware:
     def _get_client_ip(scope: Scope, headers: list) -> str:
         """
         获取客户端真实 IP。
-        优先级：X-Forwarded-For > X-Real-IP > scope["client"]
+
+        修改原因：旧逻辑无条件信任转发头且取 XFF 最左值，可被伪造。
+        修改方式：改用 core.client_ip.resolve_client_ip，仅当直连对端属于
+        TRUSTED_PROXIES 时才解析转发头，并按右向左跳过可信代理取值。
+        目的：IP 黑名单、配额和统计使用的地址不能被外部直连伪造。
         """
         headers_dict = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in headers}
-
-        # X-Forwarded-For: client, proxy1, proxy2 —— 取第一个
-        forwarded_for = headers_dict.get("x-forwarded-for")
-        if forwarded_for:
-            real_ip = forwarded_for.split(",")[0].strip()
-            if real_ip:
-                return real_ip
-
-        real_ip_header = headers_dict.get("x-real-ip")
-        if real_ip_header:
-            return real_ip_header.strip()
-
         client = scope.get("client")
-        return client[0] if client else "unknown"
+        peer_ip = client[0] if client else None
+
+        from core.client_ip import resolve_client_ip
+
+        return resolve_client_ip(
+            peer_ip,
+            forwarded_for=headers_dict.get("x-forwarded-for"),
+            real_ip=headers_dict.get("x-real-ip"),
+        )
 
     def _normalize_endpoint(self, method: str, path: str) -> str:
         """归一化端点路径，将带模型名的路径转换为模板格式"""
@@ -287,20 +287,6 @@ class StatsMiddleware:
             # 修改原因：BYOK token 由“本地模板前缀 + 用户真实上游 key”组成，不会出现在 api_list 中。
             # 修改方式：精确匹配失败后按 app.state.byok_prefixes 做最长前缀匹配，并把统计 token 改为模板 key。
             # 目的：本地鉴权仍按 api_keys 条目计费/限速，真实上游 key 只放入请求上下文供上游调用。
-            # 修改原因：管理后台 /auth/login 下发的是 JWT，不在 api_list 中；方言端点精确匹配修复生效后，
-            #           标准鉴权分支把携带 JWT 的管理页面请求全部 403，统计/日志/渠道等页面不可用。
-            # 修改方式：key 匹配前先校验 JWT 签名与 admin 角色，命中则跳过 key 匹配与配额/余额检查，
-            #           完整校验（含 admin IP 黑名单）由路由层 verify_admin_api_key 执行。
-            # 目的：恢复管理后台访问；无凭证、伪造、过期或非 admin 角色的 JWT 仍被中间件拒绝。
-            _admin_jwt_ok = False
-            if token.count(".") == 2:
-                try:
-                    from core.jwt_utils import is_admin_jwt
-
-                    _admin_jwt_ok = is_admin_jwt(token)
-                except Exception:
-                    _admin_jwt_ok = False
-
             byok_real_key = None
             byok_template_key = None
             try:
@@ -327,13 +313,24 @@ class StatsMiddleware:
                     api_index, byok_template_key, byok_real_key = byok_result
                     token = byok_template_key
 
+            # Standard /v1 management requests carry the JWT issued by /auth/login.
+            # Match verify_api_key's admin mapping before rejecting unknown API keys;
+            # keep only the configured key (never the JWT) in request statistics.
+            from core.auth import _is_admin_jwt_token, _resolve_admin_api_index
+            is_admin_jwt = _is_admin_jwt_token(token)
+            if api_index is None and is_admin_jwt:
+                admin_index = _resolve_admin_api_index(app)
+                if admin_index is not None and 0 <= admin_index < len(api_list):
+                    api_index = admin_index
+                    token = api_list[admin_index]
+
             if api_index is not None:
                 # 修改原因：Key 级启用开关需要在中间件标准鉴权分支同样生效（方言前缀变动时的兜底路径）。
                 # 修改方式：与 core/auth.py 使用同一判定函数；admin JWT 豁免。
                 # 目的：禁用后所有入口一致拒绝。
                 try:
-                    from core.auth import is_api_key_disabled, _is_admin_jwt_token
-                    if is_api_key_disabled(app, api_index) and not _is_admin_jwt_token(token):
+                    from core.auth import is_api_key_disabled
+                    if is_api_key_disabled(app, api_index) and not is_admin_jwt:
                         response = openai_error_response("API Key has been disabled", 403)
                         await response(scope, receive, send)
                         reset_byok_context(byok_context_tokens)
@@ -390,10 +387,6 @@ class StatsMiddleware:
                         await response(scope, receive, send)
                         reset_byok_context(byok_context_tokens)
                         return
-            elif _admin_jwt_ok:
-                # admin JWT：签名与角色已验证；统计 token 改记为固定标识，
-                # 避免原始 JWT 被写入统计库。后续权限由路由层 verify_admin_api_key 判定。
-                token = "admin-jwt"
             else:
                 response = openai_error_response("Invalid or missing API Key", 403)
                 await response(scope, receive, send)

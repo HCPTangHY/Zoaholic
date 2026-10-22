@@ -3,10 +3,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from db import DISABLE_DATABASE
+from routes.deps import rate_limit_dependency, verify_admin_api_key
 
 router = APIRouter()
 
@@ -125,15 +126,43 @@ def _build_health_payload(app, *, readiness: bool) -> tuple[dict[str, Any], int]
     return payload, status_code
 
 
+def _public_probe_payload(app, *, readiness: bool) -> tuple[dict[str, Any], int]:
+    """公开探针的最小响应。
+
+    修改原因：匿名 /healthz 与 /readyz 曾返回版本、启动时间、渠道/Key 数量、
+    内存与连接池详情（连接池标识可能含代理凭证）。
+    修改方式：对外只保留探活/就绪判定所需的 status 与时间戳，
+    状态码语义（200/503）与旧版完全一致。
+    目的：健康探针可继续匿名使用，详细诊断移至管理员接口。
+    """
+    full_payload, status_code = _build_health_payload(app, readiness=readiness)
+    return {
+        "status": full_payload["status"],
+        "probe": full_payload["probe"],
+        "timestamp": full_payload["timestamp"],
+    }, status_code
+
+
 @router.get("/healthz")
 async def healthz(request: Request):
-    """存活探针：进程存活且事件循环正常即返回 200"""
-    payload, status_code = _build_health_payload(request.app, readiness=False)
+    """存活探针：进程存活且事件循环正常即返回 200（仅返回状态，不含诊断详情）"""
+    payload, status_code = _public_probe_payload(request.app, readiness=False)
     return JSONResponse(status_code=status_code, content=payload)
 
 
 @router.get("/readyz")
 async def readyz(request: Request):
-    """就绪探针：要求启动完成、配置已加载、运行时组件已初始化"""
+    """就绪探针：要求启动完成、配置已加载、运行时组件已初始化（仅返回状态）"""
+    payload, status_code = _public_probe_payload(request.app, readiness=True)
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+@router.get("/v1/health/details", dependencies=[Depends(rate_limit_dependency)])
+async def health_details(request: Request, token: str = Depends(verify_admin_api_key)):
+    """管理员健康详情：包含版本、启动时间、各组件检查与运行时指标。
+
+    原 /healthz 完整载荷迁移至此，需管理员凭证；连接池标识已在
+    metrics 层脱敏，不再包含代理凭证。
+    """
     payload, status_code = _build_health_payload(request.app, readiness=True)
     return JSONResponse(status_code=status_code, content=payload)

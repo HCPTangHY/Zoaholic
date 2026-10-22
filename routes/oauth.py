@@ -7,7 +7,7 @@ import secrets
 import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from routes.deps import verify_admin_api_key
@@ -975,6 +975,12 @@ async def remove_account(key_id: str, request: Request, provider: str):
 @router.get("/v1/oauth/export", dependencies=[Depends(verify_admin_api_key)])
 async def export_credentials(provider: str, request: Request):
     """导出指定渠道的所有 OAuth 凭证（含 refresh_token，敏感操作）。"""
+    # 修改原因：凭证导出是认证被绕过时损失最大的接口之一。
+    # 修改方式：默认启用，ENABLE_OAUTH_EXPORT=false 时部署级禁用。
+    # 目的：不需要迁移/备份能力的部署可彻底关闭凭证导出。
+    from core.env import env_bool
+    if not env_bool("ENABLE_OAUTH_EXPORT", True):
+        raise HTTPException(status_code=403, detail="OAuth credential export is disabled on this deployment")
     # 修改原因：迁移和备份需要完整凭据，普通 list_accounts 默认会脱敏 token。
     # 修改方式：导出端点强制 provider query，并以 include_tokens=True 读取该渠道账号。
     # 目的：只在管理员显式调用导出接口时返回 refresh_token，日常列表仍保持脱敏。

@@ -3,19 +3,34 @@ from __future__ import annotations
 import gc
 import os
 import sys
+import time
 from collections import Counter
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from routes.deps import verify_admin_api_key
 
-# 修改原因：/debug/* 端点会暴露进程内存细节，tracemalloc 开关还构成外部性能攻击面。
-# 修改方式：路由级统一挂 admin 鉴权。
-# 目的：内存排查工具仅限管理员使用。
+# 修改原因：/debug/* 端点会暴露进程内存细节，tracemalloc 开关还构成性能攻击面。
+# 修改方式：路由级统一挂 admin 鉴权；注册与否由 ENABLE_DEBUG_ENDPOINTS 控制（见 routes/__init__.py）；
+# 昂贵的对象普查/快照操作增加最小调用间隔，防止即使持有凭证也把服务打卡。
+# 目的：内存排查工具仅限管理员、默认不开启、开启后也有频率保护。
 router = APIRouter(dependencies=[Depends(verify_admin_api_key)])
 
 _baseline: dict[str, int] | None = None
+
+# 昂贵诊断操作的最小调用间隔（秒），可环境变量调整
+DEBUG_MIN_INTERVAL = float(os.getenv("DEBUG_MEMORY_MIN_INTERVAL", "2"))
+_last_expensive_call: float = 0.0
+
+
+def _throttle_expensive() -> None:
+    """对需要遍历 gc 对象或拍快照的端点限频。"""
+    global _last_expensive_call
+    now = time.monotonic()
+    if now - _last_expensive_call < DEBUG_MIN_INTERVAL:
+        raise HTTPException(status_code=429, detail="debug endpoint cooling down, retry later")
+    _last_expensive_call = now
 
 
 def _get_rss_mb() -> float | None:
@@ -51,6 +66,7 @@ def _coroutine_census() -> dict[str, int]:
 
 @router.get("/debug/memory")
 async def debug_memory():
+    _throttle_expensive()
     gc_stats = gc.get_stats()
     top_types = _type_census()
     return {
@@ -65,6 +81,7 @@ async def debug_memory():
 @router.get("/debug/memory/diff")
 async def debug_memory_diff():
     global _baseline
+    _throttle_expensive()
     current = _type_census()
     if _baseline is None:
         _baseline = current
@@ -85,7 +102,11 @@ async def debug_memory_diff():
 
 import tracemalloc as _tm
 
-@router.get("/debug/memory/tracemalloc/start")
+# 修改原因：tracemalloc 开/关会改变全局运行时状态（开启后显著拖慢服务），
+# 属于有副作用操作，不应使用 GET。
+# 修改方式：start/stop 改为 POST；top 保持 GET 但受限频保护。
+# 目的：避免预取/扫描类 GET 请求意外触发，也让语义更正确。
+@router.post("/debug/memory/tracemalloc/start")
 async def tm_start():
     if _tm.is_tracing():
         return {"status": "already tracing"}
@@ -94,6 +115,7 @@ async def tm_start():
 
 @router.get("/debug/memory/tracemalloc/top")
 async def tm_top():
+    _throttle_expensive()
     if not _tm.is_tracing():
         return {"error": "not tracing, call /debug/memory/tracemalloc/start first"}
     snapshot = _tm.take_snapshot()
@@ -113,7 +135,7 @@ async def tm_top():
         "top30": top,
     }
 
-@router.get("/debug/memory/tracemalloc/stop")
+@router.post("/debug/memory/tracemalloc/stop")
 async def tm_stop():
     if _tm.is_tracing():
         _tm.stop()

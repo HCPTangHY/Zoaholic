@@ -46,17 +46,15 @@ async def _send_error_frame(websocket: WebSocket, status: int, message: str,
 
 
 def _get_client_ip(websocket: WebSocket) -> str:
-    """与 StatsMiddleware 相同的客户端 IP 解析优先级。"""
-    forwarded_for = websocket.headers.get("x-forwarded-for")
-    if forwarded_for:
-        real_ip = forwarded_for.split(",")[0].strip()
-        if real_ip:
-            return real_ip
-    real_ip_header = websocket.headers.get("x-real-ip")
-    if real_ip_header:
-        return real_ip_header.strip()
+    """与 StatsMiddleware 相同的客户端 IP 解析（仅信任可信代理的转发头）。"""
+    from core.client_ip import resolve_client_ip
+
     client = websocket.client
-    return client.host if client else "unknown"
+    return resolve_client_ip(
+        client.host if client else None,
+        forwarded_for=websocket.headers.get("x-forwarded-for"),
+        real_ip=websocket.headers.get("x-real-ip"),
+    )
 
 
 def _authenticate(websocket: WebSocket) -> tuple[Optional[int], Optional[str], Optional[str]]:

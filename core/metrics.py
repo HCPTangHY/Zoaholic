@@ -1,7 +1,7 @@
 """
 运行时指标采集模块。
 
-提供以下维度的实时指标，供 /healthz、/readyz 及外部监控脚本使用：
+提供以下维度的实时指标，供管理员健康详情接口及内部监控使用：
 
 1. 活跃请求追踪（active requests）
 2. 连接池快照（httpx AsyncClient pool stats）
@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -119,6 +120,17 @@ def get_request_metrics() -> Dict[str, Any]:
 
 # ==================== 连接池快照 ====================
 
+def _redact_credentials(key: str) -> str:
+    """去除连接池标识中内嵌 URL 的用户名密码。
+
+    修改原因：池标识由 host + 完整代理 URL 拼接，若代理配置带认证信息，
+    会随监控快照外泄。
+    修改方式：把 scheme://user:pass@ 中的凭证段替换为 ***。
+    目的：诊断接口只暴露拓扑，不暴露凭证。
+    """
+    return re.sub(r"://[^@/\s]+@", "://***@", key)
+
+
 def get_pool_metrics(client_manager) -> Dict[str, Any]:
     """
     从 ClientManager 提取连接池统计。
@@ -138,7 +150,7 @@ def get_pool_metrics(client_manager) -> Dict[str, Any]:
 
     for key, client in clients.items():
         pool_info = _extract_pool_info(client)
-        pool_info["key"] = key
+        pool_info["key"] = _redact_credentials(str(key))
         pools.append(pool_info)
         total_active += pool_info.get("active_connections", 0)
         total_idle += pool_info.get("idle_connections", 0)

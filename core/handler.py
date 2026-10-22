@@ -890,6 +890,11 @@ class ModelRequestHandler:
                 attempt_request_data = await apply_channel_inbound_interceptors(
                     attempt_request_data, None, provider, _interceptor_api_key_info, provider_enabled_plugins
                 )
+            # 修改原因：渠道级插件的 HTTPException 需要像 Key 级入站拦截器一样直接返回给客户端。
+            # 修改方式：HTTPException 原样上抛（不进入 provider 重试），其它异常保持原有的记录后继续。
+            # 目的：与入站阶段的异常语义对齐，避免渠道级 reject 被静默忽略。
+            except HTTPException:
+                raise
             except Exception as _channel_inbound_err:
                 logger.warning(f"Channel inbound interceptors error for provider {provider_name}: {_channel_inbound_err}")
 

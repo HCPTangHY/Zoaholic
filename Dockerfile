@@ -41,4 +41,9 @@ COPY . .
 COPY --from=frontend_builder /app/static ./static
 
 # 部分云平台会注入 $PORT；用 shell 形式让变量生效
-CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips '*'"]
+# 部分云平台会注入 $PORT；用 shell 形式让变量生效
+# 修改原因：--forwarded-allow-ips '*' 默认信任任意对端，可被直连伪造来源 IP。
+# 修改方式：默认仅信任回环，反代在容器外时通过 FORWARDED_ALLOW_IPS 指定网桥/代理地址；
+# 监听地址同样支持 HOST 覆盖（容器内默认 0.0.0.0）。
+# 目的：与应用层 TRUSTED_PROXIES 一致，收紧代理信任边界。
+CMD ["sh", "-c", "python -m uvicorn main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\""]

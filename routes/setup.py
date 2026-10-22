@@ -33,9 +33,11 @@ def _get_config_storage() -> str:
 
 
 class SetupStatus(BaseModel):
+    # 修改原因：匿名状态接口曾额外暴露 has_config / has_admin_user，
+    # 前端（Login.tsx / Setup.tsx）实际只使用 needs_setup。
+    # 修改方式：公开响应只保留 needs_setup。
+    # 目的：减少匿名可探的部署状态信息。
     needs_setup: bool
-    has_config: bool
-    has_admin_user: bool
 
 
 class SetupInitRequest(BaseModel):
@@ -165,11 +167,7 @@ async def setup_status():
     admin_user = await _get_admin_user()
     needs_setup = (not has_config) or (admin_user is None)
 
-    return SetupStatus(
-        needs_setup=needs_setup,
-        has_config=has_config,
-        has_admin_user=admin_user is not None,
-    )
+    return SetupStatus(needs_setup=needs_setup)
 
 
 @router.post("/init", response_model=SetupInitResponse)

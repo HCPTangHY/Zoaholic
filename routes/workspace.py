@@ -16,12 +16,22 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from routes.deps import rate_limit_dependency, verify_admin_api_key
+from core.env import env_bool
 
-# 修改原因：本文件全部端点（浏览/读/写/删/下载后端文件）都是管理面能力，
-# 但 router 一直未挂鉴权，只靠已失效的中间件兜底，属于鉴权缺口。
-# 修改方式：router 级统一挂 admin 鉴权依赖。
-# 目的：工作区文件操作仅限管理员访问。
-router = APIRouter(dependencies=[Depends(verify_admin_api_key)])
+
+async def _ensure_workspace_enabled():
+    """部署级开关：ENABLE_WORKSPACE_API=false 时整组文件读写接口不可用。
+
+    修改原因：workspace 提供服务器文件读写，属于认证被绕过即全盘皮书的位置。
+    修改方式：保持默认启用（兼容现有控制台），允许通过环境变量在不需要此
+    能力的部署上彻底关闭，关闭后返回 404。
+    目的：缩小高权限攻击面。
+    """
+    if not env_bool("ENABLE_WORKSPACE_API", True):
+        raise HTTPException(status_code=404, detail="Workspace API is disabled on this deployment")
+
+
+router = APIRouter(dependencies=[Depends(_ensure_workspace_enabled)])
 
 # ==================== 配置 ====================
 

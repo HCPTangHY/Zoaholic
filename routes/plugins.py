@@ -211,6 +211,13 @@ async def upload_plugin(
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
+
+    # 修改原因：插件上传等价于远程代码执行，部分部署希望彻底禁用。
+    # 修改方式：默认保持启用（兼容现有控制台），ENABLE_PLUGIN_UPLOAD=false 时拒绝。
+    # 目的：提供部署级关闭开关，降低认证被绕过时的损失。
+    from core.env import env_bool
+    if not env_bool("ENABLE_PLUGIN_UPLOAD", True):
+        raise HTTPException(status_code=403, detail="Plugin upload is disabled on this deployment")
     
     filename = file.filename
     
