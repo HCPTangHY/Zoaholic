@@ -309,6 +309,29 @@ async def workspace_write(
     if len(content_bytes) > MAX_WRITE_SIZE:
         raise HTTPException(status_code=413, detail=f"内容过大，最大允许 {MAX_WRITE_SIZE // 1024 // 1024}MB")
 
+    if normalized == "api.yaml":
+        from utils import yaml as _yaml_loader
+        try:
+            parsed_yaml = _yaml_loader.load(body.content)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"api.yaml YAML 语法解析失败: {e}")
+        if not isinstance(parsed_yaml, dict) or not isinstance(parsed_yaml.get("providers"), list):
+            raise HTTPException(status_code=400, detail="api.yaml 必须包含 providers 列表")
+        if abs_path.exists():
+            try:
+                old_yaml = _yaml_loader.load(abs_path.read_text(encoding="utf-8")) or {}
+                old_p_len = len(old_yaml.get("providers") or []) if isinstance(old_yaml, dict) else 0
+                new_p_len = len(parsed_yaml.get("providers") or [])
+                if old_p_len > 5 and new_p_len < old_p_len - 1:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"拒绝直接覆写 api.yaml：渠道数量从 {old_p_len} 骤降至 {new_p_len}",
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+
     # 备份原文件（如果存在）
     backup_content = None
     if abs_path.exists():
@@ -346,6 +369,9 @@ async def workspace_delete(
         raise HTTPException(status_code=404, detail="文件不存在")
     if abs_path.is_dir():
         raise HTTPException(status_code=400, detail="不能通过此接口删除目录")
+    _protected_names = {"api.yaml", "oauth_state.json", "stats.db", "zoaholic.db", "one-api.db", "oauth.db", "logs.db"}
+    if abs_path.name in _protected_names or abs_path.suffix.lower() == ".db" or ".bak" in abs_path.name:
+        raise HTTPException(status_code=403, detail=f"受保护的核心配置/凭据/数据库文件禁止删除: '{normalized}'")
 
     try:
         abs_path.unlink()

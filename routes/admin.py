@@ -215,13 +215,91 @@ async def api_config_update(
     app = get_app()
     updated = False
 
+    replace_all = bool(config.get("replace_all") or config.get("force_shrink"))
+
     # 支持同时更新 providers、api_keys、preferences 和顶层 ip_blacklist 段，保持与 /v1/api_config 返回结构一致
     if "providers" in config:
-        app.state.config["providers"] = config["providers"]
+        incoming_providers = config["providers"]
+        if not isinstance(incoming_providers, list):
+            raise HTTPException(status_code=400, detail="providers must be a list.")
+        from utils import _sanitize_config_for_persistence
+        existing_providers = (_sanitize_config_for_persistence({"providers": app.state.config.get("providers") or []}).get("providers") or [])
+        if not replace_all and len(existing_providers) > 5:
+            if len(incoming_providers) == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Refusing to clear all providers without replace_all=true.",
+                )
+            if (
+                1 <= len(incoming_providers) <= 10
+                and len(incoming_providers) < len(existing_providers) - 1
+                and all(isinstance(p, dict) and p.get("provider") for p in incoming_providers)
+            ):
+                # 局部传入少量渠道时自动按 provider 名称原地合并（upsert），防止误清空其余渠道
+                merged_providers = list(existing_providers)
+                for item in incoming_providers:
+                    pname = item.get("provider")
+                    idx = _find_provider_index(merged_providers, pname)
+                    if idx != -1:
+                        old_p = merged_providers[idx]
+                        if isinstance(old_p, dict):
+                            if ("api" not in item or item.get("api") is None) and old_p.get("api") is not None:
+                                item = {**item, "api": old_p["api"]}
+                            if ("model" not in item or item.get("model") is None) and old_p.get("model") is not None:
+                                item = {**item, "model": old_p["model"]}
+                        merged_providers[idx] = item
+                    else:
+                        merged_providers.append(item)
+                incoming_providers = merged_providers
+            elif len(incoming_providers) < len(existing_providers) - 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Refusing to shrink providers from {len(existing_providers)} to "
+                        f"{len(incoming_providers)} without replace_all=true."
+                    ),
+                )
+        app.state.config["providers"] = incoming_providers
         updated = True
 
     if "api_keys" in config:
-        app.state.config["api_keys"] = config["api_keys"]
+        incoming_keys = config["api_keys"]
+        if not isinstance(incoming_keys, list):
+            raise HTTPException(status_code=400, detail="api_keys must be a list.")
+        existing_keys = app.state.config.get("api_keys") or []
+        if not replace_all and len(existing_keys) > 2:
+            if len(incoming_keys) == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Refusing to clear all api_keys without replace_all=true.",
+                )
+            if (
+                1 <= len(incoming_keys) <= 2
+                and len(incoming_keys) < len(existing_keys) - 1
+                and all(isinstance(k, dict) and k.get("api") for k in incoming_keys)
+            ):
+                # 局部传入单个/两个 api_key 时按 api 字段原地合并（upsert），防止误清空其余访问 Key
+                merged_keys = list(existing_keys)
+                for item in incoming_keys:
+                    kval = item.get("api")
+                    matched = False
+                    for i, ek in enumerate(merged_keys):
+                        if isinstance(ek, dict) and ek.get("api") == kval:
+                            merged_keys[i] = item
+                            matched = True
+                            break
+                    if not matched:
+                        merged_keys.append(item)
+                incoming_keys = merged_keys
+            elif len(incoming_keys) < len(existing_keys) - 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Refusing to shrink api_keys from {len(existing_keys)} to "
+                        f"{len(incoming_keys)} without replace_all=true."
+                    ),
+                )
+        app.state.config["api_keys"] = incoming_keys
         updated = True
 
     if "ip_blacklist" in config:
@@ -353,6 +431,13 @@ async def update_provider(
     provider_index = _find_provider_index(providers, provider_id)
     if provider_index == -1:
         raise HTTPException(status_code=404, detail=f'Provider "{provider_id}" not found.')
+
+    old_provider = providers[provider_index]
+    if isinstance(old_provider, dict):
+        if ("api" not in provider_data or provider_data.get("api") is None) and old_provider.get("api") is not None:
+            provider_data = {**provider_data, "api": old_provider["api"]}
+        if ("model" not in provider_data or provider_data.get("model") is None) and old_provider.get("model") is not None:
+            provider_data = {**provider_data, "model": old_provider["model"]}
 
     providers[provider_index] = provider_data
     # 增量重建：只重建被修改的渠道的 CircularList，其他保持不动

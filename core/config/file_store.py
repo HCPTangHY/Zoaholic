@@ -56,11 +56,39 @@ def save_api_yaml(config_data):
                     f"This usually indicates a config parsing error. Original file preserved."
                 )
                 return
-            if len(existing_providers) > 5 and len(new_providers) < len(existing_providers) * 0.2:
-                logger.warning(
-                    f"[save_api_yaml] WARNING: providers count dropped from {len(existing_providers)} to {len(new_providers)}. "
-                    f"Proceeding with write, but this might indicate a problem."
+            import shutil
+            import time as _time
+            if len(existing_providers) > 5 and len(new_providers) < len(existing_providers) * 0.5 and not config_data.get("_allow_mass_shrink"):
+                try:
+                    _snap = f"{target_path}.bak_autosave_{_time.strftime('%Y%m%d_%H%M%S')}"
+                    shutil.copy2(target_path, _snap)
+                    logger.warning(f"[save_api_yaml] old config snapshotted to {_snap}")
+                except Exception as _snap_err:
+                    logger.warning(f"[save_api_yaml] snapshot before overwrite failed: {_snap_err}")
+                logger.error(
+                    f"[save_api_yaml] BLOCKED: refusing to shrink providers from {len(existing_providers)} to {len(new_providers)} without _allow_mass_shrink."
                 )
+                raise RuntimeError(
+                    f"Blocked unsafe api.yaml overwrite: providers dropped from {len(existing_providers)} to {len(new_providers)}"
+                )
+            # 每次正常保存前在 data/config_backups/ 保留最近 10 份滚动备份
+            if len(existing_providers) >= 10:
+                try:
+                    _bak_dir = os.path.join(os.path.dirname(target_path) or ".", "data", "config_backups")
+                    os.makedirs(_bak_dir, exist_ok=True)
+                    _rolling_snap = os.path.join(_bak_dir, f"api.yaml.bak_{_time.strftime('%Y%m%d_%H%M%S')}")
+                    shutil.copy2(target_path, _rolling_snap)
+                    _all_baks = sorted(
+                        [os.path.join(_bak_dir, fn) for fn in os.listdir(_bak_dir) if fn.startswith("api.yaml.bak_")],
+                        key=lambda p: os.path.getmtime(p),
+                    )
+                    for _old_b in _all_baks[:-10]:
+                        try:
+                            os.remove(_old_b)
+                        except OSError:
+                            pass
+                except Exception as _rb_err:
+                    logger.warning(f"[save_api_yaml] rolling backup warning: {_rb_err}")
         except Exception as e:
             logger.warning(f"[save_api_yaml] Could not read existing file for safety check: {e}")
 
