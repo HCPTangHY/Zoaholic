@@ -363,9 +363,11 @@ export default function Playground() {
     setIsGenerating(true);
     const msgList = [...newMessages];
 
+    // 本地错误提示不应作为 system 消息发给模型。
+    const chatMessages = msgList.filter(message => message.role !== 'system').map(serializeMessage);
     const requestMessages = systemPrompt
-      ? [{ role: 'system', content: systemPrompt }, ...msgList.map(serializeMessage)]
-      : msgList.map(serializeMessage);
+      ? [{ role: 'system', content: systemPrompt }, ...chatMessages]
+      : chatMessages;
 
     const appendSystemError = (text: string) => {
       const msg = (text || '未知错误').toString();
@@ -374,21 +376,13 @@ export default function Playground() {
 
     const parseErrorFromResponse = async (res: Response) => {
       const rawText = await res.text().catch(() => '');
-      if (!rawText) return `HTTP ${res.status}`;
+      let details = rawText;
       try {
-        const data = JSON.parse(rawText);
-        if (data?.error) {
-          if (typeof data.error === 'string') return data.error;
-          if (typeof data.error === 'object') {
-            return data.error.message || data.error.detail || data.error.code || JSON.stringify(data.error);
-          }
-        }
-        if (data?.detail) return typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail);
-        if (data?.message) return typeof data.message === 'string' ? data.message : JSON.stringify(data.message);
-        return rawText;
+        details = JSON.stringify(JSON.parse(rawText), null, 2);
       } catch {
-        return rawText;
+        // 非 JSON 响应（如代理错误页面）保留原文。
       }
+      return [`HTTP ${res.status} ${res.statusText}`.trim(), details].filter(Boolean).join('\n\n');
     };
 
     try {
@@ -441,31 +435,9 @@ export default function Playground() {
             try {
               const data = JSON.parse(dataStr);
 
-              if (data?.error) {
-                const errMsg = typeof data.error === 'string'
-                  ? data.error
-                  : (data.error.message || data.error.detail || JSON.stringify(data.error));
+              if (data?.error || data?.choices?.[0]?.error) {
+                const errMsg = JSON.stringify(data, null, 2);
 
-                try { await reader.cancel(); } catch { }
-                setMessages(prev => {
-                  const updated = [...prev];
-                  if (updated[assistantIndex]) {
-                    updated[assistantIndex] = {
-                      role: 'assistant',
-                      content: fullContent,
-                      reasoning_content: fullReasoning,
-                      isTyping: false,
-                    };
-                  }
-                  updated.push({ role: 'system', content: `请求失败：${errMsg}` });
-                  return updated;
-                });
-                return;
-              }
-
-              const choiceErr = data?.choices?.[0]?.error;
-              if (choiceErr) {
-                const errMsg = choiceErr.message || JSON.stringify(choiceErr);
                 try { await reader.cancel(); } catch { }
                 setMessages(prev => {
                   const updated = [...prev];
@@ -514,6 +486,10 @@ export default function Playground() {
 
       } else {
         const data = await res.json();
+        if (data?.error || data?.choices?.[0]?.error) {
+          appendSystemError(JSON.stringify(data, null, 2));
+          return;
+        }
         const assistantMsg = data.choices[0]?.message;
         setMessages([...msgList, { role: 'assistant', content: assistantMsg.content }]);
       }
@@ -876,7 +852,7 @@ export default function Playground() {
                     </div>
                   ) : (
                     <div className="space-y-2">
-                      {msg.content ? (markdownRendering ? (
+                      {msg.content ? (markdownRendering && msg.role !== 'system' ? (
                         <div className="text-[14.5px] leading-relaxed">
                           <MarkdownRenderer content={msg.content} tone={msg.role === 'user' ? 'inverse' : 'default'} className={msg.role === 'user' ? 'my-0' : 'my-1'} />
                           {msg.isTyping ? <span className="inline-block w-1.5 h-3.5 bg-current opacity-60 animate-pulse align-middle ml-0.5" /> : null}
