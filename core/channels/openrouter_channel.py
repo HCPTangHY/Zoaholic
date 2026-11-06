@@ -265,25 +265,25 @@ async def fetch_openrouter_response_stream(client, url, headers, payload, model,
                             
                             # 检查是否结束
                             finish_reason = choices[0].get("finish_reason")
-                            if finish_reason:
-                                usage = json_data.get("usage", {})
-                                cache_usage = extract_cache_usage(usage)
-                                # 流式结束 chunk 中的缓存字段需要在生成 usage SSE 前写入 current_info，并继续返回给下游。
-                                merge_usage(
-                                    prompt_tokens=usage.get("prompt_tokens", 0),
-                                    completion_tokens=usage.get("completion_tokens", 0),
-                                    total_tokens=usage.get("total_tokens", 0),
-                                    **cache_usage,
-                                )
-                                sse_string = await generate_sse_response(
-                                    timestamp, model, None, None, None, None, None,
-                                    usage.get("total_tokens", 0),
-                                    usage.get("prompt_tokens", 0),
-                                    usage.get("completion_tokens", 0),
-                                    cached_tokens=cache_usage["cached_tokens"],
-                                    cache_creation_tokens=cache_usage["cache_creation_tokens"],
-                                )
-                                yield sse_string
+                        usage = json_data.get("usage")
+                        if isinstance(usage, dict) and (usage.get("prompt_tokens") or usage.get("completion_tokens") or usage.get("total_tokens")):
+                            cache_usage = extract_cache_usage(usage)
+                            # 流式结束 chunk（可能与 finish_reason 同帧，也可能在后续空 choices chunk）中的缓存与 token 写入 current_info。
+                            merge_usage(
+                                prompt_tokens=usage.get("prompt_tokens", 0),
+                                completion_tokens=usage.get("completion_tokens", 0),
+                                total_tokens=usage.get("total_tokens", 0),
+                                **cache_usage,
+                            )
+                            sse_string = await generate_sse_response(
+                                timestamp, model, None, None, None, None, None,
+                                usage.get("total_tokens", 0),
+                                usage.get("prompt_tokens", 0),
+                                usage.get("completion_tokens", 0),
+                                cached_tokens=cache_usage["cached_tokens"],
+                                cache_creation_tokens=cache_usage["cache_creation_tokens"],
+                            )
+                            yield sse_string
                     except json.JSONDecodeError:
                         logger.error(f"无法解析JSON: {line}")
     

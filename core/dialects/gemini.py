@@ -102,6 +102,14 @@ async def parse_gemini_request(
                 messages.append(Message(role="system", content=sys_text))
 
     # contents
+    # [2026-10-19] Gemini native 请求格式的 functionCall 没有 id，只有 name。
+    # 上游 OpenAI 兼容通道校验 assistant.tool_calls[].id 与 role=tool.tool_call_id
+    # 必须一一对应。这里为每次 functionCall 生成唯一 call_N，并按 name 登记；
+    # 遇到 functionResponse 时消费同名调用的 id，避免出现
+    # "tool_call_id did not have response messages" 的 400。
+    _call_seq = 0
+    _pending_call_ids: Dict[str, List[str]] = {}
+
     for content in native_body.get("contents", []) or []:
         if not isinstance(content, dict):
             continue
@@ -136,7 +144,11 @@ async def parse_gemini_request(
             # 2. 处理函数调用 (Gemini native -> Canonical tool_calls)
             if "functionCall" in part:
                 fc = part["functionCall"]
-                tc_id = f"call_{len(tool_calls)}"
+                _fc_name = str(fc.get("name") or "")
+                tc_id = f"call_{_call_seq}"
+                _call_seq += 1
+                if _fc_name:
+                    _pending_call_ids.setdefault(_fc_name, []).append(tc_id)
                 tc = {
                     "id": tc_id,
                     "type": "function",
@@ -153,11 +165,20 @@ async def parse_gemini_request(
             # 3. 处理函数返回 (Gemini native -> Canonical tool role)
             if "functionResponse" in part:
                 fr = part["functionResponse"]
+                _fr_name = fr.get("name")
+                _fr_queue = _pending_call_ids.get(_fr_name) if _fr_name else None
+                if _fr_queue:
+                    # 并行同名调用按出现顺序逐个消费，保证 id 不重复。
+                    _fr_call_id = _fr_queue.pop(0)
+                else:
+                    # 找不到对应 functionCall（旧历史或截断请求）时保留旧行为，
+                    # 用 name 兜底而不是直接崩溃。
+                    _fr_call_id = _fr_name
                 messages.append(Message(
                     role="tool",
-                    name=fr.get("name"),
+                    name=_fr_name,
                     content=json_dumps_text(fr.get("response") or {}, ensure_ascii=False),
-                    tool_call_id=fr.get("name") # Gemini 通常用 name 匹配
+                    tool_call_id=_fr_call_id
                 ))
                 continue
 
@@ -489,9 +510,9 @@ def parse_gemini_usage(data: Any) -> Optional[Dict[str, int]]:
         return None
     usage = data.get("usageMetadata")
     if usage:
-        prompt = usage.get("promptTokenCount", 0)
-        completion = usage.get("candidatesTokenCount", 0)
-        total = usage.get("totalTokenCount", prompt + completion)
+        prompt = (usage.get("promptTokenCount", 0) or 0) + (usage.get("toolUsePromptTokenCount", 0) or 0)
+        completion = (usage.get("candidatesTokenCount", 0) or 0) + (usage.get("thoughtsTokenCount", 0) or 0)
+        total = usage.get("totalTokenCount", 0) or (prompt + completion)
         # Gemini 的缓存命中字段在 usageMetadata.cachedContentTokenCount，需映射为统一 cached_tokens。
         cache_usage = extract_cache_usage(usage)
         if prompt or completion or cache_usage["cached_tokens"] or cache_usage["cache_creation_tokens"]:

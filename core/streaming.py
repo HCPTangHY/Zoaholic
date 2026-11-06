@@ -193,10 +193,19 @@ class LoggingStreamingResponse(Response):
 
         if usage_info:
             # usage 解析同时覆盖普通 token 与 Prompt Caching 字段，保证透传流式响应也能入库缓存统计。
-            for _usage_key in ("prompt_tokens", "completion_tokens", "cached_tokens", "cache_creation_tokens"):
+            for _usage_key in ("cached_tokens", "cache_creation_tokens", "completion_tokens"):
                 new_val = usage_info.get(_usage_key, 0)
                 if new_val > 0:
                     self.current_info[_usage_key] = new_val
+            new_prompt = usage_info.get("prompt_tokens", 0)
+            if new_prompt > 0:
+                existing_prompt = self.current_info.get("prompt_tokens", 0)
+                existing_cache = self.current_info.get("cached_tokens", 0) + self.current_info.get("cache_creation_tokens", 0)
+                chunk_has_cache = (usage_info.get("cached_tokens", 0) > 0) or (usage_info.get("cache_creation_tokens", 0) > 0)
+                if not chunk_has_cache and existing_cache > 0 and new_prompt < existing_prompt:
+                    self.current_info["prompt_tokens"] = max(existing_prompt, new_prompt + existing_cache)
+                else:
+                    self.current_info["prompt_tokens"] = new_prompt
             # total_tokens 始终重算，确保一致性
             self.current_info["total_tokens"] = (
                 self.current_info.get("prompt_tokens", 0)

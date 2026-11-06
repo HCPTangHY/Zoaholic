@@ -209,8 +209,8 @@ def parse_passthrough_usage(data: Any) -> Optional[Dict[str, int]]:
     gemini_usage = data.get("usageMetadata")
     if isinstance(gemini_usage, dict):
         cache_usage = extract_cache_usage(gemini_usage)
-        prompt = gemini_usage.get("promptTokenCount", 0) or 0
-        completion = gemini_usage.get("candidatesTokenCount", 0) or 0
+        prompt = (gemini_usage.get("promptTokenCount", 0) or 0) + (gemini_usage.get("toolUsePromptTokenCount", 0) or 0)
+        completion = (gemini_usage.get("candidatesTokenCount", 0) or 0) + (gemini_usage.get("thoughtsTokenCount", 0) or 0)
         total = gemini_usage.get("totalTokenCount", 0) or (prompt + completion)
         if prompt or completion or cache_usage["cached_tokens"] or cache_usage["cache_creation_tokens"]:
             return {

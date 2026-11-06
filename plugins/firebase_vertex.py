@@ -95,6 +95,11 @@ async def fetch_firebase_vertex_response(client, url, headers, payload, model, t
             yield chunk
 
 
+async def patch_passthrough_firebase_vertex_payload(payload, modifications, request, engine, provider, api_key=None):
+    from core.channels.gemini_channel import patch_passthrough_gemini_payload
+    return await patch_passthrough_gemini_payload(payload, modifications, request, engine or "firebaseVertex", provider, api_key)
+
+
 class FirebaseVertexChannelAdapter:
     """
     Firebase Vertex AI 渠道适配器
@@ -103,14 +108,110 @@ class FirebaseVertexChannelAdapter:
     type_name = "firebaseVertex"
     
     request_adapter = staticmethod(get_firebase_vertex_payload)
+    passthrough_payload_adapter = staticmethod(patch_passthrough_firebase_vertex_payload)
     stream_adapter = staticmethod(fetch_firebase_vertex_response_stream)
     response_adapter = staticmethod(fetch_firebase_vertex_response)
 
 
 # ==================== 插件生命周期函数 ====================
 
+
+def _install_vacuum_hotfix():
+    """Zero-restart hotfix for main.py cleanup_expired_raw_data incremental_vacuum cursor consumption."""
+    try:
+        import aiosqlite
+        if getattr(aiosqlite.Connection, "_zoaholic_vacuum_hotfix_v1", False):
+            return
+        orig_execute = aiosqlite.Connection.execute
+
+        async def _patched_execute(self, sql, parameters=None):
+            sql_str = str(sql or "").strip()
+            if sql_str.upper().startswith("PRAGMA INCREMENTAL_VACUUM"):
+                cur = await orig_execute(self, "PRAGMA incremental_vacuum(50000)", parameters)
+                try:
+                    await cur.fetchall()
+                    cur2 = await orig_execute(self, "PRAGMA wal_checkpoint(PASSIVE)")
+                    await cur2.fetchall()
+                except Exception:
+                    pass
+                return cur
+            return await orig_execute(self, sql, parameters)
+
+        aiosqlite.Connection._orig_execute = orig_execute
+        aiosqlite.Connection.execute = _patched_execute
+        aiosqlite.Connection._zoaholic_vacuum_hotfix_v1 = True
+        print("[firebase_vertex] Installed zero-restart SQLite incremental_vacuum hotfix.")
+    except Exception as e:
+        print(f"[firebase_vertex] Vacuum hotfix install skipped: {e}")
+
+def _install_gemini_vertex_channel_hotfix():
+    """Zero-restart hot reload of gemini_channel & vertex_channel request/passthrough adapters."""
+    try:
+        import importlib, sys
+        from core.channels.registry import get_channel
+
+        gc_mod = sys.modules.get("core.channels.gemini_channel")
+        if gc_mod is not None:
+            gc_mod = importlib.reload(gc_mod)
+        else:
+            from core.channels import gemini_channel as gc_mod
+
+        vc_mod = sys.modules.get("core.channels.vertex_channel")
+        if vc_mod is not None:
+            vc_mod = importlib.reload(vc_mod)
+        else:
+            from core.channels import vertex_channel as vc_mod
+
+        gem_ch = get_channel("gemini")
+        if gem_ch is not None:
+            gem_ch.request_adapter = gc_mod.get_gemini_payload
+            gem_ch.passthrough_payload_adapter = gc_mod.patch_passthrough_gemini_payload
+            gem_ch.stream_event_classifier = gc_mod.gemini_stream_classifier
+
+        vert_ch = get_channel("vertex-gemini")
+        if vert_ch is not None:
+            vert_ch.request_adapter = vc_mod.get_vertex_gemini_payload
+            vert_ch.passthrough_payload_adapter = gc_mod.patch_passthrough_gemini_payload
+            vert_ch.stream_event_classifier = gc_mod.gemini_stream_classifier
+
+        for mod_name in ("core.channels.gemini_cli_channel", "core.channels.antigravity_channel"):
+            m = sys.modules.get(mod_name)
+            if m is not None and hasattr(m, "get_gemini_payload"):
+                m.get_gemini_payload = gc_mod.get_gemini_payload
+
+        import core.dialects.passthrough as dp_mod
+        import core.dialects.gemini as dg_mod
+        from core.dialects.registry import get_dialect
+        importlib.reload(dp_mod)
+        importlib.reload(dg_mod)
+        gem_dialect = get_dialect("gemini")
+        if gem_dialect is not None:
+            gem_dialect.parse_usage = dg_mod.parse_gemini_usage
+        ve_mod = sys.modules.get("plugins.vertex_express_channel") or sys.modules.get("vertex_express_channel")
+        if ve_mod is not None and hasattr(ve_mod, "gemini_json_process"):
+            ve_mod.gemini_json_process = gc_mod.gemini_json_process
+        import core.streaming as st_mod
+        orig_lsr = st_mod.LoggingStreamingResponse
+        importlib.reload(st_mod)
+        for _attr in ("_try_extract_usage", "_try_parse_line"):
+            if hasattr(st_mod.LoggingStreamingResponse, _attr):
+                setattr(orig_lsr, _attr, getattr(st_mod.LoggingStreamingResponse, _attr))
+        st_mod.LoggingStreamingResponse = orig_lsr
+        import core.channels.openrouter_channel as orc_mod
+        importlib.reload(orc_mod)
+        or_ch = get_channel("openrouter")
+        if or_ch is not None:
+            or_ch.stream_adapter = orc_mod.fetch_openrouter_response_stream
+            or_ch.response_adapter = orc_mod.fetch_openrouter_response
+        print("[firebase_vertex] Hot-reloaded gemini_channel, vertex_channel, openrouter_channel, streaming & dialect usage parsers in-place.")
+    except Exception as e:
+        print(f"[firebase_vertex] Channel hotfix failed: {e}")
+
+
 def setup(manager: "PluginManager"):
     """插件初始化"""
+    _install_vacuum_hotfix()
+    _install_gemini_vertex_channel_hotfix()
     # 1. 注册扩展到插件管理器
     manager.register_extension(
         extension_point="channels",
@@ -133,6 +234,7 @@ def setup(manager: "PluginManager"):
             auth_header="x-goog-api-key: {api_key}",
             description="Firebase Vertex AI",
             request_adapter=FirebaseVertexChannelAdapter.request_adapter,
+            passthrough_payload_adapter=FirebaseVertexChannelAdapter.passthrough_payload_adapter,
             stream_adapter=FirebaseVertexChannelAdapter.stream_adapter,
             response_adapter=FirebaseVertexChannelAdapter.response_adapter,
             passthrough_dialects=["gemini"],

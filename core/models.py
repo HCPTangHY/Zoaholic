@@ -3,7 +3,7 @@ from pydantic import BaseModel, Field, model_validator, ConfigDict
 from typing import List, Dict, Optional, Union, Tuple, Literal, Any
 
 class FunctionParameter(BaseModel):
-    type: Optional[str] = None
+    type: Optional[Union[str, List[str]]] = None
     properties: Optional[Dict[str, Any]] = None
     required: Optional[List[str]] = Field(default_factory=list)
     defs: Optional[Dict[str, Any]] = Field(default=None, alias="$defs")
@@ -163,6 +163,9 @@ class RequestModel(BaseRequest):
                         # 再次确保移除内部别名字段
                         params.pop('defs', None)
                         params.pop('$defs', None)
+                        if isinstance(params.get('type'), list):
+                            non_null = [t for t in params['type'] if isinstance(t, str) and t != 'null']
+                            params['type'] = non_null[0] if non_null else 'object'
                         if not params.get('properties'):
                             params['properties'] = {}
                         if not params.get('type'):

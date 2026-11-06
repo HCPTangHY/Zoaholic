@@ -71,7 +71,7 @@ EXTENSIONS = [
 ]
 
 # V4 系列（默认 thinking）与 V3 时代思考模型的命名特征
-_THINKING_MODEL_RE = re.compile(r"deepseek[-_a-z0-9.]*?(v4|reasoner)", re.IGNORECASE)
+_THINKING_MODEL_RE = re.compile(r"deepseek[-_a-z0-9.]*?(v4|reasoner|flash)", re.IGNORECASE)
 
 _THINKING_BLOCK_TYPES = ("thinking", "redacted_thinking")
 
@@ -102,6 +102,8 @@ def _thinking_active(payload: Dict[str, Any], model: str) -> bool:
     """判断 thinking 模式是否生效：显式 enabled 优先，其次按模型名判断（V4 默认启用）。"""
     thinking = payload.get("thinking")
     if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        return True
+    if payload.get("reasoning_effort"):
         return True
     return bool(_THINKING_MODEL_RE.search(model or ""))
 
@@ -199,6 +201,12 @@ async def deepseek_thinking_backfill_request_interceptor(
             patched = _backfill_claude(payload, "")
         elif engine == "openai":
             patched = _backfill_openai(payload, "")
+            if _thinking_active(payload, model) and payload.get("tool_choice") not in (None, "auto", "none"):
+                logger.info(
+                    "[deepseek_thinking_backfill] model=%s thinking 模式下将不兼容的 tool_choice=%r 自动降级为 'auto'",
+                    model, payload.get("tool_choice"),
+                )
+                payload["tool_choice"] = "auto"
         else:
             return url, headers, payload
         if patched:

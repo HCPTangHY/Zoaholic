@@ -966,7 +966,7 @@ export default function Logs() {
               {/* 列表摘要只在命中缓存时追加弱化文本，避免缓存数字抢占主要 token 信息。 */}
               {cachedTokens > 0 ? (
                 <>
-                  <span className="text-muted-foreground">{(log.prompt_tokens || 0) - cachedTokens}</span>
+                  <span className="text-muted-foreground">{Math.max(0, (log.prompt_tokens || 0) - cachedTokens)}</span>
                   <span className="text-[10px] text-emerald-600/80 dark:text-emerald-400/80">(+{cachedTokens} {(cachedTokens / (log.prompt_tokens || 1) * 100).toFixed(1)}%)</span>
                 </>
               ) : (

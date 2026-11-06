@@ -61,7 +61,343 @@ async def format_image_message(image_url: str) -> dict:
         }
     }
 
-gemini_max_token_65k_models = ["gemini-2.5-pro", "gemini-2.0-pro", "gemini-2.0-flash-thinking", "gemini-2.5-flash"]
+gemini_max_token_65k_models = [
+    "gemini-2.5-pro", "gemini-2.0-pro", "gemini-2.0-flash-thinking", "gemini-2.5-flash",
+    "gemini-3", "gemini-4",
+]
+
+_GEMINI_CORE_HARM_CATEGORIES = (
+    "HARM_CATEGORY_HARASSMENT",
+    "HARM_CATEGORY_HATE_SPEECH",
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+    "HARM_CATEGORY_DANGEROUS_CONTENT",
+    "HARM_CATEGORY_CIVIC_INTEGRITY",
+    "HARM_CATEGORY_JAILBREAK",
+)
+_VERTEX_EXTRA_HARM_CATEGORIES = (
+    "HARM_CATEGORY_IMAGE_HATE",
+    "HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT",
+    "HARM_CATEGORY_IMAGE_HARASSMENT",
+    "HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT",
+)
+
+
+def _is_vertex_provider(engine: str | None, provider: dict | None) -> bool:
+    eng = str(engine or (provider or {}).get("engine") or "").strip().lower()
+    if eng in ("firebasevertex", "vertex-gemini", "vertex-express", "vertex") or eng.startswith("firebasevertex") or eng.startswith("vertex"):
+        return True
+    base_url = str((provider or {}).get("base_url") or "").strip().lower()
+    if "vertex" in base_url or "aiplatform.googleapis.com" in base_url:
+        return True
+    return False
+
+
+def build_gemini_safety_settings(threshold: str, *, is_vertex: bool = False) -> list[dict]:
+    cats = list(_GEMINI_CORE_HARM_CATEGORIES)
+    if is_vertex:
+        cats.extend(_VERTEX_EXTRA_HARM_CATEGORIES)
+    return [{"category": c, "threshold": threshold} for c in cats]
+
+
+_GEMINI_UNSUPPORTED_SCHEMA_FIELDS = (
+    "additionalProperties",
+    "additionalItems",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "$schema",
+    "$id",
+    "$comment",
+    "$anchor",
+    "$dynamicRef",
+    "$dynamicAnchor",
+    "$vocabulary",
+    "$defs",
+    "definitions",
+    "defs",
+    "dependencies",
+    "dependentRequired",
+    "dependentSchemas",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "not",
+    "minItems",
+    "maxItems",
+    "uniqueItems",
+    "minimum",
+    "maximum",
+    "multipleOf",
+    "patternProperties",
+    "propertyNames",
+    "minProperties",
+    "maxProperties",
+    "contains",
+    "minContains",
+    "maxContains",
+    "if",
+    "then",
+    "else",
+    "contentEncoding",
+    "contentMediaType",
+    "contentSchema",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+    "examples",
+    "strict",
+)
+
+
+def inline_schema_refs(parameters, extra_defs=None):
+    """展开 JSON Schema 中的 $ref/$defs/definitions，消除 Gemini Protobuf 不支持的 $ref 字段。"""
+    if not isinstance(parameters, dict):
+        return
+    defs = {}
+    for defs_key in ("$defs", "definitions", "defs"):
+        extracted = parameters.pop(defs_key, None)
+        if isinstance(extracted, dict):
+            defs.update(extracted)
+    if isinstance(extra_defs, dict):
+        for k, v in extra_defs.items():
+            defs.setdefault(k, v)
+
+    def _resolve(node, depth):
+        if isinstance(node, dict):
+            for defs_key in ("$defs", "definitions", "defs"):
+                nested_defs = node.pop(defs_key, None)
+                if isinstance(nested_defs, dict):
+                    for k, v in nested_defs.items():
+                        defs.setdefault(k, v)
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/"):
+                name = ref.rsplit("/", 1)[-1]
+                if depth >= 2 or name not in defs:
+                    node.pop("$ref", None)
+                    node.setdefault("type", "object")
+                    desc = node.get("description", "")
+                    node["description"] = f"{desc}\nSchema ref: {name}".strip()
+                else:
+                    merged = copy.deepcopy(defs[name])
+                    for k, v in node.items():
+                        if k != "$ref":
+                            merged[k] = v
+                    node.clear()
+                    node.update(merged)
+                    _resolve(node, depth + 1)
+                    return
+            for value in list(node.values()):
+                _resolve(value, depth)
+        elif isinstance(node, list):
+            for item in node:
+                _resolve(item, depth)
+
+    _resolve(parameters, 0)
+
+
+def process_tool_parameters(data):
+    """递归清洗 JSON Schema 使其兼容 Google Gemini / Vertex AI OpenAPI 3.0 Protobuf Schema。"""
+    if not isinstance(data, dict):
+        return
+
+    # 0. 处理逻辑组合符 (anyOf / oneOf / allOf)
+    for key in ("anyOf", "oneOf", "allOf"):
+        if key in data:
+            logic_list = data.pop(key)
+            if isinstance(logic_list, list) and logic_list:
+                if any(
+                    isinstance(item, dict) and (item.get("type") == "null" or ("const" in item and item.get("const") is None))
+                    for item in logic_list
+                ):
+                    data["nullable"] = True
+                non_null_items = [
+                    item for item in logic_list
+                    if isinstance(item, dict) and item.get("type") != "null" and not ("const" in item and item.get("const") is None)
+                ]
+                # Case A: 所有非 null 分支均为 const / enum 字面量枚举（如 Zod/TypeBox 联合字面量）
+                if non_null_items and all(
+                    ("const" in item or isinstance(item.get("enum"), list))
+                    and "properties" not in item
+                    and "items" not in item
+                    for item in non_null_items
+                ):
+                    merged_enum = []
+                    for item in non_null_items:
+                        if "const" in item and item.get("const") is not None:
+                            s_val = str(item["const"])
+                            if s_val not in merged_enum:
+                                merged_enum.append(s_val)
+                        if isinstance(item.get("enum"), list):
+                            for val in item["enum"]:
+                                if val is None:
+                                    data["nullable"] = True
+                                else:
+                                    s_val = str(val)
+                                    if s_val not in merged_enum:
+                                        merged_enum.append(s_val)
+                    if merged_enum:
+                        data["enum"] = merged_enum
+                        data["type"] = "string"
+                # Case B: allOf 多对象属性合并
+                elif key == "allOf" and len(non_null_items) > 1 and any("properties" in item for item in non_null_items):
+                    merged_props = dict(data.get("properties") or {})
+                    merged_req = list(data.get("required") or [])
+                    for item in non_null_items:
+                        item_copy = copy.deepcopy(item)
+                        process_tool_parameters(item_copy)
+                        if isinstance(item_copy.get("properties"), dict):
+                            merged_props.update(item_copy["properties"])
+                        if isinstance(item_copy.get("required"), list):
+                            for r_key in item_copy["required"]:
+                                if r_key not in merged_req:
+                                    merged_req.append(r_key)
+                        for k, v in item_copy.items():
+                            if k not in ("properties", "required") and k not in data:
+                                data[k] = v
+                    if merged_props:
+                        data["properties"] = merged_props
+                        data.setdefault("type", "object")
+                    if merged_req:
+                        data["required"] = merged_req
+                # Case C: 常规 anyOf / oneOf，取第一个有实质定义的非 null 分支递归清洗后合并
+                elif non_null_items:
+                    main_item = next(
+                        (
+                            item for item in non_null_items
+                            if (item.get("type") and item.get("type") != "null")
+                            or "properties" in item
+                            or "items" in item
+                            or "const" in item
+                            or "enum" in item
+                        ),
+                        non_null_items[0],
+                    )
+                    main_copy = copy.deepcopy(main_item)
+                    process_tool_parameters(main_copy)
+                    for k, v in main_copy.items():
+                        if k not in data:
+                            data[k] = v
+
+    # 0.5 处理单字段 const -> enum 以及联合类型数组 type: ["string", "null"]
+    if "const" in data:
+        const_val = data.pop("const")
+        if const_val is None:
+            data["nullable"] = True
+        else:
+            data["enum"] = [str(const_val)]
+            data["type"] = "string"
+
+    raw_type = data.get("type")
+    if isinstance(raw_type, list):
+        if "null" in raw_type or None in raw_type:
+            data["nullable"] = True
+        non_null_types = [t for t in raw_type if isinstance(t, str) and t != "null"]
+        data["type"] = non_null_types[0] if non_null_types else "string"
+
+    if isinstance(data.get("enum"), list):
+        raw_enum = data["enum"]
+        if None in raw_enum:
+            data["nullable"] = True
+        clean_enum = [str(v) for v in raw_enum if v is not None]
+        if clean_enum:
+            data["enum"] = clean_enum
+            data["type"] = "string"
+        else:
+            data.pop("enum", None)
+
+    # 0.8 处理 prefixItems 与非 dict 的 items（元组数组或缺失 items 的 array）
+    if "prefixItems" in data:
+        prefix_items = data.pop("prefixItems")
+        if "items" not in data or isinstance(data.get("items"), bool):
+            if isinstance(prefix_items, list) and prefix_items and isinstance(prefix_items[0], dict):
+                data["items"] = copy.deepcopy(prefix_items[0])
+            else:
+                data["items"] = {"type": "string"}
+
+    # 1. 移除 Gemini 不支持的字段
+    for field in _GEMINI_UNSUPPORTED_SCHEMA_FIELDS:
+        data.pop(field, None)
+
+    # 2. 确保 required 中的属性在 properties 中确实存在
+    properties = data.get("properties")
+    required = data.get("required")
+    if isinstance(required, list):
+        if isinstance(properties, dict):
+            data["required"] = [field for field in required if field in properties]
+            if not data["required"]:
+                data.pop("required", None)
+        else:
+            data.pop("required", None)
+
+    # 3. 将 'default' 值移入 'description'
+    if "default" in data:
+        default_value = data.pop("default")
+        description = data.get("description", "")
+        data["description"] = f"{description}\nDefault: {default_value}".strip()
+
+    # 4. 补齐缺失的 type 并递归处理嵌套 properties 与 items
+    if isinstance(properties, dict):
+        data.setdefault("type", "object")
+        for val in properties.values():
+            process_tool_parameters(val)
+
+    items = data.get("items")
+    if isinstance(items, list):
+        data["items"] = copy.deepcopy(items[0]) if (items and isinstance(items[0], dict)) else {"type": "string"}
+        items = data["items"]
+    elif isinstance(items, bool):
+        data["items"] = {"type": "string"}
+        items = data["items"]
+
+    if data.get("type") == "array" and not isinstance(items, dict):
+        data["items"] = {"type": "string"}
+        items = data["items"]
+
+    if isinstance(items, dict):
+        data.setdefault("type", "array")
+        process_tool_parameters(items)
+
+
+def _extract_tool_result_text(content) -> str:
+    """将 OpenAI tool 消息的 content (str | list[ContentItem] | None) 归一化为纯文本。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("text"):
+                    parts.append(str(item["text"]))
+            elif hasattr(item, "text") and item.text:
+                parts.append(str(item.text))
+        return "\n".join(parts)
+    return str(content)
+
+
+def apply_gemini_response_format(request, generation_config: dict) -> None:
+    """将 OpenAI response_format (json_object / json_schema) 转换为 Gemini generationConfig 字段。"""
+    resp_fmt = getattr(request, "response_format", None)
+    if not resp_fmt:
+        return
+    fmt_type = resp_fmt.get("type") if isinstance(resp_fmt, dict) else getattr(resp_fmt, "type", None)
+    if fmt_type == "json_object":
+        generation_config["responseMimeType"] = "application/json"
+    elif fmt_type == "json_schema":
+        generation_config["responseMimeType"] = "application/json"
+        js_obj = resp_fmt.get("json_schema") if isinstance(resp_fmt, dict) else getattr(resp_fmt, "json_schema", None)
+        raw_schema = None
+        if isinstance(js_obj, dict):
+            raw_schema = js_obj.get("schema")
+        elif js_obj is not None:
+            raw_schema = getattr(js_obj, "schema", None)
+        if isinstance(raw_schema, dict) and raw_schema:
+            schema_copy = copy.deepcopy(raw_schema)
+            inline_schema_refs(schema_copy)
+            process_tool_parameters(schema_copy)
+            generation_config["responseSchema"] = schema_copy
 
 
 def normalize_gemini_payload(payload: dict) -> dict:
@@ -105,8 +441,77 @@ async def patch_passthrough_gemini_payload(
     provider: dict,
     api_key=None,
 ) -> dict:
-    """透传模式下对 Gemini native payload 做渠道级修饰（system_prompt 注入）。"""
-    system_prompt = modifications.get("system_prompt")
+    """透传模式下对 Gemini native payload 做渠道级修饰（system_prompt 注入 + trailing model 兜底 + AIS/Vertex safetySettings 对齐）。"""
+    if isinstance(payload, dict):
+        is_vertex = _is_vertex_provider(engine, provider)
+        contents = payload.get("contents")
+        if isinstance(contents, list):
+            if not is_vertex:
+                # AIS 渠道 (generativelanguage.googleapis.com) 的 contents 仅允许 role 为 user/model，
+                # 严禁出现 role="system"（如客户端针对 Vertex 追加的尾部空 system 块）。
+                cleaned_contents = []
+                for _m in contents:
+                    if isinstance(_m, dict) and _m.get("role") == "system":
+                        _pts = _m.get("parts") if isinstance(_m.get("parts"), list) else []
+                        _non_empty = any(
+                            isinstance(p, dict) and (str(p.get("text") or "").strip() or any(k != "text" for k in p))
+                            for p in _pts
+                        )
+                        if _non_empty:
+                            _m_copy = dict(_m)
+                            _m_copy["role"] = "user"
+                            cleaned_contents.append(_m_copy)
+                        continue
+                    cleaned_contents.append(_m)
+                contents = cleaned_contents
+                payload["contents"] = contents
+
+            for _msg in contents:
+                if not isinstance(_msg, dict) or _msg.get("role") != "model":
+                    continue
+                _parts = _msg.get("parts")
+                if not isinstance(_parts, list):
+                    continue
+                _fc_parts = [p for p in _parts if isinstance(p, dict) and ("functionCall" in p or "function_call" in p)]
+                if _fc_parts and not any(p.get("thoughtSignature") or p.get("thought_signature") for p in _fc_parts):
+                    _turn_sig = next(
+                        (p.get("thoughtSignature") or p.get("thought_signature") for p in _parts if isinstance(p, dict) and (p.get("thoughtSignature") or p.get("thought_signature"))),
+                        None,
+                    )
+                    _fc_parts[0]["thoughtSignature"] = _turn_sig or "skip_thought_signature_validator"
+            if not contents or (isinstance(contents[-1], dict) and contents[-1].get("role") == "model"):
+                contents.append({"role": "user", "parts": [{"thought": True, "text": " "}]})
+        s_key = "safetySettings" if "safetySettings" in payload else ("safety_settings" if "safety_settings" in payload else None)
+        if s_key and isinstance(payload.get(s_key), list):
+            items = [x for x in payload[s_key] if isinstance(x, dict)]
+            if not is_vertex:
+                # AIS 渠道过滤掉 Vertex 专属的 HARM_CATEGORY_IMAGE_* 避免 400
+                payload[s_key] = [
+                    x for x in items
+                    if x.get("category") not in _VERTEX_EXTRA_HARM_CATEGORIES
+                ]
+            else:
+                # Vertex 渠道自动补齐缺失的 4 个 IMAGE_* 分类
+                existing = {x.get("category") for x in items}
+                default_thresh = next((x.get("threshold") for x in items if x.get("threshold")), "OFF")
+                for c in _VERTEX_EXTRA_HARM_CATEGORIES:
+                    if c not in existing:
+                        items.append({"category": c, "threshold": default_thresh})
+                payload[s_key] = items
+
+        raw_tools = payload.get("tools")
+        if isinstance(raw_tools, list):
+            for _t_group in raw_tools:
+                if not isinstance(_t_group, dict):
+                    continue
+                _decls = _t_group.get("functionDeclarations") or _t_group.get("function_declarations")
+                if isinstance(_decls, list):
+                    for _decl in _decls:
+                        if isinstance(_decl, dict) and isinstance(_decl.get("parameters"), dict):
+                            inline_schema_refs(_decl["parameters"])
+                            process_tool_parameters(_decl["parameters"])
+
+    system_prompt = (modifications or {}).get("system_prompt") if isinstance(modifications, dict) else None
     system_prompt_text = str(system_prompt).strip() if system_prompt is not None else ""
     if not system_prompt_text:
         return payload
@@ -173,6 +578,8 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
     # 修改方式：在转换 functionCall 时记录 tool_call_id → 函数名映射，生成 functionResponse 时优先查映射。
     # 目的：让 functionResponse 名称始终与本轮 functionCall 一致，避免上游因名称不匹配拒绝请求。
     tool_call_name_map = {}
+    pending_fc_names = []
+    seen_non_system = False
 
     try:
         request_messages = [Message(role="user", content=request.prompt)]
@@ -181,10 +588,21 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
     for msg in request_messages:
         if msg.role == "assistant":
             msg.role = "model"
+        elif msg.role in ("system", "developer"):
+            if seen_non_system:
+                msg.role = "user"
+            else:
+                msg.role = "system"
+        if msg.role != "system":
+            seen_non_system = True
         
         parts = []
-        # 提取该消息可能携带的签名
-        msg_signature = getattr(msg, "thoughtSignature", None)
+        # 提取该消息可能携带的签名（兼容 thoughtSignature / thought_signature / signature）
+        msg_signature = (
+            getattr(msg, "thoughtSignature", None)
+            or getattr(msg, "thought_signature", None)
+            or getattr(msg, "signature", None)
+        )
 
         # 1. 处理思维链
         reasoning = getattr(msg, "reasoning_content", None)
@@ -248,10 +666,18 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
                 }
                 if getattr(tc, "id", None):
                     tool_call_name_map[tc.id] = tc.function.name
-                # 签名逻辑：第一个 FC 必须携带签名
-                sig = (getattr(tc, "extra_content", {}) or {}).get("google", {}).get("thoughtSignature")
+                pending_fc_names.append(tc.function.name)
+                # 签名逻辑：第一个 FC 必须携带签名（兼容 thoughtSignature / thought_signature / signature）
+                _ec_google = (getattr(tc, "extra_content", {}) or {}).get("google", {}) or {}
+                sig = (
+                    _ec_google.get("thoughtSignature")
+                    or _ec_google.get("thought_signature")
+                    or _ec_google.get("signature")
+                    or getattr(tc, "thoughtSignature", None)
+                    or getattr(tc, "thought_signature", None)
+                )
                 if not sig and i == 0:
-                    sig = msg_signature
+                    sig = msg_signature or "skip_thought_signature_validator"
                 
                 if sig:
                     part["thoughtSignature"] = sig
@@ -270,7 +696,12 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
             if msg.tool_call_id:
                 fc_name = tool_call_name_map.get(msg.tool_call_id)
             if not fc_name:
-                fc_name = msg.name or msg.tool_call_id or "unknown_function"
+                if msg.name:
+                    fc_name = msg.name
+                elif pending_fc_names:
+                    fc_name = pending_fc_names.pop(0)
+                else:
+                    fc_name = msg.tool_call_id or "unknown_function"
             # Google AI Studio API 要求函数响应的角色为 "user"
             # 它将函数执行结果视为由用户/环境提供的上下文
             # 修改原因：OpenAI 格式里每个 tool 响应是独立消息，但 Gemini 要求同一 function call turn 的全部响应合并在一个 user turn 的 parts 里。
@@ -279,7 +710,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
             fr_part = {
                 "functionResponse": {
                     "name": fc_name,
-                    "response": {"result": msg.content}
+                    "response": {"result": _extract_tool_result_text(msg.content)}
                 }
             }
             if messages and messages[-1].get("role") == "user" and any("functionResponse" in p for p in messages[-1].get("parts", [])):
@@ -292,42 +723,25 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
         elif msg.role != "system" and parts:
             messages.append({"role": msg.role, "parts": parts})
         elif msg.role == "system":
-            # 系统提示词处理逻辑保持不变
+            # 系统提示词处理逻辑保持不变（不再将连续下划线压缩为单下划线）
             sys_text = "".join([p.get("text", "") for p in parts if "text" in p])
-            sys_text = re.sub(r"_+", "_", sys_text)
-            system_prompt = system_prompt + "\n\n" + sys_text
+            if sys_text:
+                system_prompt = f"{system_prompt}\n\n{sys_text}" if system_prompt else sys_text
     if system_prompt.strip():
-        systemInstruction = {"parts": [{"text": system_prompt}]}
+        systemInstruction = {"parts": [{"text": system_prompt.strip()}]}
+
+    if messages and messages[-1].get("role") == "model":
+        messages.append({"role": "user", "parts": [{"thought": True, "text": " "}]})
 
     if any(off_model in original_model for off_model in gemini_max_token_65k_models) or _is_image_model(original_model):
         safety_settings = "OFF"
     else:
         safety_settings = "BLOCK_NONE"
 
+    is_vertex = _is_vertex_provider(engine, provider)
     payload = {
         "contents": messages or [{"role": "user", "parts": [{"text": "No messages"}]}],
-        "safetySettings": [
-            {
-                "category": "HARM_CATEGORY_HARASSMENT",
-                "threshold": safety_settings
-            },
-            {
-                "category": "HARM_CATEGORY_HATE_SPEECH",
-                "threshold": safety_settings
-            },
-            {
-                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                "threshold": safety_settings
-            },
-            {
-                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                "threshold": safety_settings
-            },
-            {
-                "category": "HARM_CATEGORY_CIVIC_INTEGRITY",
-                "threshold": "BLOCK_NONE"
-            },
-        ]
+        "safetySettings": build_gemini_safety_settings(safety_settings, is_vertex=is_vertex),
     }
 
     if systemInstruction:
@@ -368,123 +782,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
         'stop',
     ]
     generation_config = {}
-
-    def inline_schema_refs(parameters, extra_defs=None):
-        # 修改原因：MCP 等客户端的工具 schema 使用 JSON Schema $ref/$defs 共享类型定义，Gemini protobuf Schema 不认识 $ref 字段，直接报 Unknown name "$ref" 400；
-        #   且 RequestModel.model_dump 有意排除 defs 字段（防严格网关报错），dump 结果只剩悬空 $ref，需要从原始 pydantic 对象恢复定义。
-        # 修改方式：defs 优先取 parameters 内联的 $defs/definitions/defs，再用 extra_defs 补齐；无论 defs 是否为空都执行解析，
-        #   可解析的 $ref 原位展开为定义副本（$ref 同层其他属性覆盖定义同名字段），不可解析或展开超过 2 层的降级为宽松 object 并把引用名写入 description。
-        # 目的：保证发往 Gemini 的 schema 一定不含 $ref，递归引用按 Gemini 对 defs 递归深度的限制截断。
-        if not isinstance(parameters, dict):
-            return
-        defs = {}
-        for defs_key in ("$defs", "definitions", "defs"):
-            extracted = parameters.pop(defs_key, None)
-            if isinstance(extracted, dict):
-                defs.update(extracted)
-        if isinstance(extra_defs, dict):
-            for k, v in extra_defs.items():
-                defs.setdefault(k, v)
-
-        def _resolve(node, depth):
-            if isinstance(node, dict):
-                ref = node.get("$ref")
-                if isinstance(ref, str) and ref.startswith("#/"):
-                    name = ref.rsplit("/", 1)[-1]
-                    if depth >= 2 or name not in defs:
-                        node.pop("$ref", None)
-                        node.setdefault("type", "object")
-                        desc = node.get("description", "")
-                        node["description"] = f"{desc}\nSchema ref: {name}".strip()
-                    else:
-                        merged = copy.deepcopy(defs[name])
-                        for k, v in node.items():
-                            if k != "$ref":
-                                merged[k] = v
-                        node.clear()
-                        node.update(merged)
-                        _resolve(node, depth + 1)
-                        return
-                for value in node.values():
-                    _resolve(value, depth)
-            elif isinstance(node, list):
-                for item in node:
-                    _resolve(item, depth)
-
-        _resolve(parameters, 0)
-
-    def process_tool_parameters(data):
-        if isinstance(data, dict):
-            # 0. 处理逻辑组合符 (OpenAI anyOf/oneOf/allOf [..., null] -> Gemini nullable: True)
-            for key in ["anyOf", "oneOf", "allOf"]:
-                if key in data:
-                    logic_list = data.pop(key)
-                    if isinstance(logic_list, list) and logic_list:
-                        # 寻找第一个带 type 的项作为主要定义
-                        main_item = next((item for item in logic_list if isinstance(item, dict) and item.get("type") and item.get("type") != "null"), logic_list[0])
-                        if isinstance(main_item, dict):
-                            # 将主要项的属性合并回当前层，但保留当前层已有的 description 等
-                            for k, v in main_item.items():
-                                if k not in data:
-                                    data[k] = v
-                        # 如果列表中包含 type: null，设置 nullable
-                        if any(isinstance(item, dict) and item.get("type") == "null" for item in logic_list):
-                            data["nullable"] = True
-
-            # 1. 移除 Gemini 不支持的字段
-            unsupported_fields = [
-                "additionalProperties",
-                "exclusiveMinimum",
-                "exclusiveMaximum",
-                "minLength",
-                "maxLength",
-                "pattern",
-                "$schema",
-                "dependencies",
-                "dependentRequired",
-                "dependentSchemas",
-                "unevaluatedItems",
-                "unevaluatedProperties",
-                "not",
-                "minItems",
-                "maxItems",
-                "uniqueItems",
-                "minimum",
-                "maximum",
-                "multipleOf",
-            ]
-            for field in unsupported_fields:
-                data.pop(field, None)
-
-            # 2. 核心修复：确保 required 中的属性在 properties 中确实存在
-            properties = data.get("properties")
-            required = data.get("required")
-            
-            if isinstance(required, list):
-                if isinstance(properties, dict):
-                    # 只保留在 properties 中存在的必填项
-                    data["required"] = [field for field in required if field in properties]
-                    if not data["required"]:
-                        data.pop("required")
-                else:
-                    # 如果没有 properties，则不能有 required
-                    data.pop("required", None)
-
-            # 3. 将 'default' 值移入 'description' (Gemini 部分模型对 default 支持不佳)
-            if "default" in data:
-                default_value = data.pop("default")
-                description = data.get("description", "")
-                data["description"] = f"{description}\nDefault: {default_value}"
-
-            # 4. 递归处理嵌套的 properties
-            if isinstance(properties, dict):
-                for val in properties.values():
-                    process_tool_parameters(val)
-            
-            # 处理 items (针对 array 类型)
-            items = data.get("items")
-            if isinstance(items, dict):
-                process_tool_parameters(items)
+    apply_gemini_response_format(request, generation_config)
 
     for field, value in request.model_dump(exclude_unset=True).items():
         if field not in miss_fields and value is not None:
@@ -772,9 +1070,9 @@ def gemini_json_process(response_json):
                 function_full_response = current_function_full_response
 
     if finishReason:
-        promptTokenCount = safe_get(response_json, "usageMetadata", "promptTokenCount", default=0)
-        candidatesTokenCount = safe_get(response_json, "usageMetadata", "candidatesTokenCount", default=0)
-        totalTokenCount = safe_get(response_json, "usageMetadata", "totalTokenCount", default=0)
+        promptTokenCount = (safe_get(response_json, "usageMetadata", "promptTokenCount", default=0) or 0) + (safe_get(response_json, "usageMetadata", "toolUsePromptTokenCount", default=0) or 0)
+        candidatesTokenCount = (safe_get(response_json, "usageMetadata", "candidatesTokenCount", default=0) or 0) + (safe_get(response_json, "usageMetadata", "thoughtsTokenCount", default=0) or 0)
+        totalTokenCount = safe_get(response_json, "usageMetadata", "totalTokenCount", default=0) or (promptTokenCount + candidatesTokenCount)
         if finishReason != "STOP":
             logger.error(f"finishReason: {finishReason}")
 
@@ -855,9 +1153,14 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
         # 获取 usage (可能在最后一个响应对象中)
         last_resp = parsed_data[-1]
         usage_metadata = safe_get(last_resp, "usageMetadata")
-        prompt_tokens = safe_get(usage_metadata, "promptTokenCount", default=promptTokenCount)
-        candidates_tokens = safe_get(usage_metadata, "candidatesTokenCount", default=candidatesTokenCount)
-        total_tokens = safe_get(usage_metadata, "totalTokenCount", default=totalTokenCount)
+        if isinstance(usage_metadata, dict):
+            prompt_tokens = (usage_metadata.get("promptTokenCount", 0) or 0) + (usage_metadata.get("toolUsePromptTokenCount", 0) or 0)
+            candidates_tokens = (usage_metadata.get("candidatesTokenCount", 0) or 0) + (usage_metadata.get("thoughtsTokenCount", 0) or 0)
+            total_tokens = usage_metadata.get("totalTokenCount", 0) or (prompt_tokens + candidates_tokens)
+        else:
+            prompt_tokens = promptTokenCount
+            candidates_tokens = candidatesTokenCount
+            total_tokens = totalTokenCount
 
         mark_adapter_metrics_managed()
         # Gemini 的 cachedContentTokenCount 与普通 token 同在 usageMetadata，需要同步写入日志统计和下游响应。
