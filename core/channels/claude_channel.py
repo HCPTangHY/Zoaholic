@@ -375,9 +375,10 @@ async def get_claude_payload(request, engine, provider, api_key=None):
 
     miss_fields = [
         'model',
-       'messages',
+        'messages',
         'tools',
         'tool_choice',
+        'parallel_tool_calls',
         'presence_penalty',
         'frequency_penalty',
         'n',
@@ -434,7 +435,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                 if raw_tool_choice == "auto":
                     payload["tool_choice"] = {"type": "auto"}
                 elif raw_tool_choice == "none":
-                    payload["tool_choice"] = {"type": "any"}
+                    payload["tool_choice"] = {"type": "none"}
                 elif raw_tool_choice == "required":
                     payload["tool_choice"] = {"type": "any"}
 
@@ -456,6 +457,77 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         payload.pop("top_p", None)
         payload.pop("top_k", None)
 
+    # 清洗截断后的孤立 tool_result，避免触发 Anthropic 400 unexpected tool_use_id
+    if isinstance(payload.get("messages"), list):
+        prev_tool_use_ids = set()
+        for m in payload["messages"]:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            cnt = m.get("content")
+            if role == "assistant":
+                prev_tool_use_ids = set()
+                if isinstance(cnt, list):
+                    for blk in cnt:
+                        if isinstance(blk, dict) and blk.get("type") == "tool_use" and blk.get("id"):
+                            prev_tool_use_ids.add(blk["id"])
+            elif role == "user":
+                if isinstance(cnt, list):
+                    new_cnt = []
+                    for blk in cnt:
+                        if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                            tuid = blk.get("tool_use_id")
+                            if not tuid or tuid not in prev_tool_use_ids:
+                                inner = blk.get("content", "")
+                                if isinstance(inner, list):
+                                    inner_txt = "\n".join(
+                                        x.get("text", str(x)) if isinstance(x, dict) else str(x)
+                                        for x in inner
+                                    )
+                                else:
+                                    inner_txt = str(inner)
+                                new_cnt.append({"type": "text", "text": f"[Tool Result ({tuid})]:\n{inner_txt}"})
+                            else:
+                                new_cnt.append(blk)
+                        else:
+                            new_cnt.append(blk)
+                    m["content"] = new_cnt
+                prev_tool_use_ids = set()
+
+    # Anthropic 开启 thinking 或使用 opus-5 / fable-5 / 4-6 模型时禁止 tool_choice 为 any/tool
+    model_lower = str(payload.get("model") or "").lower()
+    tc_obj = payload.get("tool_choice")
+    if isinstance(tc_obj, dict) and tc_obj.get("type") in ("any", "tool"):
+        if payload.get("thinking") or any(k in model_lower for k in ("opus-5", "fable-5", "opus-4-6", "sonnet-4-6")):
+            payload["tool_choice"] = {"type": "auto"}
+
+    # 修复：Opus 4.6 / 5.5 等新模型禁止末尾 assistant message prefill（必须以 user 消息结尾）
+    if isinstance(payload.get("messages"), list) and payload["messages"]:
+        if any(k in model_lower for k in ("opus-5", "fable-5", "opus-4-6", "sonnet-4-6")):
+            while payload["messages"] and payload["messages"][-1].get("role") == "assistant":
+                last_msg = payload["messages"].pop()
+                last_content = last_msg.get("content", "")
+                prefill_text = ""
+                if isinstance(last_content, str):
+                    prefill_text = last_content.strip()
+                elif isinstance(last_content, list):
+                    prefill_text = "".join(
+                        b.get("text", "") for b in last_content if isinstance(b, dict) and b.get("type") == "text"
+                    ).strip()
+                if prefill_text:
+                    note = f"\n\n{prefill_text}"
+                    if payload["messages"] and payload["messages"][-1].get("role") == "user":
+                        u_content = payload["messages"][-1].get("content")
+                        if isinstance(u_content, str):
+                            payload["messages"][-1]["content"] = u_content + note
+                        elif isinstance(u_content, list):
+                            u_content.append({"type": "text", "text": note})
+                    else:
+                        payload["messages"].append({"role": "user", "content": [{"type": "text", "text": note.strip()}]})
+            if not payload["messages"]:
+                payload["messages"].append({"role": "user", "content": [{"type": "text", "text": "Continue."}]})
+
+    payload.pop("parallel_tool_calls", None)
     return url, headers, payload
 
 
@@ -678,6 +750,10 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
 
                     # 处理 content_block_start 事件，记录当前块类型
                     event_type = resp.get("type", "")
+                    if event_type in ("ping", "message_start"):
+                        yield ": keepalive\n\n"
+                        if event_type == "ping":
+                            continue
                     if event_type == "content_block_start":
                         content_block = resp.get("content_block", {})
                         current_block_type = content_block.get("type", "")

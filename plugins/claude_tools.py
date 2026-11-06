@@ -301,17 +301,18 @@ def _has_cache_control(payload: Dict[str, Any]) -> bool:
 
 
 def _inject_auto_cache(payload: Dict[str, Any], provider: Dict[str, Any]) -> None:
-    """自动注入顶层 cache_control，走 Anthropic 自动缓存。客户端自带则跳过。"""
+    """自动注入顶层 cache_control（Anthropic 自动滚动缓存）+ system 尾块锚点。客户端自带则跳过。"""
     if _has_cache_control(payload):
         return
     # 从 provider preferences 的 enabled_plugins 参数读 TTL
-    # 格式：claude_tools:cache=1h 或 claude_tools:cache=5m
+    # 格式：claude_tools:cache=1h 或 claude_tools:cache=5m（兼容 : 和 , 分隔）
     ttl = None
     for plugin_entry in provider.get("preferences", {}).get("enabled_plugins", []):
         if isinstance(plugin_entry, str) and plugin_entry.startswith("claude_tools"):
-            for part in plugin_entry.split(":")[1:]:
+            for part in re.split(r"[:;,]", plugin_entry)[1:]:
+                part = part.strip()
                 if part.startswith("cache="):
-                    ttl = part[6:]  # "1h" 或 "5m"
+                    ttl = part[6:].strip()  # "1h" 或 "5m"
                     break
             break
     if not ttl:
@@ -319,7 +320,14 @@ def _inject_auto_cache(payload: Dict[str, Any], provider: Dict[str, Any]) -> Non
     cc = {"type": "ephemeral"}
     if ttl == "1h":
         cc["ttl"] = "1h"
-    payload["cache_control"] = cc
+    # 1. 固定锚点：在 system 最后一个非空文本块打上 cache_control，确保跨会话/压缩后 system+tools 固定命中
+    system = payload.get("system")
+    if isinstance(system, list) and system:
+        last_sys = system[-1]
+        if isinstance(last_sys, dict) and last_sys.get("type") == "text" and last_sys.get("text"):
+            last_sys["cache_control"] = dict(cc)
+    # 2. 滚动锚点：顶层 cache_control，Anthropic 自动将断点挂在最后一块可缓存消息并随轮次前移
+    payload["cache_control"] = dict(cc)
     logger.debug(f"[claude_tools] Injected auto cache_control: {cc}")
 
 
@@ -417,6 +425,8 @@ async def claude_tools_request_interceptor(
     # ── 2. 解析后缀 ──
     base_model, features, thinking_budget = parse_model_suffixes(model)
     if not features:
+        # 修复：无后缀模型（如 claude-opus-5-5 / claude-opus-4-6）也必须执行自动 prompt caching 注入
+        _inject_auto_cache(payload, provider)
         return url, headers, payload
 
     logger.info(f"[claude_tools] model={model}, features={features}, engine={engine}")

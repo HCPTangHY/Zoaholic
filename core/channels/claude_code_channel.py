@@ -1070,6 +1070,20 @@ def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None, versi
     # ── Layer 2 + 4: 字符串级清洗（system + messages 中的文本） ──
     _sanitize_text_blocks(payload)
 
+    # ── Layer 8: 确保 system 尾块、tools 尾项与顶层自动缓存断点生效 ──
+    cc = payload.get("cache_control") if isinstance(payload.get("cache_control"), dict) else {"type": "ephemeral"}
+    sys_list = payload.get("system")
+    if isinstance(sys_list, list) and sys_list:
+        last_sys = sys_list[-1]
+        if isinstance(last_sys, dict) and last_sys.get("type") == "text" and last_sys.get("text"):
+            last_sys.setdefault("cache_control", dict(cc))
+    tools_list = payload.get("tools")
+    if isinstance(tools_list, list) and tools_list:
+        last_tool = tools_list[-1]
+        if isinstance(last_tool, dict):
+            last_tool.setdefault("cache_control", dict(cc))
+    payload.setdefault("cache_control", dict(cc))
+
     return payload
 
 
