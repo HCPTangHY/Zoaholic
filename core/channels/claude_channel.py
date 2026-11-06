@@ -179,6 +179,52 @@ async def get_claude_passthrough_meta(request, engine, provider, api_key=None):
     return url, headers, {}
 
 
+def downgrade_tool_choice_for_thinking(payload: dict) -> None:
+    """开启 extended thinking 时把 tool_choice 的 any/tool 降级为 auto。
+
+    Anthropic 在 thinking 开启时只接受 tool_choice 为 auto 或 none，any/tool 会返回 400。
+    """
+    thinking = payload.get("thinking")
+    if not isinstance(thinking, dict) or thinking.get("type") == "disabled":
+        return
+    tool_choice = payload.get("tool_choice")
+    if isinstance(tool_choice, dict) and tool_choice.get("type") in ("any", "tool"):
+        payload["tool_choice"] = {"type": "auto"}
+
+
+def _demote_orphan_tool_results(messages: list) -> None:
+    """把找不到前一条 assistant 中对应 tool_use 的 tool_result 改为普通文本块。
+
+    上下文被截断或压缩后可能只剩下 tool_result，Anthropic 会返回 400 unexpected tool_use_id。
+    """
+    prev_tool_use_ids: set = set()
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if message.get("role") == "assistant":
+            prev_tool_use_ids = {
+                block.get("id") for block in content or []
+                if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id")
+            } if isinstance(content, list) else set()
+            continue
+        if message.get("role") == "user" and isinstance(content, list):
+            for index, block in enumerate(content):
+                if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                    continue
+                tool_use_id = block.get("tool_use_id")
+                if tool_use_id and tool_use_id in prev_tool_use_ids:
+                    continue
+                inner = block.get("content", "")
+                if isinstance(inner, list):
+                    inner = "\n".join(
+                        item.get("text", str(item)) if isinstance(item, dict) else str(item)
+                        for item in inner
+                    )
+                content[index] = {"type": "text", "text": f"[Tool Result ({tool_use_id})]:\n{inner}"}
+        prev_tool_use_ids = set()
+
+
 async def get_claude_payload(request, engine, provider, api_key=None):
     """构建 Claude API 的请求 payload"""
     model_dict = get_model_dict(provider)
@@ -360,6 +406,8 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         else:
             message_index = message_index + 1
 
+    _demote_orphan_tool_results(messages)
+
     max_tokens = 32768
 
     payload = {
@@ -375,9 +423,11 @@ async def get_claude_payload(request, engine, provider, api_key=None):
 
     miss_fields = [
         'model',
-       'messages',
+        'messages',
         'tools',
         'tool_choice',
+        # Anthropic 不接受 OpenAI 的 parallel_tool_calls，透传会返回 400 Extra inputs are not permitted
+        'parallel_tool_calls',
         'presence_penalty',
         'frequency_penalty',
         'n',
@@ -434,7 +484,7 @@ async def get_claude_payload(request, engine, provider, api_key=None):
                 if raw_tool_choice == "auto":
                     payload["tool_choice"] = {"type": "auto"}
                 elif raw_tool_choice == "none":
-                    payload["tool_choice"] = {"type": "any"}
+                    payload["tool_choice"] = {"type": "none"}
                 elif raw_tool_choice == "required":
                     payload["tool_choice"] = {"type": "any"}
 
@@ -455,6 +505,8 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         payload["temperature"] = 1
         payload.pop("top_p", None)
         payload.pop("top_k", None)
+
+    downgrade_tool_choice_for_thinking(payload)
 
     return url, headers, payload
 

@@ -283,6 +283,10 @@ def apply_thinking_config(payload: Dict[str, Any], budget_tokens: int, model: st
     payload.pop("top_p", None)
     payload.pop("top_k", None)
 
+    # 后缀开启 thinking 发生在 payload 构建之后，这里需要再处理一次 tool_choice
+    from core.channels.claude_channel import downgrade_tool_choice_for_thinking
+    downgrade_tool_choice_for_thinking(payload)
+
 
 def apply_tool_config(payload: Dict[str, Any], tool_type: str) -> None:
     if "tools" not in payload:
