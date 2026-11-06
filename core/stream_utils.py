@@ -89,3 +89,28 @@ async def aiter_decoded_lines(
 
     if buffer:
         yield bytes(buffer).decode(encoding, errors=errors)
+
+
+async def aiter_line_aligned_text(source: AsyncIterable[str]) -> AsyncIterator[str]:
+    """把文本流重新切分到行边界，原样保留换行符与空行。
+
+    说明：
+    - 每次产出以 "\\n" 结尾的若干完整行，拼接结果与输入逐字节一致。
+    - 不含换行的分片先缓存，等到下一个换行再与之合并产出；结束时产出剩余尾部。
+    - 用列表缓存未完成的行，超长单行（如内联 Base64 图片）也不会反复复制字符串。
+    """
+    tail: list[str] = []
+    async for chunk in source:
+        if not chunk:
+            continue
+        cut = chunk.rfind("\n")
+        if cut < 0:
+            tail.append(chunk)
+            continue
+        tail.append(chunk[:cut + 1])
+        yield "".join(tail)
+        rest = chunk[cut + 1:]
+        tail = [rest] if rest else []
+
+    if tail:
+        yield "".join(tail)
