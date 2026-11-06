@@ -20,11 +20,11 @@ from plugins.deepseek_thinking_backfill import (
 )
 
 PROVIDER_DS_CLAUDE = {
-    "provider": "ds打野",
+    "provider": "ds-anthropic",
     "base_url": "https://api.deepseek.com/anthropic",
 }
 PROVIDER_DS_OPENAI = {
-    "provider": "ds自用",
+    "provider": "ds-openai",
     "base_url": "https://api.deepseek.com",
 }
 

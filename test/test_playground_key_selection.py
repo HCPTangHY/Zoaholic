@@ -35,7 +35,7 @@ def test_playground_keys_endpoint_returns_global_user_api_keys(monkeypatch):
                     {
                         "api": "sk-test-user-key-000000000000000000000000",
                         "role": "user",
-                        "name": "HCP",
+                        "name": "user",
                     },
                 ]
             }
@@ -55,7 +55,7 @@ def test_playground_keys_endpoint_returns_global_user_api_keys(monkeypatch):
             },
             {
                 "index": 1,
-                "name": "HCP",
+                "name": "user",
                 "masked_key": "sk-...0000",
                 "api": "sk-test-user-key-000000000000000000000000",
             },

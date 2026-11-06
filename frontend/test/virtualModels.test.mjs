@@ -30,7 +30,7 @@ const virtualModels = {
     enabled: true,
     chain: [
       { type: 'model', value: 'deepseek-chat' },
-      { type: 'channel', value: '打野硅基', model: 'deepseek-v4' },
+      { type: 'channel', value: 'example-channel', model: 'deepseek-v4' },
     ],
   },
   'disabled-route': {
@@ -71,7 +71,7 @@ assert.deepEqual(Object.keys(virtualTestProvider.preferences.virtual_models), ['
 
 assert.equal(
   summarizeVirtualChain(virtualModels['deepseek-chat'].chain, 'deepseek-chat'),
-  'deepseek-chat → 打野硅基 → deepseek-v4',
+  'deepseek-chat → example-channel → deepseek-v4',
 );
 assert.equal(summarizeVirtualChain([], 'empty'), '未配置链条');
 

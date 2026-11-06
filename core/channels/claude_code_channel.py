@@ -987,8 +987,8 @@ def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None, versi
         payload["system"].append({"type": "text", "text": original_system_text})
 
     # ── Layer 3: Tool name 重命名 ──
-    # 修改原因：原有的 _TOOL_RENAME_MAP 只覆盖了40个通用名，Clonoth 等客户端特有的
-    #   snake_case 工具名（list_dir, save_memory, discord_manage 等）不在映射表中，
+    # 修改原因：原有的 _TOOL_RENAME_MAP 只覆盖了40个通用名，部分第三方客户端特有的
+    #   snake_case 工具名（list_dir, read_file, web_search 等）不在映射表中，
     #   原样发给上游会被 Anthropic 判定为第三方。
     # 修改方式：先查映射表，未命中且包含下划线的名称自动转 PascalCase。
     # 目的：确保所有工具名都以 PascalCase 形式发往上游，响应侧再反向还原。

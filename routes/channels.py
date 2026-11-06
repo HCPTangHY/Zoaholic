@@ -542,7 +542,7 @@ async def fetch_channel_models(
     
     # OAuth 渠道：api 字段是邮箱/key_id，路由层统一 resolve 成 access_token
     if getattr(channel, "is_oauth", False) and hasattr(app.state, "oauth_manager"):
-        # 修改原因：oauth_state 第一层 key 是用户配置的 provider 名，不是 engine；Antigravity 的 key 可能是“反重力oauth”。
+        # 修改原因：oauth_state 第一层 key 是用户配置的 provider 名，不是 engine；Antigravity 的 key 可能是任意自定义名称（如 “my-antigravity”）。
         # 修改方式：先把 api/api_key 归一为 key_id 候选，再遍历 OAuthManager._state 的所有 channel_id 调 resolve。
         # 目的：models_adapter 只接收已经解析好的 access_token，保持签名为 (client, provider) 且不自行做 OAuth 查找。
         _om = app.state.oauth_manager
