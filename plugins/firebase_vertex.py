@@ -203,7 +203,57 @@ def _install_gemini_vertex_channel_hotfix():
         if or_ch is not None:
             or_ch.stream_adapter = orc_mod.fetch_openrouter_response_stream
             or_ch.response_adapter = orc_mod.fetch_openrouter_response
-        print("[firebase_vertex] Hot-reloaded gemini_channel, vertex_channel, openrouter_channel, streaming & dialect usage parsers in-place.")
+
+        # Zero-restart hot-reload of core.utils.truncate_for_logging & core.response._wrap_response_aread
+        import core.utils as u_mod
+        orig_trunc = getattr(u_mod, "truncate_for_logging", None)
+        importlib.reload(u_mod)
+        if orig_trunc is not None and hasattr(u_mod, "truncate_for_logging"):
+            orig_trunc.__code__ = u_mod.truncate_for_logging.__code__
+            u_mod.truncate_for_logging = orig_trunc
+
+        import core.response as resp_mod
+        orig_wrap_aread = getattr(resp_mod, "_wrap_response_aread", None)
+        importlib.reload(resp_mod)
+        if orig_wrap_aread is not None and hasattr(resp_mod, "_wrap_response_aread"):
+            orig_wrap_aread.__code__ = resp_mod._wrap_response_aread.__code__
+            resp_mod._wrap_response_aread = orig_wrap_aread
+
+        if gem_ch is not None and hasattr(gc_mod, "fetch_gemini_response"):
+            gem_ch.response_adapter = gc_mod.fetch_gemini_response
+            gem_ch.stream_adapter = gc_mod.fetch_gemini_response_stream
+
+        # Zero-restart periodic gc.collect() + malloc_trim(0) maintenance loop
+        import asyncio as _aio_gc, gc as _gc, ctypes as _ctypes
+        _old_gc_task = getattr(sys, "_zoaholic_hot_gc_task", None)
+        if _old_gc_task is not None and not _old_gc_task.done():
+            _old_gc_task.cancel()
+        async def _hot_gc_trim_loop():
+            try:
+                _libc = _ctypes.CDLL("libc.so.6")
+                _libc.malloc_trim.argtypes = [_ctypes.c_size_t]
+                _libc.malloc_trim.restype = _ctypes.c_int
+            except Exception:
+                _libc = None
+            while True:
+                await _aio_gc.sleep(180)
+                try:
+                    with open("/proc/self/statm", "r") as _sf:
+                        _rss = (int(_sf.read().split()[1]) * 4096) // (1024 * 1024)
+                    _gc.collect()
+                    if _libc is not None:
+                        _libc.malloc_trim(0)
+                except Exception:
+                    pass
+        try:
+            _loop = _aio_gc.get_running_loop()
+            sys._zoaholic_hot_gc_task = _loop.create_task(_hot_gc_trim_loop())
+            _gc.collect()
+            _ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
+        print("[firebase_vertex] Hot-reloaded gemini_channel, vertex_channel, openrouter_channel, utils.truncate_for_logging, response._wrap_response_aread, streaming & GC trim loop in-place.")
     except Exception as e:
         print(f"[firebase_vertex] Channel hotfix failed: {e}")
 

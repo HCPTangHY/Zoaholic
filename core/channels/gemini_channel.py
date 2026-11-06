@@ -1107,7 +1107,10 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
         return
 
     response_bytes = await response.aread()
+    if hasattr(response, "_content"):
+        response._content = b""
     response_json = await asyncio.to_thread(json_loads, response_bytes)
+    response_bytes = None
 
     if isinstance(response_json, str):
         import ast
@@ -1123,6 +1126,11 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
     if isinstance(parsed_data, list) and len(parsed_data) > 0:
         first_resp = parsed_data[0]
         is_thinking, reasoning_content, content, image_base64, function_call_name, function_full_response, finishReason, blockReason, promptTokenCount, candidatesTokenCount, totalTokenCount, thought_signature, function_calls_list = gemini_json_process(first_resp)
+        if image_base64 and isinstance(first_resp, dict):
+            for _cand in (first_resp.get("candidates") or []):
+                for _p in ((_cand.get("content") or {}).get("parts") or []):
+                    if isinstance(_p, dict) and isinstance(_p.get("inlineData"), dict) and "data" in _p["inlineData"]:
+                        _p["inlineData"]["data"] = "" 
         
         if blockReason and blockReason != "STOP":
             msg = _extract_gemini_block_message(first_resp) or blockReason

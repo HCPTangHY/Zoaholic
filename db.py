@@ -559,7 +559,7 @@ if not DISABLE_DATABASE:
                 cursor.execute("PRAGMA journal_mode=WAL;")
                 cursor.execute("PRAGMA busy_timeout = 30000;")  # 30 seconds
                 cursor.execute("PRAGMA synchronous = NORMAL;")  # Faster writes
-                cursor.execute("PRAGMA cache_size = -64000;")  # 64MB cache
+                cursor.execute("PRAGMA cache_size = -4000;")  # 4MB cache per connection
             except Exception as e:
                 logger.error(f"Failed to set PRAGMA for SQLite: {e}")
             finally:

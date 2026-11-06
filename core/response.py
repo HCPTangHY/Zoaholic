@@ -242,7 +242,11 @@ def _wrap_response_aread(response):
         result = await original_aread()(*args, **kwargs)
         if captured_info:
             try:
-                captured_info["upstream_response_body"] = truncate_for_logging(result)
+                if isinstance(result, (bytes, bytearray, str)) and len(result) > 256 * 1024:
+                    import asyncio as _aio_resp
+                    captured_info["upstream_response_body"] = await _aio_resp.to_thread(truncate_for_logging, result)
+                else:
+                    captured_info["upstream_response_body"] = truncate_for_logging(result)
             except Exception as e:
                 logger.error(f"Error saving upstream response body (aread): {str(e)}")
         return result

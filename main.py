@@ -404,8 +404,12 @@ async def cleanup_expired_raw_data():
                             if not db_path:
                                 db_path = "data/stats.db"
                             async with aiosqlite.connect(db_path) as vacuum_conn:
-                                # 每次回收最多 2000 页（约 8MB），轻量不阻塞
-                                await vacuum_conn.execute("PRAGMA incremental_vacuum(2000)")
+                                # 必须 fetchall() 消费游标，否则 SQLite 只会 step 1 页（4KB）就停下；
+                                # 每次最多回收 50000 页（约 200MB）并附带一次非阻塞 PASSIVE checkpoint。
+                                async with vacuum_conn.execute("PRAGMA incremental_vacuum(50000)") as cur:
+                                    await cur.fetchall()
+                                async with vacuum_conn.execute("PRAGMA wal_checkpoint(PASSIVE)") as cur:
+                                    await cur.fetchall()
                                 logger.info("SQLite incremental_vacuum completed after raw data cleanup")
                         except Exception as ve:
                             logger.warning(f"SQLite incremental_vacuum failed (non-critical): {ve}")
@@ -883,6 +887,15 @@ async def lifespan(app: FastAPI):
         import ctypes
         _libc = ctypes.CDLL("libc.so.6")
         _has_malloc_trim = hasattr(_libc, 'malloc_trim')
+        if _has_malloc_trim:
+            _libc.malloc_trim.argtypes = [ctypes.c_size_t]
+            _libc.malloc_trim.restype = ctypes.c_int
+        if hasattr(_libc, 'mallopt'):
+            _libc.mallopt.argtypes = [ctypes.c_int, ctypes.c_int]
+            _libc.mallopt.restype = ctypes.c_int
+            _libc.mallopt(-3, 131072)  # M_MMAP_THRESHOLD = 128 KB (disable dynamic 32MB bump)
+            _libc.mallopt(-1, 131072)  # M_TRIM_THRESHOLD = 128 KB
+            _libc.mallopt(-8, 2)       # M_ARENA_MAX = 2
     except Exception:
         _libc = None
         _has_malloc_trim = False
@@ -894,27 +907,32 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(300)  # 5 分钟
             tick += 1
 
+            # 当 RSS >= 450MB 或每 15 分钟（3 个 tick）或凌晨 4 点时，先做 gc.collect() 回收循环引用，再做 malloc_trim(0)
+            now = datetime.now(timezone(timedelta(hours=8)))  # CST
+            rss_mb = 0
+            try:
+                with open("/proc/self/statm", "r") as _sf:
+                    rss_mb = (int(_sf.read().split()[1]) * 4096) // (1024 * 1024)
+            except Exception:
+                pass
+            if rss_mb >= 450 or tick % 3 == 0 or (now.hour == 4 and now.minute < 5):
+                try:
+                    before = gc.get_count()
+                    collected = gc.collect()
+                    after = gc.get_count()
+                    if collected > 0 or (now.hour == 4 and now.minute < 5):
+                        logger.info(f"[memory_maintenance] gc.collect() done (rss={rss_mb}MB): freed {collected} objects, counts {before} -> {after}")
+                except Exception as e:
+                    logger.warning(f"[memory_maintenance] gc.collect() failed: {e}")
+
             # malloc_trim 每轮都做
             if _has_malloc_trim:
                 try:
                     _libc.malloc_trim(0)
                     if tick % 12 == 1:  # 每小时日志一次
-                        logger.info("[memory_maintenance] malloc_trim(0) executed")
+                        logger.info(f"[memory_maintenance] malloc_trim(0) executed (rss={rss_mb}MB)")
                 except Exception as e:
                     logger.warning(f"[memory_maintenance] malloc_trim failed: {e}")
-
-            # 凌晨 4 点做一次 gen2 GC
-            now = datetime.now(timezone(timedelta(hours=8)))  # CST
-            if now.hour == 4 and now.minute < 5:
-                try:
-                    before = gc.get_count()
-                    collected = gc.collect()
-                    after = gc.get_count()
-                    logger.info(f"[memory_maintenance] gen2 collect done: freed {collected} objects, counts {before} -> {after}")
-                    if _has_malloc_trim:
-                        _libc.malloc_trim(0)
-                except Exception as e:
-                    logger.warning(f"[memory_maintenance] gc.collect() failed: {e}")
 
     asyncio.get_running_loop().create_task(memory_maintenance())
 

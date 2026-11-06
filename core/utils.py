@@ -411,6 +411,16 @@ def truncate_for_logging(
             data = data.decode("utf-8", errors="replace")
 
         if isinstance(data, str):
+            # 若大体积 JSON 字符串（>256KB，如含 Base64 图片的请求/响应）中夹带超长字面量，
+            # 先用 C 正则原地截断 >4096 字符的巨型字符串字面量，避免全量 json.loads 展开 10MB+ AST 树
+            if len(data) > 256 * 1024 and not data.lstrip().startswith('data: '):
+                import re as _re_trunc
+                _ms = max_str_length
+                data = _re_trunc.sub(
+                    r'"([^"\\]{4096,})"',
+                    lambda m: f'"{m.group(1)[:_ms]}... [截断 {len(m.group(1)) - _ms} 字符]"',
+                    data,
+                )
             # 检测是否是 SSE 格式（以 "data: " 开头）
             stripped = data.strip()
             if stripped.startswith('data: '):
