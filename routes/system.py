@@ -36,8 +36,9 @@ def _detect_deploy_type() -> str:
         return "docker"
     try:
         with open("/proc/1/cgroup", "r") as f:
-            if "docker" in f.read() or "containerd" in f.read():
-                return "docker"
+            cgroup = f.read()
+        if "docker" in cgroup or "containerd" in cgroup:
+            return "docker"
     except Exception:
         pass
     if os.getenv("DOCKER_CONTAINER") or os.getenv("container"):
