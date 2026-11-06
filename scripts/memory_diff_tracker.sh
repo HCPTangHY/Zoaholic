@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-ZOAHOLIC_PORT="${ZOAHOLIC_PORT:-8101}"
+ZOAHOLIC_PORT="${ZOAHOLIC_PORT:-${PORT:-8000}}"
 ZOAHOLIC_HOST="${ZOAHOLIC_HOST:-127.0.0.1}"
 BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 LOG_FILE="${BASE_DIR}/data/memory_diff.log"

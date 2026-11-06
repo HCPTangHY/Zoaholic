@@ -13,13 +13,13 @@
 #   ./scripts/health_monitor.sh
 #
 #   # cron 每分钟跑一次（推荐）
-#   * * * * * /www/wwwroot/Zoaholic/scripts/health_monitor.sh --cron
+#   * * * * * /path/to/zoaholic/scripts/health_monitor.sh --cron
 #
 #   # 后台常驻（每 CHECK_INTERVAL 秒轮询）
 #   nohup ./scripts/health_monitor.sh --daemon &
 #
 # 环境变量覆盖（均有默认值）：
-#   ZOAHOLIC_PORT           服务端口        (默认 8101)
+#   ZOAHOLIC_PORT           服务端口        (默认取 PORT，未设置时为 8000)
 #   ZOAHOLIC_HOST           服务地址        (默认 127.0.0.1)
 #   HEALTH_TIMEOUT          curl 超时秒数   (默认 5)
 #   MAX_FAILURES            连续失败阈值    (默认 3)
@@ -34,7 +34,7 @@ set -euo pipefail
 
 # ==================== 配置 ====================
 
-ZOAHOLIC_PORT="${ZOAHOLIC_PORT:-8101}"
+ZOAHOLIC_PORT="${ZOAHOLIC_PORT:-${PORT:-8000}}"
 ZOAHOLIC_HOST="${ZOAHOLIC_HOST:-127.0.0.1}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-5}"
 MAX_FAILURES="${MAX_FAILURES:-3}"

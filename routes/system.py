@@ -60,18 +60,14 @@ def _detect_deploy_type() -> str:
 
 
 def _get_source_dir() -> str:
-    """获取源码 git 目录"""
+    """获取源码目录：优先使用 ZOAHOLIC_SOURCE_DIR，否则为当前运行代码所在的项目根目录。"""
+    # 修改原因：原实现在找不到 .git 时会向上遍历父目录，并回退到写死的服务器路径，
+    #   既暴露部署环境，又可能把无关的仓库当成源码目录，导致自动更新在错误的目录执行 git pull。
+    # 修改方式：只认显式配置的 ZOAHOLIC_SOURCE_DIR 和当前项目根目录，不再猜测其他路径。
+    # 目的：部署方式判断与自动更新只作用于当前实例自身或用户明确指定的目录。
     env_dir = os.getenv("ZOAHOLIC_SOURCE_DIR")
     if env_dir and os.path.isdir(os.path.join(env_dir, ".git")):
         return env_dir
-    d = Path(__file__).resolve().parent.parent
-    for _ in range(5):
-        if (d / ".git").is_dir():
-            return str(d)
-        d = d.parent
-    for known in ["/www/wwwroot/zoaholic_original", "/opt/zoaholic"]:
-        if os.path.isdir(os.path.join(known, ".git")):
-            return known
     return str(Path(__file__).resolve().parent.parent)
 
 
@@ -390,7 +386,9 @@ async def perform_update(
 async def _update_git(steps: list) -> JSONResponse:
     """Git 部署更新：pull + sync + build + restart"""
     cwd = _get_source_dir()
-    prod_dir = os.getenv("ZOAHOLIC_PROD_DIR", "/www/wwwroot/Zoaholic")
+    # 修改原因：默认同步目标是写死的服务器路径，从开发目录触发更新时会覆盖该路径下的文件。
+    # 修改方式：只有显式配置 ZOAHOLIC_PROD_DIR 时才把源码同步到另一个目录，未配置时只更新当前目录。
+    prod_dir = os.getenv("ZOAHOLIC_PROD_DIR") or cwd
 
     # Step 1: git pull
     result = await asyncio.to_thread(
