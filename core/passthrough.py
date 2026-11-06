@@ -21,7 +21,7 @@ from core.models import RequestModel
 from core.request import get_payload
 from core.response import check_response
 from core.streaming import LoggingStreamingResponse
-from core.stream_utils import close_async_iterator, OwnedAsyncIterator
+from core.stream_utils import aiter_line_aligned_text, close_async_iterator, OwnedAsyncIterator
 from core.stream_errors import reset_stream_state, extract_stream_error, UpstreamStreamError
 from core.utils import get_engine, get_model_dict, is_local_api_key, provider_api_circular_list
 from utils import apply_custom_headers, has_header_case_insensitive, safe_get, wait_for_timeout, iter_sse_with_keepalive
@@ -237,9 +237,13 @@ async def _fetch_passthrough_stream(
             yield error_message            
             return
         
-        # aiter_text 由 httpx 内部处理 UTF-8 解码（含多字节字符边界），
-        # SSE 服务端通常在每个事件后 flush，因此每个 chunk 大概率是完整的 SSE 事件。
-        async for text in response.aiter_text():
+        # aiter_text 由 httpx 内部处理 UTF-8 解码（含多字节字符边界）。
+        # 修改原因：网络分片不保证落在行边界上（经 CDN、反代或其他中转时尤其常见），
+        #   响应拦截器按 chunk 执行，逐行解析的插件拿到半行会解析失败，或在半行末尾补换行把 data 帧拆坏。
+        # 修改方式：用 aiter_line_aligned_text 缓存到最后一个换行符，只把完整的行交给拦截器和下游，
+        #   换行符与空行原样保留，流结束时冲刷剩余内容。
+        # 目的：SSE 的 data 行（以及 Gemini 非 SSE 的 JSON 数组流）都完整地经过响应拦截器，透传字节不变。
+        async for text in aiter_line_aligned_text(response.aiter_text()):
             if text:
                 text = await _apply_response_path_interceptors(
                     text, engine or "passthrough", model or "", is_stream=True,
