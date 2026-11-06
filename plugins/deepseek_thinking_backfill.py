@@ -193,13 +193,27 @@ async def deepseek_thinking_backfill_request_interceptor(
             model = payload["model"]
         if not _is_deepseek_context(provider, model, url):
             return url, headers, payload
-        if _thinking_disabled(payload):
-            return url, headers, payload
-        if engine == "claude":
-            if not _thinking_active(payload, model):
+        if engine == "openai":
+            # DeepSeek only supports max_tokens; restore max_completion_tokens -> max_tokens if max_tokens is absent
+            max_comp = payload.pop("max_completion_tokens", None)
+            if payload.get("max_tokens") is None and max_comp is not None:
+                payload["max_tokens"] = max_comp
+
+            # If thinking is already explicitly disabled (e.g. via -nothink sub-channel override), strip reasoning_effort and skip backfill
+            if _thinking_disabled(payload):
+                payload.pop("reasoning_effort", None)
                 return url, headers, payload
-            patched = _backfill_claude(payload, "")
-        elif engine == "openai":
+
+            effort = payload.get("reasoning_effort")
+            if isinstance(effort, str):
+                effort_clean = effort.strip()
+                if effort_clean.lower() == "none":
+                    payload["thinking"] = {"type": "disabled"}
+                    payload.pop("reasoning_effort", None)
+                    return url, headers, payload
+                elif effort_clean:
+                    payload["thinking"] = {"type": "enabled"}
+
             patched = _backfill_openai(payload, "")
             if _thinking_active(payload, model) and payload.get("tool_choice") not in (None, "auto", "none"):
                 logger.info(
@@ -207,6 +221,12 @@ async def deepseek_thinking_backfill_request_interceptor(
                     model, payload.get("tool_choice"),
                 )
                 payload["tool_choice"] = "auto"
+        elif engine == "claude":
+            if _thinking_disabled(payload):
+                return url, headers, payload
+            if not _thinking_active(payload, model):
+                return url, headers, payload
+            patched = _backfill_claude(payload, "")
         else:
             return url, headers, payload
         if patched:
