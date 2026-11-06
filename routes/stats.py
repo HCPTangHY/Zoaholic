@@ -1513,6 +1513,7 @@ class UsageAnalysisEntry(BaseModel):
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     total_tokens: int = 0
+    recorded_cost: float = 0.0
 
 
 @router.get("/v1/stats/usage_analysis", dependencies=[Depends(rate_limit_dependency)])
@@ -1526,7 +1527,7 @@ async def get_usage_analysis(
     model: Optional[str] = Query(default=None, description="Model filter, comma-separated for multiple"),
 ):
     """
-    按渠道和模型分组的用量分析，返回请求次数、Token 消耗量和基于当前配置价格的实时费用。
+    按渠道和模型分组的用量分析，返回请求次数、Token 消耗量、历史记录费用及当前报价估算费用。
     """
     if DISABLE_DATABASE:
         return JSONResponse(content={"data": []})
@@ -1564,7 +1565,8 @@ async def get_usage_analysis(
             "SELECT provider, model, COUNT(*) AS request_count, "
             "COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens, "
             "COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens, "
-            "COALESCE(SUM(total_tokens), 0) AS total_tokens "
+            "COALESCE(SUM(total_tokens), 0) AS total_tokens, "
+            f"COALESCE(SUM({_key_analytics_cost_sql()}), 0.0) AS recorded_cost "
             "FROM request_stats WHERE 1=1"
         )
         params: list = []
@@ -1603,6 +1605,7 @@ async def get_usage_analysis(
                 "total_prompt_tokens": int(row.get("total_prompt_tokens") or 0),
                 "total_completion_tokens": int(row.get("total_completion_tokens") or 0),
                 "total_tokens": int(row.get("total_tokens") or 0),
+                "recorded_cost": _safe_float(row.get("recorded_cost")),
             }
             for row in rows
         ]
@@ -1615,6 +1618,7 @@ async def get_usage_analysis(
                 func.coalesce(func.sum(RequestStat.prompt_tokens), 0).label('total_prompt_tokens'),
                 func.coalesce(func.sum(RequestStat.completion_tokens), 0).label('total_completion_tokens'),
                 func.coalesce(func.sum(RequestStat.total_tokens), 0).label('total_tokens'),
+                func.coalesce(func.sum(_key_analytics_sa_cost_expr()), 0.0).label('recorded_cost'),
             )
             if start_dt:
                 query = query.where(RequestStat.timestamp >= start_dt)
@@ -1648,6 +1652,7 @@ async def get_usage_analysis(
                     "total_prompt_tokens": int(row.total_prompt_tokens or 0),
                     "total_completion_tokens": int(row.total_completion_tokens or 0),
                     "total_tokens": int(row.total_tokens or 0),
+                    "recorded_cost": _safe_float(row.recorded_cost),
                 }
                 for row in result.fetchall()
             ]

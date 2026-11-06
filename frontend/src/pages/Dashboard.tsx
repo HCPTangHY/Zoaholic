@@ -24,6 +24,7 @@ interface AnalysisEntry {
   total_prompt_tokens: number;
   total_completion_tokens: number;
   total_tokens: number;
+  recorded_cost: number;
 }
 
 const TIME_RANGES = [
@@ -240,6 +241,7 @@ export default function Dashboard() {
     if (!token) return;
     setAnalysisLoading(true);
     setAnalysisQueried(true);
+    setAnalysisData([]);
     setTrendData([]);
     setTokenBreakdown([]);
     try {
@@ -336,6 +338,7 @@ export default function Dashboard() {
   const analysisTotalPrompt = analysisData.reduce((s, r) => s + r.total_prompt_tokens, 0);
   const analysisTotalCompletion = analysisData.reduce((s, r) => s + r.total_completion_tokens, 0);
   const analysisTotalTokensAll = analysisData.reduce((s, r) => s + r.total_tokens, 0);
+  const analysisTotalCost = analysisData.reduce((s, r) => s + r.recorded_cost, 0);
 
   const topCards = [
     { label: '总请求量', value: formatCompact(totalRequests), icon: Zap, color: 'text-amber-500', bg: 'bg-amber-500/10' },
@@ -791,7 +794,7 @@ export default function Dashboard() {
 
                 {/* 汇总卡片 */}
                 {analysisData.length > 0 && (
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
                     <div className="bg-muted/50 rounded-lg p-3 text-center">
                       <p className="text-xs text-muted-foreground">总请求次数</p>
                       <p className="text-lg font-bold text-foreground mt-1">{formatCompact(analysisTotalRequests)}</p>
@@ -808,6 +811,10 @@ export default function Dashboard() {
                       <p className="text-xs text-muted-foreground">总 Token</p>
                       <p className="text-lg font-bold text-foreground mt-1">{formatTokens(analysisTotalTokensAll)}</p>
                     </div>
+                    <div className="bg-amber-500/10 rounded-lg p-3 text-center" title="按请求发生时记录的价格统计">
+                      <p className="text-xs text-muted-foreground">费用合计（USD）</p>
+                      <p className="text-lg font-bold text-amber-600 dark:text-amber-400 mt-1">{formatCost(analysisTotalCost)}</p>
+                    </div>
                   </div>
                 )}
 
@@ -822,12 +829,13 @@ export default function Dashboard() {
                         <th className="px-4 py-3 text-right">输入 Token</th>
                         <th className="px-4 py-3 text-right">输出 Token</th>
                         <th className="px-4 py-3 text-right">总 Token</th>
+                        <th className="px-4 py-3 text-right">费用（USD）</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-border">
                       {analysisData.length === 0 ? (
                         <tr>
-                          <td colSpan={6} className="px-4 py-8 text-center text-muted-foreground">
+                          <td colSpan={7} className="px-4 py-8 text-center text-muted-foreground">
                             {analysisLoading ? '查询中...' : '暂无数据'}
                           </td>
                         </tr>
@@ -840,6 +848,7 @@ export default function Dashboard() {
                             <td className="px-4 py-3 text-right text-muted-foreground">{formatTokens(entry.total_prompt_tokens)}</td>
                             <td className="px-4 py-3 text-right text-muted-foreground">{formatTokens(entry.total_completion_tokens)}</td>
                             <td className="px-4 py-3 text-right font-mono font-bold text-foreground">{formatTokens(entry.total_tokens)}</td>
+                            <td className="px-4 py-3 text-right font-mono text-amber-600 dark:text-amber-400">{formatCost(entry.recorded_cost)}</td>
                           </tr>
                         ))
                       )}
