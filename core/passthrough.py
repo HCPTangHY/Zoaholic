@@ -169,6 +169,15 @@ def _filter_passthrough_headers(original_headers: Optional[Dict[str, str]],
             continue
         if name in strip_extra:
             continue
+        if engine == "vertex-claude":
+            if name == "anthropic-version":
+                continue
+            if name == "anthropic-beta":
+                from core.channels.vertex_channel import filter_vertex_claude_beta_header
+                filtered_beta = filter_vertex_claude_beta_header(str(v))
+                if filtered_beta:
+                    result[k] = filtered_beta
+                continue
         if name in keep_extra:
             result[k] = v
             continue
@@ -568,6 +577,11 @@ async def process_request_passthrough(
     )
 
     # 渠道级透传 payload 修饰（把"渠道特殊逻辑"收敛在各自 channel 文件内）
+    if engine == "vertex-claude" and isinstance(payload, dict) and passthrough_ctx.original_headers:
+        for _hk, _hv in passthrough_ctx.original_headers.items():
+            if str(_hk).lower() == "anthropic-version" and _hv:
+                payload["_inbound_anthropic_version"] = str(_hv).strip()
+                break
     if channel and getattr(channel, "passthrough_payload_adapter", None):
         payload = await channel.passthrough_payload_adapter(
             payload,

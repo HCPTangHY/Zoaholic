@@ -222,6 +222,28 @@ class VertexProvider(OAuthProvider):
                 except (json.JSONDecodeError, KeyError):
                     pass
         if not client_email or not private_key:
+            # 兼容 Google OAuth authorized_user (gcloud ADC refresh_token) 凭据刷新
+            rtok = str(credential.get("refresh_token") or "").strip()
+            cid = str(credential.get("client_id") or "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com").strip()
+            csec = str(credential.get("client_secret") or "d-FL95Q19q7MQmFpd7hHD0Ty").strip()
+            if rtok and not rtok.startswith("{") and cid and csec:
+                import httpx as _httpx
+                async with _httpx.AsyncClient(timeout=15) as _hc:
+                    _resp = await _hc.post(
+                        "https://oauth2.googleapis.com/token",
+                        data={
+                            "client_id": cid,
+                            "client_secret": csec,
+                            "refresh_token": rtok,
+                            "grant_type": "refresh_token",
+                        },
+                    )
+                    _resp.raise_for_status()
+                    _tdata = _resp.json()
+                credential["access_token"] = _tdata["access_token"]
+                credential["expires_at"] = int(time.time()) + int(_tdata.get("expires_in", 3500)) - 60
+                credential.setdefault("email", credential.get("project_id") or "gcloud_adc_user")
+                return credential
             raise ValueError("Missing client_email or private_key in credential")
         access_token = await get_access_token(client_email, private_key)
         credential["access_token"] = access_token
@@ -353,7 +375,8 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
         'Content-Type': 'application/json'
     }
     is_express = _is_vertex_express_key(api_key)
-    if api_key and not is_express and not (provider.get("client_email") and provider.get("private_key")):
+    is_aiza = isinstance(api_key, str) and api_key.strip().startswith("AIza")
+    if api_key and not is_express and not is_aiza and not (provider.get("client_email") and provider.get("private_key")):
         headers['Authorization'] = f"Bearer {api_key}"
     elif provider.get("client_email") and provider.get("private_key"):
         access_token = await get_access_token(provider['client_email'], provider['private_key'])
@@ -377,6 +400,15 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     elif "google-vertex-ai" in vertex_base_url:
         loc_val = await location.next()
         url = f"{vertex_base_url}/projects/{project_id}/locations/{loc_val}/publishers/google/models/{original_model}:{gemini_stream}"
+    elif is_aiza:
+        headers.pop("Authorization", None)
+        actual_key = api_key.strip()
+        sse_suffix = "&alt=sse" if request.stream else ""
+        if "aiplatform.googleapis.com" in vertex_base_url:
+            ais_base = vertex_base_url.split("aiplatform.googleapis.com")[0] + "generativelanguage.googleapis.com/v1beta"
+        else:
+            ais_base = "https://generativelanguage.googleapis.com/v1beta"
+        url = f"{ais_base}/models/{original_model}:{gemini_stream}?key={actual_key}{sse_suffix}"
     elif is_express:
         headers.pop("Authorization", None)
         exp_pid, actual_key = await extract_vertex_express_project_id(api_key, vertex_base_url)
@@ -805,7 +837,7 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
         elif tool_call_id:
             messages.append({"role": "user", "content": [{
                 "type": "tool_result",
-                "tool_use_id": tool_id,
+                "tool_use_id": tool_call_id,
                 "content": content
             }]})
         elif msg.role == "function":
@@ -903,7 +935,133 @@ async def get_vertex_claude_payload(request, engine, provider, api_key=None):
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
 
+    _normalize_vertex_claude_payload_in_place(payload, original_model, is_stream=bool(request.stream))
+
     return url, headers, payload
+
+
+_VERTEX_STRIP_BETA_PREFIXES = (
+    "oauth-",
+    "prompt-caching-scope-",
+    "claude-code-",
+)
+
+
+def filter_vertex_claude_beta_header(raw_beta: str) -> str:
+    """剥离发往 Vertex AI 的 anthropic-beta 中的私有/OAuth 标识，其余特性原样保留由客户端自行回退。"""
+    if not raw_beta or not isinstance(raw_beta, str):
+        return ""
+    kept = []
+    for seg in raw_beta.split(","):
+        s = seg.strip()
+        if s and not s.startswith(_VERTEX_STRIP_BETA_PREFIXES) and s not in kept:
+            kept.append(s)
+    return ",".join(kept)
+
+
+def _normalize_vertex_claude_payload_in_place(payload: dict, original_model: str, *, is_stream: bool) -> dict:
+    """清理并规范化发往 Vertex Claude 的请求体（兼容透传与转换模式）。"""
+    if not isinstance(payload, dict):
+        return payload
+    inbound_ver = str(payload.pop("_inbound_anthropic_version", None) or "").strip()
+    if inbound_ver:
+        payload["anthropic_version"] = "vertex-2023-10-16" if inbound_ver == "2023-06-01" else inbound_ver
+    else:
+        existing_ver = str(payload.get("anthropic_version") or "").strip()
+        if existing_ver and existing_ver != "2023-06-01":
+            payload["anthropic_version"] = existing_ver
+        else:
+            payload["anthropic_version"] = "vertex-2023-10-16"
+    payload.pop("model", None)
+    if isinstance(payload.get("anthropic_beta"), list):
+        kept_betas = [
+            b.strip() for b in payload["anthropic_beta"]
+            if isinstance(b, str) and b.strip() and not b.strip().startswith(_VERTEX_STRIP_BETA_PREFIXES)
+        ]
+        if kept_betas:
+            payload["anthropic_beta"] = kept_betas
+        else:
+            payload.pop("anthropic_beta", None)
+    if is_stream:
+        payload["stream"] = True
+    else:
+        payload.pop("stream", None)
+
+    # Claude 4.x / 5.x on Vertex 要求 thinking.type = "adaptive" + output_config.effort（拒绝 thinking.type = "enabled"）
+    thinking = payload.get("thinking")
+    model_l = str(original_model or "").lower()
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled" and "claude-3" not in model_l:
+        budget = thinking.get("budget_tokens")
+        effort = "max"
+        if isinstance(budget, (int, float)):
+            if budget <= 2048:
+                effort = "low"
+            elif budget <= 8192:
+                effort = "medium"
+            elif budget <= 24576:
+                effort = "high"
+            else:
+                effort = "max"
+        new_thinking: dict = {"type": "adaptive"}
+        if "display" in thinking:
+            new_thinking["display"] = thinking["display"]
+        payload["thinking"] = new_thinking
+        out_cfg = payload.get("output_config")
+        if not isinstance(out_cfg, dict):
+            out_cfg = {}
+            payload["output_config"] = out_cfg
+        out_cfg.setdefault("effort", effort)
+        payload.pop("top_p", None)
+        payload.pop("top_k", None)
+        payload.pop("temperature", None)
+
+    # Claude 4.7 / 4.8 / 5.x 系列已废弃 temperature / top_p / top_k，传入会报 400
+    if any(k in model_l for k in ("-5", "4-7", "4-8", "4.7", "4.8")):
+        payload.pop("temperature", None)
+        payload.pop("top_p", None)
+        payload.pop("top_k", None)
+    return payload
+
+
+async def get_vertex_claude_passthrough_meta(request, engine, provider, api_key=None):
+    """Vertex Claude 原生 Anthropic /v1/messages 透传元数据适配器。"""
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if api_key and not (provider.get("client_email") and provider.get("private_key")):
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif provider.get("client_email") and provider.get("private_key"):
+        access_token = await get_access_token(provider["client_email"], provider["private_key"])
+        headers["Authorization"] = f"Bearer {access_token}"
+
+    project_id = _get_vertex_project_id(provider)
+    model_dict = get_model_dict(provider)
+    original_model = model_dict[request.model]
+    location = gemini_preview  # global
+    vertex_base_url = provider.get("base_url", "https://aiplatform.googleapis.com/v1").rstrip("/")
+    action = "streamRawPredict" if request.stream else "rawPredict"
+    loc = await location.next()
+    url = f"{vertex_base_url}/projects/{project_id}/locations/{loc}/publishers/anthropic/models/{original_model}:{action}"
+    return url, headers, None
+
+
+async def patch_passthrough_vertex_claude_payload(
+    payload: dict,
+    modifications: dict,
+    request,
+    engine: str,
+    provider: dict,
+    api_key=None,
+) -> dict:
+    """透传模式下将 Anthropic /v1/messages 请求体转换为 Vertex Claude 兼容格式。"""
+    from .claude_channel import patch_passthrough_claude_payload
+    payload = await patch_passthrough_claude_payload(payload, modifications, request, engine, provider, api_key)
+    model_dict = get_model_dict(provider)
+    original_model = model_dict.get(request.model, request.model)
+    if is_tools_disabled(provider):
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+    return _normalize_vertex_claude_payload_in_place(payload, original_model, is_stream=bool(request.stream))
 
 
 async def fetch_vertex_gemini_response(client, url, headers, payload, model, timeout):
@@ -1247,6 +1405,9 @@ def register():
         auth_header="Authorization: Bearer {access_token}",
         description="Google Vertex AI (Claude)",
         request_adapter=get_vertex_claude_payload,
+        passthrough_adapter=get_vertex_claude_passthrough_meta,
+        passthrough_payload_adapter=patch_passthrough_vertex_claude_payload,
+        passthrough_dialects=["claude"],
         response_adapter=fetch_vertex_claude_response,
         # 修改原因：Vertex Claude streamRawPredict 返回标准 Anthropic SSE，不是 Vertex Gemini 的逐行 JSON 流。
         # 修改方式：注册时直接复用 claude_channel.fetch_claude_response_stream；旧函数保留但不再作为适配器使用。

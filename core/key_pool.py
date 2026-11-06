@@ -19,34 +19,47 @@ from .log_config import logger
 
 
 def parse_rate_limit(limit_string):
-    # 定义时间单位到秒的映射
+    # 定义时间单位到秒的映射（负值 < -1 表示滑动窗口 Token 限流：-60=TPM, -3600=TPH, -86400=TPD）
     time_units = {
         's': 1, 'sec': 1, 'second': 1,
-        'm': 60, 'min': 60, 'minute': 60,
-        'h': 3600, 'hr': 3600, 'hour': 3600,
-        'd': 86400, 'day': 86400,
+        'm': 60, 'min': 60, 'minute': 60, 'rpm': 60,
+        'h': 3600, 'hr': 3600, 'hour': 3600, 'rph': 3600,
+        'd': 86400, 'day': 86400, 'rpd': 86400,
         'mo': 2592000, 'month': 2592000,
         'y': 31536000, 'year': 31536000,
         'tpr': -1,
+        'tpm': -60,
+        'tph': -3600,
+        'tpd': -86400,
+        'otpm': -1000060,
+        'otph': -1003600,
+        'otpd': -1086400,
+    }
+    si_multipliers = {
+        'k': 1_000, 'K': 1_000,
+        'm': 1_000_000, 'M': 1_000_000,
+        'g': 1_000_000_000, 'G': 1_000_000_000,
+        'b': 1_000_000_000, 'B': 1_000_000_000,
     }
 
     # 处理多个限制条件
     limits = []
-    for limit in limit_string.split(','):
+    for limit in str(limit_string or '').split(','):
         limit = limit.strip()
-        # 使用正则表达式匹配数字和单位
-        match = re.match(r'^(\d+)/(\w+)$', limit)
+        if not limit:
+            continue
+        match = re.match(r'^(\d+(?:\.\d+)?)([kKmMgGbB]?)/(\w+)$', limit)
         if not match:
-            raise ValueError(f"Invalid rate limit format: {limit}")
+            raise ValueError(f"Invalid rate limit spec: {limit}")
 
-        count, unit = match.groups()
-        count = int(count)
+        count_str, suffix, unit = match.groups()
+        count = int(float(count_str) * (si_multipliers.get(suffix, 1) if suffix else 1))
+        unit_l = unit.lower()
 
-        # 转换单位到秒
-        if unit not in time_units:
+        if unit_l not in time_units:
             raise ValueError(f"Unknown time unit: {unit}")
 
-        seconds = time_units[unit]
+        seconds = time_units[unit_l]
         limits.append((count, seconds))
 
     return limits
@@ -166,6 +179,8 @@ class ThreadSafeCircularList:
         # 修改方式：将 self.requests[api_key][model] 初始化为 deque(maxlen=1000)，并记录 next 调用次数用于惰性清理。
         # 目的：限制单个 model 的时间戳数量，同时给过期 model/api_key 项提供清理入口。
         self.requests = defaultdict(lambda: defaultdict(lambda: deque(maxlen=1000)))
+        self.token_requests = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50000)))
+        self.output_token_requests = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50000)))
         self._request_cleanup_counter = 0
         self.cooling_until = defaultdict(float)
         self.rate_limits = {}
@@ -368,8 +383,58 @@ class ThreadSafeCircularList:
             rate_limit = self.rate_limits.get("default", [(999999, 60)])  #默认限制
             matched_default = True
 
-        # 检查所有速率限制条件
+        # 检查所有速率限制条件（limit_period > 0 为请求次数窗口；-1000000 < limit_period < -1 为总 Token 窗口；limit_period < -1000000 为输出 Token 窗口）
+        token_reqs_map = getattr(self, "token_requests", None)
+        if token_reqs_map is None:
+            self.token_requests = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50000)))
+            token_reqs_map = self.token_requests
+        out_token_reqs_map = getattr(self, "output_token_requests", None)
+        if out_token_reqs_map is None:
+            self.output_token_requests = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50000)))
+            out_token_reqs_map = self.output_token_requests
+
         for limit_count, limit_period in rate_limit:
+            if limit_period == -1:
+                continue
+            if limit_period < -1000000:
+                win_sec = -limit_period - 1000000
+                if matched_default:
+                    recent_out_tokens = sum(
+                        tok for mk_treqs in out_token_reqs_map[item].values()
+                        for ts, tok in mk_treqs if ts > now - win_sec
+                    )
+                else:
+                    recent_out_tokens = sum(
+                        tok for ts, tok in out_token_reqs_map[item][model_key] if ts > now - win_sec
+                    )
+                if recent_out_tokens >= limit_count:
+                    if not is_check:
+                        logger.warning(
+                            f"API key {item}: model: {model_key} has been output-token rate limited "
+                            f"({recent_out_tokens}/{limit_count} output tokens in {win_sec}s)"
+                        )
+                    return True
+                continue
+            if limit_period < -1:
+                win_sec = -limit_period
+                if matched_default:
+                    recent_tokens = sum(
+                        tok for mk_treqs in token_reqs_map[item].values()
+                        for ts, tok in mk_treqs if ts > now - win_sec
+                    )
+                else:
+                    recent_tokens = sum(
+                        tok for ts, tok in token_reqs_map[item][model_key] if ts > now - win_sec
+                    )
+                if recent_tokens >= limit_count:
+                    if not is_check:
+                        logger.warning(
+                            f"API key {item}: model: {model_key} has been token rate limited "
+                            f"({recent_tokens}/{limit_count} tokens in {win_sec}s)"
+                        )
+                    return True
+                continue
+
             if matched_default:
                 # default 规则：跨所有模型汇总计数，作为该 key 的总量限制
                 recent_requests = sum(
@@ -385,14 +450,24 @@ class ThreadSafeCircularList:
                 return True
 
         # 清理太旧的请求记录
-        max_period = max(period for _, period in rate_limit)
-        model_requests = self.requests[item][model_key]
-        cutoff = now - max_period
-        # 修改原因：requests 最内层已改为 deque，若用列表推导重新赋值会丢失 maxlen 上限。
-        # 修改方式：按时间顺序从左侧弹出超出限流窗口的时间戳，保留同一个 deque 对象。
-        # 目的：继续清理窗口外记录，同时保持 deque(maxlen=1000) 的内存上限。
-        while model_requests and model_requests[0] <= cutoff:
-            model_requests.popleft()
+        pos_periods = [period for _, period in rate_limit if period > 0]
+        if pos_periods:
+            max_period = max(pos_periods)
+            model_requests = self.requests[item][model_key]
+            cutoff = now - max_period
+            while model_requests and model_requests[0] <= cutoff:
+                model_requests.popleft()
+
+        neg_periods = [(-period - 1000000 if period < -1000000 else -period) for _, period in rate_limit if period < -1]
+        if neg_periods:
+            max_tok_period = max(neg_periods)
+            tok_cutoff = now - max_tok_period
+            model_tok_requests = token_reqs_map[item][model_key]
+            while model_tok_requests and model_tok_requests[0][0] <= tok_cutoff:
+                model_tok_requests.popleft()
+            model_out_tok_requests = out_token_reqs_map[item][model_key]
+            while model_out_tok_requests and model_out_tok_requests[0][0] <= tok_cutoff:
+                model_out_tok_requests.popleft()
 
         # 记录新的请求
         if not is_check:
@@ -400,6 +475,24 @@ class ThreadSafeCircularList:
 
         return False
 
+    def record_token_usage(self, item: str, model: str = None, tokens: int = 0, output_tokens: int = 0) -> None:
+        """记录单次请求消耗的总 Token 数与输出 Token 数（用于 TPM/TPD 与 OTPM/OTPD 滑动窗口限流）。"""
+        if not item:
+            return
+        now = time()
+        mk = model if model else "default"
+        if tokens and tokens > 0:
+            token_reqs_map = getattr(self, "token_requests", None)
+            if token_reqs_map is None:
+                self.token_requests = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50000)))
+                token_reqs_map = self.token_requests
+            token_reqs_map[item][mk].append((now, int(tokens)))
+        if output_tokens and output_tokens > 0:
+            out_token_reqs_map = getattr(self, "output_token_requests", None)
+            if out_token_reqs_map is None:
+                self.output_token_requests = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50000)))
+                out_token_reqs_map = self.output_token_requests
+            out_token_reqs_map[item][mk].append((now, int(output_tokens)))
 
     async def next(self, model: str = None):
         async with self.lock:
@@ -415,24 +508,44 @@ class ThreadSafeCircularList:
             if self.schedule_algorithm == "fixed_priority":
                 self.index = 0
 
+            preferred_sticky_idx = None
+            has_valid_sticky = False
             if self.schedule_algorithm == "sticky_ip" and len(self.items) > 0:
                 from .middleware import request_info
                 info = request_info.get()
                 client_ip = info.get("client_ip", "") if isinstance(info, dict) else ""
                 now = time()
-                session = self._sticky_sessions.get(client_ip)
-                if session and session[1] > now and session[0] < len(self.items):
-                    # 已有 session 且未过期且 index 合法 → 粘滞
-                    self.index = session[0]
-                else:
-                    # 新 IP 或 session 过期 → round_robin 游标分配，保证均匀
-                    # self.index 已经是当前 round_robin 位置，不用动
-                    pass
-                # 不管是粘滞还是新分配，都在拿到 key 后更新 session（见下方）
+                session = self._sticky_sessions.get(client_ip) if client_ip else None
+                if session and session[1] > now and 0 <= session[0] < len(self.items):
+                    pref_item = self.items[session[0]]
+                    # 仅当原绑定 key 未被永久禁用时保持粘滞锚定，且不污染全局 round_robin 游标 self.index
+                    if pref_item not in self.disabled_keys and self.cooling_until.get(pref_item, 0) != float('inf'):
+                        preferred_sticky_idx = session[0]
+                        has_valid_sticky = True
 
             # 检查是否即将完成一个循环，并据此触发重排序
             if self.schedule_algorithm == "smart_round_robin" and len(self.items) > 0 and self.index == len(self.items) - 1:
                 self._trigger_reorder()
+
+            if preferred_sticky_idx is not None:
+                # 1) 优先尝试已粘滞的 key（不改动全局 self.index）
+                pref_item = self.items[preferred_sticky_idx]
+                if not await self.is_rate_limited(pref_item, model):
+                    self._sticky_sessions[client_ip] = (preferred_sticky_idx, time() + 3600)
+                    return pref_item
+                # 2) 若原绑定 key 仅处于短暂秒级冷却（如 3 秒冷却），临时按游标借用可用 key，
+                #    但不覆盖 _sticky_sessions[client_ip]，下一次请求自动回到原 key 续接热缓存！
+                search_idx = (preferred_sticky_idx + 1) % len(self.items)
+                checked = 1
+                while checked < len(self.items):
+                    cand_item = self.items[search_idx]
+                    search_idx = (search_idx + 1) % len(self.items)
+                    checked += 1
+                    if not await self.is_rate_limited(cand_item, model):
+                        return cand_item
+                    await asyncio.sleep(0)
+                logger.warning("All API keys are rate limited!")
+                raise HTTPException(status_code=429, detail="Too many requests")
 
             start_index = self.index
             while True:
@@ -440,8 +553,8 @@ class ThreadSafeCircularList:
                 self.index = (self.index + 1) % len(self.items)
 
                 if not await self.is_rate_limited(item, model):
-                    # sticky_ip: 记录本次分配，1小时 TTL
-                    if self.schedule_algorithm == "sticky_ip" and client_ip:
+                    # sticky_ip: 首次分配或原 key 永久禁用时写入绑定，1小时 TTL
+                    if self.schedule_algorithm == "sticky_ip" and client_ip and not has_valid_sticky:
                         key_idx = (self.index - 1) % len(self.items)
                         self._sticky_sessions[client_ip] = (key_idx, time() + 3600)
                         # 惰性清理过期 session（每 100 次）

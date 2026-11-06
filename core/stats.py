@@ -700,6 +700,20 @@ def enqueue_stats(current_info: dict, app=None, get_model_prices_func=None) -> N
     except Exception:
         pass
 
+    try:
+        from core.key_pool import provider_api_circular_list
+        _prov_name = current_info.get("provider_id") or current_info.get("provider")
+        _used_key = current_info.get("_used_api_key")
+        _tok_total = (current_info.get("total_tokens") or 0) or (
+            (current_info.get("prompt_tokens") or 0) + (current_info.get("completion_tokens") or 0)
+        )
+        if _prov_name and _used_key and _tok_total > 0:
+            _clist = provider_api_circular_list.get(_prov_name)
+            if _clist is not None and hasattr(_clist, "record_token_usage"):
+                _clist.record_token_usage(_used_key, current_info.get("model") or "default", int(_tok_total))
+    except Exception:
+        pass
+
     _stats_buffer.append((current_info.copy(), app))
     _ensure_stats_consumer_started()
     if len(_stats_buffer) >= _STATS_BATCH_SIZE and _stats_flush_event is not None:

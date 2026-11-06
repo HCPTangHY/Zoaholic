@@ -658,6 +658,16 @@ async def fetch_claude_response_stream(client, url, headers, payload, model, tim
 
                     output_tokens = safe_get(resp, "usage", "output_tokens", default=0)
                     if output_tokens:
+                        raw_stop_reason = safe_get(resp, "delta", "stop_reason", default="")
+                        if raw_stop_reason != "refusal":
+                            if raw_stop_reason == "tool_use" or tc_index > 0:
+                                _finish_reason = "tool_calls"
+                            elif raw_stop_reason == "max_tokens":
+                                _finish_reason = "length"
+                            else:
+                                _finish_reason = "stop"
+                            stop_sse = await generate_sse_response(timestamp, model, stop=_finish_reason)
+                            yield stop_sse
                         total_tokens = input_tokens + output_tokens
                         merge_usage(
                             prompt_tokens=input_tokens,
