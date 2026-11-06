@@ -153,6 +153,8 @@ def _install_gemini_vertex_channel_hotfix():
         gc_mod = sys.modules.get("core.channels.gemini_channel")
         if gc_mod is not None:
             gc_mod = importlib.reload(gc_mod)
+            gc_mod._unwrapped_fetch_gemini_response = gc_mod.fetch_gemini_response
+            gc_mod._unwrapped_fetch_gemini_response_stream = gc_mod.fetch_gemini_response_stream
         else:
             from core.channels import gemini_channel as gc_mod
 

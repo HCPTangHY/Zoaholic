@@ -21,7 +21,14 @@ class OAuthManager:
     # 主动刷新参数
     PROACTIVE_INTERVAL = 30       # 轮询间隔（秒）
     PROACTIVE_MARGIN = 600        # 过期前多少秒开始刷新（10 分钟）
-    PROACTIVE_CONCURRENCY = 8     # 同时刷新上限
+    PROACTIVE_CONCURRENCY = 5     # 正常模式同时刷新上限
+    # 修改原因：同一轮内多个账号同时刷新失败时，继续并发刷新会放大上游限流并让一批账号一起进入熔断。
+    # 修改方式：某一轮出现失败后，下一轮切换为慢速模式：按过期时间排序，每轮最多刷新 PROACTIVE_SLOW_BATCH 个，
+    #           依次执行并间隔 PROACTIVE_SLOW_DELAY 秒（附加随机抖动），其余账号顺延到下一轮；某一轮无失败后恢复正常模式。
+    # 目的：保留定时主动刷新，同时在出现错误时降低刷新压力。
+    PROACTIVE_SLOW_BATCH = 4      # 慢速模式每轮最多刷新账号数
+    PROACTIVE_SLOW_DELAY = 2.0    # 慢速模式两次刷新之间的间隔（秒）
+    PROACTIVE_SLOW_JITTER = 1.0   # 慢速模式间隔附加的随机抖动上限（秒）
 
     def __init__(self, state_path: str = STATE_PATH):
         # 修改原因：OAuth 凭据需要按渠道隔离，同一邮箱可能同时存在于多个 provider name 下。
@@ -45,6 +52,7 @@ class OAuthManager:
         self._quota_flush_delay = 30
         self._proactive_task: asyncio.Task | None = None
         self._proactive_semaphore = asyncio.Semaphore(self.PROACTIVE_CONCURRENCY)
+        self._proactive_slow_mode = False
         # 修改原因：渠道注册表现在支持在 register_channel 时声明 oauth_provider，manager 初始化后应立即接入该机制。
         # 修改方式：安装一个 registry 回调，并要求重放已有渠道，处理 manager 创建前已经完成的渠道注册。
         # 目的：让 OAuth provider 注册从 main.py 硬编码扫描迁移到渠道注册表自动同步，同时保留旧兜底逻辑。
@@ -817,68 +825,103 @@ class OAuthManager:
 
     async def _proactive_refresh_loop(self) -> None:
         """后台循环：定期扫描所有 OAuth 账号，主动刷新即将过期的 token。"""
-        import time as _time
-
         while True:
             try:
                 await asyncio.sleep(self.PROACTIVE_INTERVAL)
             except asyncio.CancelledError:
                 return
 
-            now = _time.time()
-            tasks: list[tuple[str, str, dict]] = []
-
-            for channel_id, accounts in list(self._state.items()):
-                if not isinstance(accounts, dict):
-                    continue
-                for key_id, cred in list(accounts.items()):
-                    if not isinstance(cred, dict):
-                        continue
-                    # 跳过没有 refresh_token 的账号
-                    if not cred.get("refresh_token"):
-                        continue
-                    # 跳过已处于熔断状态的账号
-                    if self._is_refresh_circuit_open(cred):
-                        continue
-                    # 跳过 status 不是 active 的账号（error / disabled 等）
-                    status = cred.get("status", "active")
-                    if status not in ("active", None):
-                        continue
-                    # 检查是否在过期边界内
-                    expires_at = cred.get("expires_at", 0)
-                    if not isinstance(expires_at, (int, float)):
-                        try:
-                            expires_at = float(expires_at)
-                        except (TypeError, ValueError):
-                            continue
-                    if now > expires_at - self.PROACTIVE_MARGIN:
-                        tasks.append((channel_id, key_id, cred))
-
-            if not tasks:
-                continue
-
-            refreshed = 0
-            failed = 0
-
-            async def _do_refresh(ch_id: str, k_id: str):
-                nonlocal refreshed, failed
-                async with self._proactive_semaphore:
-                    try:
-                        token = await self.resolve(ch_id, k_id)
-                        if token:
-                            refreshed += 1
-                        else:
-                            failed += 1
-                    except Exception as e:
-                        failed += 1
-                        logger.debug("[proactive_refresh] %s:%s error: %s", ch_id, k_id, e)
-
-            batch = [_do_refresh(ch, k) for ch, k, _ in tasks]
             try:
-                await asyncio.gather(*batch, return_exceptions=True)
+                await self._proactive_refresh_cycle()
             except asyncio.CancelledError:
                 return
+            except Exception as e:
+                # 单轮异常不能终止后台任务，否则之后所有账号都不再主动刷新。
+                logger.warning("[proactive_refresh] cycle error: %s", e)
 
-            if refreshed or failed:
-                logger.info("[proactive_refresh] cycle done: %d refreshed, %d failed (of %d candidates)",
-                            refreshed, failed, len(tasks))
+    def _collect_proactive_candidates(self, now: float) -> list[tuple[str, str, float]]:
+        """收集需要主动刷新的账号，返回 (channel_id, key_id, expires_at) 列表。"""
+        tasks: list[tuple[str, str, float]] = []
+        for channel_id, accounts in list(self._state.items()):
+            if not isinstance(accounts, dict):
+                continue
+            for key_id, cred in list(accounts.items()):
+                if not isinstance(cred, dict):
+                    continue
+                # 跳过没有 refresh_token 的账号
+                if not cred.get("refresh_token"):
+                    continue
+                # 跳过已处于熔断状态的账号
+                if self._is_refresh_circuit_open(cred):
+                    continue
+                # 跳过 status 不是 active 的账号（error / disabled 等）
+                status = cred.get("status", "active")
+                if status not in ("active", None):
+                    continue
+                # 检查是否在过期边界内
+                expires_at = cred.get("expires_at", 0)
+                if not isinstance(expires_at, (int, float)):
+                    try:
+                        expires_at = float(expires_at)
+                    except (TypeError, ValueError):
+                        continue
+                if now > expires_at - self.PROACTIVE_MARGIN:
+                    tasks.append((channel_id, key_id, float(expires_at)))
+        return tasks
+
+    async def _refresh_one_proactive(self, channel_id: str, key_id: str) -> bool:
+        """主动刷新单个账号，成功返回 True。异常只记录，不向外抛出。"""
+        try:
+            return bool(await self.resolve(channel_id, key_id))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("[proactive_refresh] %s:%s error: %s", channel_id, key_id, e)
+            return False
+
+    async def _proactive_refresh_cycle(self, now: float | None = None) -> tuple[int, int]:
+        """执行一轮主动刷新，返回 (refreshed, failed)。
+
+        正常模式：全部候选账号并发刷新，并发数受 PROACTIVE_CONCURRENCY 限制。
+        慢速模式：按过期时间从早到晚取前 PROACTIVE_SLOW_BATCH 个，依次刷新并间隔，其余顺延到下一轮。
+        本轮出现失败则下一轮进入慢速模式；本轮无失败则下一轮回到正常模式。
+        """
+        import random
+        import time as _time
+
+        now = _time.time() if now is None else now
+        tasks = self._collect_proactive_candidates(now)
+        if not tasks:
+            return 0, 0
+
+        slow = self._proactive_slow_mode
+        deferred = 0
+        if slow:
+            tasks.sort(key=lambda item: item[2])
+            deferred = max(0, len(tasks) - self.PROACTIVE_SLOW_BATCH)
+            results: list[bool] = []
+            for index, (channel_id, key_id, _) in enumerate(tasks[: self.PROACTIVE_SLOW_BATCH]):
+                if index:
+                    await asyncio.sleep(self.PROACTIVE_SLOW_DELAY + random.uniform(0, self.PROACTIVE_SLOW_JITTER))
+                results.append(await self._refresh_one_proactive(channel_id, key_id))
+        else:
+            async def _guarded(channel_id: str, key_id: str) -> bool:
+                async with self._proactive_semaphore:
+                    return await self._refresh_one_proactive(channel_id, key_id)
+
+            results = list(await asyncio.gather(*(_guarded(ch, k) for ch, k, _ in tasks)))
+
+        refreshed = sum(1 for ok in results if ok)
+        failed = len(results) - refreshed
+
+        if failed and not slow:
+            logger.warning("[proactive_refresh] %d refresh failed, switching to slow mode (batch=%d, delay=%.1fs)",
+                           failed, self.PROACTIVE_SLOW_BATCH, self.PROACTIVE_SLOW_DELAY)
+        elif slow and not failed:
+            logger.info("[proactive_refresh] slow-mode cycle clean, back to normal mode (concurrency=%d)",
+                        self.PROACTIVE_CONCURRENCY)
+        self._proactive_slow_mode = failed > 0
+
+        logger.info("[proactive_refresh] cycle done (%s): %d refreshed, %d failed, %d deferred (of %d candidates)",
+                    "slow" if slow else "normal", refreshed, failed, deferred, len(tasks))
+        return refreshed, failed

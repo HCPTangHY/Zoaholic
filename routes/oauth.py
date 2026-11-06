@@ -742,13 +742,22 @@ async def import_account(request: Request):
 
         if oauth_provider:
             try:
-                updated = await oauth_provider.refresh_token(token_data)
+                if hasattr(oauth_mgr, "refresh_provider"):
+                    updated = await oauth_mgr.refresh_provider(type_name, token_data)
+                else:
+                    updated = await oauth_provider.refresh_token(token_data)
+                already_exists = _key_exists_in_provider(request.app, channel_id, client_email)
                 await oauth_mgr.register(channel_id, client_email, type_name, updated)
+                if not already_exists:
+                    await _sync_provider_api_key_add(request.app, channel_id, client_email)
                 return {"message": "Service account imported", "key_id": client_email}
             except Exception as e:
                 return JSONResponse({"error": f"Failed to verify service account: {e}"}, status_code=400)
         else:
+            already_exists = _key_exists_in_provider(request.app, channel_id, client_email)
             await oauth_mgr.register(channel_id, client_email, type_name, token_data)
+            if not already_exists:
+                await _sync_provider_api_key_add(request.app, channel_id, client_email)
             return {"message": "Service account imported (unverified)", "key_id": client_email}
 
     key_id = body["key_id"]

@@ -171,15 +171,37 @@ def create_jwt(client_email, private_key):
     return b'.'.join(segments).decode()
 
 
-async def get_access_token(client_email, private_key):
+def _extract_vertex_proxy_from_config(config: dict | None) -> str | None:
+    """优先从运行时配置中的 Vertex 渠道或全局 preferences 提取代理，兜底读取环境变量。"""
+    if isinstance(config, dict):
+        providers = config.get("providers")
+        if not isinstance(providers, list):
+            api_cfg = config.get("api_config") if isinstance(config.get("api_config"), dict) else {}
+            providers = api_cfg.get("providers") if isinstance(api_cfg.get("providers"), list) else []
+        for p in providers:
+            if not isinstance(p, dict):
+                continue
+            eng = str(p.get("engine") or "").strip()
+            if eng in ("vertex-gemini", "vertex-claude"):
+                p_proxy = safe_get(p, "preferences", "proxy", default=None) or p.get("proxy")
+                if isinstance(p_proxy, str) and p_proxy.strip():
+                    return p_proxy.strip()
+        g_proxy = safe_get(config, "preferences", "proxy", default=None)
+        if isinstance(g_proxy, str) and g_proxy.strip():
+            return g_proxy.strip()
+    return (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+    )
+
+
+async def get_access_token(client_email, private_key, proxy_url: str | None = None):
     """获取 Vertex AI 访问令牌"""
     jwt = await asyncio.to_thread(create_jwt, client_email, private_key)
-
-    # 修改原因：服务账号 JWT 换取 Google access_token 时直接访问 oauth2.googleapis.com，代理环境下裸连容易超时。
-    # 修改方式：按常见大小写环境变量读取 HTTPS_PROXY 或 HTTP_PROXY，并传给 httpx 的单数 proxy 参数。
-    # 目的：无代理环境传 None 保持原行为，有代理环境时 token 请求可以正常通过代理访问 Google。
-    proxy_url = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy') or os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')
-    async with httpx.AsyncClient(proxy=proxy_url) as client:
+    effective_proxy = proxy_url or _extract_vertex_proxy_from_config(None)
+    async with httpx.AsyncClient(proxy=effective_proxy, timeout=15.0) as client:
         response = await client.post(
             "https://oauth2.googleapis.com/token",
             data={
@@ -192,19 +214,16 @@ async def get_access_token(client_email, private_key):
         return response.json()["access_token"]
 
 
-
 class VertexProvider(OAuthProvider):
     """Vertex AI Service Account OAuth provider."""
     redirect_mode = "manual"
     localhost_redirect_uri = ""
 
     async def refresh_token(self, credential: dict, config=None) -> dict:
-        # 修改原因：Vertex AI 使用服务账号 JWT 换取 access_token，不走浏览器授权流程。
-        # 修改方式：从导入的 credential 读取 client_email/private_key，并复用现有 get_access_token 生成 Bearer token。
-        # 目的：让 OAuthManager 可以刷新并保存 Vertex AI 的短期 access_token。
+        import inspect
+        proxy_url = _extract_vertex_proxy_from_config(config)
         client_email = credential.get("client_email", "")
         private_key = credential.get("private_key", "")
-        # 自动检测：如果 refresh_token 字段是 service account JSON，解析并提取字段
         if not client_email or not private_key:
             raw_token = credential.get("refresh_token", "")
             if isinstance(raw_token, str) and raw_token.strip().startswith("{"):
@@ -222,13 +241,12 @@ class VertexProvider(OAuthProvider):
                 except (json.JSONDecodeError, KeyError):
                     pass
         if not client_email or not private_key:
-            # 兼容 Google OAuth authorized_user (gcloud ADC refresh_token) 凭据刷新
             rtok = str(credential.get("refresh_token") or "").strip()
             cid = str(credential.get("client_id") or "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com").strip()
             csec = str(credential.get("client_secret") or "d-FL95Q19q7MQmFpd7hHD0Ty").strip()
             if rtok and not rtok.startswith("{") and cid and csec:
                 import httpx as _httpx
-                async with _httpx.AsyncClient(timeout=15) as _hc:
+                async with _httpx.AsyncClient(proxy=proxy_url, timeout=15.0) as _hc:
                     _resp = await _hc.post(
                         "https://oauth2.googleapis.com/token",
                         data={
@@ -245,7 +263,14 @@ class VertexProvider(OAuthProvider):
                 credential.setdefault("email", credential.get("project_id") or "gcloud_adc_user")
                 return credential
             raise ValueError("Missing client_email or private_key in credential")
-        access_token = await get_access_token(client_email, private_key)
+        try:
+            params = inspect.signature(get_access_token).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "proxy_url" in params and proxy_url:
+            access_token = await get_access_token(client_email, private_key, proxy_url=proxy_url)
+        else:
+            access_token = await get_access_token(client_email, private_key)
         credential["access_token"] = access_token
         credential["expires_at"] = int(time.time()) + 3500
         credential.setdefault("email", client_email)
@@ -374,9 +399,10 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     headers = {
         'Content-Type': 'application/json'
     }
+    if isinstance(api_key, str) and api_key.strip().startswith("AIza"):
+        raise ValueError("AI Studio API Key (AIza...) is not supported in vertex-gemini channel")
     is_express = _is_vertex_express_key(api_key)
-    is_aiza = isinstance(api_key, str) and api_key.strip().startswith("AIza")
-    if api_key and not is_express and not is_aiza and not (provider.get("client_email") and provider.get("private_key")):
+    if api_key and not is_express and not (provider.get("client_email") and provider.get("private_key")):
         headers['Authorization'] = f"Bearer {api_key}"
     elif provider.get("client_email") and provider.get("private_key"):
         access_token = await get_access_token(provider['client_email'], provider['private_key'])
@@ -400,15 +426,6 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     elif "google-vertex-ai" in vertex_base_url:
         loc_val = await location.next()
         url = f"{vertex_base_url}/projects/{project_id}/locations/{loc_val}/publishers/google/models/{original_model}:{gemini_stream}"
-    elif is_aiza:
-        headers.pop("Authorization", None)
-        actual_key = api_key.strip()
-        sse_suffix = "&alt=sse" if request.stream else ""
-        if "aiplatform.googleapis.com" in vertex_base_url:
-            ais_base = vertex_base_url.split("aiplatform.googleapis.com")[0] + "generativelanguage.googleapis.com/v1beta"
-        else:
-            ais_base = "https://generativelanguage.googleapis.com/v1beta"
-        url = f"{ais_base}/models/{original_model}:{gemini_stream}?key={actual_key}{sse_suffix}"
     elif is_express:
         headers.pop("Authorization", None)
         exp_pid, actual_key = await extract_vertex_express_project_id(api_key, vertex_base_url)
@@ -1360,6 +1377,58 @@ async def fetch_vertex_claude_models(client, provider):
     return models
 
 
+async def get_vertex_gemini_passthrough_meta(request, engine, provider, api_key=None):
+    """Vertex Gemini 原生 /v1beta 透传轻量元数据适配器（仅构建 URL 与认证头）。"""
+    if isinstance(api_key, str) and api_key.strip().startswith("AIza"):
+        raise ValueError("AI Studio API Key (AIza...) is not supported in vertex-gemini channel")
+    headers = {"Content-Type": "application/json"}
+    is_express = _is_vertex_express_key(api_key)
+    if api_key and not is_express and not (provider.get("client_email") and provider.get("private_key")):
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif provider.get("client_email") and provider.get("private_key"):
+        access_token = await get_access_token(provider["client_email"], provider["private_key"])
+        headers["Authorization"] = f"Bearer {access_token}"
+    project_id = _get_vertex_project_id(provider)
+    gemini_stream = "streamGenerateContent" if request.stream else "generateContent"
+    model_dict = get_model_dict(provider)
+    original_model = model_dict.get(request.model, request.model)
+    location = gemini_preview
+    vertex_base_url = provider.get("base_url", "https://aiplatform.googleapis.com/v1beta").rstrip("/")
+    if vertex_base_url.endswith("#"):
+        url = vertex_base_url[:-1].rstrip("/")
+    elif is_express:
+        headers.pop("Authorization", None)
+        exp_pid, actual_key = await extract_vertex_express_project_id(api_key, vertex_base_url)
+        effective_pid = project_id or exp_pid
+        sse_suffix = "&alt=sse" if request.stream else ""
+        if effective_pid:
+            url = f"{vertex_base_url}/projects/{effective_pid}/locations/global/publishers/google/models/{original_model}:{gemini_stream}?key={actual_key}{sse_suffix}"
+        else:
+            url = f"{vertex_base_url}/publishers/google/models/{original_model}:{gemini_stream}?key={actual_key}{sse_suffix}"
+    else:
+        loc_val = await location.next()
+        url = f"{vertex_base_url}/projects/{project_id}/locations/{loc_val}/publishers/google/models/{original_model}:{gemini_stream}"
+    return url, headers, None
+
+
+async def patch_passthrough_vertex_gemini_payload(
+    payload: dict,
+    modifications: dict,
+    request,
+    engine: str,
+    provider: dict,
+    api_key=None,
+) -> dict:
+    """透传模式下对发往 Vertex Gemini 的 payload 做修饰，并自动补齐缺失的 contents[].role。"""
+    from .gemini_channel import patch_passthrough_gemini_payload
+    payload = await patch_passthrough_gemini_payload(payload, modifications, request, engine, provider, api_key)
+    if isinstance(payload, dict) and isinstance(payload.get("contents"), list):
+        for item in payload["contents"]:
+            if isinstance(item, dict) and not item.get("role"):
+                item["role"] = "user"
+    return payload
+
+
 def register():
     """注册 Vertex AI 渠道到注册中心"""
     from .registry import register_channel
@@ -1367,7 +1436,6 @@ def register():
     from .gemini_channel import gemini_stream_classifier
     
     # 注册 Vertex Gemini
-    from .gemini_channel import patch_passthrough_gemini_payload
     register_channel(
         id="vertex-gemini",
         type_name="vertex-gemini",
@@ -1375,10 +1443,8 @@ def register():
         auth_header="Authorization: Bearer {access_token}",
         description="Google Vertex AI (Gemini)",
         request_adapter=get_vertex_gemini_payload,
-        # 修改原因：Gemini 原生请求透传至 vertex-gemini 时需要渠道级 payload 修饰器。
-        # 修改方式：复用 gemini_channel 的 patch_passthrough_gemini_payload（仅注入 system_prompt），Vertex 格式兼容。
-        # 目的：透传时仍能应用渠道配置的 system_prompt。
-        passthrough_payload_adapter=patch_passthrough_gemini_payload,
+        passthrough_adapter=get_vertex_gemini_passthrough_meta,
+        passthrough_payload_adapter=patch_passthrough_vertex_gemini_payload,
         # 修改原因：vertex-gemini 接受 Gemini 原生格式，透传兼容性应由渠道自身声明。
         # 修改方式：声明 passthrough_dialects=["gemini"]，detect_passthrough 优先检查此字段。
         # 目的：Gemini 方言入口的请求发往 vertex-gemini 时走透传，避免双重转换。
