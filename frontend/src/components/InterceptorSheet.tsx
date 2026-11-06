@@ -16,7 +16,7 @@ import {
 interface PluginOption {
   plugin_name: string;
   version: string;
-  description: string;
+  description?: string | null;
   enabled: boolean;
   inbound_interceptors?: unknown[];
   channel_inbound_interceptors?: unknown[];
@@ -116,7 +116,7 @@ export function InterceptorSheet({
 
       return (
         plugin.plugin_name.toLowerCase().includes(normalizedSearch) ||
-        plugin.description.toLowerCase().includes(normalizedSearch)
+        (plugin.description ?? '').toLowerCase().includes(normalizedSearch)
       );
     });
   }, [activeTab, effectivePlugins, normalizedSearch]);

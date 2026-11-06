@@ -15,10 +15,23 @@ assert.match(source, /\{ value: 'response', label: '响应拦截' \}/, '应保�
 assert.match(source, /\{ value: 'channel_outbound', label: '渠道出站' \}/, '应保留渠道出站标签');
 assert.match(source, /\{ value: 'key_outbound', label: 'Key 出站' \}/, '应保留 Key 出站标签');
 
-// 插件搜索：应按名称/描述过滤。
-assert.match(source, /normalizedSearch/, 'InterceptorSheet 应保留插件搜索过滤');
-assert.match(source, /plugin\.plugin_name\.toLowerCase\(\)\.includes\(normalizedSearch\)/, '搜索应匹配插件名称');
-assert.match(source, /plugin\.description\.toLowerCase\(\)\.includes\(normalizedSearch\)/, '搜索应匹配插件描述');
+// 运行组件中的筛选逻辑，覆盖接口返回 null 描述时的搜索崩溃。
+const filterBody = source.match(/const filteredPlugins = useMemo\(\(\) => \{([\s\S]*?)\n  \}, \[activeTab, effectivePlugins, normalizedSearch\]\);/);
+assert.ok(filterBody, '应能提取插件筛选逻辑');
+const filterPlugins = new Function('effectivePlugins', 'activeTab', 'normalizedSearch', filterBody[1]);
+const plugins = [
+  { plugin_name: 'builtin', description: null, request_interceptors: [{}] },
+  { plugin_name: 'legacy', response_interceptors: [{}] },
+  { plugin_name: 'Claude_Tools', description: '工具兼容 Compatibility', request_interceptors: [{}] },
+];
+assert.deepEqual(filterPlugins(plugins, 'all', ''), plugins, '空搜索应显示全部插件');
+assert.deepEqual(filterPlugins(plugins, 'all', 'missing'), [], '描述缺失时未命中搜索不应崩溃');
+assert.deepEqual(filterPlugins(plugins, 'all', 'builtin'), [plugins[0]], '描述为 null 时仍可按名称搜索');
+assert.deepEqual(filterPlugins(plugins, 'all', 'legacy'), [plugins[1]], '描述缺失时仍可按名称搜索');
+assert.deepEqual(filterPlugins(plugins, 'all', 'claude'), [plugins[2]], '名称搜索应忽略大小写');
+assert.deepEqual(filterPlugins(plugins, 'all', 'compatibility'), [plugins[2]], '描述搜索应忽略大小写');
+assert.deepEqual(filterPlugins(plugins, 'request', '工具'), [plugins[2]], '应支持中文描述和阶段筛选');
+assert.deepEqual(filterPlugins(plugins, 'response', '工具'), [], '搜索不应包含其他阶段的插件');
 
 // Tab 和搜索过滤之后，应把已启用和未启用插件拆成两组展示。
 assert.match(source, /const selectedPlugins: PluginOption\[\] = \[\]/, '应保留已启用分组');
