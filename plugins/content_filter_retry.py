@@ -248,7 +248,17 @@ async def _wrapped_fetch_stream(client, url, headers, payload, model, timeout):
         should_retry = False
         first = True
 
+        try:
+            import time as _time_mod
+            _cf_info = request_info.get()
+            if isinstance(_cf_info, dict):
+                _cf_info["_last_stream_activity_at"] = _time_mod.monotonic()
+        except Exception:
+            _cf_info = None
         async for chunk in _original_stream_adapter(client, url, headers, current_payload, model, timeout):
+            if isinstance(_cf_info, dict):
+                _cf_info["_upstream_first_byte_ok"] = True
+                _cf_info["_last_stream_activity_at"] = _time_mod.monotonic()
             if first:
                 first = False
                 if _is_content_filter_error(chunk) and attempt < max_retries:

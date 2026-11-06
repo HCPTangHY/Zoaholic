@@ -23,7 +23,7 @@ from core.response import check_response
 from core.streaming import LoggingStreamingResponse
 from core.stream_utils import close_async_iterator, OwnedAsyncIterator
 from core.stream_errors import reset_stream_state, extract_stream_error, UpstreamStreamError
-from core.utils import get_engine, is_local_api_key, provider_api_circular_list
+from core.utils import get_engine, get_model_dict, is_local_api_key, provider_api_circular_list
 from utils import apply_custom_headers, has_header_case_insensitive, safe_get, wait_for_timeout, iter_sse_with_keepalive
 
 if TYPE_CHECKING:
@@ -336,7 +336,7 @@ async def _fetch_passthrough_response(
     yield result
 
 
-async def _passthrough_error_wrapper(generator, channel_id="passthrough", keepalive_interval: Optional[int] = None, *, stream=True, current_info=None, engine=None):
+async def _passthrough_error_wrapper(generator, channel_id="passthrough", keepalive_interval: Optional[int] = None, *, stream=True, current_info=None, engine=None, stream_header_timeout: Optional[float] = None):
     """
     透传模式的简单错误包装器。
 
@@ -345,7 +345,7 @@ async def _passthrough_error_wrapper(generator, channel_id="passthrough", keepal
     if stream:
         from core.stream_pipeline import prepare_stream
         return await prepare_stream(generator, current_info=current_info, keepalive_interval=keepalive_interval,
-                                    engine=engine)
+                                    stream_header_timeout=stream_header_timeout, engine=engine)
     from time import time as time_now
     start_time = time_now()
     first_response_time = None
@@ -458,6 +458,7 @@ async def process_request_passthrough(
     force_api_key: Optional[str] = None,
     api_key_info: Optional[Dict[str, Any]] = None,
     key_enabled_plugins: Optional[List[str]] = None,
+    stream_header_timeout: Optional[float] = None,
 ) -> Response:
     """
     透传模式请求处理：
@@ -475,7 +476,7 @@ async def process_request_passthrough(
     from core.channels import get_channel
 
     timeout_value = int(timeout_value)
-    model_dict = provider["_model_dict_cache"]
+    model_dict = get_model_dict(provider)
     original_model = model_dict[request.model]
 
     channel_id = f"{provider['provider']}"
@@ -725,6 +726,7 @@ async def process_request_passthrough(
                 # 使用简单的透传错误包装器，不做 JSON 解析
                 wrapped_generator, first_response_time = await _passthrough_error_wrapper(
                     generator, channel_id, keepalive_interval=keepalive_interval,
+                    stream_header_timeout=stream_header_timeout,
                     current_info=current_info,
                     engine=engine,
                 )

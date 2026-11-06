@@ -316,7 +316,7 @@ class StreamInspector:
 
 
 def reset_stream_state(info):
-    for key in ("_stream_error", "_stream_error_handled", "_stream_committed", "_stream_has_output", "_stream_raw_inspector", "_channel_stats_call", "error_message", "adapter_metrics_managed", "content_start_time"):
+    for key in ("_stream_error", "_stream_error_handled", "_stream_committed", "_stream_has_output", "_stream_raw_inspector", "_channel_stats_call", "error_message", "adapter_metrics_managed", "content_start_time", "_upstream_header_ok", "_upstream_first_byte_ok", "_last_stream_activity_at"):
         info.pop(key, None)
     for key in ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_creation_tokens"):
         info[key] = 0

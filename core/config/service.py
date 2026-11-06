@@ -290,7 +290,7 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
                                 new_circular.cooling_until[k] = until
                                 new_circular.auto_disabled_info[k] = info
 
-        if "models.inference.ai.azure.com" in provider['base_url'] and not provider.get("model"):
+        if "models.inference.ai.azure.com" in (provider.get('base_url') or '') and not provider.get("model"):
             provider['model'] = [
                 "gpt-4o",
                 "gpt-4.1",

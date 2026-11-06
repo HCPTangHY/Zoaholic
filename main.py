@@ -53,6 +53,7 @@ DEFAULT_TIMEOUT = int(os.getenv("TIMEOUT", 600))
 # 修改方式：为 keepalive_interval 提供可环境变量覆盖的合理默认值，配置文件仍可按全局/渠道/模型覆盖。
 # 目的：默认每 15 秒向下游发送 SSE 注释帧，避免客户端或中间代理因空闲无字节而断开。
 DEFAULT_KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", 15))
+DEFAULT_STREAM_HEADER_TIMEOUT = int(os.getenv("STREAM_HEADER_TIMEOUT", 60))
 # DEBUG 环境变量支持 true/false/1/0/yes/no
 is_debug = env_bool("DEBUG", False)
 logger.info("DISABLE_DATABASE: %s", DISABLE_DATABASE)
@@ -66,33 +67,43 @@ except Exception:
     VERSION = 'unknown'
 logger.info("VERSION: %s", VERSION)
 
-def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT):
-    # 存储超时配置
-    # 修改原因：旧逻辑在 preferences 为空或未声明某项偏好时，会让 global 默认值变成空 dict，
-    # 后续调用方若传入兜底值就可能覆盖启动期 default_timeout（keepalive 因此默认落到 99999 并被禁用）。
-    # 修改方式：先写入 default_timeout，再叠加配置文件中的全局/模型级覆盖。
-    # 目的：让 model_timeout、keepalive_interval 等偏好都稳定遵守启动期默认值，同时保留现有覆盖语义。
+def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT, alias_keys=()):
+    # 存储超时配置（支持全局与单渠道覆盖，兼容直接填数值或按模型名的字典，以及别名键如 header_timeout）
     preference_dict = {"default": default_timeout}
     preferences = safe_get(all_config, "preferences", default={})
     providers = safe_get(all_config, "providers", default=[])
-    if preferences:
-        if isinstance(preferences.get(preference_key), int):
-            preference_dict["default"] = preferences.get(preference_key)
-        else:
-            preference_settings = preferences.get(preference_key, {}) or {}
-            for model_name, timeout_value in preference_settings.items():
+    keys_to_check = (preference_key,) + tuple(alias_keys or ())
+    if isinstance(preferences, dict) and preferences:
+        raw_global = None
+        for k in keys_to_check:
+            if preferences.get(k) is not None:
+                raw_global = preferences.get(k)
+                break
+        if isinstance(raw_global, (int, float)) and not isinstance(raw_global, bool):
+            preference_dict["default"] = raw_global
+        elif isinstance(raw_global, dict):
+            for model_name, timeout_value in raw_global.items():
                 preference_dict[model_name] = timeout_value
 
     result = defaultdict(lambda: defaultdict(lambda: default_timeout))
     for provider in providers:
-        provider_preference_settings = safe_get(provider, "preferences", preference_key, default={})
-        if provider_preference_settings:
-            for model_name, timeout_value in provider_preference_settings.items():
-                result[provider['provider']][model_name] = timeout_value
+        if not isinstance(provider, dict) or "provider" not in provider:
+            continue
+        prov_prefs = safe_get(provider, "preferences", default={})
+        if not isinstance(prov_prefs, dict):
+            continue
+        raw_prov = None
+        for k in keys_to_check:
+            if prov_prefs.get(k) is not None:
+                raw_prov = prov_prefs.get(k)
+                break
+        if isinstance(raw_prov, (int, float)) and not isinstance(raw_prov, bool):
+            result[provider["provider"]]["default"] = raw_prov
+        elif isinstance(raw_prov, dict):
+            for model_name, timeout_value in raw_prov.items():
+                result[provider["provider"]][model_name] = timeout_value
 
     result["global"] = preference_dict
-    # print("result", json.dumps(result, indent=4))
-
     return result
 
 # ---- 数据库压缩闸门 ----
@@ -703,6 +714,9 @@ async def lifespan(app: FastAPI):
 
         app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
         app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", DEFAULT_KEEPALIVE_INTERVAL)
+        app.state.stream_header_timeouts = init_preference(
+            app.state.config, "stream_header_timeout", DEFAULT_STREAM_HEADER_TIMEOUT, alias_keys=("header_timeout",)
+        )
         # 初始化 models_list（用于存储从其他 API Key 引用的模型列表）
         app.state.models_list = {}
         # pprint(dict(app.state.provider_timeouts))

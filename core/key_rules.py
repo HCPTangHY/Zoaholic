@@ -158,6 +158,7 @@ def resolve_key_rules(preferences: Dict[str, Any]) -> List[dict]:
                 converted.append({
                     "match": {"status": int_codes},
                     "duration": new_duration,
+                    "retry": True,
                 })
         
         keywords = auto_disable.get("keywords") or []
@@ -187,8 +188,8 @@ def resolve_key_rules(preferences: Dict[str, Any]) -> List[dict]:
     
     # ── 全部为空：使用硬编码默认规则 ──
     return _normalize_rules([
-        {"match": {"status": [401, 403]}, "duration": -1},
-        {"match": "default", "duration": 60},
+        {"match": {"status": [401, 403]}, "duration": -1, "retry": True},
+        {"match": "default", "duration": 60, "retry": True},
     ])
 
 

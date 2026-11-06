@@ -162,17 +162,25 @@ async def iter_sse_with_keepalive(
         await close_async_iterator(generator, wait_task)
 
 
-async def prepare_stream(generator, *, current_info=None, keepalive_interval=None, error_triggers=(), request_url=None, app=None, engine=None):
-    """Inspect before returning to handler; only then allow downstream headers/keepalives."""
+async def prepare_stream(generator, *, current_info=None, keepalive_interval=None, stream_header_timeout=None, error_triggers=(), request_url=None, app=None, engine=None):
+    """Inspect before returning to handler; decouple stream_header_timeout (default 60s) from keepalive_interval."""
     from core.response_context import get_current_request_info
 
     info = current_info if current_info is not None else (get_current_request_info() or {})
     if not isinstance(info, dict):
         info = {}
     # 每次尝试都是新的首段：清掉可能残留的上一次提交标记，避免共享上下文污染。
-    for key in ("_stream_committed", "_stream_error", "_stream_error_handled", "_stream_has_output", "_stream_raw_inspector"):
+    for key in ("_stream_committed", "_stream_error", "_stream_error_handled", "_stream_has_output", "_stream_raw_inspector", "_upstream_header_ok", "_upstream_first_byte_ok", "_last_stream_activity_at"):
         info.pop(key, None)
     start = time_module.monotonic()
+    header_timeout = stream_header_timeout if stream_header_timeout is not None else info.get("_stream_header_timeout")
+    try:
+        header_timeout = float(header_timeout) if header_timeout is not None else None
+        if header_timeout is not None and header_timeout <= 0:
+            header_timeout = None
+    except (TypeError, ValueError):
+        header_timeout = None
+
     # 优先使用渠道注册表声明的事件分类器，未声明时由 guard_stream 内部走通用结构判断。
     classifier = None
     if engine:
@@ -186,10 +194,45 @@ async def prepare_stream(generator, *, current_info=None, keepalive_interval=Non
     pending = None
     first = None
     try:
-        # 首包等待沿用旧语义：有 keepalive 配置时等满一个心跳间隔，未配置时无限等待。
-        # 上游错误响应头几乎总在心跳间隔内到达，能在此窗口内抛回 handler 换取正确的 HTTP 状态码。
-        # 修复：旧实现用 min(3s, keepalive) 且超时后立即标记已提交，导致慢到的 400 退化为 200+流内错误帧。
-        if keepalive_interval:
+        if header_timeout is not None:
+            # 解耦模式：
+            # 1) 在上游尚未返回响应头/首字节（_upstream_first_byte_ok 为 False）前，最多等待 header_timeout（默认 60s），
+            #    期间绝不因 keepalive_interval（20s）提前退出 handler 重试循环或抢发 HTTP 200 OK；
+            #    若 60s 内上游返回 429/400/502 等错误，直接抛回 handler 换下一个 Key 重试；
+            #    若满 60s 仍未收到响应头/首包，直接抛 httpx.ReadTimeout 触发 handler 换下一个 Key 重试。
+            # 2) 若内层插件（如 gemini_empty_retry）已在 header_timeout 内收到 200 OK 响应头及思考分片（_upstream_first_byte_ok=True），
+            #    正处于暂存思考帧等待正文阶段，则在满 keepalive_interval 时放行进入 iter_sse_with_keepalive 发送心跳保活。
+            wait_task = None
+            while True:
+                now = time_module.monotonic()
+                activity_base = max(start, float(info.get("_last_stream_activity_at") or start))
+                remaining_header = header_timeout - (now - activity_base)
+                if remaining_header <= 0 and not info.get("_upstream_first_byte_ok"):
+                    await close_async_iterator(guarded, wait_task)
+                    raise httpx.ReadTimeout(f"Stream header/first-byte timeout after {header_timeout}s")
+
+                slice_timeout = remaining_header if remaining_header > 0 else (keepalive_interval or header_timeout)
+                if keepalive_interval and keepalive_interval > 0:
+                    slice_timeout = min(slice_timeout, float(keepalive_interval))
+
+                item_or_task, status = await wait_for_timeout(guarded, timeout=slice_timeout, wait_task=wait_task)
+                if status == "reentrant":
+                    raise RuntimeError("stream read reentrant before response")
+                if status == "success":
+                    first = item_or_task
+                    pending = None
+                    break
+                # status == "timeout"
+                wait_task = item_or_task
+                if info.get("_upstream_first_byte_ok") and keepalive_interval:
+                    pending, first = wait_task, None
+                    break
+                now_after = time_module.monotonic()
+                activity_base_after = max(start, float(info.get("_last_stream_activity_at") or start))
+                if (now_after - activity_base_after) >= header_timeout and not info.get("_upstream_first_byte_ok"):
+                    await close_async_iterator(guarded, wait_task)
+                    raise httpx.ReadTimeout(f"Stream header/first-byte timeout after {header_timeout}s")
+        elif keepalive_interval:
             first, status = await wait_for_timeout(guarded, timeout=keepalive_interval)
             if status == "timeout":
                 pending, first = first, None
@@ -245,12 +288,14 @@ async def error_handling_wrapper(
     last_message_role=None,
     done_message: Optional[str] = None,
     *,
+    stream_header_timeout=None,
     request_url: Optional[str] = None,
     app: Optional[object] = None,
     current_info=None,
 ):
     if stream:
         return await prepare_stream(generator, current_info=current_info, keepalive_interval=keepalive_interval,
+                                    stream_header_timeout=stream_header_timeout,
                                     error_triggers=error_triggers,
                                     request_url=request_url, app=app, engine=engine)
 

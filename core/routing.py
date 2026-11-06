@@ -86,7 +86,7 @@ def _append_literal_model_rules(
     for provider in config["providers"]:
         if provider.get("enabled") is False:
             continue
-        model_dict = provider["_model_dict_cache"]
+        model_dict = get_model_dict(provider)
         if model_name in model_dict:
             _append_provider_rule(provider_rules, provider["provider"], model_name)
         else:
@@ -313,7 +313,7 @@ async def get_provider_rules(
             # 跳过禁用的渠道
             if provider.get("enabled") is False:
                 continue
-            model_dict = provider["_model_dict_cache"]
+            model_dict = get_model_dict(provider)
             # 识别被重定向的上游原名
             upstream_candidates = {v for k, v in model_dict.items() if v != k}
             # 如果渠道配置了 model_prefix，只返回带前缀的模型名
@@ -322,8 +322,8 @@ async def get_provider_rules(
                 # 跳过通配符标记，"*" 渠道不能在 all 模式下枚举
                 if model == "*":
                     continue
-                # 过滤掉被重定向的上游原名
-                if model in upstream_candidates:
+                # 过滤掉被重定向的上游原名（但若调用方显式请求的就是该模型名则放行）
+                if model in upstream_candidates and model != request_model:
                     continue
                 # 如果有前缀，只返回带前缀的模型名
                 if prefix and not model.startswith(prefix):
@@ -363,7 +363,7 @@ async def get_provider_rules(
                     # 跳过禁用的渠道
                     if provider.get("enabled") is False:
                         continue
-                    model_dict = provider["_model_dict_cache"]
+                    model_dict = get_model_dict(provider)
                     if provider['provider'] == provider_name:
                         models_list.extend(list(model_dict.keys()))
                         matched_provider = provider
@@ -376,7 +376,7 @@ async def get_provider_rules(
                 pool_model = _get_pool_sharing_model_name(
                     matched_provider,
                     request_model,
-                    matched_provider["_model_dict_cache"]
+                    get_model_dict(matched_provider)
                 )
 
             # If the provider name is also the public model namespace (for
@@ -421,7 +421,7 @@ async def get_provider_rules(
             # 跳过禁用的渠道
             if provider.get("enabled") is False:
                 continue
-            model_dict = provider["_model_dict_cache"]
+            model_dict = get_model_dict(provider)
             if model_rule in model_dict.keys():
                 _append_provider_rule(provider_rules, provider["provider"], model_rule)
             else:
@@ -476,7 +476,7 @@ def get_provider_list(
             })
         else:
             for provider in config['providers']:
-                model_dict = provider["_model_dict_cache"]
+                model_dict = get_model_dict(provider)
                 if not model_dict:
                     continue
                 model_name_split = "/".join(item.split("/")[1:])
@@ -510,7 +510,7 @@ def get_provider_list(
                         # 修改原因：pool_sharing 通过带前缀规则命中，但下游请求仍使用用户传入的无前缀模型名。
                         # 修改方式：provider.model 按 {上游原始名: 用户请求名} 构造，缓存按 {用户请求名: 上游原始名} 注入。
                         # 目的：用户看到 deepseek-chat 不变，实际发送给上游的仍是带前缀渠道配置中的原始模型。
-                        shared_model_dict = dict(provider["_model_dict_cache"])
+                        shared_model_dict = dict(get_model_dict(provider))
                         shared_model_dict[request_model] = model_dict[model_name_split]
                         new_provider = {
                             "provider": provider["provider"],
@@ -538,7 +538,7 @@ def get_provider_list(
                             "model": [{model_dict[model_name_split]: request_model}],
                             "preferences": provider.get("preferences", {}),
                             "tools": provider.get("tools", False),
-                            "_model_dict_cache": provider["_model_dict_cache"],
+                            "_model_dict_cache": get_model_dict(provider),
                             "project_id": provider.get("project_id", None),
                             "private_key": provider.get("private_key", None),
                             "client_email": provider.get("client_email", None),
@@ -558,7 +558,7 @@ def get_provider_list(
                             "model": [{model_dict[model_name_split]: request_model}],
                             "preferences": provider.get("preferences", {}),
                             "tools": provider.get("tools", False),
-                            "_model_dict_cache": provider["_model_dict_cache"],
+                            "_model_dict_cache": get_model_dict(provider),
                             "project_id": provider.get("project_id", None),
                             "private_key": provider.get("private_key", None),
                             "client_email": provider.get("client_email", None),

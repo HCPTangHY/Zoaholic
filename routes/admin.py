@@ -103,6 +103,15 @@ async def _persist_config(app, sections_to_verify=None, changed_providers=None):
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"Invalid rate_limit configuration: {e}") from e
         apply_backend_log_preferences((app.state.config or {}).get("preferences") or {})
+        try:
+            from main import init_preference, DEFAULT_TIMEOUT, DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_STREAM_HEADER_TIMEOUT
+            app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
+            app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", DEFAULT_KEEPALIVE_INTERVAL)
+            app.state.stream_header_timeouts = init_preference(
+                app.state.config, "stream_header_timeout", DEFAULT_STREAM_HEADER_TIMEOUT, alias_keys=("header_timeout",)
+            )
+        except Exception as _pref_err:
+            logger.warning(f"Failed to refresh runtime timeout preferences on config update: {_pref_err}")
 
     except HTTPException:
         # 修改原因：内部已经构造出的 HTTPException 应保留原始状态码。

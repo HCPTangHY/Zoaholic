@@ -54,8 +54,16 @@ async def check_response(response, error_log):
             error_json = error_str
         return {"error": f"{error_log} HTTP Error", "status_code": response.status_code, "details": error_json}
     
-    # 成功响应：包装 aiter_text / aiter_bytes 方法以自动记录上游响应
+    # 成功响应：记录已收到上游 2xx 响应头，并包装 aiter_text / aiter_bytes 方法以自动记录上游响应
     if response:
+        try:
+            current_info = request_info.get()
+            if isinstance(current_info, dict):
+                import time as _time_mod
+                current_info["_upstream_header_ok"] = True
+                current_info["_last_stream_activity_at"] = _time_mod.monotonic()
+        except Exception:
+            pass
         _wrap_response_iterators(response)
     
     return None

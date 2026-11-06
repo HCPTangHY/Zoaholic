@@ -67,6 +67,14 @@ def get_model_dict(provider):
         # 目的：确保 request.model 为虚拟模型名时，所有渠道实现都能解析到真实上游模型名。
         return dict(provider["_model_dict_cache"])
 
+    # 修改原因：service.update_config 会为每个渠道注入 _model_dict_cache，但热更新中途失败等异常路径会漏注入，
+    # 导致下游 provider["_model_dict_cache"] 直接下标时抛 KeyError。
+    # 修改方式：get_model_dict 作为统一读取入口，已有缓存时直接返回；缓存缺失时下面照常重算。
+    # 目的：让所有调用点改用 get_model_dict 后既能享受缓存，又不会因运行时字段缺失而 500。
+    cached_model_dict = provider.get("_model_dict_cache")
+    if isinstance(cached_model_dict, dict):
+        return cached_model_dict
+
     model_dict = {}
     prefix = provider.get('model_prefix', '').strip()
     
