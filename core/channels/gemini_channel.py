@@ -196,6 +196,26 @@ def inline_schema_refs(parameters, extra_defs=None):
     _resolve(parameters, 0)
 
 
+# 多类型联合拆成 anyOf 分支时，只属于某一类型的约束字段要跟随对应分支。
+_TYPE_SPECIFIC_SCHEMA_FIELDS = {
+    "array": ("items", "prefixItems", "minItems", "maxItems"),
+    "object": ("properties", "required", "minProperties", "maxProperties"),
+    "string": ("enum", "format"),
+    "number": ("minimum", "maximum"),
+    "integer": ("minimum", "maximum"),
+}
+
+
+def _is_typed_schema_branch(item) -> bool:
+    """判断 anyOf/oneOf 分支是否自带类型定义（而不是只有 required 一类的约束）。"""
+    if not isinstance(item, dict):
+        return False
+    return (
+        (item.get("type") is not None and item.get("type") != "null")
+        or any(k in item for k in ("properties", "items", "enum", "anyOf", "oneOf", "allOf"))
+    )
+
+
 def process_tool_parameters(data):
     """递归清洗 JSON Schema 使其兼容 Google Gemini / Vertex AI OpenAPI 3.0 Protobuf Schema。"""
     if not isinstance(data, dict):
@@ -260,7 +280,21 @@ def process_tool_parameters(data):
                         data.setdefault("type", "object")
                     if merged_req:
                         data["required"] = merged_req
-                # Case C: 常规 anyOf / oneOf，取第一个有实质定义的非 null 分支递归清洗后合并
+                # Case C: 多个自带类型的 anyOf / oneOf 分支，保留为 Gemini Schema 原生支持的 anyOf，
+                #   避免只取第一个分支导致参数类型被改变（如 string | number 变成 string）。
+                elif (
+                    key in ("anyOf", "oneOf")
+                    and len(non_null_items) > 1
+                    and not any(k in data for k in ("type", "properties", "items"))
+                    and all(_is_typed_schema_branch(item) for item in non_null_items)
+                ):
+                    branches = []
+                    for item in non_null_items:
+                        branch = copy.deepcopy(item)
+                        process_tool_parameters(branch)
+                        branches.append(branch)
+                    data["anyOf"] = branches
+                # Case D: 其他情况，取第一个有实质定义的非 null 分支递归清洗后合并
                 elif non_null_items:
                     main_item = next(
                         (
@@ -292,8 +326,24 @@ def process_tool_parameters(data):
     if isinstance(raw_type, list):
         if "null" in raw_type or None in raw_type:
             data["nullable"] = True
-        non_null_types = [t for t in raw_type if isinstance(t, str) and t != "null"]
-        data["type"] = non_null_types[0] if non_null_types else "string"
+        non_null_types = list(dict.fromkeys(t for t in raw_type if isinstance(t, str) and t != "null"))
+        if len(non_null_types) > 1:
+            # 真正的多类型联合：Gemini Schema 的 type 只能是标量，改写为 anyOf，每个类型一个分支。
+            data.pop("type")
+            branches = []
+            for type_name in non_null_types:
+                branch = {"type": type_name}
+                for field in _TYPE_SPECIFIC_SCHEMA_FIELDS.get(type_name, ()):
+                    if field in data:
+                        branch[field] = copy.deepcopy(data[field])
+                process_tool_parameters(branch)
+                branches.append(branch)
+            for type_name in non_null_types:
+                for field in _TYPE_SPECIFIC_SCHEMA_FIELDS.get(type_name, ()):
+                    data.pop(field, None)
+            data["anyOf"] = branches
+        else:
+            data["type"] = non_null_types[0] if non_null_types else "string"
 
     if isinstance(data.get("enum"), list):
         raw_enum = data["enum"]
@@ -302,7 +352,8 @@ def process_tool_parameters(data):
         clean_enum = [str(v) for v in raw_enum if v is not None]
         if clean_enum:
             data["enum"] = clean_enum
-            data["type"] = "string"
+            if "anyOf" not in data:
+                data["type"] = "string"
         else:
             data.pop("enum", None)
 
