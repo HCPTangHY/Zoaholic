@@ -250,7 +250,7 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
             old_auto_disabled = {}
             old_auto_cooling = {}
             # 注意: 此处直接读旧实例的共享状态未加锁，但热重载窗口极短且为只读快照，风险可接受
-            if old_circular and hasattr(old_circular, 'auto_disabled_info'):
+            if old_circular:
                 old_auto_disabled = dict(old_circular.auto_disabled_info)
                 old_auto_cooling = {k: old_circular.cooling_until[k] for k in old_auto_disabled}
 

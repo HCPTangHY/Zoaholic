@@ -181,19 +181,6 @@ class ApiKeysStatesResponse(BaseModel):
 
 # ============== 数据库初始化 ==============
 
-def _map_sa_type_to_sql_type(sa_type):
-    """将 SQLAlchemy 类型映射到 SQL 类型字符串"""
-    type_map = {
-        sqltypes.Integer: "INTEGER",
-        sqltypes.String: "TEXT",
-        sqltypes.Float: "REAL",
-        sqltypes.Boolean: "BOOLEAN",
-        sqltypes.DateTime: "DATETIME",
-        sqltypes.Text: "TEXT"
-    }
-    return type_map.get(type(sa_type), "TEXT")
-
-
 def _get_default_sql(default):
     """生成列默认值的 SQL 片段"""
     if default is None:
@@ -450,13 +437,12 @@ def _parse_price_str(price_str) -> tuple:
     return prompt_price, completion_price, cached_price
 
 
-def _match_model_price(model_price_dict: dict, model_name: str, *, use_default: bool = True):
+def _match_model_price(model_price_dict: dict, model_name: str):
     """
     在一个 model_price 字典中，按前缀匹配模型名，返回 (prompt_price, completion_price, cached_price) 或 None。
 
     匹配规则：遍历字典 key，如果 model_name 以该 key 开头则命中；
     多个前缀同时匹配时，取最长的那个（最精确匹配）。
-    use_default=True 时，未命中前缀也会尝试 "default" 兜底。
     """
     if not model_price_dict or not model_name:
         return None
@@ -465,11 +451,6 @@ def _match_model_price(model_price_dict: dict, model_name: str, *, use_default: 
     if matched:
         matched.sort(key=lambda x: len(x[0]), reverse=True)
         return _parse_price_str(matched[0][1])
-    # 兜底 default
-    if use_default:
-        default_str = model_price_dict.get("default")
-        if default_str is not None:
-            return _parse_price_str(default_str)
     return None
 
 
@@ -505,13 +486,13 @@ def get_current_model_prices(app, model_name: str, provider_name: str = None):
                     if prefix and model_name.startswith(prefix):
                         model_name = model_name[len(prefix):]
                     provider_prices = safe_get(p, 'preferences', 'model_price', default={})
-                    result = _match_model_price(provider_prices, model_name, use_default=False)
+                    result = _match_model_price(provider_prices, model_name)
                     if result is not None:
                         return result
                     break
 
         # 2. 全局精确/前缀匹配（不用 default）
-        result = _match_model_price(global_prices, model_name, use_default=False)
+        result = _match_model_price(global_prices, model_name)
         if result is not None:
             return result
 
@@ -709,7 +690,7 @@ def enqueue_stats(current_info: dict, app=None, get_model_prices_func=None) -> N
         )
         if _prov_name and _used_key and _tok_total > 0:
             _clist = provider_api_circular_list.get(_prov_name)
-            if _clist is not None and hasattr(_clist, "record_token_usage"):
+            if _clist is not None:
                 _clist.record_token_usage(_used_key, current_info.get("model") or "default", int(_tok_total))
     except Exception:
         pass
@@ -889,111 +870,6 @@ async def _batch_write_stats(batch: list) -> None:
                 await asyncio.sleep(delay)
             else:
                 logger.error(f"Error batch updating stats: {str(e)}")
-                if is_debug:
-                    import traceback
-                    traceback.print_exc()
-                break
-
-
-async def update_stats(current_info: dict, app=None, get_model_prices_func=None):
-    """
-    更新请求统计到数据库
-    
-    Args:
-        current_info: 包含请求信息的字典
-        app: FastAPI 应用实例（用于获取模型价格）
-        get_model_prices_func: 获取模型价格的函数，签名为 (model_name) -> (prompt_price, completion_price[, cached_price])
-    """
-    if DISABLE_DATABASE:
-        return
-
-    # 在成功请求时，快照当前价格，写入数据库
-    try:
-        if current_info.get("success") and current_info.get("model"):
-            if get_model_prices_func:
-                price_result = get_model_prices_func(current_info["model"])
-            elif app:
-                price_result = get_current_model_prices(
-                    app, current_info["model"], provider_name=current_info.get("provider"))
-            else:
-                price_result = 0.0, 0.0, 0.0
-            prompt_price, completion_price, cached_price = _unpack_model_prices(price_result)
-            current_info["prompt_price"] = prompt_price
-            current_info["completion_price"] = completion_price
-            _apply_cached_prompt_price(current_info, prompt_price, cached_price)
-    except Exception:
-        pass
-
-    # 使用重试机制写入数据库
-    for attempt in range(SQLITE_MAX_RETRIES):
-        try:
-            if (DB_TYPE or "sqlite").lower() == "d1":
-                from db import d1_client
-                if d1_client is None:
-                    return
-                async with db_semaphore:
-                    columns = [column.key for column in RequestStat.__table__.columns]
-                    filtered_info = {k: v for k, v in current_info.items() if k in columns}
-                    for key, value in list(filtered_info.items()):
-                        if isinstance(value, str):
-                            filtered_info[key] = value.replace('\x00', '')
-                        elif isinstance(value, bool):
-                            filtered_info[key] = 1 if value else 0
-                        elif isinstance(value, datetime):
-                            filtered_info[key] = format_d1_datetime(value)
-
-                    insert_cols = [k for k in filtered_info.keys() if k != "id"]
-                    placeholders = ", ".join(["?" for _ in insert_cols])
-                    sql = (
-                        f"INSERT INTO request_stats ({', '.join(insert_cols)}) "
-                        f"VALUES ({placeholders})"
-                    )
-                    params = [filtered_info[k] for k in insert_cols]
-                    await d1_client.execute(sql, params)
-
-                check_key = current_info.get("api_key")
-                if app and check_key and hasattr(app.state, 'paid_api_keys_states'):
-                    if check_key in app.state.paid_api_keys_states and current_info.get("total_tokens", 0) > 0:
-                        await update_paid_api_keys_states(app, check_key)
-                _record_quota_usage_from_info(current_info, app, check_key)
-                return
-
-            # 等待获取数据库访问权限
-            async with db_semaphore:
-                async with async_session_scope() as session:
-                    async with session.begin():
-                        columns = [column.key for column in RequestStat.__table__.columns]
-                        filtered_info = {k: v for k, v in current_info.items() if k in columns}
-
-                        # 清洗字符串中的 NUL 字符，防止 PostgreSQL 报错
-                        for key, value in filtered_info.items():
-                            if isinstance(value, str):
-                                filtered_info[key] = value.replace('\x00', '')
-
-                        new_request_stat = RequestStat(**filtered_info)
-                        session.add(new_request_stat)
-                        await session.commit()
-
-            # 检查付费 API 密钥状态更新
-            check_key = current_info.get("api_key")
-            if app and check_key and hasattr(app.state, 'paid_api_keys_states'):
-                if check_key in app.state.paid_api_keys_states and current_info.get("total_tokens", 0) > 0:
-                    await update_paid_api_keys_states(app, check_key)
-            _record_quota_usage_from_info(current_info, app, check_key)
-            return  # 成功后直接返回
-
-        except Exception as e:
-            error_str = str(e).lower()
-            is_lock_error = 'database is locked' in error_str or 'busy' in error_str
-            
-            if is_lock_error and attempt < SQLITE_MAX_RETRIES - 1:
-                # 数据库锁定，等待后重试
-                delay = SQLITE_RETRY_DELAY * (2 ** attempt)  # 指数退避
-                logger.warning(f"Database locked, retrying in {delay}s (attempt {attempt + 1}/{SQLITE_MAX_RETRIES})")
-                await asyncio.sleep(delay)
-            else:
-                # 最后一次重试失败或非锁定错误
-                logger.error(f"Error updating stats: {str(e)}")
                 if is_debug:
                     import traceback
                     traceback.print_exc()

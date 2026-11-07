@@ -11,16 +11,6 @@ from core.channels.registry import register_channel, unregister_channel
 from routes import channels as channels_route
 
 
-class _DummyApp:
-    """为渠道测试 helper 提供最小 app，避免单元测试依赖真实服务进程。"""
-
-    def __init__(self):
-        # 修改原因：_build_test_provider 只需要读取 app 参数以保持与路由调用签名一致。
-        # 修改方式：提供带 state.config 的最小对象，不启动真实 FastAPI 应用。
-        # 目的：让测试专注于 provider 构建、请求构建和响应提取的稳定行为。
-        self.state = type("State", (), {"config": {}})()
-
-
 def test_key_candidate_helpers_preserve_string_dict_and_disabled_shapes():
     """测试 Key 归一化，覆盖字符串、对象和禁用标记三种输入格式。"""
     # 修改原因：/v1/channels/test 需要兼容前端保存态、逐 Key 测试态和旧格式。
@@ -66,9 +56,9 @@ def test_build_test_provider_cleans_snapshot_selects_key_and_resolves_prefixed_a
             "upstream_model": "real-model",
         }
 
-        provider, selected_api_key, resolved_engine = channels_route._build_test_provider(test_config, _DummyApp())
+        provider, selected_api_key = channels_route._build_test_provider(test_config)
 
-        assert resolved_engine == engine
+        assert provider["engine"] == engine
         assert selected_api_key == "sk-active"
         assert provider["api"] == "sk-active"
         assert provider["base_url"] == "https://api.example.test/v1"

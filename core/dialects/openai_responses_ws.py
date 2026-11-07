@@ -60,37 +60,33 @@ def _get_client_ip(websocket: WebSocket) -> str:
 
 
 def _authenticate(websocket: WebSocket) -> tuple[Optional[int], Optional[str], Optional[str]]:
-    """WS 握手鉴权，复用 HTTP 路径同款逻辑。
+    """WS 握手鉴权，统一复用 HTTP 鉴权函数 authenticate_api_key_token。
 
-    返回 (api_index, token, error_msg)。error_msg 非空表示鉴权失败。
+    返回 (api_index, token_for_stats, error_msg)。error_msg 非空表示鉴权失败。
     """
     app = websocket.app
+    from fastapi import HTTPException
+    from core.auth import authenticate_api_key_token
     from core.middleware import get_api_key_from_headers
-    from core.auth import is_api_key_disabled
-    from core.ip_blacklist import is_global_ip_blocked, is_key_ip_blocked
 
     headers = [(k.lower().encode("latin-1"), v.encode("latin-1"))
                for k, v in websocket.headers.items()]
     token = get_api_key_from_headers(headers)
-    if not token:
-        return None, None, "Invalid or missing API Key"
+    client_ip = _get_client_ip(websocket)
+
+    try:
+        api_index = authenticate_api_key_token(app, token, client_ip)
+    except HTTPException as exc:
+        detail = exc.detail
+        if isinstance(detail, dict):
+            msg = str((detail.get("error") or {}).get("message") or "IP is blocked")
+        else:
+            msg = str(detail or "Unauthorized")
+        return None, None, msg
 
     api_list = getattr(app.state, "api_list", [])
-    try:
-        api_index = api_list.index(token)
-    except ValueError:
-        return None, None, "Invalid or missing API Key"
-
-    if is_api_key_disabled(app, api_index):
-        return None, None, "API Key has been disabled"
-
-    client_ip = _get_client_ip(websocket)
-    if is_global_ip_blocked(app, client_ip):
-        return None, None, "IP is blocked"
-    if is_key_ip_blocked(app, api_index, client_ip):
-        return None, None, "IP is blocked"
-
-    return api_index, token, None
+    token_for_stats = api_list[api_index] if 0 <= api_index < len(api_list) else token
+    return api_index, token_for_stats, None
 
 
 # ==================== Chat Completions → Responses API 转换 ====================

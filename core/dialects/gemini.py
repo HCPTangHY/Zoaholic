@@ -332,7 +332,7 @@ async def render_gemini_response(
             fn = tc.get("function") or {}
             try:
                 args = json_loads(fn.get("arguments") or "{}")
-            except:
+            except (ValueError, TypeError):
                 args = {}
             
             part = {

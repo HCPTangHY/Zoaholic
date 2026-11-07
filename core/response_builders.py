@@ -218,14 +218,14 @@ async def generate_sse_response(
 
     return sse_response
 
-async def generate_no_stream_response(timestamp, model, content=None, tools_id=None, function_call_name=None, function_call_content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, image_base64=None, thought_signature=None, cached_tokens=0, cache_creation_tokens=0, return_dict: bool = False, tool_calls_list: list[dict] | None = None, refusal=None):
+async def generate_no_stream_response(timestamp, model, content=None, role=None, total_tokens=0, prompt_tokens=0, completion_tokens=0, reasoning_content=None, image_base64=None, thought_signature=None, cached_tokens=0, cache_creation_tokens=0, return_dict: bool = True, tool_calls_list: list[dict] | None = None):
 
     random.seed(timestamp)
     random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=29))
     message = {
         "role": role,
         "content": content,
-        "refusal": refusal
+        "refusal": None
     }
     if reasoning_content:
         message["reasoning_content"] = reasoning_content
@@ -279,45 +279,6 @@ async def generate_no_stream_response(timestamp, model, content=None, tools_id=N
                         "content": None,
                         "tool_calls": normalized_tool_calls,
                         "refusal": None
-                    },
-                    "logprobs": None,
-                    "finish_reason": "tool_calls"
-                }
-            ],
-            "usage": None,
-            "service_tier": "default",
-            "system_fingerprint": "fp_4691090a87"
-        }
-
-    elif function_call_name:
-        if not tools_id:
-            tools_id = f"call_{random_str}"
-
-        arguments_json = json_dumps_text(function_call_content, ensure_ascii=False)
-
-        sample_data = {
-            "id": f"chatcmpl-{random_str}",
-            "object": "chat.completion",
-            "created": timestamp,
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": tools_id,
-                            "type": "function",
-                            "function": {
-                                "name": function_call_name,
-                                "arguments": arguments_json
-                            },
-                            "extra_content": {"google": {"thoughtSignature": thought_signature}} if thought_signature else None
-                        }
-                    ],
-                    "refusal": None
                     },
                     "logprobs": None,
                     "finish_reason": "tool_calls"
@@ -500,14 +461,3 @@ def parse_json_safely(json_str):
             # 两种方法都失败，抛出异常
             raise Exception(f"无法解析JSON字符串: {e}, {json_str}")
 
-async def upload_image_to_0x0st(base64_image: str, max_size_mb: float = 10.0):
-    """
-    图床上传链路已暂时关闭。
-
-    当前统一返回 None，让上层稳定走 inline base64 回退路径。
-    保留此函数签名，便于后续按需恢复或切换其他上传方案。
-    """
-    _ = base64_image
-    _ = max_size_mb
-    logger.info("[upload_image] External image upload is disabled. Use inline base64 instead.")
-    return None

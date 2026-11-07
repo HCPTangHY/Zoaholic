@@ -39,31 +39,22 @@ def detect_passthrough(dialect_id: str, target_engine_id: str) -> bool:
     3. 都未声明时：dialect_id == target_engine_id → 透传
     """
     # ── 渠道侧声明（优先） ──
-    try:
-        from core.channels import get_channel
-        channel = get_channel(target_engine_id)
-    except Exception:
-        channel = None
+    from core.channels import get_channel
+    channel = get_channel(target_engine_id)
 
-    if channel:
-        accepted = getattr(channel, "passthrough_dialects", None)
-        if accepted:
-            return dialect_id in accepted
+    if channel and channel.passthrough_dialects:
+        return dialect_id in channel.passthrough_dialects
 
     # ── 方言侧声明（兜底） ──
-    dialect = None
-    try:
-        from .registry import get_dialect
-        dialect = get_dialect(dialect_id)
-    except Exception:
-        dialect = None
+    from .registry import get_dialect
+    dialect = get_dialect(dialect_id)
 
     if not dialect:
         return dialect_id == target_engine_id
 
     target_type = channel.type_name if channel else target_engine_id
 
-    expected_engines = getattr(dialect, "target_engine", None) or [dialect_id]
+    expected_engines = dialect.target_engine or [dialect_id]
     if not isinstance(expected_engines, (list, tuple, set)):
         expected_engines = [expected_engines]
 

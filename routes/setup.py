@@ -60,11 +60,6 @@ class SetupLoginResponse(BaseModel):
     admin_api_key: str
 
 
-async def _ensure_admin_user_table():
-    # 表结构由 core/stats.create_tables() 负责创建；这里不额外处理。
-    return
-
-
 async def _get_admin_user():
     # 延迟导入，避免循环引用
     from db import AdminUser
@@ -126,7 +121,7 @@ async def _upsert_admin_user(username: str, password: str, jwt_secret: str) -> N
                 existing.username = username
                 existing.password_hash = pwd_hash
                 # 若之前没有 jwt_secret，则补上
-                if not getattr(existing, "jwt_secret", None):
+                if not existing.jwt_secret:
                     existing.jwt_secret = jwt_secret
             await db.commit()
 

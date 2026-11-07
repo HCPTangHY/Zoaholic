@@ -128,12 +128,6 @@ def _resolve_cc_version(provider) -> str:
     return value or CLAUDE_CODE_CLI_VERSION
 
 
-def _strip_gateway_headers(headers: dict) -> dict:
-    """清洗响应头中的网关/代理指纹前缀。"""
-    return {
-        k: v for k, v in headers.items()
-        if not any(k.lower().startswith(p) for p in _GATEWAY_HEADER_PREFIXES)
-    }
 # 修改原因：anthropic-beta 头的完整集合是 Anthropic 判定请求来源的关键维度之一，
 #   缺少任何"官方 CLI 请求才带"的 beta 都会被降级到第三方额度。
 # 修改方式：对齐 sub2api FullClaudeCodeMimicryBetas() 的完整列表及顺序。
@@ -912,19 +906,6 @@ def _build_billing_header(messages: list, version: str = "", entrypoint: str = "
         f"{_BILLING_HEADER_PREFIX} cc_version={ver}.{digest}; "
         f"cc_entrypoint={ep};"
     )
-
-
-def _has_billing_header(system) -> bool:
-    """检查 system 中是否已有 billing header。"""
-    if isinstance(system, str):
-        return system.strip().startswith(_BILLING_HEADER_PREFIX)
-    if isinstance(system, list) and system:
-        first = system[0]
-        if isinstance(first, dict):
-            return (first.get("text") or "").strip().startswith(_BILLING_HEADER_PREFIX)
-        if isinstance(first, str):
-            return first.strip().startswith(_BILLING_HEADER_PREFIX)
-    return False
 
 
 def _sanitize_for_plan_billing(payload: dict, headers: dict | None = None, version_override: str = "") -> dict:

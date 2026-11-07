@@ -346,7 +346,7 @@ async def render_claude_response(
                 fn = tc.get("function") or {}
                 try:
                     args = json_loads(fn.get("arguments") or "{}")
-                except:
+                except (ValueError, TypeError):
                     args = {}
                 content.append({
                     "type": "tool_use",

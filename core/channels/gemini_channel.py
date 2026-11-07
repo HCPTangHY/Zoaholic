@@ -20,7 +20,6 @@ from ..utils import (
     generate_no_stream_response,
     end_of_line,
     generate_chunked_image_md,
-    upload_image_to_0x0st,
 )
 from ..response import check_response
 from ..json_utils import json_loads, json_dumps_text, json_dumps_bytes

@@ -74,14 +74,6 @@ _version_lock = asyncio.Lock()
 _version_background_task: asyncio.Task | None = None
 
 
-async def _async_return(value):
-    """返回一个可 await 的固定值，供测试替换异步版本解析函数。"""
-    # 修改原因：单元测试需要把 get_antigravity_version 替换为轻量可 await 对象。
-    # 修改方式：提供一个极小的 async helper，测试中可用 lambda 返回它。
-    # 目的：不访问真实 updater 服务也能覆盖 User-Agent 拼装逻辑。
-    return value
-
-
 # ═══════════════════════════════════════════════════════════════════
 # 版本管理
 # ═══════════════════════════════════════════════════════════════════

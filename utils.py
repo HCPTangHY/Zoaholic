@@ -23,7 +23,6 @@ from core.utils import (
     is_tools_disabled,
     get_engine,
     get_proxy,
-    update_initial_model,
     truncate_for_logging,
     end_of_line,
     generate_sse_response,
@@ -36,56 +35,18 @@ from core.utils import (
     get_base64_image,
     _convert_webp_base64_to_png,
     _prepare_image_for_upload,
-    upload_image_to_0x0st,
     parse_json_safely,
 )
 from core.json_utils import json_dumps_text, json_loads
 from core.config.codec import _YamlHelper, _quote_colon_strings, yaml
-from core.config import file_store as _config_file
-from core.config import loader as _config_loader
+from core.config.file_store import API_YAML_PATH, _BASE_DIR, save_api_yaml
+from core.config.loader import load_config, yaml_error_message
 from core.config.service import (
     _PROVIDER_STRIP_FIELDS,
     _expand_sub_channels,
     _strip_provider_fields,
-    update_config as _update_config,
+    update_config,
 )
-
-_BASE_DIR = _config_file._BASE_DIR
-API_YAML_PATH = _config_file.API_YAML_PATH
-yaml_error_message = _config_loader.yaml_error_message
-
-
-def _sync_api_yaml_path() -> None:
-    """同步兼容门面上的 API_YAML_PATH 到配置文件模块。
-
-    修改原因：拆分前调用方可以 monkeypatch 或直接赋值 utils.API_YAML_PATH，save_api_yaml/load_config/update_config 都会读取同一模块全局变量。
-    修改方式：根 utils.py 保留同名变量，并在兼容包装函数执行前写回 core.config.file_store。
-    目的：保持旧测试和旧扩展对 utils.API_YAML_PATH 的运行时覆盖能力。
-    """
-    _config_file.API_YAML_PATH = API_YAML_PATH
-
-
-def save_api_yaml(config_data):
-    """兼容旧入口，保存配置前同步 API_YAML_PATH。"""
-    _sync_api_yaml_path()
-    return _config_file.save_api_yaml(config_data)
-
-
-async def update_config(*args, **kwargs):
-    """兼容旧入口，规范化配置前同步 API_YAML_PATH。"""
-    _sync_api_yaml_path()
-    return await _update_config(*args, **kwargs)
-
-
-async def load_config(*args, **kwargs):
-    """兼容旧入口，加载配置前同步 API_YAML_PATH，并回写 yaml_error_message。"""
-    global yaml_error_message
-    _sync_api_yaml_path()
-    result = await _config_loader.load_config(*args, **kwargs)
-    yaml_error_message = _config_loader.yaml_error_message
-    return result
-
-
 from core.config.serialization import (
     _rebuild_api_with_labels,
     _sanitize_config_for_persistence,
@@ -163,8 +124,6 @@ __all__ = [
     "save_config_to_db",
     "truncate_for_logging",
     "update_config",
-    "update_initial_model",
-    "upload_image_to_0x0st",
     "wait_for_timeout",
     "yaml",
     "yaml_error_message",

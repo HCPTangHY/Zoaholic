@@ -140,12 +140,3 @@ def lookup_price(model_name: str) -> Optional[tuple[float, float, float]]:
 
 # 后台定时刷新已移至 main.py 统一 daily_maintenance 循环
 
-
-def get_cache_info() -> dict:
-    """返回缓存状态信息"""
-    return {
-        "cached_models": len(_price_cache),
-        "updated_at": _cache_updated_at,
-        "ttl": _CACHE_TTL,
-        "age_seconds": time.time() - _cache_updated_at if _cache_updated_at else None,
-    }

@@ -33,20 +33,6 @@ PLUGIN_INFO = {
 
 EXTENSIONS = ["channels:vertex-express"]
 
-# ==================== Project ID 缓存 ====================
-
-_project_id_cache: Dict[tuple, str] = {}
-
-
-async def get_project_id(key: str, base_url: str = "https://aiplatform.googleapis.com") -> str:
-    """从 Express Key 中提取 Project ID（支持 project_id:AQ.xxx 直解析、缓存与代理探测）"""
-    from core.channels.vertex_channel import extract_vertex_express_project_id
-    pid, _ = await extract_vertex_express_project_id(key, base_url)
-    if pid:
-        _project_id_cache[(base_url, key)] = pid
-    return pid
-
-
 # ==================== 渠道适配器实现 ====================
 
 async def get_vertex_express_payload(request, engine, provider, api_key=None):
@@ -178,11 +164,9 @@ def teardown(manager: "PluginManager"):
     manager.unregister_extension("channels", "vertex-express")
     from core.channels.registry import unregister_channel
     unregister_channel("vertex-express")
-    _project_id_cache.clear()
     print(f"[{PLUGIN_INFO['name']}] Channel 'vertex-express' unregistered!")
 
 
 def unload():
     """插件卸载回调"""
-    _project_id_cache.clear()
     print(f"[{PLUGIN_INFO['name']}] Plugin unloading...")

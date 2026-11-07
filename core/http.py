@@ -24,8 +24,7 @@ MAX_OUTBOUND_LOG_BUFFER_SIZE = 10000
 
 # ==================== 缓冲区 ====================
 
-_outbound_log_buffer_size = DEFAULT_OUTBOUND_LOG_BUFFER_SIZE
-_outbound_log_buffer: deque = deque(maxlen=_outbound_log_buffer_size)
+_outbound_log_buffer: deque = deque(maxlen=DEFAULT_OUTBOUND_LOG_BUFFER_SIZE)
 _outbound_log_lock = RLock()
 _outbound_log_next_id = 1
 
@@ -236,19 +235,6 @@ def get_outbound_log_entries(
         "items": filtered,
         "total": total,
         "max_id": max_id,
-        "buffer_size": _outbound_log_buffer_size,
+        "buffer_size": DEFAULT_OUTBOUND_LOG_BUFFER_SIZE,
     }
 
-
-def set_outbound_log_buffer_size(size: int) -> int:
-    """调整出站日志缓冲区大小"""
-    global _outbound_log_buffer_size, _outbound_log_buffer
-
-    normalized = max(50, min(MAX_OUTBOUND_LOG_BUFFER_SIZE, int(size)))
-
-    with _outbound_log_lock:
-        snapshot = list(_outbound_log_buffer)[-normalized:]
-        _outbound_log_buffer_size = normalized
-        _outbound_log_buffer = deque(snapshot, maxlen=normalized)
-
-    return normalized

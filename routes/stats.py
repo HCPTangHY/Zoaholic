@@ -1506,16 +1506,6 @@ async def get_key_analytics_detail(
 
 # ============ Usage Analysis (用量分析与费用模拟) ============
 
-class UsageAnalysisEntry(BaseModel):
-    provider: str
-    model: str
-    request_count: int = 0
-    total_prompt_tokens: int = 0
-    total_completion_tokens: int = 0
-    total_tokens: int = 0
-    recorded_cost: float = 0.0
-
-
 @router.get("/v1/stats/usage_analysis", dependencies=[Depends(rate_limit_dependency)])
 async def get_usage_analysis(
     request: Request,
@@ -2033,7 +2023,7 @@ async def api_keys_states(token: str = Depends(verify_admin_api_key)):
                 quota_states[api] = quota_registry.get_key_status(api)
 
     response = ApiKeysStatesResponse(api_keys_states=states_dict)
-    resp_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
+    resp_dict = response.model_dump()
     resp_dict['quota_states'] = quota_states
     return resp_dict
 

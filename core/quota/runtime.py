@@ -315,14 +315,6 @@ class QuotaCounter:
         if tokens_out > 0:
             self._record_metric_event(Metric.TOKEN_OUT, float(tokens_out), normalized_model, normalized_ip, now)
 
-    def restore_cost(self, qualifier: str, total: float):
-        """从 DB 恢复 key 级 cost 永久累计值（重启后调用）。"""
-
-        # 修改原因：新 ScopedStore 中 key 级 cost 不再按 qualifier 拆分存储，qualifier 只用于状态输出和多规则标签。
-        # 修改方式：把恢复值写入 scope_id='key'、metric='cost' 的永久 accumulator。
-        # 目的：保持旧 restore_cost 调用兼容，同时让所有 key 级 cost 规则共享同一累计费用。
-        self._store.get_or_create_accumulator('key', Metric.COST.value).set_permanent(total)
-
     def get_status(self, model: str = 'default') -> dict:
         """获取当前配额状态（供 API 返回）。"""
 
@@ -805,9 +797,6 @@ class QuotaRegistry:
         if self._global_dimensional:
             self._global_dimensional.record_usage(model, cost, tokens, tokens_in=tokens_in, tokens_out=tokens_out, client_ip=client_ip)
         self._check_and_save()
-
-    def get_counter(self, api_key: str) -> Optional[QuotaCounter]:
-        return self._counters.get(api_key)
 
     def get_key_status(self, api_key: str, model: str = 'default') -> dict:
         counter = self._counters.get(api_key)

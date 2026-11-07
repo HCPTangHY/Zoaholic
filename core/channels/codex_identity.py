@@ -58,20 +58,6 @@ def restore_codex_identity(data: bytes, state: dict) -> bytes:
     return result
 
 
-def confuse_codex_identity_response(data: bytes, state: dict) -> bytes:
-    """响应侧混淆：把上游响应里可能出现的原始 ID 替换成混淆值。"""
-    # 修改原因：部分上游或中间层可能返回未混淆的原始身份，继续转发会破坏身份隔离假设。
-    # 修改方式：复用请求侧 state 的 original→confused bytes 映射，按原始值长度倒序执行正向替换。
-    # 目的：在需要保持上游语义为混淆身份时，提供与还原函数对称的替换能力。
-    if not isinstance(data, (bytes, bytearray)):
-        return data
-    result = bytes(data)
-    for original, confused in _iter_replacements(state, reverse=False):
-        if original and confused and original in result:
-            result = result.replace(original, confused)
-    return result
-
-
 def _new_state(auth_id: str, enabled: bool) -> dict:
     # 修改原因：响应还原阶段只能可靠处理字节流，不能依赖 JSON 结构仍然存在。
     # 修改方式：state 同时保存少量文本状态和 original/confused 的 bytes 替换表。

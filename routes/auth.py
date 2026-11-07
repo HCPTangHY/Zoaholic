@@ -87,7 +87,7 @@ async def login(payload: LoginRequest = Body(...)):
         from core.jwt_utils import set_jwt_secret
 
         if not (os.getenv("JWT_SECRET") or "").strip():
-            if admin_user is not None and getattr(admin_user, "jwt_secret", None):
+            if admin_user is not None and admin_user.jwt_secret:
                 set_jwt_secret(str(admin_user.jwt_secret))
     except Exception:
         pass

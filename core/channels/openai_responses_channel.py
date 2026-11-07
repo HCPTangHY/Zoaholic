@@ -89,27 +89,6 @@ async def get_responses_passthrough_meta(request, engine, provider, api_key=None
     return url, headers, {}
 
 
-def _as_text_from_responses_content(content) -> str:
-    """把 Responses input 中的 content（str 或 list）尽量抽成纯文本，用于 instructions 合并。"""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for it in content:
-            if isinstance(it, str):
-                parts.append(it)
-            elif isinstance(it, dict):
-                t = it.get("type")
-                if t in ("input_text", "text", "output_text"):
-                    txt = it.get("text")
-                    if txt:
-                        parts.append(str(txt))
-        return "".join(parts)
-    return str(content)
-
-
 async def get_responses_payload(request, engine, provider, api_key=None):
     """构建 OpenAI Responses API 的请求 payload（对齐 b119589 的稳定实现）"""
     headers = {

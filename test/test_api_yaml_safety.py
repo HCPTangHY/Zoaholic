@@ -5,6 +5,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import utils
+from core.config import file_store
 
 
 def _write_yaml(path: Path, data: dict) -> None:
@@ -41,9 +42,9 @@ def test_save_api_yaml_refuses_to_overwrite_existing_providers_with_empty_list(t
         "preferences": {},
     }
     _write_yaml(target, existing_config)
-    monkeypatch.setattr(utils, "API_YAML_PATH", str(target))
+    monkeypatch.setattr(file_store, "API_YAML_PATH", str(target))
 
-    utils.save_api_yaml({"providers": [], "api_keys": [], "preferences": {}})
+    file_store.save_api_yaml({"providers": [], "api_keys": [], "preferences": {}})
 
     # 修改原因：手动编辑 YAML 解析异常后，规范化得到的空 providers 不能覆盖原始正确配置。
     # 修改方式：把 API_YAML_PATH 指向临时文件，调用真实 save_api_yaml 后重新读取磁盘内容。
@@ -55,10 +56,10 @@ def test_save_api_yaml_allows_empty_providers_when_existing_file_has_no_provider
     """旧文件本来没有渠道时，空 providers 写入不应被安全检查误拦截。"""
     target = tmp_path / "api.yaml"
     _write_yaml(target, {"providers": [], "api_keys": [], "preferences": {"old": True}})
-    monkeypatch.setattr(utils, "API_YAML_PATH", str(target))
+    monkeypatch.setattr(file_store, "API_YAML_PATH", str(target))
 
     new_config = {"providers": [], "api_keys": [], "preferences": {"new": True}}
-    utils.save_api_yaml(new_config)
+    file_store.save_api_yaml(new_config)
 
     # 修改原因：安全保护只针对“从有渠道变成零渠道”的异常场景，不能阻止合法空配置保存。
     # 修改方式：用旧 providers 为空的临时文件调用真实保存逻辑。

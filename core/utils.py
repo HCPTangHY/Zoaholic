@@ -27,7 +27,7 @@ from core.response_builders import (
     generate_chunked_image_md, get_image_format, encode_image,
     get_image_from_url, get_encode_image, get_base64_image,
     _convert_webp_base64_to_png, _prepare_image_for_upload,
-    upload_image_to_0x0st, parse_json_safely,
+    parse_json_safely,
 )
 
 # 本地 API Key 前缀：用于判断 provider 名是否为本地聚合器 Key
@@ -260,61 +260,6 @@ def get_proxy(proxy, client_config = {}):
             client_config["proxy"] = proxy
     return client_config
 
-async def update_initial_model(provider):
-    try:
-        engine, stream_mode, _ = get_engine(provider, endpoint=None, original_model="")
-        # print("engine", engine, provider)
-        api_url = provider['base_url']
-        api = provider['api']
-        proxy = safe_get(provider, "preferences", "proxy", default=None)
-        client_config = get_proxy(proxy)
-        if engine == "gemini":
-            before_v1 = api_url.split("/v1beta")[0]
-            url = before_v1 + "/v1beta/models"
-            params = {"key": api}
-            async with httpx.AsyncClient(**client_config) as client:
-                response = await client.get(url, params=params)
-
-            original_models = response.json()
-            if original_models.get("error"):
-                raise Exception({"error": original_models.get("error"), "endpoint": url, "api": api})
-
-            models = {"data": []}
-            for model in original_models["models"]:
-                models["data"].append({
-                    "id": model["name"].split("models/")[-1],
-                })
-        else:
-            endpoint = BaseAPI(api_url=api_url)
-            endpoint_models_url = endpoint.v1_models
-            if isinstance(api, list):
-                api = api[0]
-            if "v1/messages" in api_url:
-                headers = {"x-api-key": api, "anthropic-version": "2023-06-01"}
-            else:
-                headers = {"Authorization": f"Bearer {api}"}
-            async with httpx.AsyncClient(**client_config) as client:
-                response = await client.get(
-                    endpoint_models_url,
-                    headers=headers,
-                )
-            models = response.json()
-            if models.get("error"):
-                logger.error({"error": models.get("error"), "endpoint": endpoint_models_url, "api": api})
-                return []
-
-        # print(models)
-        models_list = models["data"]
-        models_id = [model["id"] for model in models_list]
-        set_models = set()
-        for model_item in models_id:
-            set_models.add(model_item)
-        models_id = list(set_models)
-        # print(models_id)
-        return models_id
-    except Exception:
-        traceback.print_exc()
-        return []
 
 def safe_get(data, *keys, default=None):
     for key in keys:

@@ -91,41 +91,21 @@ async def _read_response_bytes(resp: "Response") -> bytes:
 
 def _create_dialect_verify_api_key(dialect_id: str):
     """为方言创建 API key 验证依赖"""
-    from core.auth import security, _extract_token
+    from core.auth import _extract_token, authenticate_api_key_token, security
+    from core.ip_blacklist import (
+        get_client_ip_from_request_info,
+        is_global_ip_blocked,
+        raise_ip_blocked,
+    )
     from fastapi.security import HTTPAuthorizationCredentials
-
-    def _resolve_admin_api_index(app) -> int | None:
-        """当客户端使用 admin JWT 访问方言端点时，将其映射到配置中的 admin api_key 索引。"""
-        api_keys_db = getattr(app.state, "api_keys_db", None) or []
-        if isinstance(api_keys_db, list):
-            for i, item in enumerate(api_keys_db):
-                if not isinstance(item, dict):
-                    continue
-                role = str(item.get("role", "")).lower()
-                if "admin" in role:
-                    return i
-            if len(api_keys_db) == 1:
-                return 0
-        return None
 
     async def verify(
         request: Request,
         credentials: HTTPAuthorizationCredentials = Depends(security),
     ) -> int:
         app = request.app
-        api_list = app.state.api_list
-
-        from core.ip_blacklist import (
-            get_client_ip_from_request_info,
-            is_global_ip_blocked,
-            is_key_ip_blocked,
-            raise_ip_blocked,
-        )
         client_ip = get_client_ip_from_request_info()
         if is_global_ip_blocked(app, client_ip):
-            # 修改原因：方言端点跳过 StatsMiddleware 的标准认证，但仍必须先执行全局 IP 黑名单。
-            # 修改方式：在方言 token 提取和 API Key 匹配前读取 request_info.client_ip 检查全局缓存。
-            # 目的：保证 Gemini/Claude 等方言入口也遵守“全局黑名单优先”。
             raise_ip_blocked()
 
         dialect = get_dialect(dialect_id)
@@ -139,95 +119,7 @@ def _create_dialect_verify_api_key(dialect_id: str):
         if not token:
             token = await _extract_token(request, credentials)
 
-        if not token:
-            from fastapi import HTTPException
-            raise HTTPException(status_code=403, detail="Invalid or missing API Key")
-
-        api_index: int | None = None
-        token_for_stats = token
-        byok_real_key: str | None = None
-        byok_template_key: str | None = None
-
-        # 1) 先尝试按普通 api_key 校验
-        try:
-            api_index = api_list.index(token)
-            try:
-                from core.byok import is_byok_api_key
-
-                if is_byok_api_key(getattr(app.state, "api_keys_db", []), api_index):
-                    # 修改原因：方言入口同样不能把 BYOK 模板 key 当成可用客户端 key。
-                    # 修改方式：精确命中 byok-xxx-* 时回退到前缀解析，并由前缀解析拒绝模板本身。
-                    # 目的：保证 x-goog-api-key 和 Authorization 两类方言鉴权都必须携带真实上游 key。
-                    api_index = None
-            except Exception:
-                pass
-        except ValueError:
-            api_index = None
-
-        # 2) 精确匹配失败后尝试 BYOK 前缀匹配。Gemini 方言可从 x-goog-api-key 取 token，默认提取器可从 x-api-key/Bearer 取 token。
-        if api_index is None:
-            try:
-                from core.byok import get_byok_prefixes, resolve_byok_token
-
-                byok_result = resolve_byok_token(token, get_byok_prefixes(app))
-                if byok_result is not None:
-                    api_index, byok_template_key, byok_real_key = byok_result
-                    token_for_stats = byok_template_key
-            except Exception:
-                api_index = None
-
-        # 3) 兼容管理控制台的 admin JWT：映射到 admin api_key
-        if api_index is None:
-            try:
-                from core.jwt_utils import is_admin_jwt
-
-                if is_admin_jwt(token):
-                    admin_index = _resolve_admin_api_index(app)
-                    if admin_index is not None:
-                        api_index = admin_index
-                        # 统计/计费使用实际 api_key（而不是 JWT 字符串）
-                        token_for_stats = api_list[api_index]
-            except Exception:
-                api_index = None
-
-        if api_index is None:
-            from fastapi import HTTPException
-            raise HTTPException(status_code=403, detail="Invalid or missing API Key")
-
-        # 修改原因：Key 级启用开关需要覆盖方言入口（如 /v1beta、/v1/messages），不能只拦标准 /v1 路由。
-        # 修改方式：与 core/auth.py 使用同一判定函数；admin JWT 映射的索引豁免，避免控制台失联。
-        # 目的：禁用后该 Key 在所有协议入口均被拒绝，重新启用即恢复。
-        try:
-            from core.auth import is_api_key_disabled, _is_admin_jwt_token
-            if is_api_key_disabled(app, api_index) and not _is_admin_jwt_token(token):
-                from fastapi import HTTPException
-                raise HTTPException(status_code=403, detail="API Key has been disabled")
-        except HTTPException:
-            raise
-        except Exception:
-            pass
-
-        if is_key_ip_blocked(app, api_index, client_ip):
-            # 修改原因：方言入口解析出 API Key 下标后，也要执行当前 Key 的 IP 黑名单。
-            # 修改方式：用 api_index 读取 app.state.api_key_ip_blacklists 对应规则。
-            # 目的：保持方言入口与 /v1 标准入口的访问控制顺序一致。
-            raise_ip_blocked()
-
-        # 更新 request_info 和 request.state 中的 API key 信息，确保统计记录模板 key 而非 BYOK 真实 key。
-        try:
-            from core.byok import store_byok_request_state, update_request_info_auth
-
-            store_byok_request_state(
-                request,
-                byok_real_key=byok_real_key,
-                template_key=byok_template_key,
-                token_for_stats=token_for_stats,
-            )
-            update_request_info_auth(app, api_index, token_for_stats, byok_real_key, byok_template_key)
-        except Exception:
-            pass
-
-        return api_index
+        return authenticate_api_key_token(app, token, client_ip, request=request)
 
     return verify
 
@@ -313,8 +205,7 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
                     # 修改原因：关闭外层方言流不会自动关闭 async for 正在消费的内层生成器。
                     # 修改方式：无论正常结束、客户端断开还是转换异常，都显式关闭原响应迭代器。
                     # 目的：退出 client.stream 上下文并把连接归还 httpx 连接池。
-                    if hasattr(source_iterator, "aclose"):
-                        await close_async_iterator(source_iterator)
+                    await close_async_iterator(source_iterator)
 
             return LoggingStreamingResponse(OwnedAsyncIterator(convert_stream(), resp.body_iterator), media_type="text/event-stream",
                                             current_info=current_info, app=app, debug=debug,

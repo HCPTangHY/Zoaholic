@@ -379,19 +379,9 @@ def _clone_request_data_for_channel_attempt(request_data: Any) -> Any:
         return request_data
 
 
-def _callable_accepts_keyword(func: Callable, keyword: str) -> bool:
-    """判断调用对象是否接受指定关键字参数。"""
-    # 修改原因：单元测试会用精简签名的 fake process_request 替换真实函数，新增 api_key_info/key_enabled_plugins 关键字会让旧测试替身报错。
-    # 修改方式：调用前检查签名；真实函数或带 **kwargs 的替身接收新参数，旧替身则跳过该关键字。
-    # 目的：保持生产路径可传递新出站上下文，同时不破坏既有测试和外部调用替身。
-    try:
-        signature = inspect.signature(func)
-    except (TypeError, ValueError):
-        return True
-    return keyword in signature.parameters or any(
-        param.kind == inspect.Parameter.VAR_KEYWORD
-        for param in signature.parameters.values()
-    )
+    # 修改原因：测试需要能直接比较 RequestModel，或从最终请求中断言模型名与消息结构。
+    # 修改方式：移除已无调用的 _ callable 探测辅助函数，由调用方直接按真实签名传递关键字。
+    # 目的：消除生产路径中的每次 inspect.signature 反射。
 
 
 def normalize_keepalive_interval(keepalive_interval: Any, timeout_value: Any) -> Optional[int]:
@@ -1028,14 +1018,9 @@ class ModelRequestHandler:
                 effective_force_api_key = byok_real_key if (byok_real_key and is_byok_provider(provider)) else force_api_key
                 process_extra_kwargs: Dict[str, Any] = {
                     "force_api_key": effective_force_api_key,
+                    "api_key_info": _interceptor_api_key_info,
+                    "key_enabled_plugins": _key_enabled_plugins,
                 }
-                # 修改原因：响应出站阶段需要把 Key 信息传入真实 process_request，但测试替身可能不接受新增参数。
-                # 修改方式：仅当当前 process_fn 签名支持时才附加 api_key_info 和 key_enabled_plugins。
-                # 目的：在不破坏既有测试替身的同时，把生产请求所需上下文传给响应处理链。
-                if _callable_accepts_keyword(process_fn, "api_key_info"):
-                    process_extra_kwargs["api_key_info"] = _interceptor_api_key_info
-                if _callable_accepts_keyword(process_fn, "key_enabled_plugins"):
-                    process_extra_kwargs["key_enabled_plugins"] = _key_enabled_plugins
 
                 if process_fn is process_request_passthrough:
                     response = await process_fn(
@@ -1259,12 +1244,13 @@ class ModelRequestHandler:
                     and not is_current_byok_request
                     and not key_rule_disabled_current
                     and api_key_count_before_rule > 1
-                    and getattr(channel_circular_list, "schedule_algorithm", None) == "sticky_ip"
+                    and channel_circular_list.schedule_algorithm == "sticky_ip"
                     and all(error not in error_message for error in exclude_error_rate_limit)
                 ):
                     # sticky_ip 下若请求耗时超过秒级冷却且未命中显式 key_rule（如 504 首包超时），
                     # 临时冷却当前失败 key 以确保下一次重试顺移借用下一把可用 key。
-                    _fallback_cd = max(int(provider.get("preferences", {}).get("cooldown_period", 3) or 3), 10)
+                    _raw_cd = provider.get("preferences", {}).get("cooldown_period")
+                    _fallback_cd = max(int(_raw_cd if _raw_cd is not None else 3), 10)
                     await channel_circular_list.set_auto_disabled(
                         current_api, duration=_fallback_cd, reason=f"status={status_code}"
                     )

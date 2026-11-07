@@ -192,24 +192,3 @@ async def get_payload(request: RequestModel, engine, provider, api_key=None):
      
     raise ValueError(f"Unknown engine: {engine}")
 
-
-async def prepare_request_payload(provider, request_data):
-    """
-    准备请求 payload 的便捷函数
-    
-    Args:
-        provider: 提供商配置
-        request_data: 请求数据字典
-        
-    Returns:
-        tuple: (url, headers, payload, engine)
-    """
-    model_dict = get_model_dict(provider)
-    request = RequestModel(**request_data)
-
-    original_model = model_dict[request.model]
-    engine, _, _ = get_engine(provider, endpoint=None, original_model=original_model)
-
-    url, headers, payload = await get_payload(request, engine, provider, api_key=provider['api'])
-
-    return url, headers, payload, engine

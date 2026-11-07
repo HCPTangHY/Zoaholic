@@ -1,6 +1,7 @@
 import sys
 import time
 from pathlib import Path
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -195,7 +196,7 @@ async def test_antigravity_fetch_quota_preserves_model_quotas_from_list_payload(
         "paidTier": {"name": "AI Pro", "availableCredits": [{"creditAmount": "120"}]},
     }
     monkeypatch.setattr(ag.httpx, "AsyncClient", FakeAsyncClient)
-    monkeypatch.setattr(ag, "get_antigravity_version", lambda: ag._async_return("1.21.9"))
+    monkeypatch.setattr(ag, "get_antigravity_version", AsyncMock(return_value="1.21.9"))
 
     provider = ag.AntigravityProvider()
     quota = await provider.fetch_quota({"access_token": "access-quota"})
@@ -245,7 +246,7 @@ async def test_antigravity_fetch_quota_groups_provider_minimums_and_ignores_tab_
     }
     FakeAsyncClient.load_code_assist_payload = {}
     monkeypatch.setattr(ag.httpx, "AsyncClient", FakeAsyncClient)
-    monkeypatch.setattr(ag, "get_antigravity_version", lambda: ag._async_return("1.21.9"))
+    monkeypatch.setattr(ag, "get_antigravity_version", AsyncMock(return_value="1.21.9"))
 
     provider = ag.AntigravityProvider()
     quota = await provider.fetch_quota({"access_token": "access-quota"})
@@ -269,7 +270,7 @@ async def test_fetch_antigravity_models_supports_list_payload(monkeypatch):
         ]
     }
     monkeypatch.setattr(ag.httpx, "AsyncClient", FakeAsyncClient)
-    monkeypatch.setattr(ag, "get_antigravity_version", lambda: ag._async_return("1.21.9"))
+    monkeypatch.setattr(ag, "get_antigravity_version", AsyncMock(return_value="1.21.9"))
 
     models = await ag.fetch_antigravity_models(None, {"api": "access-models"})
 

@@ -211,27 +211,6 @@ def resolve_virtual_model(
     return resolved
 
 
-def _collect_real_model_names(config: Dict[str, Any]) -> Set[str]:
-    """收集所有真实渠道对外暴露的模型名。"""
-    # 修改原因：虚拟模型名与真实模型名冲突时，请求入口会出现两种解释。
-    # 修改方式：基于 provider 的 _model_dict_cache 或实时计算结果收集所有对外模型名。
-    # 目的：在启动或保存配置时提前阻止含义不确定的虚拟模型配置。
-    names: Set[str] = set()
-    providers = config.get("providers") or []
-    if not isinstance(providers, list):
-        return names
-
-    for provider in providers:
-        if not isinstance(provider, dict):
-            continue
-        model_dict = _get_provider_model_dict(provider)
-        for model_name in model_dict.keys():
-            model_name = str(model_name).strip()
-            if model_name and model_name != "*":
-                names.add(model_name)
-    return names
-
-
 def validate_virtual_models_config(config: Dict[str, Any]) -> None:
     """校验虚拟模型配置，供启动和保存配置时调用。"""
     # 修改原因：虚拟模型名现在允许覆盖同名真实模型，请求入口由 get_matching_providers 的虚拟优先逻辑消除歧义。

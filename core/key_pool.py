@@ -312,26 +312,6 @@ class ThreadSafeCircularList:
             bool: 如果 key 被禁用返回 True，否则返回 False
         """
         return item in self.disabled_keys
-    
-    def set_key_disabled(self, item: str, disabled: bool = True):
-        """设置某个 key 的禁用状态
-        
-        Args:
-            item: API key
-            disabled: True 表示禁用，False 表示启用
-        """
-        if disabled:
-            self.disabled_keys.add(item)
-        else:
-            self.disabled_keys.discard(item)
-    
-    def update_disabled_keys(self, disabled_keys: set):
-        """更新禁用的 key 集合
-        
-        Args:
-            disabled_keys: 新的禁用 key 集合
-        """
-        self.disabled_keys = set(disabled_keys) if disabled_keys else set()
 
     def _cleanup_stale_request_keys(self):
         """清理超过 1 小时没有新请求的 requests 索引。
@@ -384,14 +364,8 @@ class ThreadSafeCircularList:
             matched_default = True
 
         # 检查所有速率限制条件（limit_period > 0 为请求次数窗口；-1000000 < limit_period < -1 为总 Token 窗口；limit_period < -1000000 为输出 Token 窗口）
-        token_reqs_map = getattr(self, "token_requests", None)
-        if token_reqs_map is None:
-            self.token_requests = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50000)))
-            token_reqs_map = self.token_requests
-        out_token_reqs_map = getattr(self, "output_token_requests", None)
-        if out_token_reqs_map is None:
-            self.output_token_requests = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50000)))
-            out_token_reqs_map = self.output_token_requests
+        token_reqs_map = self.token_requests
+        out_token_reqs_map = self.output_token_requests
 
         for limit_count, limit_period in rate_limit:
             if limit_period == -1:
@@ -482,17 +456,9 @@ class ThreadSafeCircularList:
         now = time()
         mk = model if model else "default"
         if tokens and tokens > 0:
-            token_reqs_map = getattr(self, "token_requests", None)
-            if token_reqs_map is None:
-                self.token_requests = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50000)))
-                token_reqs_map = self.token_requests
-            token_reqs_map[item][mk].append((now, int(tokens)))
+            self.token_requests[item][mk].append((now, int(tokens)))
         if output_tokens and output_tokens > 0:
-            out_token_reqs_map = getattr(self, "output_token_requests", None)
-            if out_token_reqs_map is None:
-                self.output_token_requests = defaultdict(lambda: defaultdict(lambda: deque(maxlen=50000)))
-                out_token_reqs_map = self.output_token_requests
-            out_token_reqs_map[item][mk].append((now, int(output_tokens)))
+            self.output_token_requests[item][mk].append((now, int(output_tokens)))
 
     async def next(self, model: str = None):
         async with self.lock:

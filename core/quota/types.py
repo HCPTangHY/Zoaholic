@@ -23,17 +23,6 @@ class QuotaGauge:
 
 
 @dataclass
-class QuotaBadge:
-    """一个标签药丸。"""
-
-    id: str               # 如 'oai_tier', 'plan_type', 'subscription'
-    label: str            # 如 'Tier 3', 'Pro', 'Plus'
-    tone: str = 'blue'    # blue / green / yellow / red / gray
-    priority: int = 100   # 越大越优先显示
-    source: str = ''      # 来源插件/渠道名
-
-
-@dataclass
 class QuotaSnapshot:
     """统一额度快照，普通 Key 和 OAuth Key 共用。"""
 
@@ -52,7 +41,6 @@ class QuotaSnapshot:
 
     # 新结构
     gauges: list = field(default_factory=list)     # List[QuotaGauge]
-    badges: list = field(default_factory=list)     # List[QuotaBadge]
     metrics: dict = field(default_factory=dict)    # 自由 KV，如 tpm/rpm
     extensions: dict = field(default_factory=dict) # 渠道/插件私有数据
     raw: Any = None
@@ -65,7 +53,7 @@ class QuotaSnapshot:
     def to_dict(self) -> dict:
         """输出为 API 响应字典，同时包含新旧字段。"""
         # 修改原因：API 需要同时服务旧前端字段和新 quota UI 字段。
-        # 修改方式：先完整生成兼容字典，再剔除 None，保留空 gauges、badges、metrics 和 extensions 作为稳定新字段。
+        # 修改方式：先完整生成兼容字典，再剔除 None，保留空 gauges、metrics 和 extensions 作为稳定新字段。
         # 目的：调用方可以直接把 QuotaSnapshot 输出合并进现有响应，而不会丢失旧字段。
         d = {
             'supported': self.supported,
@@ -79,7 +67,6 @@ class QuotaSnapshot:
             'currency': self.currency,
             'expires_at': self.expires_at,
             'gauges': [_gauge_to_dict(g) for g in self.gauges],
-            'badges': [_badge_to_dict(b) for b in self.badges],
             'metrics': self.metrics,
             'extensions': self.extensions,
             'raw': self.raw,
@@ -102,9 +89,3 @@ def _gauge_to_dict(g) -> dict:
             d[attr] = v
     return d
 
-
-def _badge_to_dict(b) -> dict:
-    # 修改原因：badge 结构需要在响应中保持轻量、可排序，并保留来源信息。
-    # 修改方式：统一输出 id、label、tone、priority 和 source 五个字段。
-    # 目的：前端可以不理解具体插件，也能按优先级展示标签药丸。
-    return {'id': b.id, 'label': b.label, 'tone': b.tone, 'priority': b.priority, 'source': b.source}

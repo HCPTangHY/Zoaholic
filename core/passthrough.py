@@ -641,7 +641,7 @@ async def process_request_passthrough(
             # 修改方式：索引匹配始终使用 original_api_key，也就是配置中的 key_id。
             # 目的：避免 token 明文进入统计索引逻辑，并保持自动冷却定位正确。
             circular_list = provider_api_circular_list.get(provider['provider'])
-            if circular_list and hasattr(circular_list, 'items'):
+            if circular_list:
                 api_keys_list = circular_list.items
                 if original_api_key in api_keys_list:
                     current_info["provider_key_index"] = api_keys_list.index(original_api_key)

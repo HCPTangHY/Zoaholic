@@ -400,7 +400,7 @@ def _build_gemini_cli_payload(payload: dict, original_model: str, provider: dict
     source_payload = copy.deepcopy(payload) if isinstance(payload, dict) else {}
     if isinstance(source_payload.get("request"), dict):
         wrapped = source_payload
-        wrapped["request"] = _normalize_gemini_cli_request_payload(copy.deepcopy(wrapped["request"]))
+        wrapped["request"] = _normalize_gemini_cli_request_payload(wrapped["request"])
         wrapped.setdefault("model", original_model)
         wrapped.setdefault("project", _extract_gemini_cli_project_id(provider))
         return wrapped

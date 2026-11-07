@@ -403,25 +403,6 @@ def build_billing_header(messages, version=DEFAULT_CLAUDE_CODE_VERSION, entrypoi
     )
 
 
-def has_billing_header(system):
-    """检查 system 中是否已经存在 billing header。"""
-    if isinstance(system, str):
-        return system.strip().startswith(BILLING_HEADER_PREFIX)
-    if isinstance(system, list) and system:
-        first_item = system[0]
-        if isinstance(first_item, dict):
-            text = first_item.get("text")
-            return isinstance(text, str) and text.strip().startswith(BILLING_HEADER_PREFIX)
-        if isinstance(first_item, str):
-            return first_item.strip().startswith(BILLING_HEADER_PREFIX)
-    return False
-
-
-def system_is_empty(system):
-    """判断 system 是否完全为空，供 Claude Code 身份声明注入使用。"""
-    return system is None or (isinstance(system, str) and not system.strip()) or (isinstance(system, list) and not system)
-
-
 def ensure_billing_header(payload, headers, billing_salt=DEFAULT_BILLING_SALT, default_version=DEFAULT_CLAUDE_CODE_VERSION, default_entrypoint=DEFAULT_ENTRYPOINT):
     """Layer 1：system prompt 重写 — billing + CC identity 在前，原 system 拼接在后。"""
     ua = str(get_header_case_insensitive(headers, "User-Agent") or "")

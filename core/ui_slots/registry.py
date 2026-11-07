@@ -82,7 +82,6 @@ def _slot_output_value(contrib: UiSlotContribution) -> Any:
 def resolve_slots_for_engine(
     engine: str,
     auth_type: str = 'api_key',
-    enabled_plugins: Optional[List[str]] = None,
     channel_slots: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """解析某个 engine/provider 最终应该使用的 slots。"""
@@ -90,7 +89,6 @@ def resolve_slots_for_engine(
     # 修改方式：先复制渠道自带 channel_slots，再收集匹配 engine 和 auth_type 的贡献；enabled_plugin 不再过滤，只写入输出条件。
     # 目的：让 oai_tier 这类插件 slot 能返回给管理端，同时避免没有启用插件的 provider 误渲染。
     result: Dict[str, Any] = dict(channel_slots or {})
-    _ = enabled_plugins
 
     candidates: Dict[str, List[UiSlotContribution]] = {}
     for contrib in _SLOT_REGISTRY.values():

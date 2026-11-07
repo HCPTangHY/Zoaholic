@@ -68,13 +68,6 @@ def test_ui_slot_registry_resolves_targets_and_marks_plugin_gate():
             "script": "export default function render() { return 'plugin'; }",
             "requires_plugin": "needs_plugin",
         }
-
-        with_plugin = resolve_slots_for_engine(
-            "openai",
-            auth_type="api_key",
-            enabled_plugins=["needs_plugin"],
-        )
-        assert with_plugin["key_background"] == resolved["key_background"]
     finally:
         for slot_id in slot_ids:
             unregister_ui_slot(slot_id)

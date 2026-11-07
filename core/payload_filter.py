@@ -105,31 +105,6 @@ def _as_set(value: Any) -> Set[str]:
     return set()
 
 
-def _pop_dot_path(payload: dict, path: str) -> bool:
-    """就地删除形如 a.b.c 的字段。返回是否成功删除。"""
-    if not path or "." not in path:
-        return False
-
-    parts = [p for p in path.split(".") if p]
-    if not parts:
-        return False
-
-    cur: Any = payload
-    for k in parts[:-1]:
-        if not isinstance(cur, dict):
-            return False
-        if k not in cur:
-            return False
-        cur = cur.get(k)
-
-    last = parts[-1]
-    if isinstance(cur, dict) and last in cur:
-        cur.pop(last, None)
-        return True
-    return False
-
-
-
 def _pop_dot_path_cow(payload: dict, path: str) -> tuple[dict, bool]:
     """删除形如 a.b.c 的字段（copy-on-write）。
 

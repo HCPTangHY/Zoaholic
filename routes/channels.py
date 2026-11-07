@@ -166,14 +166,13 @@ def _select_test_api_key(test_config: Dict[str, Any], provider_snapshot: Any) ->
     return None
 
 
-def _build_test_provider(test_config: Dict[str, Any], app: Any) -> tuple[Dict[str, Any], Optional[str], str]:
-    """从测试配置构建干净 provider、选中的 Key 和 engine。"""
+def _build_test_provider(test_config: Dict[str, Any]) -> tuple[Dict[str, Any], Optional[str]]:
+    """从测试配置构建干净 provider 和选中的 Key。"""
     # 修改原因：原 test_channel 同时负责 snapshot 清洗、engine 推断、base_url、模型映射和 Key 选择，难以维护。
     # 修改方式：把单渠道测试 provider 的构建集中到一个模块级函数，返回 handler 所需的最小输入。
     # 目的：让主路由只做调度，同时保留别名、model_prefix、upstream_model_hint 和默认 base_url 行为。
     from core.utils import get_model_dict
 
-    _ = app
     provider_snapshot = test_config.get("provider_snapshot")
     provider = _clean_test_provider_snapshot(provider_snapshot)
     selected_api_key = _select_test_api_key(test_config, provider_snapshot)
@@ -249,7 +248,7 @@ def _build_test_provider(test_config: Dict[str, Any], app: Any) -> tuple[Dict[st
     if resolved_model not in model_dict:
         raise HTTPException(status_code=400, detail=f"model '{model}' 不在当前渠道模型配置中")
 
-    return provider, selected_api_key, engine
+    return provider, selected_api_key
 
 
 def _build_test_request(test_config: Dict[str, Any]):
@@ -669,8 +668,7 @@ async def test_channel(
     if virtual_route_test:
         override_providers = _resolve_virtual_test(test_config, app)
     else:
-        provider, selected_api_key, engine = _build_test_provider(test_config, app)
-        _ = engine
+        provider, selected_api_key = _build_test_provider(test_config)
         override_providers = [provider]
 
     test_request = _build_test_request(test_config)
@@ -917,7 +915,7 @@ def _oauth_quota_to_balance_result(quota: Any, error: Optional[str] = None) -> D
 def _append_quota_snapshot_fields(result: Dict[str, Any]) -> Dict[str, Any]:
     """在旧 BalanceResult 响应上追加 QuotaSnapshot 新字段。"""
     # 修改原因：/v1/channels/balance 需要继续返回旧字段，同时让前端可以开始读取统一 quota 字段。
-    # 修改方式：在所有返回分支末尾把旧结果转成 QuotaSnapshot，只追加 gauges、badges、metrics、extensions 四类新字段。
+    # 修改方式：在所有返回分支末尾把旧结果转成 QuotaSnapshot，只追加 gauges、metrics、extensions 三类新字段。
     # 目的：不改变现有余额查询逻辑和旧字段含义，降低 P0 接入风险。
     if not isinstance(result, dict):
         return result
@@ -927,7 +925,6 @@ def _append_quota_snapshot_fields(result: Dict[str, Any]) -> Dict[str, Any]:
     balance_snapshot = from_balance_result(result)
     if result.get("quota_inner") is not None or result.get("quota_outer") is not None:
         snapshot = from_oauth_account(result)
-        snapshot.badges.extend(balance_snapshot.badges)
         if not snapshot.gauges:
             snapshot.gauges.extend(balance_snapshot.gauges)
     else:
@@ -935,7 +932,7 @@ def _append_quota_snapshot_fields(result: Dict[str, Any]) -> Dict[str, Any]:
 
     snapshot_fields = snapshot.to_dict()
     merged = dict(result)
-    for key, default in (("gauges", []), ("badges", []), ("metrics", {}), ("extensions", {})):
+    for key, default in (("gauges", []), ("metrics", {}), ("extensions", {})):
         if merged.get(key) is None:
             merged[key] = snapshot_fields.get(key, default.copy())
     return merged

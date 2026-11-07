@@ -148,14 +148,3 @@ class ClientManager:
             await client.aclose()
             self._client_locks.pop(key, None)
         return True
-
-    async def reset_all_clients(self) -> int:
-        """
-        重置所有客户端连接（不需要重启服务）
-        
-        Returns:
-            重置的客户端数量
-        """
-        count = len(self.clients)
-        await self.close()
-        return count
