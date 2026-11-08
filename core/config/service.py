@@ -137,6 +137,9 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
     # 修改方式：顶层 ip_blacklist 规范为字符串数组，非法条目直接抛出 ValueError 阻止保存。
     # 目的：避免请求期才发现格式错误，并为运行时预解析缓存提供稳定输入。
     config_data['ip_blacklist'] = normalize_ip_blacklist(config_data.get('ip_blacklist'))
+    from core.key_hierarchy import prepare_key_hierarchy
+    config_data.pop('_key_hierarchy_index', None)
+    config_data['api_keys'] = prepare_key_hierarchy(config_data.get('api_keys', []))
 
     # 修改原因：/v1/api_config/update 可以只保存 preferences，此时传入的是已经包含运行时子渠道的 app.state.config。
     # 修改方式：展开子渠道前先移除 _is_sub_channel 运行时 provider，再从主渠道重新展开。
@@ -364,8 +367,7 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
             key_groups = [key_groups]
         elif not isinstance(key_groups, list):
             key_groups = ["default"]
-        if not key_groups:
-            key_groups = ["default"]
+
         config_data['api_keys'][index]['groups'] = key_groups
 
         # 确保api字段为字符串类型
@@ -383,9 +385,10 @@ async def update_config(config_data, use_config_url=False, skip_model_fetch=Fals
             config_data['api_keys'][index]['model'] = models
             api_keys_db[index]['model'] = models
         else:
-            # Default to all models if 'model' field is not set
-            config_data['api_keys'][index]['model'] = ["all"]
-            api_keys_db[index]['model'] = ["all"]
+            # Explicit empty child permissions deny access; legacy root defaults remain unchanged.
+            models = [] if 'model' in api_key else ["all"]
+            config_data['api_keys'][index]['model'] = models
+            api_keys_db[index]['model'] = models
 
     api_list = [item["api"] for item in api_keys_db]
     # 修改原因：BYOK 模式不新增配置字段，只能从 api_keys[].api 的通配符后缀推断本地身份前缀。

@@ -10,6 +10,7 @@
 """
 
 import asyncio
+import json
 from collections import deque
 
 from core.env import env_bool
@@ -18,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any
 
 from pydantic import BaseModel, field_serializer
-from sqlalchemy import inspect, text, func, select
+from sqlalchemy import inspect, text, func, select, or_
 from sqlalchemy.sql import sqltypes
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -523,7 +524,30 @@ def get_current_model_prices(app, model_name: str, provider_name: str = None):
         return 0.0, 0.0, 0.0
 
 
-async def compute_total_cost_from_db(filter_api_key: Optional[str] = None, start_dt_obj: Optional[datetime] = None) -> float:
+def key_history_patterns(key_id: str) -> list[str]:
+    """Match one complete element of the compact JSON array, not an ID substring."""
+    encoded = json.dumps(key_id).replace('!', '!!').replace('%', '!%').replace('_', '!_')
+    return ['%' + left + encoded + right + '%' for left in ('[', ',') for right in (',', ']')]
+
+
+def key_history_filter(key_id: str, api_key: str, branch: bool = False):
+    direct = or_(RequestStat.api_key_id == key_id,
+                 RequestStat.api_key_id.is_(None) & (RequestStat.api_key == api_key))
+    return or_(direct, *(RequestStat.key_ancestor_ids.like(pattern, escape='!')
+                        for pattern in key_history_patterns(key_id))) if branch else direct
+
+
+def key_history_sql(key_id: str, api_key: str, branch: bool = False):
+    direct = '(api_key_id = ? OR (api_key_id IS NULL AND api_key = ?))'
+    params = [key_id, api_key]
+    if branch:
+        patterns = key_history_patterns(key_id)
+        return '(' + direct + ' OR ' + ' OR '.join("key_ancestor_ids LIKE ? ESCAPE '!'" for _ in patterns) + ')', params + patterns
+    return direct, params
+
+
+async def compute_total_cost_from_db(filter_api_key: Optional[str] = None, start_dt_obj: Optional[datetime] = None,
+                                     branch_key_id: Optional[str] = None) -> float:
     """
     直接从数据库历史记录累计成本：
     sum((prompt_tokens*prompt_price + completion_tokens*completion_price)/1e6)
@@ -542,7 +566,11 @@ async def compute_total_cost_from_db(filter_api_key: Optional[str] = None, start
             "FROM request_stats WHERE 1=1"
         )
         params: list[Any] = []
-        if filter_api_key:
+        if branch_key_id is not None:
+            clause, key_params = key_history_sql(branch_key_id, filter_api_key, branch=True)
+            sql += ' AND ' + clause
+            params.extend(key_params)
+        elif filter_api_key:
             sql += " AND api_key = ?"
             params.append(filter_api_key)
         if start_dt_obj:
@@ -557,7 +585,9 @@ async def compute_total_cost_from_db(filter_api_key: Optional[str] = None, start
     async with async_session_scope() as session:
         expr = (func.coalesce(RequestStat.prompt_tokens, 0) * func.coalesce(RequestStat.prompt_price, 0.0) + func.coalesce(RequestStat.completion_tokens, 0) * func.coalesce(RequestStat.completion_price, 0.0)) / 1000000.0
         query = select(func.coalesce(func.sum(expr), 0.0))
-        if filter_api_key:
+        if branch_key_id is not None:
+            query = query.where(key_history_filter(branch_key_id, filter_api_key, branch=True))
+        elif filter_api_key:
             query = query.where(RequestStat.api_key == filter_api_key)
         if start_dt_obj:
             query = query.where(RequestStat.timestamp >= start_dt_obj)
@@ -662,9 +692,6 @@ def enqueue_stats(current_info: dict, app=None, get_model_prices_func=None) -> N
     # 修改原因：请求路径不能再直接等待 SQLite 写入，否则会在 db_semaphore 前堆积协程并阻塞事件循环。
     # 修改方式：同步计算价格后只保存 current_info.copy() 快照，再启动或唤醒唯一的后台 consumer。
     # 目的：让请求结束路径保持轻量，同时防止调用方后续修改 current_info 影响待写入统计。
-    if DISABLE_DATABASE:
-        return
-
     try:
         if current_info.get("success") and current_info.get("model"):
             if get_model_prices_func:
@@ -695,7 +722,16 @@ def enqueue_stats(current_info: dict, app=None, get_model_prices_func=None) -> N
     except Exception:
         pass
 
-    _stats_buffer.append((current_info.copy(), app))
+    # Quota settlement is independent of database availability and write retries.
+    _record_quota_usage_from_info(current_info, app, current_info.get('api_key'))
+    if DISABLE_DATABASE:
+        return
+    queued_info = current_info.copy()
+    if 'key_ancestor_ids' in queued_info:
+        queued_info['key_ancestor_ids'] = json.dumps(queued_info['key_ancestor_ids'], separators=(',', ':'))
+    if 'key_ancestor_keys' in queued_info:
+        queued_info['key_ancestor_keys'] = list(queued_info['key_ancestor_keys'])
+    _stats_buffer.append((queued_info, app))
     _ensure_stats_consumer_started()
     if len(_stats_buffer) >= _STATS_BATCH_SIZE and _stats_flush_event is not None:
         _stats_flush_event.set()
@@ -728,6 +764,9 @@ def _record_quota_usage_from_info(current_info: dict, app, check_key: str) -> No
             tokens_in=tokens_in,
             tokens_out=tokens_out,
             client_ip=client_ip,
+            ancestor_keys=current_info.get('key_ancestor_keys'),
+            api_key_id=current_info.get('api_key_id'),
+            ancestor_ids=current_info.get('key_ancestor_ids'),
         )
 
 
@@ -828,11 +867,7 @@ async def _batch_write_stats(batch: list) -> None:
                         await d1_client.execute(sql, params)
 
                 for current_info, app in batch:
-                    check_key = current_info.get("api_key")
-                    if app and check_key and hasattr(app.state, 'paid_api_keys_states'):
-                        if check_key in app.state.paid_api_keys_states and current_info.get("total_tokens", 0) > 0:
-                            await update_paid_api_keys_states(app, check_key)
-                    _record_quota_usage_from_info(current_info, app, check_key)
+                    await _update_paid_chain_states(current_info, app)
                 return
 
             async with db_semaphore:
@@ -853,11 +888,7 @@ async def _batch_write_stats(batch: list) -> None:
                             session.add(new_request_stat)
 
             for current_info, app in batch:
-                check_key = current_info.get("api_key")
-                if app and check_key and hasattr(app.state, 'paid_api_keys_states'):
-                    if check_key in app.state.paid_api_keys_states and current_info.get("total_tokens", 0) > 0:
-                        await update_paid_api_keys_states(app, check_key)
-                _record_quota_usage_from_info(current_info, app, check_key)
+                await _update_paid_chain_states(current_info, app)
             return
 
         except Exception as e:
@@ -1127,6 +1158,23 @@ async def get_usage_data(filter_api_key: Optional[str] = None, filter_model: Opt
 
 # ============== 付费 API 密钥状态 ==============
 
+async def _update_paid_chain_states(current_info, app):
+    if not app or not current_info.get('total_tokens', 0):
+        return
+    states = getattr(app.state, 'paid_api_keys_states', {})
+    if current_info.get('api_key_id') is not None:
+        ancestor_ids = current_info.get('key_ancestor_ids') or []
+        if isinstance(ancestor_ids, str):
+            ancestor_ids = json.loads(ancestor_ids)
+        ids = {current_info['api_key_id'], *ancestor_ids}
+        keys = [key['api'] for key in app.state.config.get('api_keys', []) if key.get('id') in ids]
+    else:
+        keys = [current_info.get('api_key'), *(current_info.get('key_ancestor_keys') or [])]
+    for key in dict.fromkeys(keys):
+        if key in states:
+            await update_paid_api_keys_states(app, key)
+
+
 async def update_paid_api_keys_states(app, paid_key: str):
     """
     更新付费API密钥的状态
@@ -1149,7 +1197,10 @@ async def update_paid_api_keys_states(app, paid_key: str):
         # 仍返回聚合的 token 统计，供前端展示
         all_tokens_info = await get_usage_data(filter_api_key=paid_key, start_dt_obj=created_at)
         # 关键修改：总消耗改为从历史数据逐条累计当时价格
-        total_cost = await compute_total_cost_from_db(filter_api_key=paid_key, start_dt_obj=created_at)
+        total_cost = await compute_total_cost_from_db(
+            filter_api_key=paid_key, start_dt_obj=created_at,
+            branch_key_id=app.state.config['api_keys'][check_index].get('id'),
+        )
 
         app.state.paid_api_keys_states[paid_key] = {
             "credits": credits,

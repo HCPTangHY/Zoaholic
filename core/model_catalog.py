@@ -48,7 +48,7 @@ def _append_authorized_virtual_models(all_models, unique_models, config, api_ind
     api_key_groups = safe_get(config, 'api_keys', api_index, 'groups', default=['default'])
     if isinstance(api_key_groups, str):
         api_key_groups = [api_key_groups]
-    if not isinstance(api_key_groups, list) or not api_key_groups:
+    if not isinstance(api_key_groups, list):
         api_key_groups = ['default']
     allowed_groups = set(api_key_groups)
 
@@ -138,7 +138,7 @@ def _split_scoped_model_rule(model_rule, config, api_list):
     return provider_name, model_name
 
 
-def post_all_models(api_index, config, api_list, models_list):
+def _post_models_for_key(api_index, config, api_list, models_list):
     all_models = []
     unique_models = set()
 
@@ -146,7 +146,7 @@ def post_all_models(api_index, config, api_list, models_list):
     api_key_groups = safe_get(config, 'api_keys', api_index, 'groups', default=['default'])
     if isinstance(api_key_groups, str):
         api_key_groups = [api_key_groups]
-    if not isinstance(api_key_groups, list) or not api_key_groups:
+    if not isinstance(api_key_groups, list):
         api_key_groups = ['default']
     allowed_groups = set(api_key_groups)
     
@@ -335,6 +335,21 @@ def post_all_models(api_index, config, api_list, models_list):
     # 按模型 ID 进行 Unicode 排序
     all_models.sort(key=lambda x: x["id"])
     return all_models
+
+
+def post_all_models(api_index, config, api_list, models_list):
+    """Intersect catalog permissions, keeping the actual caller as list owner."""
+    from core.key_hierarchy import key_chain
+    key = config['api_keys'][api_index]
+    models = _post_models_for_key(api_index, config, api_list, models_list)
+    if not key.get('parent_id'):
+        return models
+    indices = {item['api']: index for index, item in enumerate(config['api_keys'])}
+    for ancestor in key_chain(config, key['api'])[1:]:
+        allowed = {item['id'] for item in _post_models_for_key(
+            indices[ancestor['api']], config, api_list, models_list)}
+        models = [item for item in models if item['id'] in allowed]
+    return models
 
 
 def get_all_models(config, allowed_groups=None):

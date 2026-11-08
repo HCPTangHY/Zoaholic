@@ -5,6 +5,7 @@ Admin 管理路由
 import os
 import string
 import secrets
+from copy import deepcopy
 
 from fastapi import APIRouter, Depends, Body, HTTPException
 from fastapi.responses import JSONResponse
@@ -58,124 +59,127 @@ def _rebuild_runtime_rate_limits(app) -> None:
         quota_registry.init_from_config(config)
 
 
-async def _persist_config(app, sections_to_verify=None, changed_providers=None):
-    """
-    持久化当前配置，并在需要写回文件时校验指定 section。
-    """
-    # 修改原因：新增单渠道 provider API 与原有全量配置保存都需要同一套落盘、运行时重建和回读校验流程。
-    # 修改方式：把 /v1/api_config/update 原先内联的持久化逻辑集中到内部 helper，并用 sections_to_verify 控制校验范围。
-    # 目的：避免三个 provider 端点复制粘贴持久化代码，确保保存失败时统一返回非 200 响应。
-    if sections_to_verify is None:
-        sections_to_verify = ["providers"]
-    else:
-        sections_to_verify = list(sections_to_verify)
+def _validate_preferences(preferences, owner: str) -> None:
+    """Reject malformed limits before runtime normalization or persistence."""
+    from core.quota.parser import parse_key, parse_value
+    from core.quota.dimensional import parse_dimensional_rules
 
-    # 配置持久化策略：
-    # - CONFIG_STORAGE=file（默认）：api.yaml 为权威，前端保存必须写回文件，否则重启会回滚
-    # - CONFIG_STORAGE=auto/db：可写 DB；其中 auto/file 默认也写回 api.yaml
+    if preferences is None:
+        return
+    if not isinstance(preferences, dict):
+        raise ValueError(f"{owner}.preferences must be an object")
+    if "rate_limit" in preferences:
+        rate = preferences["rate_limit"]
+        if not isinstance(rate, (str, dict)):
+            raise ValueError(f"{owner}.rate_limit must be a string or object")
+        for value in rate.values() if isinstance(rate, dict) else [rate]:
+            if not isinstance(value, str):
+                raise ValueError(f"{owner}.rate_limit values must be strings")
+            parse_rate_limit(value)
+    if "quota" in preferences:
+        quota = preferences["quota"]
+        if not isinstance(quota, dict):
+            raise ValueError(f"{owner}.quota must be an object")
+        for key, value in quota.items():
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{owner}.quota values must be nonempty strings")
+            parse_key(key)
+            parse_value(value)
+    if "quota_rules" in preferences:
+        rules = preferences["quota_rules"]
+        if not isinstance(rules, list) or len(parse_dimensional_rules(rules)) != len(rules):
+            raise ValueError(f"{owner}.quota_rules contains invalid rules")
+
+
+def _validate_candidate_shape(config: dict) -> None:
+    _validate_preferences(config.get("preferences"), "global")
+    for section in ("api_keys", "providers"):
+        entries = config.get(section, [])
+        if not isinstance(entries, list):
+            raise ValueError(f"{section} must be a list")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError(f"Each {section} entry must be an object")
+            _validate_preferences(entry.get("preferences"), section)
+
+
+async def _persist_config(app, sections_to_verify=None, changed_providers=None, *, candidate_config=None):
+    """Prepare and persist privately, then publish runtime fields without awaiting.
+
+    External file/DB writes are not a distributed transaction: a storage failure
+    may require reconciliation, but it never publishes an unverified candidate.
+    """
+    from copy import copy
+    from types import SimpleNamespace
+    from core.byok import build_byok_prefixes
+    from core.ip_blacklist import apply_runtime_ip_blacklists
+    from core.config.file_store import save_api_yaml
+    from core.config.db_store import save_config_to_db
+    from core.log_config import logger
+    from utils import _sanitize_config_for_persistence
+
+    sections_to_verify = list(sections_to_verify) if sections_to_verify is not None else ["providers"]
     config_storage = (os.getenv("CONFIG_STORAGE") or "file").strip().lower()
-
     save_to_db = config_storage in ("auto", "db")
-    # auto/file：始终写回 api.yaml，保证 yaml 权威；db：默认不写文件（可用 SYNC_CONFIG_TO_FILE 打开）
-    save_to_file = (config_storage in ("file", "auto")) or env_bool("SYNC_CONFIG_TO_FILE", False)
-
+    save_to_file = config_storage in ("file", "auto") or env_bool("SYNC_CONFIG_TO_FILE", False)
+    source = app.state.config if candidate_config is None else candidate_config
     try:
-        app.state.config, app.state.api_keys_db, app.state.api_list = await update_config(
-            app.state.config,
-            use_config_url=False,
-            skip_model_fetch=True,
-            save_to_file=save_to_file,
-            save_to_db=save_to_db,
-            changed_providers=changed_providers,
+        _validate_candidate_shape(source)
+        candidate = _sanitize_config_for_persistence(source)
+        config, keys, api_list = await update_config(
+            candidate, use_config_url=False, skip_model_fetch=True,
+            save_to_file=False, save_to_db=False, changed_providers=changed_providers,
         )
-        # 修改原因：update_config 保持三元返回，BYOK 前缀表属于运行时派生状态。
-        # 修改方式：热更新配置后基于最新 api_keys_db 重建 app.state.byok_prefixes。
-        # 目的：管理端保存 BYOK 通配符 key 后，标准和方言鉴权立即生效。
-        from core.byok import build_byok_prefixes
-        from core.ip_blacklist import apply_runtime_ip_blacklists
-        app.state.byok_prefixes = build_byok_prefixes(app.state.api_keys_db)
-        # 修改原因：update_config 返回的是规范化配置，IP 黑名单的运行时缓存也要随管理端保存同步刷新。
-        # 修改方式：在 BYOK 前缀重建之后预解析顶层和 Key 级 ip_blacklist 到 app.state。
-        # 目的：管理员保存配置后无需重启即可立即拦截被禁 IP。
-        apply_runtime_ip_blacklists(app)
-        try:
-            _rebuild_runtime_rate_limits(app)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid rate_limit configuration: {e}") from e
-        apply_backend_log_preferences((app.state.config or {}).get("preferences") or {})
+        # Build independently; registry callbacks target the live app after publication.
+        staged = SimpleNamespace(state=SimpleNamespace(config=config, api_keys_db=keys, api_list=api_list))
+        staged.state.byok_prefixes = build_byok_prefixes(keys)
+        apply_runtime_ip_blacklists(staged)
+        _rebuild_runtime_rate_limits(staged)
+        staged.state.user_api_keys_rate_limit._config_getter = lambda: app.state.config
+        staged.state.user_api_keys_rate_limit._api_list_getter = lambda: app.state.api_list
         try:
             from main import init_preference, DEFAULT_TIMEOUT, DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_STREAM_HEADER_TIMEOUT
-            app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
-            app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", DEFAULT_KEEPALIVE_INTERVAL)
-            app.state.stream_header_timeouts = init_preference(
-                app.state.config, "stream_header_timeout", DEFAULT_STREAM_HEADER_TIMEOUT, alias_keys=("header_timeout",)
-            )
-        except Exception as _pref_err:
-            logger.warning(f"Failed to refresh runtime timeout preferences on config update: {_pref_err}")
+            staged.state.provider_timeouts = init_preference(config, "model_timeout", DEFAULT_TIMEOUT)
+            staged.state.keepalive_interval = init_preference(config, "keepalive_interval", DEFAULT_KEEPALIVE_INTERVAL)
+            staged.state.stream_header_timeouts = init_preference(
+                config, "stream_header_timeout", DEFAULT_STREAM_HEADER_TIMEOUT, alias_keys=("header_timeout",))
+        except ImportError as exc:
+            logger.warning("Could not load timeout initialization: %s", exc)
 
+        if save_to_db:
+            # Call storage directly: update_config's historical DB fallback swallows errors.
+            await save_config_to_db(config)
+        if save_to_file:
+            save_api_yaml(config)
+            with open(API_YAML_PATH, "r", encoding="utf-8") as file:
+                saved = yaml.load(file) or {}
+            expected = dump_config_to_json_obj(config)
+            actual = dump_config_to_json_obj(saved)
+            mismatches = [section for section in sections_to_verify
+                          if expected.get(section) != actual.get(section)]
+            if mismatches:
+                raise HTTPException(500, f"Config write verification failed: {mismatches}")
+
+        # No awaits below: retain the latest usage accumulated while storage was pending.
+        current_quota = getattr(app.state, "quota_registry", None)
+        if current_quota is not None:
+            quota = copy(current_quota)
+            quota._counters = current_quota._counters.copy()
+            quota._dimensional_counters = current_quota._dimensional_counters.copy()
+            quota._credential_aliases = current_quota._credential_aliases.copy()
+            quota.init_from_config(config)
+            staged.state.quota_registry = quota
+        apply_backend_log_preferences(config.get("preferences") or {})
+        for name, value in vars(staged.state).items():
+            setattr(app.state, name, value)
     except HTTPException:
-        # 修改原因：内部已经构造出的 HTTPException 应保留原始状态码。
-        # 修改方式：在通用异常包装前直接重新抛出。
-        # 目的：避免配置校验类错误被误包装成 500。
         raise
-    except ValueError as e:
-        # 修改原因：虚拟模型命名冲突和嵌套引用属于用户配置错误。
-        # 修改方式：将 update_config 抛出的 ValueError 转为 400 响应。
-        # 目的：保存配置时给前端明确反馈，而不是表现为服务端持久化失败。
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except Exception as e:
-        # 不允许“假成功”：只要持久化过程有异常，直接返回非 200
-        raise HTTPException(status_code=500, detail=f"Failed to update/persist config: {e}") from e
-
-    # 进一步防止“假成功”：当本次要求写 yaml 时，回读文件校验关键段一致。
-    if save_to_file:
-        try:
-            with open(API_YAML_PATH, "r", encoding="utf-8") as f:
-                file_config = yaml.load(f) or {}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Config write verification failed (cannot read api.yaml): {e}") from e
-
-        # 仅比较“可持久化配置”，忽略运行时字段（例如 providers 下的 _model_dict_cache）
-        runtime_persistable = dump_config_to_json_obj(app.state.config or {})
-        file_persistable = dump_config_to_json_obj(file_config or {})
-
-        runtime_subset = {
-            "providers": runtime_persistable.get("providers", []),
-            "api_keys": runtime_persistable.get("api_keys", []),
-            "preferences": runtime_persistable.get("preferences", {}),
-            # 修改原因：全局 IP 黑名单存放在 api.yaml 顶层，不在 preferences 中。
-            # 修改方式：写回校验子集显式加入 ip_blacklist 字段。
-            # 目的：保存全局黑名单时也能发现 api.yaml 未同步的问题。
-            "ip_blacklist": runtime_persistable.get("ip_blacklist", []),
-        }
-        file_subset = {
-            "providers": file_persistable.get("providers", []),
-            "api_keys": file_persistable.get("api_keys", []),
-            "preferences": file_persistable.get("preferences", {}),
-            "ip_blacklist": file_persistable.get("ip_blacklist", []),
-        }
-
-        runtime_encoded = runtime_subset
-        file_encoded = file_subset
-
-        mismatched_sections = [
-            key for key in sections_to_verify
-            if runtime_encoded.get(key) != file_encoded.get(key)
-        ]
-        if mismatched_sections:
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    f"Config write verification failed: api.yaml is out of sync. "
-                    f"path={API_YAML_PATH}, verify_sections={sections_to_verify}, mismatched_sections={mismatched_sections}"
-                ),
-            )
-
-    return {
-        "save_to_file": save_to_file,
-        "save_to_db": save_to_db,
-        "api_yaml_path": API_YAML_PATH if save_to_file else None,
-    }
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to update/persist config: {exc}") from exc
+    return {"save_to_file": save_to_file, "save_to_db": save_to_db,
+            "api_yaml_path": API_YAML_PATH if save_to_file else None}
 
 
 @router.get("/v1/generate-api-key", dependencies=[Depends(rate_limit_dependency)])
@@ -201,7 +205,11 @@ async def api_config(api_index: int = Depends(verify_admin_api_key)):
     from utils import _sanitize_config_for_persistence
     clean_config = _sanitize_config_for_persistence(app.state.config)
     encoded_config = jsonable_encoder(clean_config)
-    return JSONResponse(content={"api_config": encoded_config})
+    effective_keys = {
+        key["id"]: {field: value for field, value in key.items() if not field.startswith("_") and field != "api"}
+        for key in app.state.config.get("api_keys", []) if key.get("id")
+    }
+    return JSONResponse(content={"api_config": encoded_config, "effective_keys": jsonable_encoder(effective_keys)}, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/v1/api_config/update", dependencies=[Depends(rate_limit_dependency)])
@@ -214,6 +222,10 @@ async def api_config_update(
     """
     app = get_app()
     updated = False
+    # 先在独立候选配置上完成关系校验，失败不能污染正在服务的配置。
+    from core.key_hierarchy import prepare_key_hierarchy, raw_key_config
+    from utils import _sanitize_config_for_persistence
+    candidate_config = _sanitize_config_for_persistence(app.state.config)
 
     replace_all = bool(config.get("replace_all") or config.get("force_shrink"))
 
@@ -259,14 +271,14 @@ async def api_config_update(
                         f"{len(incoming_providers)} without replace_all=true."
                     ),
                 )
-        app.state.config["providers"] = incoming_providers
+        candidate_config["providers"] = deepcopy(incoming_providers)
         updated = True
 
     if "api_keys" in config:
         incoming_keys = config["api_keys"]
         if not isinstance(incoming_keys, list):
             raise HTTPException(status_code=400, detail="api_keys must be a list.")
-        existing_keys = app.state.config.get("api_keys") or []
+        existing_keys = [raw_key_config(key) for key in app.state.config.get("api_keys", [])]
         if not replace_all and len(existing_keys) > 2:
             if len(incoming_keys) == 0:
                 raise HTTPException(
@@ -299,24 +311,40 @@ async def api_config_update(
                         f"{len(incoming_keys)} without replace_all=true."
                     ),
                 )
-        app.state.config["api_keys"] = incoming_keys
+        incoming_keys = deepcopy(incoming_keys)
+        # 旧客户端按凭据编辑时保留稳定 ID；改名或调整顺序不改变关系。
+        ids_by_api = {key.get("api"): key.get("id") for key in existing_keys}
+        for key in incoming_keys:
+            if not isinstance(key, dict):
+                raise HTTPException(400, "Each API Key must be an object")
+            existing_id = ids_by_api.get(key.get("api"))
+            if existing_id:
+                if key.get("id") and key["id"] != existing_id:
+                    raise HTTPException(400, "An existing Key ID cannot be replaced")
+                key["id"] = existing_id
+        remaining_ids = {key.get("id") for key in incoming_keys}
+        removed_ids = {key.get("id") for key in existing_keys} - remaining_ids
+        for key in existing_keys:
+            if key.get("parent_id") in removed_ids:
+                raise HTTPException(400, "Move or delete child Keys before deleting their parent")
+        candidate_config["api_keys"] = incoming_keys
         updated = True
 
     if "ip_blacklist" in config:
         # 修改原因：全局 IP 黑名单按需求存放在 api.yaml 顶层，而不是 preferences 内。
         # 修改方式：允许 /v1/api_config/update 直接更新顶层 ip_blacklist，后续由 update_config 校验并规范化。
         # 目的：前端保存全局黑名单后能持久化到 api.yaml 顶层并热更新。
-        app.state.config["ip_blacklist"] = config["ip_blacklist"]
+        candidate_config["ip_blacklist"] = config["ip_blacklist"]
         updated = True
 
     # 更新全局 preferences（包括 SCHEDULING_ALGORITHM 等设置）
     if "preferences" in config:
-        if "preferences" not in app.state.config:
-            app.state.config["preferences"] = {}
-        app.state.config["preferences"].update(config["preferences"])
+        if not isinstance(config["preferences"], dict):
+            raise HTTPException(400, "preferences must be an object")
+        candidate_config.setdefault("preferences", {}).update(config["preferences"])
         # 前端发送 null 表示显式删除该字段，清理掉 None 值
-        for k in [k for k, v in app.state.config["preferences"].items() if v is None]:
-            del app.state.config["preferences"][k]
+        for k in [k for k, v in candidate_config["preferences"].items() if v is None]:
+            del candidate_config["preferences"][k]
         updated = True
 
     if not updated:
@@ -329,7 +357,14 @@ async def api_config_update(
     # 修改方式：按请求中的顶层键生成校验范围，并复用统一 helper 返回的 persisted 信息。
     # 目的：保持原全量配置接口行为不变，同时让单渠道接口共享同一套保存与校验逻辑。
     sections_to_verify = [key for key in ("providers", "api_keys", "preferences", "ip_blacklist") if key in config]
-    persisted = await _persist_config(app, sections_to_verify=sections_to_verify)
+    try:
+        _validate_candidate_shape(candidate_config)
+        prepared = prepare_key_hierarchy(candidate_config.get("api_keys", []))
+        candidate_config["api_keys"] = [raw_key_config(key) for key in prepared]
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    persisted = await _persist_config(app, sections_to_verify=sections_to_verify,
+                                      candidate_config=candidate_config)
 
     return JSONResponse(content={
         "message": "API config updated",
@@ -381,13 +416,14 @@ async def create_provider(
         raise HTTPException(status_code=400, detail='Provider data must include a non-empty "provider" field.')
 
     app = get_app()
-    providers = _get_providers_config(app)
+    candidate = deepcopy(app.state.config)
+    providers = candidate["providers"]
     if _find_provider_index(providers, provider_name) != -1:
         raise HTTPException(status_code=409, detail=f'Provider "{provider_name}" already exists.')
 
     providers.append(provider_data)
     # 增量重建：只重建新增的渠道
-    await _persist_config(app, changed_providers={provider_name})
+    await _persist_config(app, changed_providers={provider_name}, candidate_config=candidate)
     return JSONResponse(
         status_code=201,
         content={"message": "Provider created", "provider_id": provider_name},
@@ -427,7 +463,8 @@ async def update_provider(
     # 修改方式：按路径 provider_id 定位原对象，并用请求体整体替换该对象，不做 deep merge。
     # 目的：允许字段删除和渠道重命名，同时保留其他渠道的最新状态。
     app = get_app()
-    providers = _get_providers_config(app)
+    candidate = deepcopy(app.state.config)
+    providers = candidate["providers"]
     provider_index = _find_provider_index(providers, provider_id)
     if provider_index == -1:
         raise HTTPException(status_code=404, detail=f'Provider "{provider_id}" not found.')
@@ -443,7 +480,7 @@ async def update_provider(
     # 增量重建：只重建被修改的渠道的 CircularList，其他保持不动
     new_provider_name = provider_data.get('provider') or provider_id
     changed = {provider_id, new_provider_name}  # 支持重命名：旧名+新名
-    await _persist_config(app, changed_providers=changed)
+    await _persist_config(app, changed_providers=changed, candidate_config=candidate)
     return JSONResponse(content={"message": "Provider updated", "provider_id": provider_id})
 
 
@@ -459,12 +496,13 @@ async def delete_provider(
     # 修改方式：后端按 provider_id 在当前配置中移除目标项，并复用统一持久化流程。
     # 目的：避免删除操作把其他设备刚保存的渠道修改一并回滚。
     app = get_app()
-    providers = _get_providers_config(app)
+    candidate = deepcopy(app.state.config)
+    providers = candidate["providers"]
     provider_index = _find_provider_index(providers, provider_id)
     if provider_index == -1:
         raise HTTPException(status_code=404, detail=f'Provider "{provider_id}" not found.')
 
     providers.pop(provider_index)
     # 删除不需要重建任何 CircularList，但传空 set 会跳过所有重建
-    await _persist_config(app, changed_providers=set())
+    await _persist_config(app, changed_providers=set(), candidate_config=candidate)
     return JSONResponse(content={"message": "Provider deleted", "provider_id": provider_id})

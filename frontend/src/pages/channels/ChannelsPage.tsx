@@ -287,6 +287,9 @@ export default function ChannelsPage() {
           目的：让用户进入页面后先看到渠道列表，并通过虚拟路由手风琴编辑虚拟模型。 */}
 
       <ProviderList
+        providers={core.providers}
+        token={core.token}
+        refreshProviders={core.refreshProviders}
         loading={core.loading}
         totalListItemCount={virtualModelsState.totalListItemCount}
         visibleListItemCount={virtualModelsState.visibleListItemCount}

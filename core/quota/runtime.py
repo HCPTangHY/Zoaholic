@@ -258,7 +258,7 @@ class QuotaCounter:
 
     # ── 公开 API ──
 
-    def check_request(self, model: str = 'default', client_ip: str = '') -> Optional[str]:
+    def check_request(self, model: str = 'default', client_ip: str = '', *, record: bool = True) -> Optional[str]:
         """请求前检查 + 记录。None = 放行，str = 拒绝原因。"""
 
         now = time()
@@ -278,9 +278,14 @@ class QuotaCounter:
                 if reason:
                     return reason
 
-        self._record_metric_event(Metric.REQUEST, 1, normalized_model, normalized_ip, now)
-        self._record_unique_ip(normalized_ip, now)
+        if record:
+            self.record_request(normalized_model, normalized_ip, now=now)
         return None
+
+    def record_request(self, model: str = 'default', client_ip: str = '', *, now=None):
+        now = time() if now is None else now
+        self._record_metric_event(Metric.REQUEST, 1, model or 'default', client_ip or '', now)
+        self._record_unique_ip(client_ip or '', now)
 
     def is_exhausted(self, model: str = 'default') -> bool:
         """只检查 key 级 cost/token 是否耗尽（不记录、不检查 request 限速）。"""
@@ -474,6 +479,8 @@ class QuotaCounter:
                         self._store.get_or_create_counter(scope_id, metric_name).add(now)
                     else:
                         self._store.get_or_create_accumulator(scope_id, metric_name).add(now, amount)
+                        if any(math.isinf(item.period) for item in rule.limits):
+                            self._snapshot_dirty = True
                     sliding_done.add(key)
                 else:
                     key = (scope_id, metric_name, limit.period)
@@ -481,10 +488,8 @@ class QuotaCounter:
                         continue
                     increment = 1 if metric == Metric.REQUEST else amount
                     window = self._store.get_fixed_window(scope_id, metric_name, limit.period)
-                    old_start = window.start
                     window.increment(now, limit.period, increment)
-                    if window.start != old_start:
-                        self._snapshot_dirty = True
+                    self._snapshot_dirty = True
                     fixed_done.add(key)
 
     def _record_unique_ip(self, client_ip: str, now: float):
@@ -622,7 +627,10 @@ class QuotaCounter:
 
     def _snapshot(self) -> dict:
         """导出固定窗口状态。"""
-        snap: dict = {'fixed': [], 'ip_fixed': []}
+        snap: dict = {'fixed': [], 'ip_fixed': [], 'permanent': []}
+        for (scope_id, metric), counter in self._store._sliding.items():
+            if isinstance(counter, _SlidingAccumulator) and counter._perm:
+                snap['permanent'].append({'s': scope_id, 'm': metric, 'v': counter._perm})
         for (scope_id, metric_name), windows in self._store._fixed.items():
             for period, window in windows.items():
                 if window.start > 0:
@@ -641,6 +649,9 @@ class QuotaCounter:
         """从快照恢复固定窗口状态（跳过已过期窗口）。"""
         now = time()
         restored = 0
+        for entry in snap.get('permanent', []):
+            self._store.get_or_create_accumulator(entry['s'], entry['m']).set_permanent(entry['v'])
+            restored += 1
         for entry in snap.get('fixed', []):
             scope_id = entry.get('s', '')
             metric = entry.get('m', '')
@@ -700,6 +711,9 @@ class QuotaRegistry:
         self._global: Optional[QuotaCounter] = None
         self._dimensional_counters: Dict[str, DimensionalQuotaCounter] = {}
         self._global_dimensional: Optional[DimensionalQuotaCounter] = None
+        self._ancestors: Dict[str, List[str]] = {}
+        self._key_ids: Dict[str, str] = {}
+        self._credential_aliases: Dict[str, str] = {}
 
     def init_from_config(self, config: dict):
         """从应用配置初始化（启动或热更新时调用）。"""
@@ -708,6 +722,33 @@ class QuotaRegistry:
         from .parser import parse_config as _parse
 
         pre_snapshot = self._capture_snapshot()
+        old_counters = self._counters.copy()
+        old_dimensional = self._dimensional_counters.copy()
+        old_global = self._global
+        old_global_dimensional = self._global_dimensional
+        old_key_ids = self._key_ids.copy()
+        keys = config.get('api_keys', [])
+        new_key_ids = {key['api']: key['id'] for key in keys if key.get('id')}
+        api_by_id = {identity: api for api, identity in new_key_ids.items()}
+        for api, identity in self._key_ids.items():
+            replacement = api_by_id.get(identity)
+            if replacement and replacement != api:
+                self._credential_aliases[api] = identity
+        self._key_ids = new_key_ids
+        by_id = {key['id']: key for key in keys if key.get('id')}
+        self._ancestors = {}
+        for key in keys:
+            ancestors = []
+            current = key
+            seen = set()
+            while current.get('parent_id'):
+                parent_id = current['parent_id']
+                if parent_id in seen or parent_id not in by_id:
+                    raise ValueError('Invalid API Key hierarchy')
+                seen.add(parent_id)
+                current = by_id[parent_id]
+                ancestors.append(current['api'])
+            self._ancestors[key.get('api', '')] = ancestors
 
         self._counters.clear()
         self._global = None
@@ -739,63 +780,85 @@ class QuotaRegistry:
                 self._dimensional_counters[api] = DimensionalQuotaCounter(dimensional_rules)
 
         snapshot = pre_snapshot if pre_snapshot.get('c') or pre_snapshot.get('g') or pre_snapshot.get('d') or pre_snapshot.get('gd') else self._read_snapshot_file()
+        stored_ids = snapshot.get('ids', {})
+        for section in ('c', 'd'):
+            snapshot[section] = {api_by_id.get(stored_ids.get(api), api): value
+                                 for api, value in snapshot.get(section, {}).items()
+                                 if api not in stored_ids or stored_ids[api] in api_by_id}
         self._apply_snapshot(snapshot)
+        # Hot reload retains sliding windows, including those absent from disk snapshots.
+        for old_api, previous in old_counters.items():
+            if old_api in old_key_ids and old_key_ids[old_api] not in api_by_id:
+                continue
+            api = api_by_id.get(old_key_ids.get(old_api), old_api)
+            current = self._counters.get(api)
+            if current is not None:
+                current._store = previous._store
+                current._ip_seen = previous._ip_seen
+                current._ip_fixed = previous._ip_fixed
+        for old_api, previous in old_dimensional.items():
+            if old_api in old_key_ids and old_key_ids[old_api] not in api_by_id:
+                continue
+            api = api_by_id.get(old_key_ids.get(old_api), old_api)
+            current = self._dimensional_counters.get(api)
+            if current is not None:
+                current._buckets = {key: bucket for key, bucket in previous._buckets.items()
+                                    if key[0] in current._rules and previous._rules[key[0]] == current._rules[key[0]]}
+        if self._global is not None and old_global is not None:
+            self._global._store = old_global._store
+            self._global._ip_seen = old_global._ip_seen
+            self._global._ip_fixed = old_global._ip_fixed
+        if self._global_dimensional is not None and old_global_dimensional is not None:
+            self._global_dimensional._buckets = {
+                key: bucket for key, bucket in old_global_dimensional._buckets.items()
+                if key[0] in self._global_dimensional._rules
+                and old_global_dimensional._rules[key[0]] == self._global_dimensional._rules[key[0]]}
         self._save_snapshot()
 
-    def check(self, api_key: str, model: str = 'default', client_ip: str = '') -> Optional[str]:
-        """请求前检查。None = 放行，str = 拒绝原因（含计数记录）。"""
+    def _chain_counters(self, api_key: str, ancestor_keys=None, *, api_key_id=None, ancestor_ids=None):
+        ancestors = self._ancestors.get(api_key, []) if ancestor_keys is None else ancestor_keys
+        api_by_id = {identity: api for api, identity in self._key_ids.items()}
+        if api_key_id is not None:
+            identities = [api_key_id, *(ancestor_ids or [])]
+            resolved = [api_by_id[identity] for identity in identities if identity in api_by_id]
+        else:
+            resolved = [key if key in self._key_ids else api_by_id.get(self._credential_aliases.get(key), key)
+                        for key in [api_key, *ancestors]]
+        for key in dict.fromkeys(resolved):
+            for counter in (self._counters.get(key), self._dimensional_counters.get(key)):
+                if counter is not None:
+                    yield key, counter
 
-        if self._global:
-            reason = self._global.check_request(model, client_ip)
+    def check(self, api_key: str, model: str = 'default', client_ip: str = '') -> Optional[str]:
+        """Check the entire chain before charging any request counter (no awaits)."""
+        counters = [('global', counter) for counter in (self._global, self._global_dimensional)
+                    if counter is not None]
+        counters.extend(self._chain_counters(api_key))
+        for owner, counter in counters:
+            reason = counter.check_request(model, client_ip, record=False)
             if reason:
                 self._check_and_save()
-                return f"[global] {reason}"
-        if self._global_dimensional:
-            reason = self._global_dimensional.check_request(model, client_ip)
-            if reason:
-                self._check_and_save()
-                return f"[global] {reason}"
-        counter = self._counters.get(api_key)
-        if counter:
-            reason = counter.check_request(model, client_ip)
-            if reason:
-                self._check_and_save()
-                return reason
-        dimensional_counter = self._dimensional_counters.get(api_key)
-        if dimensional_counter:
-            reason = dimensional_counter.check_request(model, client_ip)
-            if reason:
-                self._check_and_save()
-                return reason
+                scope = '[global] ' if owner == 'global' else ('[ancestor] ' if owner != api_key else '')
+                return scope + reason
+        for _, counter in counters:
+            counter.record_request(model, client_ip)
         self._check_and_save()
         return None
 
     def is_exhausted(self, api_key: str, model: str = 'default') -> bool:
-        """检查 key 级 cost/token 是否耗尽（不记录请求计数）。用于 middleware 预检。"""
-
-        counter = self._counters.get(api_key)
-        if counter and counter.is_exhausted(model):
-            return True
-        dimensional_counter = self._dimensional_counters.get(api_key)
-        return dimensional_counter.is_exhausted(model) if dimensional_counter else False
+        return any(counter.is_exhausted(model) for _, counter in self._chain_counters(api_key))
 
     def record_usage(self, api_key: str, model: str, cost: float = 0.0, tokens: int = 0,
-                     tokens_in: int = 0, tokens_out: int = 0, client_ip: str = ''):
-        """请求完成后记录用量。"""
-
-        # 修改原因：per-IP cost/token 规则需要知道 client_ip；旧接口只传 cost/tokens 会导致 ip scope 永远无法累加。
-        # 修改方式：接口追加 tokens_in、tokens_out 和 client_ip，并向 key 计数器与 global 计数器同步传递。
-        # 目的：让统计写入后的真实用量可以覆盖 key scope 与 ip scope 的全部 token/cost metric。
-        counter = self._counters.get(api_key)
-        if counter:
-            counter.record_usage(model, cost, tokens, tokens_in=tokens_in, tokens_out=tokens_out, client_ip=client_ip)
-        dimensional_counter = self._dimensional_counters.get(api_key)
-        if dimensional_counter:
-            dimensional_counter.record_usage(model, cost, tokens, tokens_in=tokens_in, tokens_out=tokens_out, client_ip=client_ip)
-        if self._global:
-            self._global.record_usage(model, cost, tokens, tokens_in=tokens_in, tokens_out=tokens_out, client_ip=client_ip)
-        if self._global_dimensional:
-            self._global_dimensional.record_usage(model, cost, tokens, tokens_in=tokens_in, tokens_out=tokens_out, client_ip=client_ip)
+                     tokens_in: int = 0, tokens_out: int = 0, client_ip: str = '',
+                     ancestor_keys=None, api_key_id=None, ancestor_ids=None):
+        """Stable request-time IDs take precedence over mutable credentials."""
+        counters = [counter for _, counter in self._chain_counters(
+            api_key, ancestor_keys, api_key_id=api_key_id, ancestor_ids=ancestor_ids)]
+        counters.extend(counter for counter in (self._global, self._global_dimensional)
+                        if counter is not None)
+        for counter in counters:
+            counter.record_usage(model, cost, tokens, tokens_in=tokens_in,
+                                 tokens_out=tokens_out, client_ip=client_ip)
         self._check_and_save()
 
     def get_key_status(self, api_key: str, model: str = 'default') -> dict:
@@ -862,19 +925,19 @@ class QuotaRegistry:
         return result
 
     def has_quota(self, api_key: str) -> bool:
-        return api_key in self._counters or api_key in self._dimensional_counters
+        return bool(self._global or self._global_dimensional) or any(self._chain_counters(api_key))
 
     # ── 快照持久化 ──
 
     def _capture_snapshot(self) -> dict:
-        data: dict = {'v': 1, 't': time(), 'c': {}, 'd': {}}
+        data: dict = {'v': 1, 't': time(), 'c': {}, 'd': {}, 'ids': dict(self._key_ids)}
         for api_key, counter in self._counters.items():
             snap = counter._snapshot()
-            if snap.get('fixed') or snap.get('ip_fixed'):
+            if snap.get('fixed') or snap.get('ip_fixed') or snap.get('permanent'):
                 data['c'][api_key] = snap
         if self._global:
             snap = self._global._snapshot()
-            if snap.get('fixed') or snap.get('ip_fixed'):
+            if snap.get('fixed') or snap.get('ip_fixed') or snap.get('permanent'):
                 data['g'] = snap
         for api_key, counter in self._dimensional_counters.items():
             snap = counter.snapshot()

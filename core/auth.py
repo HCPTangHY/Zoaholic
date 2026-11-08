@@ -104,6 +104,21 @@ def _is_admin_jwt_token(token: Optional[str]) -> bool:
         return False
 
 
+def check_key_ancestry_access(app, api_index: int, client_ip, *, admin_jwt: bool = False) -> None:
+    """Check activation and IP policy without replacing the caller identity."""
+    from core.key_hierarchy import key_chain
+
+    keys = app.state.api_keys_db
+    config = {"api_keys": keys}
+    indices = {key['api']: index for index, key in enumerate(keys)}
+    for key in key_chain(config, keys[api_index]['api']):
+        index = indices[key['api']]
+        if is_api_key_disabled(app, index) and not admin_jwt:
+            raise HTTPException(status_code=403, detail="API Key has been disabled")
+        if is_key_ip_blocked(app, index, client_ip):
+            raise_ip_blocked()
+
+
 def authenticate_api_key_token(
     app,
     token: Optional[str],
@@ -154,11 +169,7 @@ def authenticate_api_key_token(
     if api_index is None:
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
 
-    if is_api_key_disabled(app, api_index) and not _is_admin_jwt_token(token):
-        raise HTTPException(status_code=403, detail="API Key has been disabled")
-
-    if is_key_ip_blocked(app, api_index, client_ip):
-        raise_ip_blocked()
+    check_key_ancestry_access(app, api_index, client_ip, admin_jwt=_is_admin_jwt_token(token))
 
     if request is not None:
         store_byok_request_state(
@@ -168,6 +179,11 @@ def authenticate_api_key_token(
             token_for_stats=token_for_stats,
         )
         update_request_info_auth(app, api_index, token_for_stats, byok_real_key, byok_template_key)
+        from core.middleware import request_info
+        from core.key_hierarchy import snapshot_key_ancestry
+        info = request_info.get()
+        if info and getattr(request, 'scope', {}).get('type') != 'websocket':
+            snapshot_key_ancestry(info, app.state.api_keys_db[api_index])
 
     return api_index
 
@@ -257,8 +273,7 @@ async def verify_admin_api_key(
         raise HTTPException(status_code=403, detail="Invalid or missing credentials")
 
     # 禁用的 admin Key 同样不能用于管理接口（JWT 路径已在上方提前返回，不受影响）
-    if is_api_key_disabled(app, api_index):
-        raise HTTPException(status_code=403, detail="API Key has been disabled")
+    check_key_ancestry_access(app, api_index, client_ip)
 
     if is_key_ip_blocked(app, api_index, client_ip):
         # 修改原因：admin API Key 也可以配置 Key 级 IP 黑名单。

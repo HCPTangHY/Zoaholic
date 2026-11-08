@@ -75,7 +75,7 @@ def _authenticate(websocket: WebSocket) -> tuple[Optional[int], Optional[str], O
     client_ip = _get_client_ip(websocket)
 
     try:
-        api_index = authenticate_api_key_token(app, token, client_ip)
+        api_index = authenticate_api_key_token(app, token, client_ip, request=websocket)
     except HTTPException as exc:
         detail = exc.detail
         if isinstance(detail, dict):
@@ -368,6 +368,8 @@ async def _handle_response_create(websocket: WebSocket, payload: dict, api_index
         # 目的：_try_extract_usage 能通过 get_dialect 找到正确的 parse_usage，token 统计正常入库。
         "dialect_id": "openai-responses",
     }
+    from core.key_hierarchy import snapshot_key_ancestry
+    snapshot_key_ancestry(request_info_data, config['api_keys'][api_index])
     info_token = request_info.set(request_info_data)
     try:
         request_model = await parse_responses_request(payload, {}, {})
@@ -438,6 +440,11 @@ async def responses_websocket(websocket: WebSocket) -> None:
                 await _send_error_frame(websocket, 400, "missing required field: model")
                 continue
 
+            # A live connection must not retain an index across key reorder/disable/migration.
+            api_index, token, error_msg = _authenticate(websocket)
+            if api_index is None:
+                await websocket.close(code=1008, reason=error_msg or "Unauthorized")
+                return
             await _handle_response_create(websocket, payload, api_index, token, client_ip)
     except WebSocketDisconnect:
         pass

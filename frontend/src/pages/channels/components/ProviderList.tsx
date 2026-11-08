@@ -1,6 +1,8 @@
 import { BarChart3, CheckCircle2, Edit, Files, Folder, Play, Power, Puzzle, Search, Trash2, X, XCircle } from 'lucide-react';
 import type React from 'react';
-import { useMemo, useRef } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { ProviderBatchActions } from './ProviderBatchActions';
+import { selectedProviderNames, type BatchProvider } from '../lib/batchProviders';
 
 import { ProviderLogo } from '../../../components/ProviderLogos';
 import type { Segment } from '../types';
@@ -9,7 +11,13 @@ import type { Segment } from '../types';
 // 修改方式：把原筛选栏、移动端卡片、桌面表格和不活跃分组整体迁移，并用 props 注入 handlers。
 // 目的：保持列表交互不变，同时让页面骨架更清晰。
 
+const batchButtonClass = 'px-3 py-2 text-sm rounded-lg border border-border hover:bg-muted transition-all duration-150 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-50 disabled:pointer-events-none';
+const batchCheckboxClass = 'h-4 w-4 shrink-0 rounded border-border accent-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-50';
+
 export interface ProviderListProps {
+  providers: BatchProvider[];
+  token: string | null;
+  refreshProviders: () => Promise<void>;
   loading: boolean;
   totalListItemCount: number;
   visibleListItemCount: number;
@@ -47,6 +55,7 @@ export interface ProviderListProps {
 }
 
 export function ProviderList({
+  providers, token, refreshProviders,
   loading, totalListItemCount, visibleListItemCount, filterKeyword, setFilterKeyword, filterEngine, setFilterEngine,
   filterGroup, setFilterGroup, filterStatus, setFilterStatus, availableEngines, availableGroups, hasActiveFilters,
   segments, expandedInactiveGroups, toggleInactiveGroup, runtimeKeyStatus, getMatchedModels, getProviderAnalyticsName,
@@ -54,6 +63,21 @@ export function ProviderList({
   handleUpdateWeight, buildSubChannelProvider, handleToggleSubChannel, openSubChannelEdit, handleDeleteSubChannel,
   renderMobileVirtualRoutesAccordion, renderDesktopVirtualRoutesAccordionRows,
 }: ProviderListProps) {
+  const [selecting, setSelecting] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
+  const visibleNames = useMemo(() => segments.flatMap(segment =>
+    segment.type === 'active' ? [segment.item.p.provider] : segment.items.map(item => item.p.provider)), [segments]);
+  const selectedNames = selectedProviderNames(visibleNames, selected);
+  useEffect(() => { setSelected(new Set()); }, [filterKeyword, filterEngine, filterGroup, filterStatus]);
+  const toggleSelected = (name: string) => {
+    if (batchBusy) return;
+    setSelected(previous => {
+      const next = new Set(previous);
+      if (next.has(name)) next.delete(name); else next.add(name);
+      return next;
+    });
+  };
   // 修改原因：ProviderCard 原定义在组件函数体内，每次渲染都产生新组件类型，React 会把全部移动端卡片卸载重建，滚动锚定失效后页面回弹。
   // 修改方式：用 useMemo 固定组件类型，处理器通过 ref 透传保持最新。
   // 目的：列表重渲染只更新属性而不再重建 DOM 节点，移动端滚动位置保持稳定。
@@ -63,6 +87,7 @@ export function ProviderList({
     handleToggleProvider, handleCopyProvider, openModal, handleDeleteProvider,
     handleUpdateWeight, buildSubChannelProvider, handleToggleSubChannel,
     openSubChannelEdit, handleDeleteSubChannel,
+    selected, toggleSelected, batchBusy, selecting,
   };
   const ProviderCard = useMemo(() => ({ p, idx }: { p: any; idx: number }) => {
     const {
@@ -70,6 +95,7 @@ export function ProviderList({
       handleToggleProvider, handleCopyProvider, openModal, handleDeleteProvider,
       handleUpdateWeight, buildSubChannelProvider, handleToggleSubChannel,
       openSubChannelEdit, handleDeleteSubChannel,
+      selected, toggleSelected, batchBusy, selecting,
     } = cardActionsRef.current;
     const isEnabled = p.enabled !== false;
     const groups = Array.isArray(p.groups) ? p.groups : p.group ? [p.group] : ['default'];
@@ -80,6 +106,7 @@ export function ProviderList({
       <div className={`bg-card border border-border rounded-xl p-4 ${!isEnabled && 'opacity-60'}`}>
         <div className="flex items-start justify-between mb-3">
           <div className="flex items-center gap-3">
+            {selecting && <input type="checkbox" className={batchCheckboxClass} aria-label={`选择渠道 ${p.provider}`} checked={selected.has(p.provider)} disabled={batchBusy} onChange={() => toggleSelected(p.provider)} />}
             <ProviderLogo name={p.provider} engine={p.engine} baseUrl={p.base_url} />
             <div>
               <div className={`font-medium ${isEnabled ? 'text-foreground' : 'text-muted-foreground'}`}>{p.provider}</div>
@@ -183,9 +210,9 @@ export function ProviderList({
     <>
       {/* ── Filter Bar ── */}
       {!loading && totalListItemCount > 0 && (
-        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+        <div className="grid grid-cols-2 items-center gap-2 lg:flex lg:flex-wrap">
           {/* 搜索框 */}
-          <div className="relative flex-1 min-w-0">
+          <div className="relative col-span-2 min-w-0 lg:flex-1 lg:min-w-48">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
             <input
               type="text"
@@ -239,6 +266,8 @@ export function ProviderList({
             <option value="disabled">已禁用</option>
           </select>
 
+          <button id="provider-selection-toggle" type="button" disabled={batchBusy || !visibleNames.length} aria-pressed={selecting} onClick={() => { setSelecting(value => !value); setSelected(new Set()); }} className={`${batchButtonClass} text-muted-foreground ${selecting ? 'border-primary/40 bg-primary/5 text-primary' : ''}`}>{selecting ? '退出选择' : '选择'}</button>
+
           {/* 清除筛选 */}
           {hasActiveFilters && (
             <button
@@ -261,6 +290,15 @@ export function ProviderList({
         </div>
       )}
 
+      {/* Keep the action component mounted while refresh/clearSelection runs so its result dialog survives. */}
+      <div className={selecting ? 'fixed inset-x-0 bottom-0 z-40 flex flex-wrap items-center gap-2 border-t border-border bg-background/95 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-lg backdrop-blur-md md:static md:border-0 md:border-b md:bg-transparent md:px-0 md:py-2 md:shadow-none md:backdrop-blur-none' : 'hidden'}>
+        <span className="mr-auto text-sm font-medium" aria-live="polite">已选 {selectedNames.length} 个</span>
+        <button type="button" aria-label="全选当前筛选渠道" title="选择当前筛选结果，包含折叠渠道" disabled={batchBusy || !visibleNames.length} onClick={() => setSelected(new Set(visibleNames))} className={batchButtonClass}>全选</button>
+        <button type="button" aria-label="取消渠道选择" disabled={batchBusy} onClick={() => { setSelecting(false); setSelected(new Set()); }} className={batchButtonClass}>取消</button>
+        <div className="w-full md:w-auto"><ProviderBatchActions providers={providers} selectedNames={selectedNames} token={token} refresh={refreshProviders} busy={batchBusy} setBusy={setBatchBusy} clearSelection={() => setSelected(new Set())} /></div>
+      </div>
+      <div className={selecting ? 'pb-[calc(10rem_+_env(safe-area-inset-bottom))] md:pb-0' : ''}>
+      <div id="channel-provider-list">
       {/* Mobile Card List */}
       <div className="md:hidden space-y-4">
         {loading ? (
@@ -358,10 +396,11 @@ export function ProviderList({
                   // 模型名匹配高亮
                   const matchedModels = getMatchedModels(p);
 
-                  return (<>
+                  return (<Fragment key={p.provider}>
                   <tr key={idx} className={`transition-colors ${isInactive ? 'opacity-50' : ''} ${isEnabled ? 'hover:bg-muted/50' : 'bg-muted/30 opacity-60'}`}>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">
+                        {selecting && <input type="checkbox" className={batchCheckboxClass} aria-label={`选择渠道 ${p.provider}`} checked={selected.has(p.provider)} disabled={batchBusy} onChange={() => toggleSelected(p.provider)} />}
                         <ProviderLogo name={p.provider} engine={p.engine} baseUrl={p.base_url} />
                         <div className="min-w-0">
                           <div className={`font-medium truncate ${isEnabled ? 'text-foreground' : 'text-muted-foreground'}`}>{p.provider}</div>
@@ -503,13 +542,15 @@ export function ProviderList({
                       </tr>
                     );
                   })}
-                </>
+                </Fragment>
                 );
               });
               })()}
             </tbody>
           </table>
         )}
+      </div>
+      </div>
       </div>
     </>
   );

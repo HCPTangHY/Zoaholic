@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, type ReactNode } from 'react';
 import { useAuthStore } from '../store/authStore';
 import { apiFetch } from '../lib/api';
+import { keyTreeRows, ownKeyFields, retainKeyOverrides, inheritedKeyValue, splitKeyQuota } from '../lib/keyHierarchy.mjs';
 import { buildEnabledPluginValue as buildPluginEntryValue, parseEnabledPluginValue, type EnabledPluginValue } from '../lib/pluginEntries';
 import { toastSuccess, toastError, toastWarning } from '../components/Toast';
 import {
@@ -12,12 +13,16 @@ import {
 } from 'lucide-react';
 import * as Dialog from '@radix-ui/react-dialog';
 import { KeyAnalyticsSheet } from '../components/KeyAnalyticsSheet';
+import { KeyBranchUsage } from '../components/KeyBranchUsage';
+import { InheritedKeyField } from '../components/InheritedKeyField';
 import { QuotaArcs } from './channels/components/QuotaComponents';
 import { InterceptorSheet } from '../components/InterceptorSheet';
 import { PluginParamsForm, type ParamSchema } from '../components/PluginParamsForm';
 
 // ========== Types ==========
 interface ApiKeyData {
+  id?: string;
+  parent_id?: string;
   api: string;
   name?: string;
   role?: string;
@@ -354,6 +359,12 @@ function PluginAddDropdown({ stage, allPlugins, enabledPluginNames, openMenu, se
 export default function Admin() {
   const { token } = useAuthStore();
   const [keys, setKeys] = useState<ApiKeyData[]>([]);
+  const [effectiveKeys, setEffectiveKeys] = useState<Record<string, ApiKeyData>>({});
+  const [collapsedKeys, setCollapsedKeys] = useState<Set<string>>(new Set());
+  const [formParentId, setFormParentId] = useState('');
+  const [overrideFields, setOverrideFields] = useState<Set<string>>(new Set());
+  const [overrideDrafts, setOverrideDrafts] = useState<Record<string, string>>({});
+  const treeRows = useMemo(() => keyTreeRows(keys, collapsedKeys), [keys, collapsedKeys]);
   const [keyStates, setKeyStates] = useState<Record<string, ApiKeyState>>({});
   // 修改原因：列表额度展示要优先使用 Phase 2 统一配额运行时状态，而不是旧 credits 余额状态。
   // 修改方式：单独保存 /v1/api_keys_states 返回的 quota_states，按 API Key 查询展示。
@@ -365,6 +376,7 @@ export default function Admin() {
   // 修改方式：增加独立 open 状态，关闭 Sheet 时再清空当前 Key。
   // 目的：让打开、关闭和切换 Key 的状态更清晰，避免后续增加关闭动画或复用组件时互相影响。
   const [analyticsOpen, setAnalyticsOpen] = useState(false);
+  const [branchUsageKey, setBranchUsageKey] = useState<ApiKeyData | null>(null);
 
 
   // Edit Sheet
@@ -461,6 +473,7 @@ export default function Admin() {
         const config = await configRes.json();
         const apiConfig = config.api_config || config;
         setKeys(apiConfig.api_keys || []);
+        setEffectiveKeys(config.effective_keys || {});
 
       }
       if (statesRes.ok) {
@@ -521,6 +534,17 @@ export default function Admin() {
     // 目的：让用户点击「保存插件配置」后仍可继续编辑 Key，最终由 API Key 保存按钮统一落盘。
     setFormEnabledPlugins(payload.enabled_plugins);
     const patchedKeys = Object.keys(payload.preferences_patch || {});
+    setOverrideFields(previous => {
+      const next = new Set(previous);
+      patchedKeys.forEach(key => next.add(`preferences.${key}`));
+      (payload.preferences_delete || []).forEach(key => next.delete(`preferences.${key}`));
+      return next;
+    });
+    setOverrideDrafts(previous => {
+      const next = { ...previous };
+      [...patchedKeys, ...(payload.preferences_delete || [])].forEach(key => delete next[`preferences.${key}`]);
+      return next;
+    });
     setFormPluginPreferenceOverrides(prev => {
       const next = { ...prev, ...(payload.preferences_patch || {}) };
       (payload.preferences_delete || []).forEach(key => { delete next[key]; });
@@ -545,7 +569,7 @@ export default function Admin() {
   };
 
   // ========== Sheet Handlers ==========
-  const openSheet = (index: number | null = null, copyFrom: ApiKeyData | null = null) => {
+  const openSheet = (index: number | null = null, copyFrom: ApiKeyData | null = null, parentId = '') => {
     setEditingIndex(index);
     setGroupInput('');
     setModelInput('');
@@ -562,9 +586,16 @@ export default function Admin() {
       source = JSON.parse(JSON.stringify(copyFrom));
       source!.api = '';
       source!.name = `${source!.name || 'Key'}_Copy`;
+      delete source!.id;
     } else if (index !== null) {
       source = keys[index];
     }
+
+    setFormParentId(parentId || source?.parent_id || '');
+    const sourceFields = ownKeyFields(source);
+    if (source?.preferences?.quota === undefined && (source?.preferences?.credits !== undefined || source?.preferences?.rate_limit !== undefined)) sourceFields.add('preferences.quota');
+    setOverrideFields(sourceFields);
+    setOverrideDrafts({});
 
     const basePreferences = source?.preferences && typeof source.preferences === 'object'
       ? { ...source.preferences }
@@ -578,7 +609,7 @@ export default function Admin() {
 
       // Parse groups
       let groups: string[] = ['default'];
-      if (Array.isArray(source.groups) && source.groups.length > 0) {
+      if (Array.isArray(source.groups)) {
         groups = source.groups;
       } else if (typeof source.group === 'string' && source.group.trim()) {
         groups = [source.group.trim()];
@@ -587,7 +618,7 @@ export default function Admin() {
       }
       setFormGroups(groups);
 
-      setFormModels(Array.isArray(source.model) ? [...source.model] : []);
+      setFormModels(Array.isArray(source.model) ? [...source.model] : ['all']);
       // 修改原因：编辑时需要优先加载新 quota 配置，同时兼容旧 credits 和 rate_limit 配置。
       // 修改方式：preferences.quota 存在时直接转成规则列表；否则把旧 rate_limit 和 credits 映射成 quota 规则。
       // 目的：旧配置打开后也能在统一配额编辑器中继续调整，并在保存时写入 preferences.quota。
@@ -645,7 +676,7 @@ export default function Admin() {
       setFormName('');
       setFormRole('');
       setFormGroups(['default']);
-      setFormModels([]);
+      setFormModels(['all']);
       setFormQuotaRules([]);
       setFormModelLimits([]);
       setFormDimensionalRules([]);
@@ -687,7 +718,7 @@ export default function Admin() {
 
   const removeGroup = (g: string) => {
     const newGroups = formGroups.filter(x => x !== g);
-    setFormGroups(newGroups.length ? newGroups : ['default']);
+    setFormGroups(newGroups);
   };
 
   // ========== Models ==========
@@ -713,7 +744,9 @@ export default function Admin() {
 
   // ========== Fetch Models by Groups ==========
   const openFetchModelsDialog = async () => {
-    const groups = formGroups.length > 0 ? formGroups : ['default'];
+    const groups = formParentId && !overrideFields.has('groups')
+      ? effectiveKeys[formParentId]?.groups ?? ['default'] : formGroups;
+    if (!groups.length) { toastWarning('当前没有授权分组'); return; }
     setFetchingModels(true);
     setModelSearchQuery('');
 
@@ -799,12 +832,16 @@ export default function Admin() {
     if (!validateIpBlacklistEntries(keyIpBlacklist)) return;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const target: any = { api: formApi.trim() };
+    let target: any = { ...(editingIndex !== null ? keys[editingIndex] : {}), api: formApi.trim() };
+    delete target.name;
+    delete target.role;
+    delete target.parent_id;
+    if (formParentId) target.parent_id = formParentId;
 
     if (formName.trim()) target.name = formName.trim();
     if (formRole.trim()) target.role = formRole.trim();
-    target.groups = formGroups.length > 0 ? formGroups : ['default'];
-    if (formModels.length > 0) target.model = formModels;
+    target.groups = formGroups;
+    target.model = formModels;
     // 修改原因：Key 级 IP 黑名单需要保存在 api_keys 条目的顶层字段，而不是 preferences 中。
     // 修改方式：textarea 解析为数组后赋给 target.ip_blacklist，空数组也保留，方便清空旧配置。
     // 目的：让每个 API Key 独立的 IP 黑名单随 API Key 保存一起持久化并热更新。
@@ -852,11 +889,35 @@ export default function Admin() {
     } else {
       delete prefs.enabled_plugins;
     }
-    if (Object.keys(prefs).length > 0) target.preferences = prefs;
+    target.preferences = prefs;
+    if (formParentId) {
+      delete prefs.credits;
+      delete prefs.rate_limit;
+      // 空数组/空对象是显式覆写，只有取消字段覆写才恢复继承。
+      if (overrideFields.has('preferences.quota')) prefs.quota ??= {};
+      if (overrideFields.has('preferences.quota_rules')) prefs.quota_rules ??= [];
+      if (overrideFields.has('preferences.excluded_channels')) prefs.excluded_channels ??= [];
+      if (overrideFields.has('preferences.excluded_models')) prefs.excluded_models ??= [];
+      if (overrideFields.has('preferences.enabled_plugins')) prefs.enabled_plugins ??= [];
+      target = retainKeyOverrides(target, overrideFields);
+    }
+
+    try {
+      for (const [field, text] of Object.entries(overrideDrafts)) {
+        if (!overrideFields.has(field)) continue;
+        const value = JSON.parse(text);
+        if (field.startsWith('preferences.')) {
+          target.preferences ??= {};
+          target.preferences[field.slice(12)] = value;
+        } else target[field] = value;
+      }
+    } catch {
+      toastWarning('覆写值必须是合法 JSON，例如 []、false、0 或带引号的字符串');
+      return;
+    }
 
     const newKeys = [...keys];
     if (editingIndex !== null) {
-      target.ip_blacklist = keyIpBlacklist;
       // 修改原因：target 由表单字段整体重建，不含原条目的 enabled 字段。
       // 修改方式：编辑已有 Key 时从原条目继承 enabled=false。
       // 目的：避免编辑保存被禁用的 Key 后意外将其重新启用。
@@ -877,7 +938,8 @@ export default function Admin() {
         setIsSheetOpen(false);
         fetchData();
       } else {
-        toastError('保存失败');
+        const error = await res.json().catch(() => ({}));
+        toastError(error, '保存失败');
       }
     } catch {
       toastError('网络错误');
@@ -928,6 +990,10 @@ export default function Admin() {
   const handleDelete = async (index: number) => {
     const keyObj = keys[index];
     const name = keyObj.name || keyObj.api?.slice(0, 12) + '...';
+    if (keys.some(key => key.parent_id && key.parent_id === keyObj.id)) {
+      toastWarning('请先迁移或删除下级 Key，再删除此 Key');
+      return;
+    }
     if (!confirm(`确定要删除 API Key "${name}" 吗？`)) return;
 
     const newKeys = keys.filter((_, i) => i !== index);
@@ -941,7 +1007,8 @@ export default function Admin() {
         setKeys(newKeys);
         fetchData();
       } else {
-        toastError('删除失败');
+        const error = await res.json().catch(() => ({}));
+        toastError(error, '删除失败');
       }
     } catch {
       toastError('网络错误');
@@ -1664,6 +1731,75 @@ export default function Admin() {
     );
   };
 
+  const toggleCollapsed = (id: string) => setCollapsedKeys(previous => {
+    const next = new Set(previous);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const renderTreeToggle = (key: ApiKeyData, hasChildren: boolean) => hasChildren && key.id ? (
+    <button type="button" onClick={() => toggleCollapsed(key.id!)} aria-expanded={!collapsedKeys.has(key.id)} aria-label={`${collapsedKeys.has(key.id) ? '展开' : '折叠'}下级 Key`} className="mr-2 px-1 text-primary">
+      {collapsedKeys.has(key.id) ? '+' : '−'}
+    </button>
+  ) : null;
+  const parentOptions = keys.filter(key => {
+    if (!key.id) return false;
+    const editingId = editingIndex !== null ? keys[editingIndex]?.id : undefined;
+    let current: ApiKeyData | undefined = key;
+    const seen = new Set<string>();
+    while (current?.id && !seen.has(current.id)) {
+      if (current.id === editingId) return false;
+      seen.add(current.id);
+      current = keys.find(item => item.id === current?.parent_id);
+    }
+    return true;
+  });
+  const parentEffective = effectiveKeys[formParentId];
+  const standardFields = new Set(['groups', 'model', 'ip_blacklist', 'preferences.quota', 'preferences.quota_rules', 'preferences.enabled_plugins', 'preferences.excluded_channels', 'preferences.excluded_models']);
+  const extraFields = [...new Set([
+    ...Object.keys(parentEffective?.preferences || {}).filter(field => !['created_at', 'name', 'group', 'credits', 'rate_limit'].includes(field)).map(field => `preferences.${field}`),
+    ...overrideFields,
+  ])].filter(field => field.startsWith('preferences.') && !standardFields.has(field) && !['preferences.created_at', 'preferences.name', 'preferences.group', 'preferences.credits', 'preferences.rate_limit'].includes(field));
+  const isInherited = (field: string) => Boolean(formParentId) && !overrideFields.has(field);
+  const initializeOverride = (field: string) => {
+    const value = inheritedKeyValue(parentEffective, field);
+    if (field === 'groups') setFormGroups(value ?? ['default']);
+    else if (field === 'model') setFormModels(value ?? ['all']);
+    else if (field === 'ip_blacklist') setFormIpBlacklistText(formatIpBlacklistText(value));
+    else if (field === 'preferences.quota') {
+      const split = splitKeyQuota(value);
+      setFormQuotaRules(split.rules); setFormModelLimits(split.models);
+    } else if (field === 'preferences.quota_rules') setFormDimensionalRules(normalizeDimensionalQuotaRules(value));
+    else if (field === 'preferences.enabled_plugins') {
+      setFormEnabledPlugins(value ?? []); setShowPluginSheet(false); setActiveKeyNode(null);
+    } else if (field === 'preferences.excluded_channels' || field === 'preferences.excluded_models') {
+      const items = Array.isArray(value) ? value : typeof value === 'string' ? value.split(',').map(item => item.trim()).filter(Boolean) : [];
+      if (field === 'preferences.excluded_channels') setFormExcludedChannels(items); else setFormExcludedModels(items);
+    } else {
+      setFormBasePreferences(previous => ({ ...previous, [field.slice(12)]: value ?? null }));
+      setOverrideDrafts(previous => ({ ...previous, [field]: JSON.stringify(value ?? null) }));
+    }
+    setOverrideFields(previous => new Set([...previous, field]));
+  };
+  const restoreInheritance = (field: string) => {
+    setOverrideFields(previous => { const next = new Set(previous); next.delete(field); return next; });
+    setOverrideDrafts(previous => { const next = { ...previous }; delete next[field]; return next; });
+    if (field === 'preferences.enabled_plugins') { setShowPluginSheet(false); setActiveKeyNode(null); }
+  };
+  const changeParent = (nextParent: string) => {
+    // Detaching makes the currently inherited values explicit, not stale form defaults.
+    if (formParentId && !nextParent) {
+      for (const field of [...standardFields, ...extraFields]) {
+        if (isInherited(field)) initializeOverride(field);
+      }
+    }
+    setFormParentId(nextParent);
+    setShowPluginSheet(false); setActiveKeyNode(null);
+  };
+  const inheritedField = (field: string, label: string, children: ReactNode) => <InheritedKeyField
+    label={label} inherited={isInherited(field)} hasParent={Boolean(formParentId)} parentName={parentEffective?.name || '未命名 Key'}
+    value={inheritedKeyValue(parentEffective, field)} onOverride={() => initializeOverride(field)} onInherit={() => restoreInheritance(field)}
+  >{children}</InheritedKeyField>;
+
   return (
     <div className="space-y-6 animate-in fade-in duration-500 font-sans">
       {/* Header */}
@@ -1703,16 +1839,17 @@ export default function Admin() {
             <button onClick={() => openSheet()} className="text-primary hover:underline text-sm font-medium">+ 新增 API Key</button>
           </div>
         ) : (
-          keys.map((keyObj, idx) => {
+          treeRows.map(({ key: keyObj, index: idx, depth, hasChildren }) => {
             const status = getStatusInfo(keyObj.api);
             const quota = getQuotaInfo(keyObj.api);
             const name = keyObj.name || keyObj.preferences?.name || '未命名密钥';
             const groups = keyObj.groups || (keyObj.group ? [keyObj.group] : ['default']);
             return (
-              <div key={idx} className="bg-card border border-border rounded-xl p-4">
+              <div key={keyObj.id || idx} style={{ marginLeft: Math.min(depth, 6) * 12 }} className="bg-card border border-border rounded-xl p-4">
                 <div className="flex items-start justify-between mb-2">
                   <div className="min-w-0 flex-1">
-                    <div className="font-medium text-foreground truncate">{name}</div>
+                    <div className="font-medium text-foreground truncate">{renderTreeToggle(keyObj, hasChildren)}{name}</div>
+                    {keyObj.parent_id && <div className="text-xs text-muted-foreground">上级：{keys.find(key => key.id === keyObj.parent_id)?.name || '未命名'} · 受上级权限及额度限制</div>}
                     <div className="text-xs text-muted-foreground font-mono mt-1 flex items-center gap-1.5">
                       <Key className="w-3 h-3 flex-shrink-0" />
                       {keyObj.api.slice(0, 7)}...{keyObj.api.slice(-4)}
@@ -1734,6 +1871,8 @@ export default function Admin() {
                 <div className="flex items-center justify-end gap-1 pt-3 border-t border-border">
                   <button onClick={() => openCreditsDialog(keyObj.api)} className="p-1.5 text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10 rounded-md" title="充值"><Wallet className="w-4 h-4" /></button>
                   <button onClick={() => openKeyAnalytics(keyObj)} className="p-1.5 text-primary hover:bg-primary/10 rounded-md" title="用量分析"><BarChart3 className="w-4 h-4" /></button>
+                  <button onClick={() => setBranchUsageKey(keyObj)} className="p-1.5 text-muted-foreground hover:bg-muted rounded-md" title="直接与下级用量汇总"><BarChart3 className="w-4 h-4" /></button>
+                  <button onClick={() => openSheet(null, null, keyObj.id)} disabled={!keyObj.id} className="p-1.5 text-primary hover:bg-muted rounded-md" title="创建子 Key"><Plus className="w-4 h-4" /></button>
                   <button onClick={() => openSheet(null, keyObj)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="复制"><Copy className="w-4 h-4" /></button>
                   <button onClick={() => handleToggleEnabled(idx)} className={`p-1.5 rounded-md ${keyObj.enabled === false ? 'text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10' : 'text-amber-600 dark:text-amber-500 hover:bg-amber-500/10'}`} title={keyObj.enabled === false ? '启用' : '禁用'}>{keyObj.enabled === false ? <Power className="w-4 h-4" /> : <PowerOff className="w-4 h-4" />}</button>
                   <button onClick={() => openSheet(idx)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="编辑"><Edit className="w-4 h-4" /></button>
@@ -1772,7 +1911,7 @@ export default function Admin() {
               </tr>
             </thead>
             <tbody className="divide-y divide-border text-sm">
-              {keys.map((keyObj, idx) => {
+              {treeRows.map(({ key: keyObj, index: idx, depth, hasChildren }) => {
                 const status = getStatusInfo(keyObj.api);
                 const quota = getQuotaInfo(keyObj.api);
                 const state = keyStates[keyObj.api];
@@ -1785,8 +1924,9 @@ export default function Admin() {
 
                 return (
                   <tr key={idx} className="hover:bg-muted/50 transition-colors group">
-                    <td className="px-6 py-4">
-                      <div className="font-medium text-foreground">{name}</div>
+                    <td className="px-6 py-4" style={{ paddingLeft: 24 + Math.min(depth, 10) * 16 }}>
+                      <div className="font-medium text-foreground">{renderTreeToggle(keyObj, hasChildren)}{name}</div>
+                      {keyObj.parent_id && <div className="text-xs text-muted-foreground">上级：{keys.find(key => key.id === keyObj.parent_id)?.name || '未命名'} · 受上级权限及额度限制</div>}
                       <div className="text-xs text-muted-foreground font-mono mt-1 flex items-center gap-1.5">
                         <Key className="w-3 h-3" />
                         {keyObj.api.slice(0, 7)}...{keyObj.api.slice(-4)}
@@ -1858,9 +1998,11 @@ export default function Admin() {
                         <button onClick={() => openCreditsDialog(keyObj.api)} className="p-1.5 text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500/10 rounded-md" title="充值额度">
                           <Wallet className="w-4 h-4" />
                         </button>
+                        <button onClick={() => setBranchUsageKey(keyObj)} className="p-1.5 text-muted-foreground hover:bg-muted rounded-md" title="直接与下级用量汇总"><BarChart3 className="w-4 h-4" /></button>
                         <button onClick={() => openKeyAnalytics(keyObj)} className="p-1.5 text-primary hover:bg-primary/10 rounded-md" title="用量分析">
                           <BarChart3 className="w-4 h-4" />
                         </button>
+                        <button onClick={() => openSheet(null, null, keyObj.id)} disabled={!keyObj.id} className="p-1.5 text-primary hover:bg-muted rounded-md" title="创建子 Key"><Plus className="w-4 h-4" /></button>
                         <button onClick={() => openSheet(null, keyObj)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md" title="复制配置">
                           <Copy className="w-4 h-4" />
                         </button>
@@ -1941,8 +2083,20 @@ export default function Admin() {
                   <p className="text-xs text-muted-foreground mt-1">包含 'admin' 的 Key 将被视为管理 Key</p>
                 </div>
 
+                <div className="border-t border-border pt-3">
+                  <label className="block text-sm font-medium">所属上级
+                    <select value={formParentId} onChange={event => changeParent(event.target.value)} className="mt-2 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+                      <option value="">独立 Key（无上级）</option>
+                      {parentOptions.map(key => <option key={key.id} value={key.id}>{key.name || '未命名 Key'}</option>)}
+                    </select>
+                  </label>
+                  {formParentId && <p className="mt-2 text-xs leading-relaxed text-muted-foreground">各项配置可继承或独立设置，权限和额度始终受上级限制。迁移不改变历史用量。</p>}
+                </div>
+              </section>
+              <section className="space-y-4">
+                <h3 className="border-b border-border pb-2 text-sm font-semibold">访问权限</h3>
                 {/* Groups */}
-                <div>
+                {inheritedField('groups', '分组', <div>
                   <label className="text-sm font-medium text-foreground mb-1.5 block">分组</label>
                   <div className="flex flex-wrap gap-2 mb-2 p-2 bg-muted/50 border border-border rounded-lg min-h-[40px]">
                     {formGroups.map(g => (
@@ -1961,8 +2115,209 @@ export default function Admin() {
                     />
                     <button onClick={addGroup} className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm">添加</button>
                   </div>
-                </div>
+                </div>)}
               </section>
+
+              {/* Models Section */}
+              <section className="space-y-4">
+                <div className="text-sm font-semibold text-foreground border-b border-border pb-2 flex items-center gap-2">
+                  <Brain className="w-4 h-4 text-purple-500" /> 模型配置
+                </div>
+
+                {inheritedField('model', '模型权限', <>
+                {/* Actions */}
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={openFetchModelsDialog}
+                    disabled={fetchingModels}
+                    className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm flex items-center gap-1.5 disabled:opacity-50"
+                  >
+                    <Download className={`w-4 h-4 ${fetchingModels ? 'animate-spin' : ''}`} /> 获取模型
+                  </button>
+                  <button onClick={clearAllModels} className="bg-red-500/10 text-red-600 dark:text-red-500 px-3 py-2 rounded-lg text-sm">清空全部</button>
+                </div>
+
+                {/* Model Chips */}
+                <div className="bg-muted/50 border border-border rounded-lg p-3 min-h-[100px] max-h-[200px] overflow-y-auto">
+                  {formModels.length === 0 ? (
+                    <div className="text-center text-muted-foreground text-sm py-4">没有模型规则。独立 Key 或已覆写此字段的子 Key 将无法调用；未覆写的子 Key 继续继承上级。需要全部模型时请添加 all。</div>
+                  ) : (
+                    <div className="flex flex-wrap gap-2">
+                      {formModels.map((m, idx) => (
+                        <span
+                          key={idx}
+                          className="bg-background border border-border text-foreground text-xs font-mono px-2 py-1 rounded flex items-center gap-1 cursor-pointer hover:bg-muted"
+                          onClick={() => copyToClipboard(m)}
+                          title="点击复制"
+                        >
+                          {m}
+                          <button onClick={(e) => { e.stopPropagation(); removeModel(m); }} className="text-muted-foreground hover:text-red-500 ml-1">
+                            <X className="w-3 h-3" />
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Manual Input */}
+                <div>
+                  <label className="text-sm font-medium text-foreground mb-1.5 block">手动输入模型规则</label>
+                  <div className="flex gap-2">
+                    <input
+                      type="text" value={modelInput} onChange={e => setModelInput(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addModelsFromInput(); } }}
+                      placeholder="例如 all, gpt-4o 用空格/逗号分隔"
+                      className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
+                    />
+                    <button onClick={addModelsFromInput} className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm">添加</button>
+                  </div>
+                  {/* 修改原因：BYOK 渠道需要通过“渠道名/*”这类模型规则授权全部模型。 */}
+                  {/* 修改方式：仅扩展手动输入模型规则下方的说明文字，并加入代码样式示例。 */}
+                  {/* 目的：让管理员在配置模型访问规则时能直接看到 BYOK 授权写法。 */}
+                  <p className="text-xs text-muted-foreground mt-1">多个用逗号或空格分隔，按回车快速添加。BYOK 用户可用 <code className="font-mono bg-muted px-1 rounded">渠道名/*</code> 授权访问指定 BYOK 渠道的所有模型</p>
+                </div>
+                </>)}
+              </section>
+              {/* Access Control Section */}
+              <section className="space-y-4">
+                <div className="text-sm font-semibold text-foreground border-b border-border pb-2 flex items-center gap-2">
+                  <Ban className="w-4 h-4 text-red-500" /> 访问控制
+                </div>
+
+                {inheritedField('ip_blacklist', 'IP 黑名单', <div className="space-y-3">
+                  <label className="text-sm font-medium text-foreground mb-1.5 block">IP 黑名单</label>
+                  {/* 修改原因：每个 API Key 需要独立维护 IP 黑名单，且字段存放在 api_keys 条目顶层。 */}
+                  {/* 修改方式：在访问控制区域增加 textarea，一行一个 IP/CIDR，保存时解析到 target.ip_blacklist。 */}
+                  {/* 目的：当前 Key 命中黑名单时在鉴权层直接返回 ip_blocked。 */}
+                  <textarea
+                    value={formIpBlacklistText}
+                    onChange={e => setFormIpBlacklistText(e.target.value)}
+                    placeholder={'例如：\n1.2.3.4\n5.6.7.0/24'}
+                    className="w-full min-h-[96px] bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
+                  />
+                  <p className="text-xs text-muted-foreground">全局及所有上级的黑名单仍会生效，当前配置不能解除上级限制。</p>
+                </div>)}
+
+                {inheritedField('preferences.excluded_channels', '排除渠道', <div className="space-y-3">
+                  <label className="text-sm font-medium text-foreground mb-1.5 block">排除渠道</label>
+                  <div className="bg-muted/50 border border-border rounded-lg p-3 min-h-[48px] max-h-[150px] overflow-y-auto">
+                    {formExcludedChannels.length === 0 ? (
+                      <div className="text-center text-muted-foreground text-xs py-1">未设置排除渠道</div>
+                    ) : (
+                      <div className="flex flex-wrap gap-2">
+                        {formExcludedChannels.map((item, idx) => (
+                          <span key={idx} className="bg-red-500/10 border border-red-500/30 text-red-600 dark:text-red-400 text-xs font-mono px-2 py-1 rounded flex items-center gap-1">
+                            {item}
+                            <button
+                              title="移除"
+                              onClick={() => setFormExcludedChannels(formExcludedChannels.filter((_, i) => i !== idx))}
+                              className="opacity-60 hover:opacity-100 ml-0.5"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={excludedChannelInput}
+                      onChange={e => setExcludedChannelInput(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          const parts = excludedChannelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
+                          if (parts.length > 0) {
+                            setFormExcludedChannels([...new Set([...formExcludedChannels, ...parts])]);
+                            setExcludedChannelInput('');
+                          }
+                        }
+                      }}
+                      placeholder="输入渠道名，逗号分隔"
+                      className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
+                    />
+                    <button
+                      onClick={() => {
+                        const parts = excludedChannelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
+                        if (parts.length > 0) {
+                          setFormExcludedChannels([...new Set([...formExcludedChannels, ...parts])]);
+                          setExcludedChannelInput('');
+                        }
+                      }}
+                      className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm"
+                    >
+                      添加
+                    </button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">命中后将直接排除整个渠道。</p>
+                </div>)}
+
+                {inheritedField('preferences.excluded_models', '排除模型', <div className="space-y-3">
+                  <label className="text-sm font-medium text-foreground mb-1.5 block">排除模型</label>
+                  <div className="bg-muted/50 border border-border rounded-lg p-3 min-h-[48px] max-h-[150px] overflow-y-auto">
+                    {formExcludedModels.length === 0 ? (
+                      <div className="text-center text-muted-foreground text-xs py-1">未设置排除模型</div>
+                    ) : (
+                      <div className="flex flex-wrap gap-2">
+                        {formExcludedModels.map((item, idx) => (
+                          <span key={idx} className="bg-orange-500/10 border border-orange-500/30 text-orange-600 dark:text-orange-400 text-xs font-mono px-2 py-1 rounded flex items-center gap-1">
+                            {item}
+                            <button
+                              title="移除"
+                              onClick={() => setFormExcludedModels(formExcludedModels.filter((_, i) => i !== idx))}
+                              className="opacity-60 hover:opacity-100 ml-0.5"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={excludedModelInput}
+                      onChange={e => setExcludedModelInput(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          const parts = excludedModelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
+                          if (parts.length > 0) {
+                            setFormExcludedModels([...new Set([...formExcludedModels, ...parts])]);
+                            setExcludedModelInput('');
+                          }
+                        }
+                      }}
+                      placeholder="输入模型名、模型前缀* 或 渠道名/模型名"
+                      className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
+                    />
+                    <button
+                      onClick={() => {
+                        const parts = excludedModelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
+                        if (parts.length > 0) {
+                          setFormExcludedModels([...new Set([...formExcludedModels, ...parts])]);
+                          setExcludedModelInput('');
+                        }
+                      }}
+                      className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm"
+                    >
+                      添加
+                    </button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    支持三种格式：
+                    <code className="bg-muted px-1 rounded">模型名</code>
+                    、<code className="bg-muted px-1 rounded">模型名前缀*</code>
+                    、<code className="bg-muted px-1 rounded">渠道名/模型名</code>
+                    。渠道名/模型名同样支持 <code className="bg-muted px-1 rounded">*</code> 前缀通配。
+                  </p>
+                </div>)}
+              </section>
+
 
               {/* Quota Section */}
               <section className="space-y-4">
@@ -1971,8 +2326,8 @@ export default function Admin() {
                 </div>
                 {/* 新规则按分组维度与度量编辑；已有 preferences.quota 仅在存在时显示兼容编辑区。 */}
                 <div className="space-y-3">
-                  {renderDimensionalRuleCard()}
-                  {(formQuotaRules.length > 0 || formModelLimits.length > 0) && (
+                  {inheritedField('preferences.quota_rules', '配额规则', renderDimensionalRuleCard())}
+                  {inheritedField('preferences.quota', '兼容配额规则', (
                     <details className="rounded-xl border border-border bg-muted/10 p-3">
                       <summary className="cursor-pointer text-xs font-medium text-muted-foreground">兼容旧配额规则</summary>
                       <div className="mt-3 space-y-3">
@@ -1981,7 +2336,7 @@ export default function Admin() {
                         {renderModelLimitCard()}
                       </div>
                     </details>
-                  )}
+                  ))}
                   <div className="text-[10px] text-muted-foreground space-y-0.5">
                     <div>格式: <code className="bg-muted px-1 rounded">数量/时间</code>，可选 <code className="bg-muted px-1 rounded">:fixed</code> 后缀。支持 <code className="bg-muted px-1 rounded">K</code> <code className="bg-muted px-1 rounded">M</code> 缩写。</div>
                     <div>新规则将分组维度与度量分开；IP 和模型可以同时选择。兼容规则继续支持旧 preferences.quota 配置。</div>
@@ -1994,6 +2349,7 @@ export default function Admin() {
                 <div className="text-sm font-semibold text-foreground border-b border-border pb-2 flex items-center gap-2">
                   <ArrowRight className="w-4 h-4 text-cyan-500" /> 请求流水线
                 </div>
+                {inheritedField('preferences.enabled_plugins', '请求插件', <>
                 {(() => {
                   const toggleKN = (id: string) => setActiveKeyNode(prev => prev === id ? null : id);
                   const inboundCount = formEnabledPlugins.filter(p => {
@@ -2167,207 +2523,18 @@ export default function Admin() {
                     </div>
                   );
                 })()}
+                </>)}
               </section>
 
-              {/* Access Control Section */}
-              <section className="space-y-4">
-                <div className="text-sm font-semibold text-foreground border-b border-border pb-2 flex items-center gap-2">
-                  <Ban className="w-4 h-4 text-red-500" /> 访问控制
-                </div>
-
-                <div className="space-y-3">
-                  <label className="text-sm font-medium text-foreground mb-1.5 block">IP 黑名单</label>
-                  {/* 修改原因：每个 API Key 需要独立维护 IP 黑名单，且字段存放在 api_keys 条目顶层。 */}
-                  {/* 修改方式：在访问控制区域增加 textarea，一行一个 IP/CIDR，保存时解析到 target.ip_blacklist。 */}
-                  {/* 目的：当前 Key 命中黑名单时在鉴权层直接返回 ip_blocked。 */}
-                  <textarea
-                    value={formIpBlacklistText}
-                    onChange={e => setFormIpBlacklistText(e.target.value)}
-                    placeholder={'例如：\n1.2.3.4\n5.6.7.0/24'}
-                    className="w-full min-h-[96px] bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
-                  />
-                  <p className="text-xs text-muted-foreground">仅影响当前 API Key。全局黑名单会先于 Key 级黑名单检查。</p>
-                </div>
-
-                <div className="space-y-3">
-                  <label className="text-sm font-medium text-foreground mb-1.5 block">排除渠道</label>
-                  <div className="bg-muted/50 border border-border rounded-lg p-3 min-h-[48px] max-h-[150px] overflow-y-auto">
-                    {formExcludedChannels.length === 0 ? (
-                      <div className="text-center text-muted-foreground text-xs py-1">未设置排除渠道</div>
-                    ) : (
-                      <div className="flex flex-wrap gap-2">
-                        {formExcludedChannels.map((item, idx) => (
-                          <span key={idx} className="bg-red-500/10 border border-red-500/30 text-red-600 dark:text-red-400 text-xs font-mono px-2 py-1 rounded flex items-center gap-1">
-                            {item}
-                            <button
-                              title="移除"
-                              onClick={() => setFormExcludedChannels(formExcludedChannels.filter((_, i) => i !== idx))}
-                              className="opacity-60 hover:opacity-100 ml-0.5"
-                            >
-                              <X className="w-3 h-3" />
-                            </button>
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                  <div className="flex gap-2">
-                    <input
-                      type="text"
-                      value={excludedChannelInput}
-                      onChange={e => setExcludedChannelInput(e.target.value)}
-                      onKeyDown={e => {
-                        if (e.key === 'Enter') {
-                          e.preventDefault();
-                          const parts = excludedChannelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
-                          if (parts.length > 0) {
-                            setFormExcludedChannels([...new Set([...formExcludedChannels, ...parts])]);
-                            setExcludedChannelInput('');
-                          }
-                        }
-                      }}
-                      placeholder="输入渠道名，逗号分隔"
-                      className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
-                    />
-                    <button
-                      onClick={() => {
-                        const parts = excludedChannelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
-                        if (parts.length > 0) {
-                          setFormExcludedChannels([...new Set([...formExcludedChannels, ...parts])]);
-                          setExcludedChannelInput('');
-                        }
-                      }}
-                      className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm"
-                    >
-                      添加
-                    </button>
-                  </div>
-                  <p className="text-xs text-muted-foreground">命中后将直接排除整个渠道。</p>
-                </div>
-
-                <div className="space-y-3">
-                  <label className="text-sm font-medium text-foreground mb-1.5 block">排除模型</label>
-                  <div className="bg-muted/50 border border-border rounded-lg p-3 min-h-[48px] max-h-[150px] overflow-y-auto">
-                    {formExcludedModels.length === 0 ? (
-                      <div className="text-center text-muted-foreground text-xs py-1">未设置排除模型</div>
-                    ) : (
-                      <div className="flex flex-wrap gap-2">
-                        {formExcludedModels.map((item, idx) => (
-                          <span key={idx} className="bg-orange-500/10 border border-orange-500/30 text-orange-600 dark:text-orange-400 text-xs font-mono px-2 py-1 rounded flex items-center gap-1">
-                            {item}
-                            <button
-                              title="移除"
-                              onClick={() => setFormExcludedModels(formExcludedModels.filter((_, i) => i !== idx))}
-                              className="opacity-60 hover:opacity-100 ml-0.5"
-                            >
-                              <X className="w-3 h-3" />
-                            </button>
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                  <div className="flex gap-2">
-                    <input
-                      type="text"
-                      value={excludedModelInput}
-                      onChange={e => setExcludedModelInput(e.target.value)}
-                      onKeyDown={e => {
-                        if (e.key === 'Enter') {
-                          e.preventDefault();
-                          const parts = excludedModelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
-                          if (parts.length > 0) {
-                            setFormExcludedModels([...new Set([...formExcludedModels, ...parts])]);
-                            setExcludedModelInput('');
-                          }
-                        }
-                      }}
-                      placeholder="输入模型名、模型前缀* 或 渠道名/模型名"
-                      className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
-                    />
-                    <button
-                      onClick={() => {
-                        const parts = excludedModelInput.split(/[,]+/).map(s => s.trim()).filter(Boolean);
-                        if (parts.length > 0) {
-                          setFormExcludedModels([...new Set([...formExcludedModels, ...parts])]);
-                          setExcludedModelInput('');
-                        }
-                      }}
-                      className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm"
-                    >
-                      添加
-                    </button>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    支持三种格式：
-                    <code className="bg-muted px-1 rounded">模型名</code>
-                    、<code className="bg-muted px-1 rounded">模型名前缀*</code>
-                    、<code className="bg-muted px-1 rounded">渠道名/模型名</code>
-                    。渠道名/模型名同样支持 <code className="bg-muted px-1 rounded">*</code> 前缀通配。
-                  </p>
-                </div>
-              </section>
-
-
-              {/* Models Section */}
-              <section className="space-y-4">
-                <div className="text-sm font-semibold text-foreground border-b border-border pb-2 flex items-center gap-2">
-                  <Brain className="w-4 h-4 text-purple-500" /> 模型配置
-                </div>
-
-                {/* Actions */}
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={openFetchModelsDialog}
-                    disabled={fetchingModels}
-                    className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm flex items-center gap-1.5 disabled:opacity-50"
-                  >
-                    <Download className={`w-4 h-4 ${fetchingModels ? 'animate-spin' : ''}`} /> 获取模型
-                  </button>
-                  <button onClick={clearAllModels} className="bg-red-500/10 text-red-600 dark:text-red-500 px-3 py-2 rounded-lg text-sm">清空全部</button>
-                </div>
-
-                {/* Model Chips */}
-                <div className="bg-muted/50 border border-border rounded-lg p-3 min-h-[100px] max-h-[200px] overflow-y-auto">
-                  {formModels.length === 0 ? (
-                    <div className="text-center text-muted-foreground text-sm py-4">暂无模型规则，点击「获取模型」或手动添加。留空表示默认 all。</div>
-                  ) : (
-                    <div className="flex flex-wrap gap-2">
-                      {formModels.map((m, idx) => (
-                        <span
-                          key={idx}
-                          className="bg-background border border-border text-foreground text-xs font-mono px-2 py-1 rounded flex items-center gap-1 cursor-pointer hover:bg-muted"
-                          onClick={() => copyToClipboard(m)}
-                          title="点击复制"
-                        >
-                          {m}
-                          <button onClick={(e) => { e.stopPropagation(); removeModel(m); }} className="text-muted-foreground hover:text-red-500 ml-1">
-                            <X className="w-3 h-3" />
-                          </button>
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                {/* Manual Input */}
-                <div>
-                  <label className="text-sm font-medium text-foreground mb-1.5 block">手动输入模型规则</label>
-                  <div className="flex gap-2">
-                    <input
-                      type="text" value={modelInput} onChange={e => setModelInput(e.target.value)}
-                      onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addModelsFromInput(); } }}
-                      placeholder="例如 all, gpt-4o 用空格/逗号分隔"
-                      className="flex-1 bg-background border border-border focus:border-primary px-3 py-2 rounded-lg text-sm font-mono text-foreground"
-                    />
-                    <button onClick={addModelsFromInput} className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm">添加</button>
-                  </div>
-                  {/* 修改原因：BYOK 渠道需要通过“渠道名/*”这类模型规则授权全部模型。 */}
-                  {/* 修改方式：仅扩展手动输入模型规则下方的说明文字，并加入代码样式示例。 */}
-                  {/* 目的：让管理员在配置模型访问规则时能直接看到 BYOK 授权写法。 */}
-                  <p className="text-xs text-muted-foreground mt-1">多个用逗号或空格分隔，按回车快速添加。BYOK 用户可用 <code className="font-mono bg-muted px-1 rounded">渠道名/*</code> 授权访问指定 BYOK 渠道的所有模型</p>
-                </div>
-              </section>
+              {extraFields.length > 0 && <details className="rounded-lg border border-border p-3">
+                <summary className="cursor-pointer text-sm font-medium">高级配置</summary>
+                <p className="mt-2 text-xs text-muted-foreground">仅用于没有专用表单的额外请求配置。JSON 中的 0、false 和空列表均会保留。</p>
+                <div className="mt-3 space-y-4">{extraFields.map(field => <div key={field}>
+                  {inheritedField(field, field.slice(12), <label className="block text-xs">{field.slice(12)}
+                    <textarea aria-label={`${field.slice(12)} JSON 覆写`} value={overrideDrafts[field] ?? JSON.stringify(currentKeyPluginPreferences[field.slice(12)] ?? null, null, 2)} onChange={event => setOverrideDrafts(previous => ({ ...previous, [field]: event.target.value }))} className="mt-2 min-h-20 w-full rounded-lg border border-border bg-background p-2 font-mono focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary" />
+                  </label>)}
+                </div>)}</div>
+              </details>}
             </div>
 
             {/* Footer */}
@@ -2379,7 +2546,7 @@ export default function Admin() {
             </div>
 
             {/* Plugin Tab Button — 与渠道编辑面板保持一致 */}
-            {!showPluginSheet && (
+            {!showPluginSheet && !isInherited('preferences.enabled_plugins') && (
               <button
                 onClick={() => setShowPluginSheet(true)}
                 className="absolute hidden sm:flex flex-col items-center gap-1.5 py-4 w-8 bg-muted border border-border border-r-0 rounded-l-lg cursor-pointer transition-all hover:bg-emerald-500/10 hover:w-9"
@@ -2394,8 +2561,8 @@ export default function Admin() {
             )}
 
             <InterceptorSheet
-              open={showPluginSheet}
-              onOpenChange={setShowPluginSheet}
+              open={showPluginSheet && !isInherited('preferences.enabled_plugins')}
+              onOpenChange={open => setShowPluginSheet(open && !isInherited('preferences.enabled_plugins'))}
               allPlugins={allPlugins}
               enabledPlugins={formEnabledPlugins}
               providerPreferences={currentKeyPluginPreferences}
@@ -2497,6 +2664,17 @@ export default function Admin() {
               <Dialog.Close className="px-4 py-2 text-sm font-medium text-foreground bg-muted hover:bg-muted/80 rounded-lg">取消</Dialog.Close>
               <button onClick={handleAddCredits} className="px-4 py-2 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg">确认添加</button>
             </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+
+      <Dialog.Root open={branchUsageKey !== null} onOpenChange={open => { if (!open) setBranchUsageKey(null); }}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
+          <Dialog.Content className="fixed right-0 top-0 z-50 h-full w-full max-w-xl space-y-4 overflow-y-auto border-l border-border bg-background p-5 shadow-xl">
+            <div className="flex items-center justify-between"><Dialog.Title className="text-lg font-semibold">用量汇总</Dialog.Title><Dialog.Close aria-label="关闭用量汇总" className="rounded p-2 hover:bg-muted"><X className="h-4 w-4" /></Dialog.Close></div>
+            <Dialog.Description className="text-sm text-muted-foreground">查看当前 Key 直接调用或包含下级的历史用量。</Dialog.Description>
+            {branchUsageKey?.id && token && <KeyBranchUsage id={branchUsageKey.id} token={token} name={branchUsageKey.name || '当前 Key'} />}
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>

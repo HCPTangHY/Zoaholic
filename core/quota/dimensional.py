@@ -264,7 +264,7 @@ class DimensionalQuotaCounter:
             self._buckets[key] = bucket
         return bucket
 
-    def check_request(self, model: str = "default", client_ip: str = "") -> Optional[str]:
+    def check_request(self, model: str = "default", client_ip: str = "", *, record: bool = True) -> Optional[str]:
         now = time()
         context = self._context(model, client_ip)
         self._ops += 1
@@ -289,7 +289,17 @@ class DimensionalQuotaCounter:
         except OverflowError as exc:
             return str(exc)
 
-        for rule, bucket in matched:
+        if record:
+            self.record_request(model, client_ip, now=now)
+        return None
+
+    def record_request(self, model: str = "default", client_ip: str = "", *, now=None):
+        now = time() if now is None else now
+        context = self._context(model, client_ip)
+        for rule in self.rules:
+            bucket = self._get_bucket(rule, context)
+            if bucket is None:
+                continue
             if rule.measure == Measure.REQUEST:
                 self._record(rule, bucket, 1.0, now)
             elif rule.aggregate == Aggregate.COUNT_DISTINCT:
@@ -443,13 +453,13 @@ class DimensionalQuotaCounter:
                 else:
                     bucket.amounts.append((now, amount))
                     bucket.permanent_amount += amount
+                    if any(math.isinf(item.period) for item in rule.limits):
+                        self._snapshot_dirty = True
                 sliding_recorded = True
             elif limit.period not in fixed_periods:
                 window = bucket.fixed.setdefault(limit.period, _FixedValue())
-                old_start = window.start
                 window.add(now, limit.period, amount)
-                if window.start != old_start:
-                    self._snapshot_dirty = True
+                self._snapshot_dirty = True
                 fixed_periods.add(limit.period)
 
     def _record_distinct(self, rule: DimensionalRule, bucket: _Bucket, value: str, now: float):
@@ -541,8 +551,9 @@ class DimensionalQuotaCounter:
                 {"period": period, "values": sorted(window.values), "start": window.start}
                 for period, window in bucket.distinct_fixed.items() if window.start > 0
             ]
-            if fixed or distinct_fixed:
-                entries.append({"rule_id": rule_id, "dimensions": bucket.dimensions, "fixed": fixed, "distinct_fixed": distinct_fixed})
+            if fixed or distinct_fixed or bucket.permanent_amount:
+                entries.append({"rule_id": rule_id, "dimensions": bucket.dimensions, "fixed": fixed,
+                                "distinct_fixed": distinct_fixed, "permanent_amount": bucket.permanent_amount})
         return {"buckets": entries}
 
     def restore_snapshot(self, snapshot: dict) -> int:
@@ -564,6 +575,7 @@ class DimensionalQuotaCounter:
                     break
                 bucket = _Bucket(dimensions={str(key): str(value) for key, value in dimensions.items()})
                 self._buckets[storage_key] = bucket
+            bucket.permanent_amount = float(entry.get('permanent_amount', 0))
             for item in entry.get("fixed", []):
                 period = float(item.get("period") or 0)
                 start = float(item.get("start") or 0)

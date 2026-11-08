@@ -56,7 +56,7 @@ def _sanitize_config_for_persistence(config_data: dict) -> dict:
 
     import copy
 
-    processed_data = copy.deepcopy(config_data or {})
+    processed_data = copy.deepcopy({k: v for k, v in (config_data or {}).items() if not k.startswith('_')})
 
     # 持久化前还原 label 到 api 列表
     for provider in processed_data.get("providers", []) or []:
@@ -73,10 +73,9 @@ def _sanitize_config_for_persistence(config_data: dict) -> dict:
         for k in keys_to_remove:
             provider.pop(k, None)
 
-    for api_key in processed_data.get("api_keys", []) or []:
-        keys_to_remove = [k for k in list(api_key.keys()) if str(k).startswith("_")]
-        for k in keys_to_remove:
-            api_key.pop(k, None)
+    if "api_keys" in processed_data:
+        from core.key_hierarchy import raw_key_config
+        processed_data["api_keys"] = [raw_key_config(key) for key in processed_data["api_keys"] or []]
 
     return processed_data
 

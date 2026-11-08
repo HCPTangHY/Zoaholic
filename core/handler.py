@@ -603,6 +603,11 @@ class ModelRequestHandler:
             # ── 正常路径：用户限速 + 全局路由 ──
             try:
                 final_api_key = self.app.state.api_list[api_index]
+                from core.middleware import request_info
+                from core.key_hierarchy import snapshot_key_ancestry
+                info = request_info.get()
+                if info is not None:
+                    snapshot_key_ancestry(info, config['api_keys'][api_index])
                 # 修改原因：Phase 2 quota 需要在旧 user_api_keys_rate_limit 消耗前检查用户 key 的统一配额。
                 # 修改方式：仅对已配置 quota 的 final_api_key 调用 quota_registry.check，并传入当前模型与 request_info 中的 client_ip。
                 # 目的：让统一配额负责用户 key 的请求、token、cost、IP 维度控制，同时保留旧 next() 作为上游 key 限速层。

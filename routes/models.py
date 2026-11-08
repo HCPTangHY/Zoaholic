@@ -47,6 +47,33 @@ def _provider_groups_allowed(provider: dict, allowed_groups: set) -> bool:
     return bool(allowed_groups.intersection(set(p_groups)))
 
 
+def _allows_byok_model_discovery(key: dict, provider: dict) -> bool:
+    """Model discovery sends a credential: require channel-wide access before sending it."""
+    groups = key.get("groups", ["default"])
+    if isinstance(groups, str):
+        groups = [groups]
+    if not isinstance(groups, list):
+        groups = ["default"]
+    if not _provider_groups_allowed(provider, set(groups)):
+        return False
+    excluded = (key.get("preferences") or {}).get("excluded_channels") or []
+    if isinstance(excluded, str):
+        excluded = [name.strip() for name in excluded.split(",")]
+    if provider["provider"] in excluded:
+        return False
+    excluded_models = (key.get("preferences") or {}).get("excluded_models") or []
+    if isinstance(excluded_models, str):
+        excluded_models = [name.strip() for name in excluded_models.split(",")]
+    if "*" in excluded_models or provider["provider"] + "/*" in excluded_models:
+        return False
+    for rule in key.get("model", []):
+        if isinstance(rule, dict) and rule:
+            rule = next(iter(rule))
+        if rule in ("all", provider["provider"] + "/*"):
+            return True
+    return False
+
+
 async def _fetch_byok_provider_models(app, provider: dict, byok_real_key: str) -> List[str]:
     """使用 BYOK 真实上游 key 动态拉取 provider 模型列表。"""
     # 修改原因：provider.model=["*"] 没有可枚举的静态模型，BYOK 请求 /v1/models 时应使用用户真实 key 查询上游。
@@ -73,7 +100,7 @@ async def _fetch_byok_provider_models(app, provider: dict, byok_real_key: str) -
                 return []
 
 
-async def build_models_for_request(api_index: int, app=None) -> List[Dict[str, Any]]:
+async def _build_models_for_request(api_index: int, app=None) -> List[Dict[str, Any]]:
     """构建当前请求可见的模型列表，支持 BYOK 动态拉取。"""
     # 修改原因：原 post_all_models 是同步函数，不能在 provider.model=["*"] 时调用上游 adapter。
     # 修改方式：先保留旧静态行为，再在 BYOK 请求中对通配符 BYOK provider 追加 adapter 动态模型。
@@ -91,27 +118,9 @@ async def build_models_for_request(api_index: int, app=None) -> List[Dict[str, A
     if not byok_real_key:
         return models
 
-    api_key_groups = safe_get(app.state.config, "api_keys", api_index, "groups", default=["default"])
-    if isinstance(api_key_groups, str):
-        api_key_groups = [api_key_groups]
-    if not isinstance(api_key_groups, list) or not api_key_groups:
-        api_key_groups = ["default"]
-    allowed_groups = set(api_key_groups)
-
-    api_models = safe_get(app.state.config, "api_keys", api_index, "model", default=[]) or []
-    authorized_byok_providers = set()
-    allow_all = False
-    for rule in api_models:
-        if isinstance(rule, dict) and rule:
-            rule = next(iter(rule.keys()))
-        if not isinstance(rule, str):
-            continue
-        if rule == "all":
-            allow_all = True
-        elif "/" in rule:
-            provider_name, model_rule = rule.split("/", 1)
-            if model_rule == "*":
-                authorized_byok_providers.add(provider_name)
+    from core.key_hierarchy import key_chain
+    key = app.state.config["api_keys"][api_index]
+    authorization_chain = key_chain(app.state.config, key["api"])
 
     for provider in app.state.config.get("providers", []) or []:
         if provider.get("enabled") is False:
@@ -120,10 +129,7 @@ async def build_models_for_request(api_index: int, app=None) -> List[Dict[str, A
             continue
         if is_local_api_key(provider.get("provider", "")):
             continue
-        if not _provider_groups_allowed(provider, allowed_groups):
-            continue
-        provider_name = provider.get("provider")
-        if not allow_all and provider_name not in authorized_byok_providers:
+        if not all(_allows_byok_model_discovery(key, provider) for key in authorization_chain):
             continue
 
         model_dict = provider.get("_model_dict_cache") or get_model_dict(provider)
@@ -141,6 +147,20 @@ async def build_models_for_request(api_index: int, app=None) -> List[Dict[str, A
 
     models.sort(key=lambda x: x["id"])
     return models
+
+
+async def build_models_for_request(api_index: int, app=None) -> List[Dict[str, Any]]:
+    app = app if app is not None else get_app()
+    models = await _build_models_for_request(api_index, app)
+    key = app.state.config['api_keys'][api_index]
+    if not key.get('parent_id'):
+        return models
+    from core.routing import get_matching_providers
+    visible = []
+    for model in models:
+        if await get_matching_providers(model['id'], app.state.config, api_index, app):
+            visible.append(model)
+    return visible
 
 
 @router.get("/v1/models", dependencies=[Depends(rate_limit_dependency)])

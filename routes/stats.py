@@ -13,7 +13,7 @@ from pydantic import BaseModel, field_serializer, Field
 from sqlalchemy import select, case, func, desc, update, delete, or_
 
 from db import RequestStat, ChannelStat, async_session_scope, DISABLE_DATABASE, DB_TYPE
-from core.stats import get_usage_data, compute_total_cost_from_db
+from core.stats import get_usage_data, compute_total_cost_from_db, key_history_filter, key_history_sql
 from utils import safe_get, query_channel_key_stats
 from routes.deps import rate_limit_dependency, verify_api_key, verify_admin_api_key, get_app
 from core.d1_client import parse_d1_datetime, format_d1_datetime
@@ -1506,6 +1506,7 @@ async def get_key_analytics_detail(
 
 # ============ Usage Analysis (用量分析与费用模拟) ============
 
+
 @router.get("/v1/stats/usage_analysis", dependencies=[Depends(rate_limit_dependency)])
 async def get_usage_analysis(
     request: Request,
@@ -1515,6 +1516,8 @@ async def get_usage_analysis(
     hours: Optional[int] = Query(default=24, ge=1, le=8760, description="Lookback hours (used when start/end not provided)"),
     provider: Optional[str] = Query(default=None, description="Provider filter, comma-separated for multiple"),
     model: Optional[str] = Query(default=None, description="Model filter, comma-separated for multiple"),
+    api_key_id: Optional[str] = None,
+    key_scope: Literal['direct', 'branch'] = 'direct',
 ):
     """
     按渠道和模型分组的用量分析，返回请求次数、Token 消耗量、历史记录费用及当前报价估算费用。
@@ -1528,6 +1531,13 @@ async def get_usage_analysis(
 
     provider_list = [p.strip() for p in provider.split(',') if p.strip()] if provider else []
     model_list = [m.strip() for m in model.split(',') if m.strip()] if model else []
+    legacy_api_key = None
+    if api_key_id is not None:
+        selected_key = next((key for key in request.app.state.config.get('api_keys', [])
+                             if key.get('id') == api_key_id), None)
+        if selected_key is None:
+            raise HTTPException(status_code=404, detail='API Key not found')
+        legacy_api_key = selected_key['api']
 
     if start_datetime or end_datetime:
         try:
@@ -1560,6 +1570,10 @@ async def get_usage_analysis(
             "FROM request_stats WHERE 1=1"
         )
         params: list = []
+        if api_key_id is not None:
+            key_sql, key_params = key_history_sql(api_key_id, legacy_api_key, branch=key_scope == 'branch')
+            sql += ' AND ' + key_sql
+            params.extend(key_params)
         if start_dt:
             sql += " AND timestamp >= ?"
             params.append(start_dt)
@@ -1610,6 +1624,8 @@ async def get_usage_analysis(
                 func.coalesce(func.sum(RequestStat.total_tokens), 0).label('total_tokens'),
                 func.coalesce(func.sum(_key_analytics_sa_cost_expr()), 0.0).label('recorded_cost'),
             )
+            if api_key_id is not None:
+                query = query.where(key_history_filter(api_key_id, legacy_api_key, branch=key_scope == 'branch'))
             if start_dt:
                 query = query.where(RequestStat.timestamp >= start_dt)
             if end_dt:
@@ -1668,6 +1684,8 @@ async def get_usage_analysis(
         "end_datetime": end_detail,
         "provider_filter": provider or "all",
         "model_filter": model or "all",
+        "api_key_id": api_key_id,
+        "key_scope": key_scope,
     })
 
 
@@ -2072,59 +2090,30 @@ async def add_credits_to_api_key(
     """
     为指定的 API key 添加额度
     """
-    from core.log_config import logger
-    from utils import update_config, save_config_to_db, save_api_yaml
-    from core.env import env_bool
-    import os
-    
+    from copy import deepcopy
+    from core.key_hierarchy import raw_key_config
+    from core.stats import update_paid_api_keys_states
+    from routes.admin import _persist_config
+
     app = get_app()
-    
     if paid_key not in app.state.paid_api_keys_states:
-        raise HTTPException(
-            status_code=404,
-            detail=f"API key '{paid_key}' not found in paid API keys states."
-        )
-
-    app.state.paid_api_keys_states[paid_key]["credits"] += float(amount)
-
-    # 持久化：同步回写 app.state.config 中的 credits
-    try:
-        api_list = getattr(app.state, 'api_list', []) or []
-        if paid_key in api_list:
-            key_index = api_list.index(paid_key)
-            api_keys = app.state.config.get('api_keys', [])
-            if key_index < len(api_keys) and isinstance(api_keys[key_index], dict):
-                if 'preferences' not in api_keys[key_index]:
-                    api_keys[key_index]['preferences'] = {}
-                api_keys[key_index]['preferences']['credits'] = app.state.paid_api_keys_states[paid_key]["credits"]
-                # 首次设置 credits 时自动写入计费起始时间
-                if not api_keys[key_index]['preferences'].get('created_at'):
-                    from datetime import datetime, timezone
-                    api_keys[key_index]['preferences']['created_at'] = datetime.now(timezone.utc)
-
-                config_storage = (os.getenv("CONFIG_STORAGE") or "file").strip().lower()
-                if config_storage in ("file", "auto") or env_bool("SYNC_CONFIG_TO_FILE", False):
-                    save_api_yaml(app.state.config)
-                if config_storage in ("auto", "db"):
-                    await save_config_to_db(app.state.config)
-    except Exception as e:
-        logger.warning(f"Failed to persist credits change: {e}")
-
-    current_credits = app.state.paid_api_keys_states[paid_key]["credits"]
-    total_cost = app.state.paid_api_keys_states[paid_key]["total_cost"]
-    app.state.paid_api_keys_states[paid_key]["enabled"] = current_credits >= total_cost
-
-    logger.info(
-        f"Credits for API key '{paid_key}' updated. "
-        f"Amount added: {amount}, New credits: {current_credits}, "
-        f"Enabled: {app.state.paid_api_keys_states[paid_key]['enabled']}"
-    )
-
+        raise HTTPException(status_code=404, detail="API key not found in paid API keys states")
+    key_index = app.state.api_list.index(paid_key)
+    candidate = deepcopy(app.state.config)
+    raw = raw_key_config(candidate['api_keys'][key_index])
+    prefs = raw.setdefault('preferences', {})
+    prefs['credits'] = app.state.paid_api_keys_states[paid_key]['credits'] + float(amount)
+    if not prefs.get('created_at'):
+        prefs['created_at'] = app.state.paid_api_keys_states[paid_key].get('created_at') or datetime.now(timezone.utc)
+    candidate['api_keys'][key_index] = raw
+    await _persist_config(app, sections_to_verify=['api_keys'], candidate_config=candidate)
+    await update_paid_api_keys_states(app, paid_key)
+    state = app.state.paid_api_keys_states[paid_key]
     return JSONResponse(content={
-        "message": f"Successfully added {amount} credits to API key '{paid_key}'.",
-        "paid_key": paid_key,
-        "new_credits": current_credits,
-        "enabled": app.state.paid_api_keys_states[paid_key]["enabled"]
+        'message': 'Credits updated',
+        'paid_key': paid_key,
+        'new_credits': state['credits'],
+        'enabled': state['enabled'],
     })
 
 

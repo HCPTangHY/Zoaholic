@@ -191,7 +191,7 @@ def _filter_provider_list(
     api_key_groups = safe_get(config, 'api_keys', api_index, 'groups', default=['default'])
     if isinstance(api_key_groups, str):
         api_key_groups = [api_key_groups]
-    if not isinstance(api_key_groups, list) or not api_key_groups:
+    if not isinstance(api_key_groups, list):
         api_key_groups = ['default']
     s_key = set(api_key_groups)
 
@@ -551,6 +551,9 @@ def get_provider_list(
                         provider_list.append(new_provider)
 
                     elif request_model.endswith("*") and model_name_split.startswith(request_model.rstrip("*")):
+                        # Bind the expanded candidate to its actual upstream model, not the full channel cache.
+                        expanded_model_dict = dict(model_dict)
+                        expanded_model_dict[request_model] = model_dict[model_name_split]
                         new_provider = {
                             "provider": provider["provider"],
                             "base_url": provider.get("base_url", ""),
@@ -558,7 +561,7 @@ def get_provider_list(
                             "model": [{model_dict[model_name_split]: request_model}],
                             "preferences": provider.get("preferences", {}),
                             "tools": provider.get("tools", False),
-                            "_model_dict_cache": get_model_dict(provider),
+                            "_model_dict_cache": expanded_model_dict,
                             "project_id": provider.get("project_id", None),
                             "private_key": provider.get("private_key", None),
                             "client_email": provider.get("client_email", None),
@@ -572,7 +575,7 @@ def get_provider_list(
     return provider_list
 
 
-async def get_matching_providers(
+async def _get_matching_providers_for_key(
     request_model: str,
     config: Dict[str, Any],
     api_index: int,
@@ -620,6 +623,31 @@ async def get_matching_providers(
     
     provider_list = get_provider_list(provider_rules, config, request_model, app)
     return _filter_provider_list(provider_list, request_model, config, api_index)
+
+
+async def get_matching_providers(
+    request_model: str, config: Dict[str, Any], api_index: int, app: "FastAPI",
+    _skip_virtual: bool = False, skip_virtual: bool = False,
+) -> List[Dict[str, Any]]:
+    """Apply existing model/group rules independently at every ancestry level."""
+    from core.key_hierarchy import key_chain
+
+    current = config['api_keys'][api_index]
+    if not current.get('parent_id'):
+        return await _get_matching_providers_for_key(request_model, config, api_index, app, _skip_virtual, skip_virtual)
+    chain = key_chain(config, current['api'])
+    indices = {key['api']: index for index, key in enumerate(config['api_keys'])}
+    candidates = await _get_matching_providers_for_key(
+        request_model, config, api_index, app, _skip_virtual, skip_virtual)
+    for ancestor in chain[1:]:
+        permitted = await _get_matching_providers_for_key(
+            request_model, config, indices[ancestor['api']], app, _skip_virtual, skip_virtual)
+        allowed = {(p['provider'], get_model_dict(p)[request_model]) for p in permitted}
+        candidates = [p for p in candidates
+                      if (p['provider'], get_model_dict(p)[request_model]) in allowed]
+        if not candidates:
+            break
+    return candidates
 
 
 async def get_right_order_providers(
