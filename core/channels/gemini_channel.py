@@ -957,6 +957,12 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
                         target[key] = value
             
             converted_config = _convert_keys(google_config)
+            # 修改原因：safetySettings、toolConfig、cachedContent 是请求根节点字段，合并进 generationConfig 会被 Google 以 400 拒绝。
+            # 修改方式：这三个字段放到 payload 根节点（覆盖默认的 safetySettings），其余字段照旧合并进 generationConfig。
+            # 目的：按 Google 文档用 extra_body.google.cached_content 等写法的请求能正常发出。
+            for key in ("safetySettings", "toolConfig", "cachedContent"):
+                if key in converted_config:
+                    payload[key] = converted_config.pop(key)
             # 合并到 generationConfig 中（extra_body.google.thinking_config -> generationConfig.thinkingConfig）
             _deep_merge(payload["generationConfig"], converted_config)
 

@@ -74,6 +74,28 @@ def _parse_gemini_tools(native_body: Dict[str, Any]) -> Optional[List[Dict[str, 
     return tools or None
 
 
+def _parse_gemini_tool_choice(native_body: Dict[str, Any]) -> Optional[Any]:
+    """toolConfig.functionCallingConfig -> OpenAI tool_choice"""
+    tool_config = native_body.get("toolConfig") or native_body.get("tool_config")
+    if not isinstance(tool_config, dict):
+        return None
+    fcc = tool_config.get("functionCallingConfig") or tool_config.get("function_calling_config")
+    if not isinstance(fcc, dict):
+        return None
+
+    mode = str(fcc.get("mode") or "").upper()
+    if mode == "AUTO":
+        return "auto"
+    if mode == "NONE":
+        return "none"
+    if mode == "ANY":
+        names = fcc.get("allowedFunctionNames") or fcc.get("allowed_function_names") or []
+        if isinstance(names, list) and len(names) == 1:
+            return {"type": "function", "function": {"name": names[0]}}
+        return "required"
+    return None
+
+
 async def parse_gemini_request(
     native_body: Dict[str, Any],
     path_params: Dict[str, str],
@@ -87,6 +109,7 @@ async def parse_gemini_request(
     - systemInstruction -> system message
     - generationConfig -> temperature/max_tokens/top_p/top_k
     - tools.function_declarations -> tools
+    - toolConfig.functionCallingConfig -> tool_choice
     """
     messages: List[Message] = []
 
@@ -245,6 +268,10 @@ async def parse_gemini_request(
         gen_config = {}
 
     tools = _parse_gemini_tools(native_body)
+    # 修改原因：toolConfig 原先被原样塞进 extra_body.google，OpenAI/Claude 等渠道读不到，强制调用（ANY）和禁止调用（NONE）都会失效。
+    # 修改方式：转换成 tool_choice，并不再放进 extra_body.google；没有工具声明时不设置，避免上游因只有 tool_choice 报错。
+    # 目的：Gemini 原生客户端的函数调用模式在非 Gemini 渠道上同样生效。
+    tool_choice = _parse_gemini_tool_choice(native_body) if tools else None
 
     if not messages:
         messages = [Message(role="user", content="")]
@@ -253,7 +280,7 @@ async def parse_gemini_request(
     # 这样可以确保像 thinkingConfig 这样的字段能透传到上游
     google_extra = {
         k: v for k, v in native_body.items()
-        if k not in ("contents", "systemInstruction", "generationConfig", "tools", "model", "stream")
+        if k not in ("contents", "systemInstruction", "generationConfig", "tools", "toolConfig", "tool_config", "model", "stream")
     }
     # 合并 generationConfig 中的额外字段
     for k, v in gen_config.items():
@@ -268,6 +295,7 @@ async def parse_gemini_request(
         top_p=gen_config.get("topP"),
         top_k=gen_config.get("topK"),
         tools=tools,
+        tool_choice=tool_choice,
         stream=stream_flag,
         extra_body={"google": google_extra} if google_extra else None,
     )
