@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import time
 from typing import Any, Dict, Optional
 
@@ -18,6 +19,7 @@ def _b64url_decode(data: str) -> bytes:
 
 
 _CACHED_SECRET: Optional[str] = None
+_EPHEMERAL_SECRET = secrets.token_urlsafe(48)
 
 
 def set_jwt_secret(secret: str) -> None:
@@ -35,7 +37,7 @@ def _jwt_secret() -> str:
     优先级：
     1) 进程内缓存（set_jwt_secret 注入）
     2) 环境变量 JWT_SECRET（推荐，但不是必须）
-    3) 临时默认值（仅用于未初始化阶段；初始化后会写入 DB 并注入缓存）
+    3) 每个进程独立生成的临时随机密钥（初始化后会写入 DB 并注入缓存）
     """
 
     if _CACHED_SECRET:
@@ -45,7 +47,7 @@ def _jwt_secret() -> str:
     if env:
         return env
 
-    return "dev-insecure-jwt-secret"
+    return _EPHEMERAL_SECRET
 
 
 def issue_jwt(payload: Dict[str, Any], *, expires_in_seconds: int = 7 * 24 * 3600) -> str:

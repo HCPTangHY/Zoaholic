@@ -9,6 +9,7 @@ except ModuleNotFoundError:
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 from starlette.responses import Response
@@ -1135,14 +1136,21 @@ SPA_ROUTES = ["/channels", "/playground", "/admin", "/settings", "/logs", "/logi
 # 缓存控制头：index.html 不缓存，静态资源（带 hash）长期缓存
 HTML_NO_CACHE_HEADERS = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
 ASSET_CACHE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}  # 1 年
+STATIC_ROOT = Path("./static").resolve()
 
 @app.get("/{path:path}")
 async def spa_fallback(path: str):
-    index_html = "./static/index.html"
+    try:
+        static_file = (STATIC_ROOT / path).resolve()
+        index_html = (STATIC_ROOT / "index.html").resolve()
+        if not static_file.is_relative_to(STATIC_ROOT) or not index_html.is_relative_to(STATIC_ROOT):
+            raise ValueError("Path escapes static root")
+    except (OSError, RuntimeError, ValueError):
+        raise HTTPException(status_code=404, detail="Not found") from None
 
     # 检查是否是前端 SPA 路由
     if path == "" or any(path.startswith(route.lstrip("/")) for route in SPA_ROUTES):
-        if os.path.isfile(index_html):
+        if index_html.is_file():
             return FileResponse(index_html, headers=HTML_NO_CACHE_HEADERS)
         # 未构建前端时，不要 500；提示用户如何生成
         return JSONResponse(
@@ -1153,15 +1161,14 @@ async def spa_fallback(path: str):
         )
 
     # 尝试返回静态文件
-    static_file = f"./static/{path}"
-    if os.path.isfile(static_file):
+    if static_file.is_file():
         # 带 hash 的静态资源可以长期缓存
         if "/assets/" in path or path.endswith((".js", ".css", ".woff2", ".woff", ".ttf")):
             return FileResponse(static_file, headers=ASSET_CACHE_HEADERS)
         return FileResponse(static_file)
 
     # 默认返回 index.html（若存在）
-    if os.path.isfile(index_html):
+    if index_html.is_file():
         return FileResponse(index_html, headers=HTML_NO_CACHE_HEADERS)
 
     return JSONResponse(

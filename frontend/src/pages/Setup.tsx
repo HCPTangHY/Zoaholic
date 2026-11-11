@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useAuthStore } from '../store/authStore';
 
 export default function Setup() {
   const [loading, setLoading] = useState(false);
@@ -9,8 +8,9 @@ export default function Setup() {
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [requiresAdminKey, setRequiresAdminKey] = useState(false);
+  const [existingAdminKey, setExistingAdminKey] = useState('');
 
-  const login = useAuthStore((s) => s.login);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -20,6 +20,7 @@ export default function Setup() {
         const res = await fetch('/setup/status');
         if (res.ok) {
           const data = await res.json();
+          setRequiresAdminKey(Boolean(data?.has_config));
           if (data?.needs_setup === false) {
             navigate('/login');
             return;
@@ -56,7 +57,10 @@ export default function Setup() {
     try {
       const res = await fetch('/setup/init', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(requiresAdminKey ? { Authorization: `Bearer ${existingAdminKey.trim()}` } : {}),
+        },
         body: JSON.stringify({
           username,
           password,
@@ -107,6 +111,20 @@ export default function Setup() {
 
         <form onSubmit={handleSubmit} className="bg-card border border-border p-8 rounded-2xl shadow-lg">
           <div className="space-y-4">
+            {requiresAdminKey && (
+              <div>
+                <label className="text-sm font-medium text-foreground mb-1.5 block">现有管理员 API Key</label>
+                <p className="text-xs text-muted-foreground mb-2">检测到已有配置，请验证管理员权限以补建账号。</p>
+                <input
+                  type="password"
+                  value={existingAdminKey}
+                  onChange={(e) => setExistingAdminKey(e.target.value)}
+                  className="w-full bg-background border border-border focus:border-primary focus:ring-1 focus:ring-primary rounded-lg px-4 py-2.5 outline-none"
+                  autoComplete="off"
+                  required
+                />
+              </div>
+            )}
             <div>
               <label className="text-sm font-medium text-foreground mb-1.5 block">管理员用户名</label>
               <input

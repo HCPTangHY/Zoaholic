@@ -6,14 +6,16 @@
 - 该路由使用 /setup 前缀（非 /v1），避免被 StatsMiddleware 对 /v1 的 API Key 鉴权拦截。
 """
 
+import asyncio
 import os
 import secrets
 from typing import Optional
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from core.log_config import logger
+from core.auth import verify_admin_api_key
 from core.security import hash_password, verify_password
 from routes.deps import get_app
 from utils import update_config, load_config_from_db
@@ -21,6 +23,7 @@ from db import DISABLE_DATABASE, async_session_scope
 
 
 router = APIRouter(prefix="/setup", tags=["Setup"])
+_setup_lock = asyncio.Lock()
 
 
 def _get_config_storage() -> str:
@@ -86,7 +89,7 @@ async def _get_admin_user():
         return await db.get(AdminUser, 1)
 
 
-async def _upsert_admin_user(username: str, password: str, jwt_secret: str) -> None:
+async def _create_admin_user(username: str, password: str, jwt_secret: str) -> None:
     from db import AdminUser
 
     if DISABLE_DATABASE:
@@ -106,23 +109,14 @@ async def _upsert_admin_user(username: str, password: str, jwt_secret: str) -> N
                     [1, username, pwd_hash, jwt_secret],
                 )
             else:
-                existing_secret = existing.get("jwt_secret")
-                next_secret = existing_secret if existing_secret else jwt_secret
-                await db.execute(
-                    "UPDATE admin_user SET username = ?, password_hash = ?, jwt_secret = ? WHERE id = ?",
-                    [username, pwd_hash, next_secret, 1],
-                )
+                raise HTTPException(status_code=409, detail="Already initialized")
         else:
             existing = await db.get(AdminUser, 1)
             if existing is None:
                 existing = AdminUser(id=1, username=username, password_hash=pwd_hash, jwt_secret=jwt_secret)
                 db.add(existing)
             else:
-                existing.username = username
-                existing.password_hash = pwd_hash
-                # 若之前没有 jwt_secret，则补上
-                if not existing.jwt_secret:
-                    existing.jwt_secret = jwt_secret
+                raise HTTPException(status_code=409, detail="Already initialized")
             await db.commit()
 
 
@@ -168,7 +162,7 @@ async def setup_status():
 
 
 @router.post("/init", response_model=SetupInitResponse)
-async def setup_init(payload: SetupInitRequest = Body(...)):
+async def setup_init(request: Request, payload: SetupInitRequest = Body(...)):
     """首次初始化：设置管理员账号密码，并写入最小可用配置到 DB。
 
     返回：管理员 API Key（用于 OpenAI 兼容 API 的管理接口鉴权）。
@@ -177,6 +171,11 @@ async def setup_init(payload: SetupInitRequest = Body(...)):
     - 后续建议通过 /auth/login 使用“账号密码 + JWT”登录管理控制台。
     """
 
+    async with _setup_lock:
+        return await _setup_init(request, payload)
+
+
+async def _setup_init(request: Request, payload: SetupInitRequest):
     if DISABLE_DATABASE:
         raise HTTPException(
             status_code=500,
@@ -188,20 +187,19 @@ async def setup_init(payload: SetupInitRequest = Body(...)):
 
     app = get_app()
 
-    # 兼容“配置已存在但管理员账号丢失/未写入”的修复场景：
-    # - 这种情况下 /auth/login 会 404（Admin user not initialized）
-    # - 但 /setup/init 又会因为已有 api_list 而 409
-    # 这里允许在 has_config=True 且 admin_user 为空时补建管理员账号，而不覆盖现有配置。
+    # 仅空白部署允许匿名初始化；已有配置的账号修复必须验证现有管理员凭证。
     admin_user = await _get_admin_user()
     has_config = bool(getattr(app.state, "api_list", None))
 
-    # 如果配置和管理员账号都已存在，则拒绝重复初始化
-    if has_config and admin_user is not None:
+    # 已有账号不能因配置暂时丢失而被覆盖。
+    if admin_user is not None:
         raise HTTPException(status_code=409, detail="Already initialized")
+    if has_config:
+        await verify_admin_api_key(request, credentials=None)
 
     # 1) 写入/更新管理员账号 + 生成并持久化 JWT secret（用户无需手动配置 JWT_SECRET 环境变量）
     jwt_secret = secrets.token_urlsafe(48)
-    await _upsert_admin_user(payload.username.strip(), payload.password, jwt_secret)
+    await _create_admin_user(payload.username.strip(), payload.password, jwt_secret)
 
     # 同步到当前进程（避免无需重启即可登录）
     try:
