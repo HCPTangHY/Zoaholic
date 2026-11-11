@@ -6,6 +6,8 @@ from typing import Optional
 import httpx
 from fastapi import HTTPException
 
+from core.public_fetch import PublicURLTransport
+
 
 _shared_fetch_client: Optional[httpx.AsyncClient] = None
 _shared_fetch_client_lock = asyncio.Lock()
@@ -58,14 +60,13 @@ async def _get_shared_fetch_client() -> httpx.AsyncClient:
         if _shared_fetch_client is not None:
             return _shared_fetch_client
 
-        transport = httpx.AsyncHTTPTransport(http2=True, verify=False, retries=1)
-        limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
+        transport = PublicURLTransport()
         timeout = httpx.Timeout(connect=15.0, read=30.0, write=30.0, pool=10.0)
         _shared_fetch_client = httpx.AsyncClient(
             transport=transport,
-            limits=limits,
             timeout=timeout,
-            follow_redirects=True,
+            follow_redirects=False,
+            trust_env=False,
         )
         return _shared_fetch_client
 
@@ -79,14 +80,28 @@ async def close_shared_fetch_client() -> None:
 
 
 async def fetch_url_content(url: str) -> tuple[bytes, str]:
-    client = await _get_shared_fetch_client()
     try:
-        response = await client.get(url)
-        response.raise_for_status()
-        content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
-        return response.content, content_type
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to fetch file from url: {url}. Error: {str(e)}")
+        target = httpx.URL(url)
+        client = await _get_shared_fetch_client()
+        for _ in range(6):
+            if (
+                target.scheme not in ("http", "https") or not target.host
+                or target.userinfo or "%" in target.host or target.port == 0
+            ):
+                raise ValueError("Invalid file URL")
+            # Every new connection, including redirects, uses the public-only backend.
+            async with client.stream("GET", target) as response:
+                if response.has_redirect_location:
+                    target = response.next_request.url
+                    continue
+                response.raise_for_status()
+                content = await response.aread()
+                content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
+                return content, content_type
+        raise ValueError("Too many redirects")
+    except Exception:
+        # Do not disclose internal addresses, response bodies or network errors.
+        raise HTTPException(status_code=400, detail="Unable to fetch file from a public HTTP(S) URL") from None
 
 
 async def get_base64_file(file_url_or_data: str) -> tuple[str, str]:
