@@ -113,7 +113,7 @@ docker run --rm -p 8000:8000 \
 | `CONFIG_STORAGE` | `file` | 配置来源策略：`auto\|db\|file\|url`。默认 `file`（`api.yaml` 为权威配置源）；云平台可用 `auto`（文件权威并同步写入 DB）或 `db`（DB 权威）。 |
 | `SYNC_CONFIG_TO_FILE` | `false` | 是否把配置同步写回 `api.yaml`。线上通常文件系统只读/临时，建议保持 `false`。 |
 | `JWT_SECRET` | （可选） | 管理控制台 JWT 签名密钥。**不设置也能用**：首次 `/setup` 会自动生成并持久化到 DB（`admin_user.jwt_secret`），后续重启复用。出于安全考虑仍建议在部署阶段直接设置环境变量。 |
-| `DISABLE_DATABASE` | `false` | 是否关闭数据库。线上一般不要关（否则无法配置入库/无法统计）。 |
+| `DISABLE_DATABASE` | `false` | 是否关闭数据库。关闭后不能完成管理员初始化，普通和管理 API 均不可用。 |
 
 ### Cloudflare D1（可选）
 
@@ -133,10 +133,18 @@ docker run --rm -p 8000:8000 \
 | `CONFIG_YAML` | YAML 文本 | 直接用环境变量提供配置种子。 |
 | `CONFIG_YAML_BASE64` | base64(YAML) | 推荐方式：把 `api.yaml` base64 后放这里，首次启动会写入 DB。 |
 | `CONFIG_URL` | `https://.../api.yaml` | 从 URL 拉取配置种子（首次写入 DB）。 |
-| `ADMIN_API_KEY` / `ADMIN_API_KEYS` | `zk-...` | 当没有任何配置来源时，生成一个“最小可启动配置”（只含管理员 key），便于先启动再进控制台完善配置。 |
+| `ADMIN_API_KEY` / `ADMIN_API_KEYS` | `zk-...` | 当没有其他配置来源时生成管理员 Key 配置。仍需在 `/setup` 使用该 Key 验证身份并创建管理员账号，之后才开放 API。 |
 | `DEBUG` | `true/false` | 开启调试日志。 |
 
 ---
+
+## 初始化与安全要求
+
+普通 API Key、管理员 API Key 和管理员 JWT 均要求完成管理员账号初始化。仅提供 `api.yaml` 或 `JWT_SECRET` 不会开放 API。已有配置但未创建管理员时，访问 `/setup` 并提供现有的显式 `role: admin` Key；普通 User Key 不能用来补建管理员。
+
+用户提供的文件 URL 仅允许公网 HTTP(S)，不允许访问本机、内网或云元数据地址。管理员仍可安装并执行 Python 插件，管理员凭据应按服务进程级高权限凭据保管。
+
+更多部署兼容性、初始化恢复方式及限制见 [安全边界说明](docs/security-boundaries.md)。
 
 ## 配置与持久化（重点：配置入库）
 

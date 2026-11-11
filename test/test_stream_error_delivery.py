@@ -328,15 +328,19 @@ async def call_handler(handler, provider, kind, *, stream=True):
 @pytest.mark.parametrize("kind", ["passthrough", "converted"])
 async def test_handler_delayed_error_defers_channel_stats_and_next_request_avoids_key(state, monkeypatch, kind):
     gate = asyncio.Event()
+    upstream_started = asyncio.Event()
     used_keys = []
     async def upstream(request):
         used_keys.append(request.headers["authorization"])
+        upstream_started.set()
         await gate.wait()
         return httpx.Response(400, json=ERROR)
 
     async with handler_case(state, monkeypatch, upstream) as (handler, stats):
         response = await asyncio.wait_for(call_handler(handler, state.provider, kind), 2)
         assert stats == []
+        # A heartbeat can return the handler before threaded payload encoding finishes.
+        await asyncio.wait_for(upstream_started.wait(), 2)
         assert used_keys == ["Bearer fake-a"]
         _, wire = await send_response(response, gate)
         assert MESSAGE.encode() in wire
@@ -344,6 +348,8 @@ async def test_handler_delayed_error_defers_channel_stats_and_next_request_avoid
         assert stats[0][1]["provider_api_key"] == "fake-a"
         assert state.records[0]["status_code"] == 502
         # A client retry must choose a different Key, not replay the committed request internally.
+        # This retry tests a pre-commit HTTP error, not a race against the 2 ms heartbeat.
+        monkeypatch.setattr("core.handler.normalize_keepalive_interval", lambda *args: None)
         response2 = await asyncio.wait_for(call_handler(handler, state.provider, kind), 2)
         assert used_keys == ["Bearer fake-a", "Bearer fake-b"]
         assert response2.status_code == 400

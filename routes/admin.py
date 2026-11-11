@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 
 from core.env import env_bool
+from core.timeout_settings import get_timeout_defaults, validate_timeout_preferences
 from core.utils import parse_rate_limit, ThreadSafeCircularList, ApiKeyRateLimitRegistry
 from utils import update_config, API_YAML_PATH, yaml, dump_config_to_json_obj
 from core.log_config import apply_backend_log_preferences
@@ -68,6 +69,7 @@ def _validate_preferences(preferences, owner: str) -> None:
         return
     if not isinstance(preferences, dict):
         raise ValueError(f"{owner}.preferences must be an object")
+    validate_timeout_preferences(preferences, owner)
     if "rate_limit" in preferences:
         rate = preferences["rate_limit"]
         if not isinstance(rate, (str, dict)):
@@ -101,6 +103,14 @@ def _validate_candidate_shape(config: dict) -> None:
             if not isinstance(entry, dict):
                 raise ValueError(f"Each {section} entry must be an object")
             _validate_preferences(entry.get("preferences"), section)
+            if section == "providers":
+                for sub in entry.get("sub_channels") or []:
+                    if isinstance(sub, dict):
+                        preferences = sub.get("preferences")
+                        if preferences is not None:
+                            if not isinstance(preferences, dict):
+                                raise ValueError("sub_channels.preferences must be an object")
+                            validate_timeout_preferences(preferences, "sub_channels")
 
 
 async def _persist_config(app, sections_to_verify=None, changed_providers=None, *, candidate_config=None):
@@ -209,7 +219,11 @@ async def api_config(api_index: int = Depends(verify_admin_api_key)):
         key["id"]: {field: value for field, value in key.items() if not field.startswith("_") and field != "api"}
         for key in app.state.config.get("api_keys", []) if key.get("id")
     }
-    return JSONResponse(content={"api_config": encoded_config, "effective_keys": jsonable_encoder(effective_keys)}, headers={"Cache-Control": "no-store"})
+    return JSONResponse(content={
+        "api_config": encoded_config,
+        "effective_keys": jsonable_encoder(effective_keys),
+        "timeout_defaults": get_timeout_defaults(),
+    }, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/v1/api_config/update", dependencies=[Depends(rate_limit_dependency)])

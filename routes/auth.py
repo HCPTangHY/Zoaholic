@@ -7,16 +7,17 @@
 - API 网关的用户侧依旧支持 API Key。
 """
 
-import os
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from core.jwt_utils import issue_jwt, decode_jwt
+from core.initialization import ensure_initialized, get_admin_user
+from core.auth import verify_admin_api_key
 from core.security import verify_password
 from routes.deps import rate_limit_dependency, get_app
-from db import DISABLE_DATABASE, async_session_scope, AdminUser, DB_TYPE
+from db import DISABLE_DATABASE
 
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -65,32 +66,8 @@ async def login(payload: LoginRequest = Body(...)):
     if DISABLE_DATABASE:
         raise HTTPException(status_code=500, detail="Database is disabled; cannot login.")
 
-    async with async_session_scope() as db:
-        if (DB_TYPE or "sqlite").lower() == "d1":
-            row = await db.query_one(
-                "SELECT id, username, password_hash, jwt_secret FROM admin_user WHERE id = ?",
-                [1],
-            )
-            admin_user = (
-                AdminUser(
-                    id=int(row.get("id") or 1),
-                    username=str(row.get("username") or ""),
-                    password_hash=str(row.get("password_hash") or ""),
-                    jwt_secret=row.get("jwt_secret"),
-                ) if row else None
-            )
-        else:
-            admin_user = await db.get(AdminUser, 1)
-
-    # 若没有显式配置 JWT_SECRET，则优先使用 DB 中持久化的 jwt_secret
-    try:
-        from core.jwt_utils import set_jwt_secret
-
-        if not (os.getenv("JWT_SECRET") or "").strip():
-            if admin_user is not None and admin_user.jwt_secret:
-                set_jwt_secret(str(admin_user.jwt_secret))
-    except Exception:
-        pass
+    await ensure_initialized(get_app())
+    admin_user = await get_admin_user()
 
     if admin_user is None:
         raise HTTPException(status_code=404, detail="Admin user not initialized. Please visit /setup.")
@@ -108,19 +85,14 @@ async def login(payload: LoginRequest = Body(...)):
     conf = getattr(app.state, "config", None) or {}
     admin_api_key = _select_admin_api_key_from_config(conf)
 
-    # 同步内存标记：已初始化
-    app.state.needs_setup = False
-
     return LoginResponse(access_token=token, admin_api_key=admin_api_key)
 
 
 @router.get("/me", response_model=MeResponse, dependencies=[Depends(rate_limit_dependency)])
 async def me(request: Request):
-    auth = request.headers.get("Authorization") or ""
-    token = auth.split(" ", 1)[1].strip() if auth.startswith("Bearer ") else ""
-
+    token = await verify_admin_api_key(request, None)
     payload = decode_jwt(token)
-    if not payload:
+    if not payload or str(payload.get("role", "")).lower() != "admin":
         raise HTTPException(status_code=403, detail="Invalid or expired token")
 
     role = str(payload.get("role", "user"))

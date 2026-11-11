@@ -69,7 +69,7 @@ def _resolve_path(rel_path: str) -> Path:
     normalized = _normalize_rel(rel_path)
     absolute = (PROJECT_ROOT / normalized).resolve()
     # 确保在项目根目录内
-    if not str(absolute).startswith(str(PROJECT_ROOT)):
+    if not absolute.is_relative_to(PROJECT_ROOT):
         raise HTTPException(status_code=403, detail="路径超出允许范围")
     return absolute
 

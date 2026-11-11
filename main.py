@@ -41,7 +41,7 @@ from core.error_response import create_error_response, openai_error_response
 
 from utils import safe_get, load_config
 
-from db import DISABLE_DATABASE, RequestStat, AdminUser, DB_TYPE, async_session_scope
+from db import DISABLE_DATABASE, RequestStat, DB_TYPE, async_session_scope
 from core.stats import (
     create_tables,
     update_paid_api_keys_states,
@@ -634,6 +634,8 @@ async def lifespan(app: FastAPI):
     set_handler_debug_mode(is_debug)
     app.state.version = VERSION
     app.state.started_at = datetime.now(timezone.utc)
+    app.state.admin_initialized = False
+    app.state.needs_setup = True
     app.state.startup_completed = False
     
     # 启动定时清理任务
@@ -649,25 +651,6 @@ async def lifespan(app: FastAPI):
             logger.exception("Database init failed during startup: %s", e)
             raise
 
-        # 确保 JWT_SECRET 在进程启动后就已确定（避免后端热更新/重启导致前端旧 JWT 立刻 403）
-        # 规则：若未显式设置环境变量 JWT_SECRET，则使用 DB 中持久化的 admin_user.jwt_secret。
-        try:
-            from core.jwt_utils import set_jwt_secret
-
-            if not (os.getenv("JWT_SECRET") or "").strip():
-                async with async_session_scope() as db:
-                    if (DB_TYPE or "sqlite").lower() == "d1":
-                        row = await db.query_one("SELECT jwt_secret FROM admin_user WHERE id = ?", [1])
-                        jwt_secret = row.get("jwt_secret") if row else None
-                    else:
-                        admin_user = await db.get(AdminUser, 1)
-                        jwt_secret = getattr(admin_user, "jwt_secret", None) if admin_user is not None else None
-
-                if jwt_secret:
-                    set_jwt_secret(str(jwt_secret))
-        except Exception as e:
-            logger.debug("JWT secret init skipped/failed: %s", e)
-
         cleanup_task = asyncio.create_task(cleanup_expired_raw_data())
         logger.info("Started raw data cleanup background task")
         if (DB_TYPE or "sqlite").lower() == "sqlite":
@@ -677,8 +660,6 @@ async def lifespan(app: FastAPI):
     if app and not hasattr(app.state, 'config'):
         # logger.warning("Config not found, attempting to reload")
         app.state.config, app.state.api_keys_db, app.state.api_list = await load_config(app)
-        # 用于前端判断是否需要进入初始化向导
-        app.state.needs_setup = not bool(app.state.api_list)
         # from ruamel.yaml.timestamp import TimeStamp
         # def json_default(obj):
         #     if isinstance(obj, TimeStamp):
@@ -745,6 +726,14 @@ async def lifespan(app: FastAPI):
             logger.info("Started logs retention cleanup background task")
         except Exception as e:
             logger.error(f"Failed to start logs retention cleanup task: {e}")
+
+    from core.initialization import refresh_initialization
+    try:
+        await refresh_initialization(app, force=True, repair_secret=True)
+    except Exception:
+        app.state.admin_initialized = False
+        app.state.needs_setup = True
+        logger.exception("Administrator initialization failed; protected APIs remain disabled")
 
     if app and not hasattr(app.state, 'client_manager'):
 
@@ -1128,18 +1117,34 @@ model_handler: Optional[ModelRequestHandler] = None
 # SPA 前端路由 fallback - 所有未匹配的前端路由都返回 index.html
 from fastapi.responses import FileResponse
 
-# 修改原因：Key Analytics 是前端独立路由，直接刷新页面时也应返回 SPA index.html。
-# 修改方式：把 /key-analytics 加入服务端 fallback 白名单。
-# 目的：避免浏览器刷新新增页面时落到静态文件 404。
-SPA_ROUTES = ["/channels", "/playground", "/admin", "/settings", "/logs", "/login"]
-
-# 缓存控制头：index.html 不缓存，静态资源（带 hash）长期缓存
-HTML_NO_CACHE_HEADERS = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
-ASSET_CACHE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}  # 1 年
 STATIC_ROOT = Path("./static").resolve()
+SPA_ROUTES = ["/channels", "/playground", "/admin", "/settings", "/logs", "/login"]
+HTML_NO_CACHE_HEADERS = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
+ASSET_CACHE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}
+
+
+class CachedStaticFiles(StaticFiles):
+    """Keep PR #33's immutable asset caching with StaticFiles path/range handling."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if response.status_code in (200, 206, 304):
+            response.headers.update(ASSET_CACHE_HEADERS)
+        return response
+
+
+# Mount safe asset handlers before the fallback, without losing cache headers.
+for asset_directory in ("assets", "icons"):
+    directory = STATIC_ROOT / asset_directory
+    if directory.is_dir() and directory.resolve().is_relative_to(STATIC_ROOT):
+        handler = CachedStaticFiles if asset_directory == "assets" else StaticFiles
+        app.mount(f"/{asset_directory}", handler(directory=directory), name=asset_directory)
+
 
 @app.get("/{path:path}")
 async def spa_fallback(path: str):
+    if path.startswith("/") or "\\" in path or "\x00" in path or ".." in path.split("/"):
+        raise HTTPException(status_code=404, detail="Not found")
     try:
         static_file = (STATIC_ROOT / path).resolve()
         index_html = (STATIC_ROOT / "index.html").resolve()
@@ -1162,7 +1167,9 @@ async def spa_fallback(path: str):
 
     # 尝试返回静态文件
     if static_file.is_file():
-        # 带 hash 的静态资源可以长期缓存
+        if static_file.suffix == ".html":
+            return FileResponse(static_file, headers=HTML_NO_CACHE_HEADERS)
+        # 保留 PR 的其他前端资源缓存行为。
         if "/assets/" in path or path.endswith((".js", ".css", ".woff2", ".woff", ".ttf")):
             return FileResponse(static_file, headers=ASSET_CACHE_HEADERS)
         return FileResponse(static_file)
@@ -1177,14 +1184,6 @@ async def spa_fallback(path: str):
             "detail": "Frontend is not built.",
         },
     )
-
-# 添加静态文件挂载（用于 assets、icons 等静态资源）
-# 注意：当仅提交源代码且未构建前端时，static 目录可能只有 .gitkeep。
-# 因此这里只在目录存在时才挂载，避免启动时报错。
-if os.path.isdir("./static/assets"):
-    app.mount("/assets", StaticFiles(directory="./static/assets"), name="assets")
-if os.path.isdir("./static/icons"):
-    app.mount("/icons", StaticFiles(directory="./static/icons"), name="icons")
 
 if __name__ == '__main__':
     import uvicorn

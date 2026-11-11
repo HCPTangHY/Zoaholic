@@ -17,6 +17,7 @@ from core.ip_blacklist import (
     raise_ip_blocked,
 )
 from core.log_config import logger
+from core.initialization import ensure_initialized, require_initialized
 from utils import InMemoryRateLimiter
 
 # 全局安全方案和速率限制器
@@ -126,6 +127,7 @@ def authenticate_api_key_token(
     request: Optional[Request] = None,
 ) -> int:
     """统一校验普通/方言请求的 API Key（含全局与 Key 级 IP 黑名单、BYOK 前缀、Admin JWT、Key 禁用检查与统计身份回写）。"""
+    require_initialized(app)
     if is_global_ip_blocked(app, client_ip):
         raise_ip_blocked()
 
@@ -203,6 +205,7 @@ async def verify_api_key(
     - 管理控制台的 admin JWT（Authorization: Bearer <jwt>）
       会被映射到配置中的 admin API Key 的 api_index。
     """
+    await ensure_initialized(request.app)
     token = await _extract_token(request, credentials)
     client_ip = get_client_ip_from_request_info()
     return authenticate_api_key_token(request.app, token, client_ip, request=request)
@@ -222,6 +225,7 @@ async def verify_admin_api_key(
     """
 
     app = request.app
+    await ensure_initialized(app)
 
     token = await _extract_token(request, credentials)
     client_ip = get_client_ip_from_request_info()
@@ -256,6 +260,15 @@ async def verify_admin_api_key(
         pass
 
     # 2) 回退按 admin API key 处理
+    return authenticate_admin_api_key_token(app, token, client_ip)
+
+
+def authenticate_admin_api_key_token(app, token: Optional[str], client_ip: Optional[str], *, require_explicit_role=False) -> str:
+    """Static admin credential only; setup recovery is the sole caller bypassing readiness."""
+    if is_global_ip_blocked(app, client_ip):
+        raise_ip_blocked()
+    if not token:
+        raise HTTPException(status_code=403, detail="Invalid or missing credentials")
     api_list = app.state.api_list
 
     api_index: Optional[int] = None
@@ -280,6 +293,11 @@ async def verify_admin_api_key(
         # 修改方式：普通 admin key 匹配成功后按 api_index 检查预解析黑名单。
         # 目的：管理端和用户端都遵守同一层级的访问控制规则。
         raise_ip_blocked()
+
+    if require_explicit_role:
+        if str(app.state.api_keys_db[api_index].get("role", "")).lower() != "admin":
+            raise HTTPException(status_code=403, detail="An explicitly configured administrator API Key is required")
+        return token
 
     # 单 key 情况直接视为 admin
     if len(api_list) == 1:

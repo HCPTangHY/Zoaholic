@@ -96,7 +96,8 @@ class PluginLoader:
     
     def _get_plugin_module_name(self, file_path: Path) -> str:
         """生成插件模块名"""
-        return f"zoaholic_plugins.{file_path.stem}"
+        name = file_path.parent.name if file_path.name == "__init__.py" else file_path.stem
+        return f"zoaholic_plugins.{name}"
     
     def _extract_plugin_info(self, module: Any, name: str, path: str, source: str) -> PluginInfo:
         """从模块中提取插件信息"""
@@ -144,11 +145,12 @@ class PluginLoader:
             logger.error(f"Invalid plugin file (must be .py): {file_path}")
             return None
         
-        if path.name.startswith("_"):
+        if path.name.startswith("_") and path.name != "__init__.py":
             logger.debug(f"Skipping private module: {file_path}")
             return None
-        
-        plugin_name = path.stem
+
+        # Package uploads enter through __init__.py, which is an entrypoint, not a private helper.
+        plugin_name = path.parent.name if path.name == "__init__.py" else path.stem
         
         # 检查是否已加载
         if plugin_name in self._plugins:

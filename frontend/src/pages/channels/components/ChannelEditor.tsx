@@ -5,11 +5,12 @@ import * as Switch from '@radix-ui/react-switch';
 import {
   Plus, Edit, Brain, Trash2, ArrowRight, RefreshCw,
   Server, X, CheckCircle2, Settings2, Copy, ToggleRight, ToggleLeft,
-  Folder, Puzzle, Network, CopyCheck, Play,
+  Folder, Puzzle, Network, CopyCheck, Play, Timer,
   Check, Wallet, Link2, GripVertical, ChevronUp, ChevronDown,
   ClipboardPaste, LogIn, Download, LayoutList, LayoutGrid, MoreHorizontal, Package, FileUp
 } from 'lucide-react';
 import { InterceptorSheet } from '../../../components/InterceptorSheet';
+import { TimeoutSettings } from '../../../components/TimeoutSettings';
 import { ProviderLogo } from '../../../components/ProviderLogos';
 import { PipelineView } from './PipelineView';
 import { summarizeVirtualChain } from '../../../lib/virtualModels';
@@ -48,6 +49,8 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
     getProviderAnalyticsName, queryAllBalances, balanceResults, setBalanceResults, balanceLoading, focusedKeyIdx, setFocusedKeyIdx, forceListMode,
     setForceListMode, runtimeKeyStatus, localCountdowns, globalModelPrice, token, importPlaceholder, setImportModalIdx, setImportToken,
     setOauthManualState, setManualUrl, refreshKeyStatus,
+    timeoutGlobalPreferences, timeoutParentPreferences, timeoutDefaults,
+    timeoutSettingsValid, setTimeoutSettingsValid, timeoutEditorVersion,
   } = state;
 
   const [keyMoreMenuOpen, setKeyMoreMenuOpen] = useState(false);
@@ -1223,6 +1226,24 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                   </div>
                 </section>}
 
+                <section aria-label="渠道超时与心跳">
+                  <div className="mb-4 flex items-center gap-2 border-b border-border pb-2 text-sm font-semibold text-foreground">
+                    <Timer className="h-4 w-4 text-muted-foreground" /> 超时与心跳
+                  </div>
+                  <TimeoutSettings
+                    key={timeoutEditorVersion}
+                    scope="channel"
+                    preferences={formData.preferences}
+                    globalPreferences={timeoutGlobalPreferences}
+                    parentPreferences={editingSubChannel ? timeoutParentPreferences : undefined}
+                    inheritanceLabel={editingSubChannel ? '沿用主渠道 / 全局配置' : '沿用全局配置'}
+                    defaults={timeoutDefaults}
+                    modelSuggestions={Array.from(new Set([...formData.models, ...formData.mappings.flatMap(mapping => [mapping.from, mapping.to]), ...getProviderModelNameListForUi()])).filter(model => model && model !== '*')}
+                    onChange={next => updateFormData('preferences', next)}
+                    onValidityChange={setTimeoutSettingsValid}
+                  />
+                </section>
+
                 {/* 6. 高级设置 */}
                 <section>
                   <div className="flex items-center gap-2 text-sm font-semibold text-foreground mb-4 border-b border-border pb-2">
@@ -1577,7 +1598,7 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
 
             <div className="p-4 bg-muted/30 border-t border-border flex justify-end gap-3 flex-shrink-0">
               <Dialog.Close className="px-4 py-2 text-sm font-medium text-foreground bg-muted hover:bg-muted/80 rounded-lg">取消</Dialog.Close>
-              <button onClick={handleSave} className="px-4 py-2 text-sm font-medium text-primary-foreground bg-primary hover:bg-primary/90 rounded-lg flex items-center gap-1.5">
+              <button onClick={handleSave} disabled={!timeoutSettingsValid} className="px-4 py-2 text-sm font-medium text-primary-foreground bg-primary hover:bg-primary/90 rounded-lg flex items-center gap-1.5 disabled:cursor-not-allowed disabled:opacity-50">
                 <CheckCircle2 className="w-4 h-4" /> 保存配置
               </button>
             </div>

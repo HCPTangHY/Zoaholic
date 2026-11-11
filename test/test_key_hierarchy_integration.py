@@ -31,7 +31,7 @@ def configuration():
 async def load(raw):
     config, keys, api_list = await update_config(deepcopy(raw), save_to_file=False,
                                                save_to_db=False, skip_model_fetch=True)
-    return SimpleNamespace(state=SimpleNamespace(config=config, api_keys_db=keys,
+    return SimpleNamespace(state=SimpleNamespace(admin_initialized=True, config=config, api_keys_db=keys,
                                                 api_list=api_list, models_list={}))
 
 

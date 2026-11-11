@@ -12,6 +12,7 @@ import {
 } from 'react';
 
 import { apiFetch } from '../../../lib/api';
+import { TIMEOUT_KEYS } from '../../../lib/timeoutSettings';
 import { createApiKeyClientId } from '../../../lib/apiKeyClientId';
 import type { EnabledPluginValue } from '../../../lib/pluginEntries';
 import { toastError, toastSuccess, toastWarning, fmtErr } from '../../../components/Toast';
@@ -30,6 +31,23 @@ import {
   serializeChannelPreferences,
   sortProvidersByWeight,
 } from '../utils';
+const TIMEOUT_FIELDS = [...TIMEOUT_KEYS, 'header_timeout'];
+
+export function ownSubChannelTimeouts(merged: Record<string, any>, own: Record<string, any>): Record<string, any> {
+  const next = { ...merged };
+  for (const field of TIMEOUT_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(own, field)) next[field] = own[field];
+    else delete next[field];
+  }
+  return next;
+}
+
+export function serializeSubChannelPreferences(merged: Record<string, any>, parent: Record<string, any>): Record<string, any> {
+  return Object.fromEntries(Object.entries(merged).filter(([field, value]) =>
+    TIMEOUT_FIELDS.includes(field as typeof TIMEOUT_FIELDS[number]) || JSON.stringify(value) !== JSON.stringify(parent[field])
+  ));
+}
+
 export interface KeyTestOverride {
   engine: string;
   base_url: string;
@@ -130,6 +148,12 @@ export interface UseChannelEditorResult {
   allPlugins: UseChannelsCoreResult['allPlugins'];
   channelTypes: UseChannelsCoreResult['channelTypes'];
   globalModelPrice: UseChannelsCoreResult['globalModelPrice'];
+  timeoutDefaults: UseChannelsCoreResult['timeoutDefaults'];
+  timeoutGlobalPreferences: Record<string, any>;
+  timeoutParentPreferences?: Record<string, any>;
+  timeoutSettingsValid: boolean;
+  setTimeoutSettingsValid: Dispatch<SetStateAction<boolean>>;
+  timeoutEditorVersion: number;
   balanceResults: UseChannelsCoreResult['balanceResults'];
   setBalanceResults: UseChannelsCoreResult['setBalanceResults'];
   balanceLoading: boolean;
@@ -223,6 +247,9 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
   } = core;
 
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [timeoutSettingsValid, setTimeoutSettingsValid] = useState(true);
+  const [timeoutEditorVersion, setTimeoutEditorVersion] = useState(0);
+  const [timeoutParentPreferences, setTimeoutParentPreferences] = useState<Record<string, any>>();
   const [originalIndex, setOriginalIndex] = useState<number | null>(null);
   const [formData, setFormData] = useState<ProviderFormData | null>(null);
   const channelModalScrollYRef = useRef(0);
@@ -323,6 +350,9 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
   }, [core, formData, isOAuthEngine]);
 
   const openModal = async (provider: any = null, index: number | null = null) => {
+    setTimeoutSettingsValid(true);
+    setTimeoutEditorVersion(version => version + 1);
+    setTimeoutParentPreferences(undefined);
     setOriginalIndex(index);
     setGroupInput('');
     setModelInput('');
@@ -860,9 +890,10 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
       enabled: sub.enabled !== false,
       remark: sub.remark || '',
       groups: freshParent.groups || ['default'],
-      preferences: { ...(freshParent.preferences || {}), ...(sub.preferences || {}) },
+      preferences: ownSubChannelTimeouts({ ...(freshParent.preferences || {}), ...(sub.preferences || {}) }, sub.preferences || {}),
       sub_channels: [],
     }, null);
+    setTimeoutParentPreferences(freshParent.preferences || {});
   };
 
   const buildSubChannelProvider = (parentIdx: number, subIdx: number): any | null => {
@@ -919,6 +950,7 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
   };
 
   const openKeyTestDialog = (initialIndex: number | null = null, subOverride?: KeyTestOverride) => {
+    if (isModalOpen && !timeoutSettingsValid) { toastWarning('请先完成超时与心跳配置'); return; }
     // 修改原因：Key 测试面板可能叠在编辑抽屉上，也可能由列表入口触发，不能只依赖编辑抽屉的打开流程。
     // 修改方式：打开前调用同一滚动锁；已有编辑抽屉锁时 applyChannelModalScrollLock 会直接返回，不覆盖原始 scrollY 快照。
     // 目的：统一保护测试面板关闭后的渠道列表位置，并避免嵌套弹窗互相覆盖恢复数据。
@@ -929,7 +961,7 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
   };
 
   const buildProviderSnapshotForTest = (): any => {
-    if (!formData) return null;
+    if (!formData || !timeoutSettingsValid) return null;
     const serializedKeys: (string | Record<string, string>)[] = formData.api_keys
       .map(k => {
         const raw = k.disabled ? `!${k.key.trim()}` : k.key.trim();
@@ -954,7 +986,9 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
     let statusCodeOverridesObj: Record<string, number> | undefined = undefined;
     try { if (statusCodeOverridesJson.trim()) statusCodeOverridesObj = JSON.parse(statusCodeOverridesJson); } catch { /* ignore */ }
     const normalizedPoolSharing = formData.model_prefix.trim() ? !!formData.preferences.pool_sharing : false;
-    const serializedPreferences = serializeChannelPreferences(formData.preferences);
+    // Test snapshots represent a runtime channel; persisted sub-channel fields remain raw.
+    const testPreferences = editingSubChannel ? { ...timeoutParentPreferences, ...formData.preferences } : formData.preferences;
+    const serializedPreferences = serializeChannelPreferences(testPreferences);
     return {
       provider: formData.provider,
       remark: formData.remark || undefined,
@@ -998,6 +1032,7 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
   };
 
   const handleSave = async () => {
+    if (!timeoutSettingsValid) { toastWarning('请先完成超时与心跳配置'); return; }
     if (!formData?.provider) {
       toastWarning('渠道名称为必填项');
       return;
@@ -1105,11 +1140,8 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
         return;
       }
       const parentPrefs = parent.preferences || {};
-      const subPrefs: Record<string, any> = {};
       const mergedPrefs = { ...serializedPreferences, pool_sharing: normalizedPoolSharing, model_price: cleanedModelPrice, headers: headersObj, post_body_parameter_overrides: overridesObj, status_code_overrides: statusCodeOverridesObj };
-      for (const [k, v] of Object.entries(mergedPrefs)) {
-        if (JSON.stringify(v) !== JSON.stringify(parentPrefs[k])) subPrefs[k] = v;
-      }
+      const subPrefs = serializeSubChannelPreferences(mergedPrefs, parentPrefs);
       const subObj: any = { engine: formData.engine, model: finalModels.length > 0 ? finalModels : undefined, enabled: formData.enabled };
       if (formData.base_url && formData.base_url !== (parent.base_url || '')) subObj.base_url = formData.base_url;
       if (formData.token_url && formData.token_url !== (parent.token_url || '')) subObj.token_url = formData.token_url;
@@ -1191,6 +1223,9 @@ export function useChannelEditor(core: UseChannelsCoreResult): UseChannelEditorR
     allPlugins,
     channelTypes,
     globalModelPrice,
+    timeoutDefaults: core.timeoutDefaults,
+    timeoutGlobalPreferences: core.apiConfigPreferences,
+    timeoutParentPreferences, timeoutSettingsValid, setTimeoutSettingsValid, timeoutEditorVersion,
     balanceResults,
     setBalanceResults,
     balanceLoading,

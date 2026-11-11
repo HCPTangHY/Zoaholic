@@ -15,7 +15,8 @@ from fastapi import APIRouter, Body, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from core.log_config import logger
-from core.auth import verify_admin_api_key
+from core.auth import _extract_token, authenticate_admin_api_key_token
+from core.initialization import ensure_initialized, get_admin_user, refresh_initialization
 from core.security import hash_password, verify_password
 from routes.deps import get_app
 from utils import update_config, load_config_from_db
@@ -39,6 +40,7 @@ class SetupStatus(BaseModel):
     needs_setup: bool
     has_config: bool
     has_admin_user: bool
+    database_enabled: bool
 
 
 class SetupInitRequest(BaseModel):
@@ -64,29 +66,7 @@ class SetupLoginResponse(BaseModel):
 
 
 async def _get_admin_user():
-    # 延迟导入，避免循环引用
-    from db import AdminUser
-
-    if DISABLE_DATABASE:
-        return None
-
-    from db import DB_TYPE
-
-    async with async_session_scope() as db:
-        if (DB_TYPE or "sqlite").lower() == "d1":
-            row = await db.query_one(
-                "SELECT id, username, password_hash, jwt_secret FROM admin_user WHERE id = ?",
-                [1],
-            )
-            if not row:
-                return None
-            return AdminUser(
-                id=int(row.get("id") or 1),
-                username=str(row.get("username") or ""),
-                password_hash=str(row.get("password_hash") or ""),
-                jwt_secret=row.get("jwt_secret"),
-            )
-        return await db.get(AdminUser, 1)
+    return await get_admin_user()
 
 
 async def _create_admin_user(username: str, password: str, jwt_secret: str) -> None:
@@ -100,24 +80,22 @@ async def _create_admin_user(username: str, password: str, jwt_secret: str) -> N
     pwd_hash = hash_password(password)
     jwt_secret = (jwt_secret or "").strip()
 
-    async with async_session_scope() as db:
-        if (DB_TYPE or "sqlite").lower() == "d1":
-            existing = await db.query_one("SELECT id, jwt_secret FROM admin_user WHERE id = ?", [1])
-            if existing is None:
+    # Keep the PR's create-only behavior. The unique id also arbitrates setup
+    # requests from different workers; report the losing insert as a conflict.
+    try:
+        async with async_session_scope() as db:
+            if (DB_TYPE or "sqlite").lower() == "d1":
                 await db.execute(
                     "INSERT INTO admin_user (id, username, password_hash, jwt_secret) VALUES (?, ?, ?, ?)",
                     [1, username, pwd_hash, jwt_secret],
                 )
             else:
-                raise HTTPException(status_code=409, detail="Already initialized")
-        else:
-            existing = await db.get(AdminUser, 1)
-            if existing is None:
-                existing = AdminUser(id=1, username=username, password_hash=pwd_hash, jwt_secret=jwt_secret)
-                db.add(existing)
-            else:
-                raise HTTPException(status_code=409, detail="Already initialized")
-            await db.commit()
+                db.add(AdminUser(id=1, username=username, password_hash=pwd_hash, jwt_secret=jwt_secret))
+                await db.commit()
+    except Exception:
+        if await _get_admin_user() is not None:
+            raise HTTPException(status_code=409, detail="Administrator was initialized by another request") from None
+        raise
 
 
 def _generate_admin_api_key() -> str:
@@ -150,14 +128,20 @@ async def setup_status():
     app = get_app()
 
     has_config = bool(getattr(app.state, "api_list", None))
-    # 需要初始化：没有配置 或 没有管理员账号
-    admin_user = await _get_admin_user()
-    needs_setup = (not has_config) or (admin_user is None)
+    try:
+        admin_user = await _get_admin_user()
+        ready = await refresh_initialization(app, force=True)
+    except Exception:
+        app.state.admin_initialized = False
+        app.state.needs_setup = True
+        raise HTTPException(status_code=503, detail="Initialization state is unavailable") from None
+    needs_setup = not ready or not has_config
 
     return SetupStatus(
         needs_setup=needs_setup,
         has_config=has_config,
         has_admin_user=admin_user is not None,
+        database_enabled=not DISABLE_DATABASE,
     )
 
 
@@ -191,23 +175,21 @@ async def _setup_init(request: Request, payload: SetupInitRequest):
     admin_user = await _get_admin_user()
     has_config = bool(getattr(app.state, "api_list", None))
 
-    # 已有账号不能因配置暂时丢失而被覆盖。
-    if admin_user is not None:
+    # Existing accounts are never overwritten. A missing config can only be
+    # recovered after proving ownership of that account, not by anonymous setup.
+    if has_config and admin_user is not None:
         raise HTTPException(status_code=409, detail="Already initialized")
     if has_config:
-        await verify_admin_api_key(request, credentials=None)
+        token = await _extract_token(request, None)
+        from core.middleware import StatsMiddleware
+        client_ip = StatsMiddleware._get_client_ip(request.scope, request.scope.get("headers", []))
+        authenticate_admin_api_key_token(app, token, client_ip, require_explicit_role=True)
+    elif admin_user is not None:
+        if admin_user.username != payload.username.strip() or not verify_password(payload.password, admin_user.password_hash):
+            raise HTTPException(status_code=403, detail="Existing administrator credentials are required")
 
-    # 1) 写入/更新管理员账号 + 生成并持久化 JWT secret（用户无需手动配置 JWT_SECRET 环境变量）
-    jwt_secret = secrets.token_urlsafe(48)
-    await _create_admin_user(payload.username.strip(), payload.password, jwt_secret)
-
-    # 同步到当前进程（避免无需重启即可登录）
-    try:
-        from core.jwt_utils import set_jwt_secret
-
-        set_jwt_secret(jwt_secret)
-    except Exception:
-        pass
+    if admin_user is None:
+        await _create_admin_user(payload.username.strip(), payload.password, secrets.token_urlsafe(48))
 
     # 2) 配置处理
     if has_config:
@@ -262,8 +244,10 @@ async def _setup_init(request: Request, payload: SetupInitRequest):
             # 目的：首次修复或补 key 后运行时状态与配置文件保持一致。
             apply_runtime_ip_blacklists(app)
 
-        # 更新内存标记
-        app.state.needs_setup = False
+        # Only this authenticated recovery path (or startup) may repair a missing
+        # persisted signing secret; the public status endpoint remains read-only.
+        if not await refresh_initialization(app, force=True, repair_secret=True):
+            raise HTTPException(status_code=503, detail="Initialization is incomplete; check database and JWT configuration")
         app.state.admin_api_key = [admin_api_key]
 
         logger.info("Setup repaired successfully; admin user created/updated.")
@@ -306,7 +290,8 @@ async def _setup_init(request: Request, payload: SetupInitRequest):
     # 目的：让 setup 初始化路径与普通启动和管理端热更新路径一致。
     apply_runtime_ip_blacklists(app)
 
-    app.state.needs_setup = False
+    if not await refresh_initialization(app, force=True, repair_secret=True):
+        raise HTTPException(status_code=503, detail="Initialization is incomplete; check database and JWT configuration")
     app.state.admin_api_key = [admin_api_key]
 
     logger.info("Setup initialized successfully; admin key created.")
@@ -317,6 +302,7 @@ async def _setup_init(request: Request, payload: SetupInitRequest):
 async def setup_login(payload: SetupLoginRequest = Body(...)):
     """使用管理员账号密码登录，返回管理员 API Key（兼容现有前端基于 API Key 的鉴权）。"""
 
+    await ensure_initialized(get_app())
     admin_user = await _get_admin_user()
     if admin_user is None:
         raise HTTPException(status_code=404, detail="Admin user not initialized")

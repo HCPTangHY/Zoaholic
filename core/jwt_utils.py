@@ -2,8 +2,8 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
-import secrets
 import time
 from typing import Any, Dict, Optional
 
@@ -19,7 +19,7 @@ def _b64url_decode(data: str) -> bytes:
 
 
 _CACHED_SECRET: Optional[str] = None
-_EPHEMERAL_SECRET = secrets.token_urlsafe(48)
+LEGACY_JWT_SECRET = "dev-insecure-jwt-secret"
 
 
 def set_jwt_secret(secret: str) -> None:
@@ -27,27 +27,22 @@ def set_jwt_secret(secret: str) -> None:
 
     global _CACHED_SECRET
     secret = (secret or "").strip()
-    if secret:
-        _CACHED_SECRET = secret
+    if not secret or secret == LEGACY_JWT_SECRET:
+        raise ValueError("A trusted JWT signing secret is required")
+    _CACHED_SECRET = secret
 
 
 def _jwt_secret() -> str:
     """获取 JWT 签名密钥。
 
-    优先级：
-    1) 进程内缓存（set_jwt_secret 注入）
-    2) 环境变量 JWT_SECRET（推荐，但不是必须）
-    3) 每个进程独立生成的临时随机密钥（初始化后会写入 DB 并注入缓存）
+    显式环境变量优先，否则使用启动或初始化时加载的持久化密钥。
+    未就绪时拒绝签发和校验，不提供默认或进程随机密钥。
     """
 
-    if _CACHED_SECRET:
-        return _CACHED_SECRET
-
-    env = (os.getenv("JWT_SECRET") or "").strip()
-    if env:
-        return env
-
-    return _EPHEMERAL_SECRET
+    secret = (os.getenv("JWT_SECRET") or "").strip() or _CACHED_SECRET
+    if not secret or secret == LEGACY_JWT_SECRET:
+        raise RuntimeError("JWT signing secret is not initialized")
+    return secret
 
 
 def issue_jwt(payload: Dict[str, Any], *, expires_in_seconds: int = 7 * 24 * 3600) -> str:
@@ -74,6 +69,9 @@ def decode_jwt(token: str) -> Optional[Dict[str, Any]]:
 
     try:
         header_b64, payload_b64, sig_b64 = token.split(".", 2)
+        header = json.loads(_b64url_decode(header_b64).decode("utf-8"))
+        if not isinstance(header, dict) or header.get("alg") != "HS256":
+            return None
         signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
         expected_sig = hmac.new(
             _jwt_secret().encode("utf-8"), signing_input, hashlib.sha256
@@ -88,9 +86,10 @@ def decode_jwt(token: str) -> Optional[Dict[str, Any]]:
             return None
 
         exp = payload.get("exp")
-        if exp is not None:
-            if int(time.time()) > int(exp):
-                return None
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)) or not math.isfinite(exp):
+            return None
+        if time.time() >= exp:
+            return None
 
         return payload
     except Exception:

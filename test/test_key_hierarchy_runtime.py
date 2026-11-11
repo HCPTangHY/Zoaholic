@@ -26,7 +26,7 @@ async def test_config_roundtrip_preserves_overrides_and_inheritance():
 def test_ws_auth_rechecks_current_key_index_and_parent_disable():
     from core.dialects.openai_responses_ws import _authenticate
     keys = prepare_key_hierarchy([{'api': 'root', 'id': 'r'}, {'api': 'child', 'parent_id': 'r'}])
-    app = SimpleNamespace(state=SimpleNamespace(api_keys_db=keys, api_list=['root', 'child']))
+    app = SimpleNamespace(state=SimpleNamespace(admin_initialized=True, api_keys_db=keys, api_list=['root', 'child']))
     socket = WebSocket({'type': 'websocket', 'app': app,
                         'headers': [(b'authorization', b'Bearer child')], 'client': ('127.0.0.1', 80)}, None, None)
     assert _authenticate(socket) == (1, 'child', None)

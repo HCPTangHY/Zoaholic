@@ -263,7 +263,7 @@ async def test_dialect_requests_are_counted_during_body_read_and_reuse_json(monk
 
     monkeypatch.setattr("routes.deps.get_model_handler", lambda: Handler())
     route = _create_generic_handler("openai", EndpointDefinition(path="/v1/chat/completions", methods=["POST"]))
-    fake_app = SimpleNamespace(state=SimpleNamespace(config={"preferences": {"log_raw_data_retention_hours": 0}}))
+    fake_app = SimpleNamespace(state=SimpleNamespace(admin_initialized=True, api_list=['initialized-test-key'], config={"preferences": {"log_raw_data_retention_hours": 0}}))
 
     async def app(scope, receive, send):
         assert get_request_metrics()["active_requests"] == baseline + 1
@@ -399,7 +399,7 @@ async def test_cancel_during_inbound_body_balances_metrics(monkeypatch):
 
     m = StatsMiddleware(app)
     m._dialect_prefixes = ["/v1"]
-    fake = SimpleNamespace(state=SimpleNamespace(config={}))
+    fake = SimpleNamespace(state=SimpleNamespace(admin_initialized=True, api_list=['initialized-test-key'], config={}))
     scope = {"type": "http", "path": "/v1/chat/completions", "method": "POST", "headers": [(b"content-type", b"application/json")], "app": fake}
     task = asyncio.create_task(m(scope, receive, send))
     await started.wait()

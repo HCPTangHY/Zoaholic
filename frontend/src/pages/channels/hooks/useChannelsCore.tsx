@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState, type Dispatch, type SetStateAction } from 'react';
 import { useAuthStore } from '../../../store/authStore';
 import { apiFetch } from '../../../lib/api';
+import type { TimeoutDefaults } from '../../../lib/timeoutSettings';
 import { toastSuccess, toastError, toastWarning, fmtErr } from '../../../components/Toast';
 import {
   Plus, Edit, Trash2, ArrowRight, RefreshCw,
@@ -110,6 +111,7 @@ export interface UseChannelsCoreResult {
   setFocusedKeyIdx: Dispatch<SetStateAction<number | null>>;
   forceListMode: boolean;
   setForceListMode: Dispatch<SetStateAction<boolean>>;
+  timeoutDefaults?: TimeoutDefaults;
   globalModelPrice: Record<string, string>;
   setGlobalModelPrice: Dispatch<SetStateAction<Record<string, string>>>;
   apiConfigPreferences: Record<string, any>;
@@ -168,6 +170,7 @@ export function useChannelsCore(): UseChannelsCoreResult {
 
   // ── 全局配置（用于价格提示等）──
   const [globalModelPrice, setGlobalModelPrice] = useState<Record<string, string>>({});
+  const [timeoutDefaults, setTimeoutDefaults] = useState<TimeoutDefaults>();
   // 修改原因：虚拟模型状态已迁出核心 hook，但初始加载仍由核心 hook 请求 /v1/api_config。
   // 修改方式：核心 hook 保存最近一次全局 preferences 和 virtual_models 快照，并用版本号通知 useVirtualModels 同步。
   // 目的：保持初始化请求不重复，同时让虚拟模型草稿由专用 hook 独立维护。
@@ -197,6 +200,7 @@ export function useChannelsCore(): UseChannelsCoreResult {
 
     const globalPrefs = data.preferences || data.api_config?.preferences || {};
     setApiConfigPreferences(globalPrefs);
+    setTimeoutDefaults(data.timeout_defaults);
     setGlobalModelPrice(globalPrefs.model_price || {});
     if (!options.syncVirtualModels) return;
 
@@ -655,7 +659,7 @@ export function useChannelsCore(): UseChannelsCoreResult {
     balanceLoading, setBalanceLoading,
     focusedKeyIdx, setFocusedKeyIdx,
     forceListMode, setForceListMode,
-    globalModelPrice, setGlobalModelPrice,
+    globalModelPrice, setGlobalModelPrice, timeoutDefaults,
     apiConfigPreferences, setApiConfigPreferences,
     loadedVirtualModels, setLoadedVirtualModels,
     loadedVirtualModelsVersion,

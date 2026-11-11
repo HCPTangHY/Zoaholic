@@ -104,6 +104,8 @@ def _create_dialect_verify_api_key(dialect_id: str):
         credentials: HTTPAuthorizationCredentials = Depends(security),
     ) -> int:
         app = request.app
+        from core.initialization import ensure_initialized
+        await ensure_initialized(app)
         client_ip = get_client_ip_from_request_info()
         if is_global_ip_blocked(app, client_ip):
             raise_ip_blocked()

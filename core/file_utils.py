@@ -6,11 +6,13 @@ from typing import Optional
 import httpx
 from fastapi import HTTPException
 
-from core.public_fetch import PublicURLTransport
+from core.public_fetch import PublicURLTransport, UnsafeFileURL, validate_file_url
 
 
 _shared_fetch_client: Optional[httpx.AsyncClient] = None
 _shared_fetch_client_lock = asyncio.Lock()
+MAX_FILE_BYTES = 50 * 1024 * 1024
+MAX_FILE_REDIRECTS = 5
 
 
 def parse_data_uri(data_uri: str) -> tuple[str, str]:
@@ -67,6 +69,7 @@ async def _get_shared_fetch_client() -> httpx.AsyncClient:
             timeout=timeout,
             follow_redirects=False,
             trust_env=False,
+            headers={"Accept-Encoding": "identity"},
         )
         return _shared_fetch_client
 
@@ -81,27 +84,40 @@ async def close_shared_fetch_client() -> None:
 
 async def fetch_url_content(url: str) -> tuple[bytes, str]:
     try:
-        target = httpx.URL(url)
+        target = validate_file_url(url)
         client = await _get_shared_fetch_client()
-        for _ in range(6):
-            if (
-                target.scheme not in ("http", "https") or not target.host
-                or target.userinfo or "%" in target.host or target.port == 0
-            ):
-                raise ValueError("Invalid file URL")
+        for hop in range(MAX_FILE_REDIRECTS + 1):
             # Every new connection, including redirects, uses the public-only backend.
             async with client.stream("GET", target) as response:
-                if response.has_redirect_location:
-                    target = response.next_request.url
+                if response.is_redirect:
+                    location = response.headers.get("Location")
+                    if not location or hop == MAX_FILE_REDIRECTS:
+                        raise HTTPException(400, "File URL redirect limit exceeded")
+                    target = validate_file_url(response.url.join(location))
                     continue
                 response.raise_for_status()
-                content = await response.aread()
+                # ponytail: identity-only HTTP responses avoid unbounded decompression.
+                # Supporting gzip/br later requires a bounded streaming decompressor;
+                # compressed file formats such as PDF/ZIP remain ordinary file bytes.
+                if response.headers.get("Content-Encoding", "identity").strip().lower() not in ("", "identity"):
+                    raise HTTPException(400, "Compressed HTTP file responses are not supported")
+                length = response.headers.get("Content-Length")
+                if length is not None and int(length) > MAX_FILE_BYTES:
+                    raise HTTPException(400, "File exceeds the 50 MiB download limit")
+                content = bytearray()
+                async for chunk in response.aiter_raw():
+                    if len(chunk) > MAX_FILE_BYTES - len(content):
+                        raise HTTPException(400, "File exceeds the 50 MiB download limit")
+                    content.extend(chunk)
                 content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
-                return content, content_type
-        raise ValueError("Too many redirects")
-    except Exception:
+                return bytes(content), content_type
+    except UnsafeFileURL:
+        raise HTTPException(400, "File URL must use an allowed public destination") from None
+    except HTTPException:
+        raise
+    except (httpx.HTTPError, ValueError, OSError):
         # Do not disclose internal addresses, response bodies or network errors.
-        raise HTTPException(status_code=400, detail="Unable to fetch file from a public HTTP(S) URL") from None
+        raise HTTPException(400, "Unable to download the requested file") from None
 
 
 async def get_base64_file(file_url_or_data: str) -> tuple[str, str]:
@@ -116,4 +132,6 @@ async def get_base64_file(file_url_or_data: str) -> tuple[str, str]:
         mime_type, _ = parse_data_uri(file_url_or_data)
         return file_url_or_data, mime_type
     else:
+        if "://" in file_url_or_data:
+            raise HTTPException(400, "File URL must use HTTP or HTTPS")
         return file_url_or_data, "application/octet-stream"

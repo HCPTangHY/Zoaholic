@@ -405,6 +405,13 @@ async def _handle_response_create(websocket: WebSocket, payload: dict, api_index
 @router.websocket("/v1/responses")
 async def responses_websocket(websocket: WebSocket) -> None:
     """Responses API WebSocket mode 端点，协议与 OpenAI 官方一致。"""
+    from fastapi import HTTPException
+    from core.initialization import ensure_initialized
+    try:
+        await ensure_initialized(websocket.app)
+    except HTTPException:
+        await websocket.close(code=1008, reason="Instance is not initialized")
+        return
     api_index, token, error_msg = _authenticate(websocket)
     if api_index is None:
         # 1008 Policy Violation：与官方 Codex 客户端对策略拒绝的处理一致

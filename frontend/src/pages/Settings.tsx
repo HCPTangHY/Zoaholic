@@ -1,9 +1,11 @@
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../store/authStore';
+import { TimeoutSettings } from '../components/TimeoutSettings';
+import { TIMEOUT_KEYS, type TimeoutDefaults, type TimeoutValue } from '../lib/timeoutSettings';
 import { apiFetch } from '../lib/api';
 import { toastSuccess, toastError, toastWarning } from '../components/Toast';
 import {
-  Save, RefreshCw, AlertCircle, Zap, Shield, Ban,
+  Save, RefreshCw, Zap, Shield, Ban,
   Timer, Database, Blocks, Plus, Trash2, Link, DollarSign
 } from 'lucide-react';
 
@@ -16,13 +18,15 @@ interface ExternalClient {
   link: string;
 }
 
-interface Preferences {
+interface Preferences extends Record<string, unknown> {
   max_retry_count?: number;
   cooldown_period?: number;
   SCHEDULING_ALGORITHM?: string;
   rate_limit?: string;
-  model_timeout?: { default?: number; [key: string]: number | undefined };
-  keepalive_interval?: { default?: number; [key: string]: number | undefined };
+  model_timeout?: TimeoutValue | null;
+  keepalive_interval?: TimeoutValue | null;
+  stream_header_timeout?: TimeoutValue | null;
+  header_timeout?: TimeoutValue | null;
   log_raw_data_retention_hours?: number;
   log_retention_mode?: string;
   log_retention_days?: number;
@@ -67,6 +71,9 @@ export default function Settings() {
   const [preferences, setPreferences] = useState<Preferences>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [timeoutsValid, setTimeoutsValid] = useState(true);
+  const [timeoutDefaults, setTimeoutDefaults] = useState<TimeoutDefaults>();
+  const [timeoutModelSuggestions, setTimeoutModelSuggestions] = useState<string[]>([]);
   const [globalIpBlacklistText, setGlobalIpBlacklistText] = useState('');
 
   // 数据库清理状态
@@ -108,6 +115,10 @@ export default function Settings() {
           }
           setPreferences(loadedPreferences);
           const apiConfig = data.api_config || data;
+          setTimeoutDefaults(data.timeout_defaults);
+          const modelNames = (apiConfig.providers || []).flatMap((provider: { model?: (string | Record<string, string>)[] }) =>
+            (provider.model || []).flatMap(model => typeof model === 'string' ? [model] : [...Object.keys(model), ...Object.values(model)]));
+          setTimeoutModelSuggestions([...new Set<string>(modelNames)].filter(name => name !== '*'));
           const rawBl = apiConfig.ip_blacklist;
           setGlobalIpBlacklistText(
             Array.isArray(rawBl) ? rawBl.filter(Boolean).join('\n')
@@ -273,7 +284,7 @@ export default function Settings() {
   };
 
   const handleSave = async () => {
-    if (!token) return;
+    if (!token || !timeoutsValid) return;
 
     // 校验并清理 model_price：去掉空前缀条目，检查价格值合法性
     const cleanedPreferences = { ...preferences };
@@ -308,10 +319,10 @@ export default function Settings() {
         toastSuccess('配置已保存成功');
       } else {
         const msg = await parseErrorMessage(res);
-        toastSuccess(`保存失败：${msg}`);
+        toastError(`保存失败：${msg}`);
       }
     } catch {
-      toastSuccess('网络错误');
+      toastError('网络错误');
     } finally {
       setSaving(false);
     }
@@ -336,7 +347,7 @@ export default function Settings() {
         </div>
         <button
           onClick={handleSave}
-          disabled={saving}
+          disabled={saving || !timeoutsValid}
           className="bg-primary hover:bg-primary/90 text-primary-foreground px-4 py-2 rounded-lg flex items-center gap-2 font-medium transition-colors disabled:opacity-50"
         >
           {saving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
@@ -519,45 +530,22 @@ export default function Settings() {
           <div className="p-4 border-b border-border bg-muted/30 flex items-center gap-2 font-medium text-foreground">
             <Timer className="w-5 h-5 text-blue-500" /> 超时与心跳配置
           </div>
-          <div className="p-6 space-y-6">
-            <div className="grid grid-cols-2 gap-6">
-              <div>
-                <label className="text-sm font-medium text-foreground mb-1.5 block">默认模型超时时间 (秒)</label>
-                <input
-                  type="number" min="30" max="3600"
-                  value={preferences.model_timeout?.default ?? 600}
-                  onChange={e => updatePreference('model_timeout', { ...(preferences.model_timeout || {}), default: parseInt(e.target.value) })}
-                  className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
-                />
-              </div>
-              <div>
-                {/* 修改原因：后端 keepalive_interval 默认值已从关闭心跳改为 15 秒，前端需要展示一致的默认值与关闭方式。
-                    修改方式：把数字输入框的 fallback 改为 15，并在输入框下方补充单位语义和 0 关闭说明。
-                    目的：让管理员在全局配置页能清楚理解 SSE 心跳的默认行为。 */}
-                <label className="text-sm font-medium text-foreground mb-1.5 block">SSE 心跳间隔 (秒)</label>
-                <input
-                  type="number" min="0" max="300"
-                  value={preferences.keepalive_interval?.default ?? 15}
-                  onChange={e => updatePreference('keepalive_interval', { ...(preferences.keepalive_interval || {}), default: parseInt(e.target.value) })}
-                  className="w-full bg-background border border-border px-3 py-2 rounded-lg text-sm text-foreground"
-                />
-                <p className="mt-1.5 text-xs text-muted-foreground">
-                  流式请求时，上游无响应超过此秒数将发送 SSE 心跳，防止连接超时断开。设为 0 关闭
-                </p>
-              </div>
-            </div>
-
-            <div className="p-4 bg-blue-500/10 border border-blue-500/20 rounded-lg flex gap-3 text-sm">
-              <AlertCircle className="w-5 h-5 text-blue-500 flex-shrink-0" />
-              <div>
-                <div className="font-medium text-blue-700 dark:text-blue-400 mb-1">长思考模型配置建议</div>
-                <ul className="list-disc pl-4 space-y-1 text-blue-600 dark:text-blue-300/80">
-                  <li>Nginx 反向代理请设置 <code className="bg-blue-500/20 px-1 rounded">proxy_read_timeout 600s;</code></li>
-                  <li>对于 DeepSeek R1 / Claude Thinking，建议心跳间隔设为 20-30 秒</li>
-                  <li>Keepalive 可以有效防止 CDN 因空闲时间过长断开连接</li>
-                </ul>
-              </div>
-            </div>
+          <div className="p-4 sm:p-6">
+            <TimeoutSettings
+              scope="global"
+              preferences={preferences}
+              defaults={timeoutDefaults}
+              modelSuggestions={timeoutModelSuggestions}
+              onValidityChange={setTimeoutsValid}
+              onChange={next => setPreferences(previous => {
+                const updated = { ...next };
+                // The global update API merges preferences; null explicitly deletes a key.
+                for (const key of [...TIMEOUT_KEYS, 'header_timeout']) {
+                  if (key in previous && !(key in updated)) updated[key] = null;
+                }
+                return updated;
+              })}
+            />
           </div>
         </section>
 

@@ -5,9 +5,10 @@
 """
 
 import shutil
+import stat
 import tempfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
@@ -21,6 +22,116 @@ router = APIRouter(prefix="/v1/plugins", tags=["plugins"])
 
 # 插件目录
 PLUGINS_DIR = Path("plugins")
+MAX_PLUGIN_UPLOAD_BYTES = 16 * 1024 * 1024
+MAX_PLUGIN_EXPANDED_BYTES = 64 * 1024 * 1024
+MAX_PLUGIN_ZIP_ENTRIES = 1024
+
+
+def _validate_plugin_name(name: str) -> None:
+    if (not name or name != name.strip() or name in (".", "..")
+            or name.startswith(".") or any(char in name for char in "/\\:")
+            or any(ord(char) < 32 or ord(char) == 127 for char in name)):
+        raise HTTPException(400, "Plugin filename must be a plain filename without a path")
+
+
+def _plugin_upload_root() -> Path:
+    root = PLUGINS_DIR.absolute()
+    # Do not follow an existing symlink in the configured installation path.
+    if any(path.is_symlink() for path in (root, *root.parents)):
+        raise HTTPException(400, "Plugin installation directory cannot contain symlinks")
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
+
+
+def _plugin_upload_target(root: Path, name: str, *, directory: bool) -> Path:
+    _validate_plugin_name(name)
+    target = root / name
+    if target.is_symlink() or not target.resolve().is_relative_to(root):
+        raise HTTPException(400, "Plugin target is outside the installation directory")
+    if target.exists() and target.is_dir() != directory:
+        raise HTTPException(400, "Plugin target has a conflicting file type")
+    return target
+
+
+def _extract_plugin_zip(archive_path: Path, destination: Path) -> None:
+    """Validate every member before extracting; never extract links or special files."""
+    with zipfile.ZipFile(archive_path) as archive:
+        members = archive.infolist()
+        if not members:
+            raise HTTPException(400, "Empty zip file")
+        if len(members) > MAX_PLUGIN_ZIP_ENTRIES:
+            raise HTTPException(413, "Plugin archive contains too many entries")
+        total = 0
+        seen = set()
+        for member in members:
+            name = member.filename
+            if member.orig_filename != name:
+                raise HTTPException(400, "Invalid plugin archive filename")
+            parts = name.rstrip("/").split("/")
+            mode = stat.S_IFMT(member.external_attr >> 16)
+            if (not name or name.startswith("/") or "\\" in name or ":" in name
+                    or any(part in ("", ".", "..") for part in parts)
+                    or any(ord(char) < 32 or ord(char) == 127 for char in name)
+                    or mode not in (0, stat.S_IFREG, stat.S_IFDIR)
+                    or (mode == stat.S_IFDIR and not member.is_dir())
+                    or (mode == stat.S_IFREG and member.is_dir())):
+                raise HTTPException(400, "Invalid path or file type in plugin archive")
+            relative = PurePosixPath(name)
+            if relative in seen or member.flag_bits & 1:
+                raise HTTPException(400, "Duplicate or encrypted plugin archive entry")
+            seen.add(relative)
+            total += member.file_size
+            if total > MAX_PLUGIN_EXPANDED_BYTES:
+                raise HTTPException(413, "Expanded plugin archive exceeds 64 MiB")
+
+        destination.mkdir()
+        extracted = 0
+        for member in members:
+            target = destination / member.filename
+            if not target.resolve().is_relative_to(destination.resolve()):
+                raise HTTPException(400, "Plugin archive path escapes extraction directory")
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member) as source, target.open("xb") as output:
+                while chunk := source.read(64 * 1024):
+                    extracted += len(chunk)
+                    if extracted > MAX_PLUGIN_EXPANDED_BYTES:
+                        raise HTTPException(413, "Expanded plugin archive exceeds 64 MiB")
+                    output.write(chunk)
+
+
+def _remove_upload_target(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _install_uploaded_plugin(candidate: Path, target: Path, entry: Path, backup: Path):
+    """Replace only the validated target; restore previous files if loading fails.
+
+    This is not a sandbox: administrators intentionally execute trusted Python.
+    Restoring files cannot undo module code that already ran before a load error.
+    """
+    manager = get_plugin_manager()
+    previous = target.exists()
+    if previous:
+        target.replace(backup)
+    try:
+        candidate.replace(target)
+        info = manager.load_plugin(str(target / entry) if target.is_dir() else str(target))
+        if info is None:
+            raise HTTPException(400, "Plugin loader did not accept the uploaded module")
+        if info.error:
+            raise HTTPException(400, f"Failed to load plugin: {info.error}")
+        return info
+    except BaseException:
+        _remove_upload_target(target)
+        if previous:
+            backup.replace(target)
+        raise
 
 
 def _get_plugin_info_dict(info) -> dict:
@@ -204,160 +315,60 @@ async def upload_plugin(
     file: UploadFile = File(...),
     _: int = Depends(verify_admin_api_key),
 ):
-    """
-    上传并安装插件
-    
-    支持 .py 单文件或 .zip 压缩包
-    """
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No filename provided")
-    
-    filename = file.filename
-    
-    # 检查文件类型
-    if not (filename.endswith(".py") or filename.endswith(".zip")):
-        raise HTTPException(
-            status_code=400, 
-            detail="Invalid file type. Only .py or .zip files are allowed"
-        )
-    
-    manager = get_plugin_manager()
-    
+    """Install an administrator-supplied Python plugin, bounded to the plugin directory."""
+    filename = file.filename or ""
+    _validate_plugin_name(filename)
+    if not filename.endswith((".py", ".zip")):
+        raise HTTPException(400, "Invalid file type. Only .py or .zip files are allowed")
+    _validate_plugin_name(Path(filename).stem)
+
     try:
-        if filename.endswith(".py"):
-            # 单文件插件
-            plugin_name = filename[:-3]  # 移除 .py 后缀
-            target_path = PLUGINS_DIR / filename
-            
-            # 保存文件（支持覆盖已存在的文件）
-            content = await file.read()
-            target_path.write_bytes(content)
-            
-            # 加载插件
-            info = manager.load_plugin(str(target_path))
-            
-            if info and info.error:
-                # 加载失败，删除文件
-                target_path.unlink(missing_ok=True)
-                raise HTTPException(status_code=400, detail=f"Failed to load plugin: {info.error}")
-            
-            logger.info(f"Uploaded and loaded plugin: {plugin_name}")
-            
+        root = _plugin_upload_root()
+        # Same filesystem permits atomic rename; underscore keeps staging out of plugin scans.
+        with tempfile.TemporaryDirectory(prefix="_upload_", dir=root) as temp_dir:
+            staging = Path(temp_dir)
+            uploaded = staging / "upload"
+            size = 0
+            with uploaded.open("xb") as output:
+                while chunk := await file.read(64 * 1024):
+                    size += len(chunk)
+                    if size > MAX_PLUGIN_UPLOAD_BYTES:
+                        raise HTTPException(413, "Plugin upload exceeds 16 MiB")
+                    output.write(chunk)
+
+            if filename.endswith(".py"):
+                target = _plugin_upload_target(root, filename, directory=False)
+                candidate, entry = uploaded, Path(filename)
+                plugin_name = Path(filename).stem
+            else:
+                extracted = staging / "extracted"
+                _extract_plugin_zip(uploaded, extracted)
+                items = list(extracted.iterdir())
+                candidate = items[0] if len(items) == 1 and items[0].is_dir() else extracted
+                plugin_name = candidate.name if candidate != extracted else Path(filename).stem
+                target = _plugin_upload_target(root, plugin_name, directory=True)
+                if (candidate / "__init__.py").is_file():
+                    entry = Path("__init__.py")
+                else:
+                    py_files = sorted(candidate.glob("*.py"))
+                    if not py_files:
+                        raise HTTPException(400, "No Python files found in plugin directory")
+                    entry = Path(py_files[0].name)
+
+            info = _install_uploaded_plugin(candidate, target, entry, staging / "previous")
+            logger.info("Uploaded and loaded plugin: %s", plugin_name)
             return JSONResponse(content={
                 "success": True,
                 "plugin": _get_plugin_info_dict(info) if info else None,
                 "message": f"Plugin '{plugin_name}' uploaded and loaded successfully",
             })
-        
-        else:
-            # ZIP 压缩包
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_path = Path(temp_dir) / filename
-                
-                # 保存临时文件
-                content = await file.read()
-                temp_path.write_bytes(content)
-                
-                # 解压
-                with zipfile.ZipFile(temp_path, 'r') as zip_ref:
-                    # 安全检查：防止路径穿越
-                    for member in zip_ref.namelist():
-                        if member.startswith('/') or '..' in member:
-                            raise HTTPException(
-                                status_code=400, 
-                                detail=f"Invalid path in zip: {member}"
-                            )
-                    
-                    zip_ref.extractall(temp_dir)
-                
-                # 查找插件目录或文件
-                extracted_items = list(Path(temp_dir).iterdir())
-                extracted_items = [p for p in extracted_items if p.name != filename]
-                
-                if not extracted_items:
-                    raise HTTPException(status_code=400, detail="Empty zip file")
-                
-                # 如果只有一个目录，使用该目录
-                if len(extracted_items) == 1 and extracted_items[0].is_dir():
-                    plugin_dir = extracted_items[0]
-                    plugin_name = plugin_dir.name
-                    target_path = PLUGINS_DIR / plugin_name
-                    
-                    # 如果目标目录已存在，先删除旧目录以支持覆盖
-                    if target_path.exists():
-                        shutil.rmtree(target_path, ignore_errors=True)
-                    
-                    # 复制目录
-                    shutil.copytree(plugin_dir, target_path)
-                    
-                    # 加载插件
-                    init_file = target_path / "__init__.py"
-                    if init_file.exists():
-                        info = manager.load_plugin(str(init_file))
-                    else:
-                        # 尝试加载目录中的 .py 文件
-                        py_files = list(target_path.glob("*.py"))
-                        if py_files:
-                            info = manager.load_plugin(str(py_files[0]))
-                        else:
-                            shutil.rmtree(target_path, ignore_errors=True)
-                            raise HTTPException(
-                                status_code=400, 
-                                detail="No Python files found in plugin directory"
-                            )
-                else:
-                    # 多个文件，创建以 zip 文件名命名的目录
-                    plugin_name = filename[:-4]  # 移除 .zip 后缀
-                    target_path = PLUGINS_DIR / plugin_name
-                    
-                    # 如果目标目录已存在，先删除旧目录以支持覆盖
-                    if target_path.exists():
-                        shutil.rmtree(target_path, ignore_errors=True)
-                    
-                    target_path.mkdir(parents=True, exist_ok=True)
-                    
-                    for item in extracted_items:
-                        if item.is_file():
-                            shutil.copy2(item, target_path / item.name)
-                        else:
-                            shutil.copytree(item, target_path / item.name)
-                    
-                    # 加载插件
-                    init_file = target_path / "__init__.py"
-                    if init_file.exists():
-                        info = manager.load_plugin(str(init_file))
-                    else:
-                        py_files = list(target_path.glob("*.py"))
-                        if py_files:
-                            info = manager.load_plugin(str(py_files[0]))
-                        else:
-                            shutil.rmtree(target_path, ignore_errors=True)
-                            raise HTTPException(
-                                status_code=400, 
-                                detail="No Python files found in extracted content"
-                            )
-                
-                if info and info.error:
-                    # 加载失败，清理
-                    if target_path.is_dir():
-                        shutil.rmtree(target_path, ignore_errors=True)
-                    else:
-                        target_path.unlink(missing_ok=True)
-                    raise HTTPException(status_code=400, detail=f"Failed to load plugin: {info.error}")
-                
-                logger.info(f"Uploaded and loaded plugin from zip: {plugin_name}")
-                
-                return JSONResponse(content={
-                    "success": True,
-                    "plugin": _get_plugin_info_dict(info) if info else None,
-                    "message": f"Plugin '{plugin_name}' uploaded and loaded successfully",
-                })
-    
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Failed to upload plugin: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to upload plugin: {str(e)}")
+    except (zipfile.BadZipFile, FileExistsError, NotADirectoryError, IsADirectoryError) as exc:
+        raise HTTPException(400, "Invalid plugin archive or installation target") from exc
+    except Exception as exc:
+        logger.exception("Failed to upload plugin")
+        raise HTTPException(500, "Failed to upload plugin") from exc
 
 
 @router.post("/{name}/enable", dependencies=[Depends(rate_limit_dependency)])

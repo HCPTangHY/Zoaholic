@@ -221,14 +221,15 @@ def token_signed_with(secret):
     return (data + b'.' + signature).decode()
 
 
-def test_default_jwt_secret_is_random_and_rejects_known_forgery(monkeypatch):
+def test_missing_jwt_secret_fails_closed_and_rejects_known_forgery(monkeypatch):
     monkeypatch.setattr(jwt_utils, '_CACHED_SECRET', None)
     monkeypatch.delenv('JWT_SECRET', raising=False)
-    secret = jwt_utils._jwt_secret()
-    assert len(secret) >= 48
-    assert jwt_utils._jwt_secret() == secret
+    with pytest.raises(RuntimeError):
+        jwt_utils._jwt_secret()
+    with pytest.raises(RuntimeError):
+        jwt_utils.issue_jwt({'role': 'admin'})
     assert not jwt_utils.is_admin_jwt(token_signed_with('dev-insecure-jwt-secret'))
-    assert jwt_utils.is_admin_jwt(jwt_utils.issue_jwt({'role': 'admin'}))
+    assert not hasattr(jwt_utils, '_EPHEMERAL_SECRET')
 
 
 def test_configured_and_persisted_jwt_secrets_remain_supported(monkeypatch):
@@ -236,8 +237,29 @@ def test_configured_and_persisted_jwt_secrets_remain_supported(monkeypatch):
     monkeypatch.setenv('JWT_SECRET', 'environment-test-secret')
     assert jwt_utils.is_admin_jwt(token_signed_with('environment-test-secret'))
     jwt_utils.set_jwt_secret('database-test-secret')
+    assert jwt_utils.is_admin_jwt(token_signed_with('environment-test-secret'))
+    assert not jwt_utils.is_admin_jwt(token_signed_with('database-test-secret'))
+    monkeypatch.delenv('JWT_SECRET')
     assert jwt_utils.is_admin_jwt(token_signed_with('database-test-secret'))
     assert not jwt_utils.is_admin_jwt(token_signed_with('environment-test-secret'))
+
+
+def test_persisted_jwt_remains_valid_after_process_restart(monkeypatch):
+    import importlib.util
+
+    monkeypatch.delenv('JWT_SECRET', raising=False)
+    monkeypatch.setattr(jwt_utils, '_CACHED_SECRET', None)
+    jwt_utils.set_jwt_secret('persisted-restart-test-secret')
+    token = jwt_utils.issue_jwt({'sub': 'owner', 'role': 'admin'})
+    # A fresh module models a new worker without inheriting process-local state.
+    spec = importlib.util.spec_from_file_location('restarted_jwt_utils', jwt_utils.__file__)
+    restarted = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(restarted)
+    assert restarted.decode_jwt(token) is None
+    restarted.set_jwt_secret('persisted-restart-test-secret')
+    assert restarted.is_admin_jwt(token)
+    restarted.set_jwt_secret('explicitly-rotated-test-secret')
+    assert restarted.decode_jwt(token) is None
 
 
 @pytest.fixture
@@ -254,6 +276,13 @@ def setup_app(monkeypatch):
     monkeypatch.setattr(setup, '_get_admin_user', AsyncMock(return_value=None))
     monkeypatch.setattr(setup, '_create_admin_user', AsyncMock())
     monkeypatch.setattr(setup, 'update_config', AsyncMock())
+    # This PR fixture never writes an administrator record. Keep readiness refresh
+    # isolated as well; the integrated HTTP-flow tests cover a real temporary DB.
+    async def refresh(app, **kwargs):
+        app.state.admin_initialized = True
+        app.state.needs_setup = False
+        return True
+    monkeypatch.setattr(setup, 'refresh_initialization', AsyncMock(side_effect=refresh))
     monkeypatch.setattr(jwt_utils, '_CACHED_SECRET', None)
     monkeypatch.delenv('JWT_SECRET', raising=False)
     return app
@@ -277,6 +306,20 @@ async def test_existing_config_setup_requires_admin_credentials(setup_app, token
 
 
 @pytest.mark.asyncio
+async def test_single_user_key_cannot_repair_admin(setup_app):
+    keys = [{'api': 'only-user-key', 'role': 'user'}]
+    setup_app.state.api_list = [keys[0]['api']]
+    setup_app.state.api_keys_db = keys
+    setup_app.state.config['api_keys'] = keys
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=setup_app), base_url='http://test') as client:
+        response = await client.post('/setup/init', json=SETUP_PAYLOAD,
+                                     headers={'Authorization': 'Bearer only-user-key'})
+    assert response.status_code == 403
+    setup._create_admin_user.assert_not_awaited()
+    setup.update_config.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('header', ['Authorization', 'x-api-key'])
 async def test_existing_config_can_be_repaired_with_admin_key(setup_app, header):
     value = 'Bearer admin-key' if header == 'Authorization' else 'admin-key'
@@ -291,13 +334,17 @@ async def test_existing_config_can_be_repaired_with_admin_key(setup_app, header)
 @pytest.mark.asyncio
 @pytest.mark.parametrize('has_config', [True, False])
 async def test_existing_admin_can_never_be_reset_through_setup(setup_app, monkeypatch, has_config):
+    from core.security import hash_password
     if not has_config:
         setup_app.state.api_list = []
-    monkeypatch.setattr(setup, '_get_admin_user', AsyncMock(return_value=SimpleNamespace(username='original')))
+    existing = SimpleNamespace(username='original', password_hash=hash_password('original-password'))
+    monkeypatch.setattr(setup, '_get_admin_user', AsyncMock(return_value=existing))
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=setup_app), base_url='http://test') as client:
         response = await client.post('/setup/init', json=SETUP_PAYLOAD)
-    assert response.status_code == 409
+    assert response.status_code == (409 if has_config else 403)
     setup._create_admin_user.assert_not_awaited()
+    setup.update_config.assert_not_awaited()
+    assert existing.username == 'original'
 
 
 @pytest.mark.asyncio
@@ -326,3 +373,73 @@ async def test_blank_setup_is_anonymous_and_serialized(setup_app, monkeypatch):
         results = await asyncio.gather(*[client.post('/setup/init', json=SETUP_PAYLOAD) for _ in range(2)])
     assert sorted(response.status_code for response in results) == [200, 409]
     create.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('old_secret', [None, 'dev-insecure-jwt-secret'])
+async def test_password_recovery_repairs_missing_persisted_secret(tmp_path, monkeypatch, old_secret):
+    from contextlib import asynccontextmanager
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from core import initialization
+    from core.security import hash_password
+    import db as database
+
+    engine = create_async_engine('sqlite+aiosqlite:///' + str(tmp_path / 'recovery.db'))
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(database.AdminUser.__table__.create)
+
+    @asynccontextmanager
+    async def scope():
+        async with sessions() as session:
+            yield session
+
+    monkeypatch.setattr(database, 'async_session_scope', scope)
+    monkeypatch.setattr(database, 'DB_TYPE', 'sqlite')
+    monkeypatch.setattr(database, 'DISABLE_DATABASE', False)
+    monkeypatch.setattr(setup, 'DISABLE_DATABASE', False)
+    monkeypatch.setattr(jwt_utils, '_CACHED_SECRET', None)
+    monkeypatch.delenv('JWT_SECRET', raising=False)
+    app = FastAPI()
+    app.state.api_list = []
+    app.state.api_keys_db = []
+    app.state.config = {}
+    app.include_router(setup.router)
+    monkeypatch.setattr(setup, 'get_app', lambda: app)
+    create = AsyncMock(side_effect=AssertionError('Recovery must never replace an existing account'))
+    monkeypatch.setattr(setup, '_create_admin_user', create)
+
+    async def update(conf, **kwargs):
+        return conf, conf['api_keys'], [key['api'] for key in conf['api_keys']]
+
+    monkeypatch.setattr(setup, 'update_config', AsyncMock(side_effect=update))
+    original_hash = hash_password('original-password')
+    try:
+        async with sessions() as session:
+            session.add(database.AdminUser(id=1, username='owner', password_hash=original_hash, jwt_secret=old_secret))
+            await session.commit()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.post('/setup/init', json={
+                'username': 'owner', 'password': 'original-password', 'confirm_password': 'original-password',
+            })
+        assert response.status_code == 200
+        assert app.state.admin_initialized
+        assert not app.state.needs_setup
+        record = await initialization.get_admin_user()
+        assert record.username == 'owner'
+        assert record.password_hash == original_hash
+        assert record.jwt_secret and record.jwt_secret != 'dev-insecure-jwt-secret'
+        assert jwt_utils._jwt_secret() == record.jwt_secret
+        create.assert_not_awaited()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_setup_does_not_report_success_if_readiness_refresh_fails(setup_app, monkeypatch):
+    monkeypatch.setattr(setup, 'refresh_initialization', AsyncMock(return_value=False))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=setup_app), base_url='http://test') as client:
+        response = await client.post('/setup/init', json=SETUP_PAYLOAD,
+                                     headers={'Authorization': 'Bearer admin-key'})
+    assert response.status_code == 503
+    assert 'admin-key' not in response.text
