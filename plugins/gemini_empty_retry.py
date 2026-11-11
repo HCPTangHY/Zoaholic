@@ -761,10 +761,26 @@ async def wrapped_passthrough_gemini_response(client, url, headers, payload, mod
     engine = ctx.get("engine") or provider.get("engine") or "gemini"
 
     async def _raw_pt_non_stream(c, u, h, p, m, t):
+        # 修改原因：这里调用 _fetch_passthrough_response 时不带 enabled_plugins，会走快路径按网络分片多次 yield 响应体。
+        #   一方面 core 的 passthrough_response_adapter 分支会对每个分片单独执行非流式响应拦截器，渠道插件拿到的是半截 JSON；
+        #   另一方面下方空回检测也按分片解析，解析失败被当成空回，启用本插件时正常响应也会换 Key 重试到上限。
+        # 修改方式：把文本分片拼成完整响应体后一次性 yield；错误 dict 等非文本项原样透出。
+        # 目的：非流式透传与非透传路径一致，拦截器和空回检测都基于完整响应体工作。
+        text_parts: List[str] = []
         async for item in _fetch_passthrough_response(
             c, u, h, p, t, engine=engine, model=m, provider=provider
         ):
+            if isinstance(item, (bytes, bytearray)):
+                item = item.decode("utf-8", errors="replace")
+            if isinstance(item, str):
+                text_parts.append(item)
+                continue
+            if text_parts:
+                yield "".join(text_parts)
+                text_parts = []
             yield item
+        if text_parts:
+            yield "".join(text_parts)
 
     async for chunk in _run_non_stream_with_retry(
         _raw_pt_non_stream, client, url, headers, payload, model, timeout, is_passthrough=True
