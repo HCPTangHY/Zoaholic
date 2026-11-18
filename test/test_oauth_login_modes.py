@@ -105,3 +105,46 @@ def test_codex_provider_declares_manual_redirect_mode():
     # 目的：避免 Codex 的 localhost 白名单要求被后续 provider 重构遗漏。
     assert CodexProvider.redirect_mode == "manual"
     assert CodexProvider.localhost_redirect_uri == "http://localhost:1455/auth/callback"
+
+
+@pytest.mark.asyncio
+async def test_oauth_origin_validation_and_success_page_target_origin():
+    from routes import oauth as oauth_routes
+
+    assert oauth_routes._normalize_http_origin("https://console.example.com:8443/channels?x=1") == "https://console.example.com:8443"
+    assert oauth_routes._normalize_http_origin("javascript:void(0)") is None
+    assert oauth_routes._normalize_http_origin("http://user:pass@other.example") is None
+    assert oauth_routes._normalize_http_origin("http://bad host") is None
+
+    oauth_routes._pending_flows.clear()
+    provider = FakeProvider(redirect_mode="auto")
+    request = FakeRequest(
+        FakeOAuthManager({"antigravity": provider}),
+        headers={"x-forwarded-proto": "https", "x-forwarded-host": "zoaholic.example"},
+    )
+    result = await oauth_routes.oauth_authorize(
+        type="antigravity",
+        provider="Antigravity-Main",
+        request=request,
+        origin="http://user@other.example",
+    )
+    assert provider.calls[0]["redirect_uri"] == "https://zoaholic.example/v1/oauth/callback"
+    assert oauth_routes._pending_flows[result["state"]]["origin"] == "https://zoaholic.example"
+
+    html_with_origin = oauth_routes._oauth_success_page(
+        "dev@example.com",
+        "state-1",
+        "Antigravity-Main",
+        target_origin="https://zoaholic.example",
+    ).body.decode("utf-8")
+    assert '"https://zoaholic.example"' in html_with_origin
+    assert "'*'" not in html_with_origin
+
+    html_fallback = oauth_routes._oauth_success_page(
+        "dev@example.com",
+        "state-1",
+        "Antigravity-Main",
+        target_origin="javascript:void(0)",
+    ).body.decode("utf-8")
+    assert "window.location.origin" in html_fallback
+    assert "'*'" not in html_fallback

@@ -77,6 +77,9 @@ async def test_public_assets_and_spa_remain_available(static_app, path, content)
     assert response.text == content
     if path in ("/", "/index.html", "/setup", "/settings", "/unknown-spa-route"):
         assert "no-store" in response.headers["cache-control"]
+        csp = response.headers["content-security-policy"]
+        assert "script-src 'self' blob:" in csp
+        assert "object-src 'none'" in csp
     if path == "/assets/app.js":
         assert response.headers["cache-control"] == "public, max-age=31536000, immutable"
 

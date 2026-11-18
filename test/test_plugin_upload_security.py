@@ -8,9 +8,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, UploadFile
+import httpx
 
+from core.security import hash_password
 from routes import plugins
+
+ADMIN_TEST_PASSWORD = "correct-admin-password"
+ADMIN_TEST_HASH = hash_password(ADMIN_TEST_PASSWORD, iterations=1000)
 
 
 def archive(entries):
@@ -36,13 +41,18 @@ def install_env(tmp_path, monkeypatch):
     monkeypatch.setattr(plugins, "PLUGINS_DIR", root)
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: SimpleNamespace(load_plugin=load))
     monkeypatch.setattr(plugins, "_get_plugin_info_dict", lambda info: {"name": "test"})
+
+    async def fake_admin():
+        return SimpleNamespace(username="owner", password_hash=ADMIN_TEST_HASH)
+
+    monkeypatch.setattr(plugins, "get_admin_user", fake_admin)
     return root, calls, result
 
 
-async def upload(filename, body=b"PLUGIN_INFO = {}\n"):
+async def upload(filename, body=b"PLUGIN_INFO = {}\n", admin_password=ADMIN_TEST_PASSWORD):
     file = UploadFile(filename=filename, file=io.BytesIO(body))
     try:
-        return await plugins.upload_plugin(file, "admin")
+        return await plugins.upload_plugin(file, admin_password, "admin")
     finally:
         await file.close()
 
@@ -299,3 +309,84 @@ async def test_duplicate_archive_names_and_case_sensitive_internal_dots(install_
     assert not calls
     await upload("plugin..version.py", b"valid")
     assert calls == [root / "plugin..version.py"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_password", [None, "", "wrong-password"])
+async def test_upload_requires_valid_admin_password_before_writing(install_env, bad_password):
+    root, calls, _ = install_env
+    with pytest.raises(HTTPException) as exc:
+        await upload("plugin.py", b"code", admin_password=bad_password)
+    assert exc.value.status_code == 403
+    assert not calls
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_upload_rejects_when_admin_account_uninitialized(install_env, monkeypatch):
+    root, calls, _ = install_env
+
+    async def no_admin():
+        return None
+
+    monkeypatch.setattr(plugins, "get_admin_user", no_admin)
+    with pytest.raises(HTTPException) as exc:
+        await upload("plugin.py", b"code")
+    assert exc.value.status_code == 503
+    assert not calls
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_upload_http_endpoint_accepts_form_password_and_ignores_header(install_env):
+    root, calls, _ = install_env
+    app = FastAPI()
+    app.include_router(plugins.router)
+    app.dependency_overrides[plugins.verify_admin_api_key] = lambda: 0
+    app.dependency_overrides[plugins.rate_limit_dependency] = lambda: None
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        rejected = await client.post(
+            "/v1/plugins/upload",
+            files={"file": ("plugin.py", b"code", "text/x-python")},
+            headers={"X-Admin-Password": ADMIN_TEST_PASSWORD},
+        )
+        assert rejected.status_code == 403
+        assert not calls
+
+        accepted = await client.post(
+            "/v1/plugins/upload",
+            data={"admin_password": ADMIN_TEST_PASSWORD},
+            files={"file": ("plugin.py", b"code", "text/x-python")},
+        )
+        assert accepted.status_code == 200
+        assert calls == [root / "plugin.py"]
+
+
+@pytest.mark.asyncio
+async def test_uninstall_requires_valid_admin_password_before_deleting(install_env, monkeypatch):
+    root, _, _ = install_env
+    plugin_file = root / "demo.py"
+    plugin_file.write_text("PLUGIN_INFO = {}\n")
+    info = SimpleNamespace(name="demo", source="directory", path=str(plugin_file))
+    loader = SimpleNamespace(get_plugin=lambda name: info if name == "demo" else None, _plugins={"demo": info})
+    unloaded = []
+    manager = SimpleNamespace(loader=loader, unload_plugin=lambda name: unloaded.append(name) or True)
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(plugins, "get_interceptor_registry", lambda: SimpleNamespace(unregister_plugin_interceptors=lambda name: None))
+
+    for bad_payload in (None, plugins.PluginPasswordRequest(admin_password=""), plugins.PluginPasswordRequest(admin_password="wrong")):
+        with pytest.raises(HTTPException) as exc:
+            await plugins.uninstall_plugin("demo", bad_payload, "admin")
+        assert exc.value.status_code == 403
+        assert plugin_file.exists()
+        assert not unloaded
+
+    response = await plugins.uninstall_plugin(
+        "demo",
+        plugins.PluginPasswordRequest(admin_password=ADMIN_TEST_PASSWORD),
+        "admin",
+    )
+    assert json.loads(response.body)["success"] is True
+    assert not plugin_file.exists()
+    assert unloaded == ["demo"]

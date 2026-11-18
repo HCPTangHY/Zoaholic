@@ -52,5 +52,13 @@ assert.match(oauthHookSource, /apiFetch\('\/v1\/channels\/balance', \{\s*method:
 assert.match(editorSource, /同步 OAuth 账号/, 'ChannelEditor 应保留同步 OAuth 账号按钮');
 assert.match(editorSource, /导出全部凭证/, 'ChannelEditor 应保留导出全部凭证按钮');
 
+// OAuth auto 回调 postMessage 必须严格校验来源、弹窗实例及必填 state/provider。
+assert.match(oauthHookSource, /if \(event\.origin !== expectedOrigin\) return;/, 'OAuth postMessage 必须校验 event.origin');
+assert.match(oauthHookSource, /if \(event\.source !== authWindow\) return;/, 'OAuth postMessage 必须校验 event.source === authWindow');
+assert.match(oauthHookSource, /if \(event\.data\.state !== state\) return;/, 'OAuth postMessage 必须要求 state 完全匹配');
+assert.match(oauthHookSource, /if \(event\.data\.provider !== providerName\) return;/, 'OAuth postMessage 必须要求 provider 完全匹配');
+assert.doesNotMatch(oauthHookSource, /event\.data\?\.state && event\.data\.state !== state/, '严禁在缺失 state 时跳过匹配校验');
+assert.doesNotMatch(oauthHookSource, /event\.data\?\.provider && event\.data\.provider !== providerName/, '严禁在缺失 provider 时跳过匹配校验');
+
 console.log('oauth key management regression passed');
 process.exit(0);

@@ -3,10 +3,22 @@ services:
     container_name: zoaholic
     build: .
     restart: always
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
       - 8001:8000
+    # 宿主机挂载目录需确保 uid/gid 10001 可写：mkdir -p data plugins && chown -R 10001:10001 data plugins
+    # 若改用 CONFIG_STORAGE=file，请同时挂载已创建的配置文件（touch api.yaml && chown 10001:10001 api.yaml）：
     volumes:
       - ./data:/home/data
+      - ./plugins:/home/plugins
+      # - ./api.yaml:/home/api.yaml
     environment:
       - TZ=Asia/Shanghai
       - DB_TYPE=sqlite

@@ -161,21 +161,21 @@ async def test_existing_admin_cannot_be_replaced_and_no_config_requires_existing
 
 
 @pytest.mark.asyncio
-async def test_auth_me_setup_login_and_dialect_gate_unready(monkeypatch):
+async def test_auth_me_and_dialect_gate_unready_and_setup_login_removed(monkeypatch):
     from core.dialects.router import _create_dialect_verify_api_key
     app = app_for()
     monkeypatch.setattr(auth, "get_app", lambda: app)
-    monkeypatch.setattr(setup, "get_app", lambda: app)
     jwt_utils.set_jwt_secret("trusted-test-secret")
     token = jwt_utils.issue_jwt({"role": "admin"})
     for call in (
         auth.me(request_for(app, token)),
-        setup.setup_login(setup.SetupLoginRequest(username="owner", password="password")),
         _create_dialect_verify_api_key("openai")(request_for(app, "user-test"), None),
     ):
         with pytest.raises(HTTPException) as error:
             await call
         assert error.value.status_code == 503
+    assert not hasattr(setup, "setup_login")
+    assert all(getattr(route, "path", None) != "/setup/login" for route in setup.router.routes)
 
 
 @pytest.mark.asyncio

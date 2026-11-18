@@ -73,6 +73,7 @@ export function useChannelOAuth({
   const [oauthManualState, setOauthManualState] = useState<OAuthManualState | null>(null);
   const [manualUrl, setManualUrl] = useState('');
   const [exchanging, setExchanging] = useState(false);
+  const oauthMessageCleanupRef = useRef<(() => void) | null>(null);
 
   const isOAuthOverlayOpen = importModalIdx !== null || oauthManualState !== null;
   const selectedChannelType = channelTypes.find(c => c.id === (formData?.engine || ''));
@@ -139,9 +140,16 @@ export function useChannelOAuth({
     if (isModalOpen && isOAuthEngine) {
       void refreshOAuthAccounts();
     } else if (!isModalOpen) {
+      oauthMessageCleanupRef.current?.();
       setOauthAccounts({});
     }
   }, [isModalOpen, isOAuthEngine, refreshOAuthAccounts]);
+
+  useEffect(() => {
+    return () => {
+      oauthMessageCleanupRef.current?.();
+    };
+  }, []);
 
   useEffect(() => {
     // 修改原因：OAuth 面板打开后，已有账号如果缺少标准 quota，需要自动批量补查一次余额。
@@ -330,6 +338,11 @@ export function useChannelOAuth({
         return;
       }
       const { auth_url, state, mode } = await res.json();
+      if (typeof state !== 'string' || !state) {
+        toastError('授权状态无效，请重试', '发起登录失败');
+        return;
+      }
+      const expectedOrigin = window.location.origin;
       const authWindow = window.open(auth_url, '_blank', 'width=600,height=700');
       if (!authWindow) {
         toastError('无法打开弹出窗口，请允许弹窗后重试');
@@ -340,20 +353,38 @@ export function useChannelOAuth({
         setManualUrl('');
         return;
       }
+      oauthMessageCleanupRef.current?.();
       let timeoutId: number | undefined;
-      const handler = (event: MessageEvent) => {
-        if (event.data?.type !== 'oauth_callback_success') return;
-        if (event.data?.state && event.data.state !== state) return;
-        if (event.data?.provider && event.data.provider !== providerName) return;
-        window.removeEventListener('message', handler);
-        if (timeoutId !== undefined) window.clearTimeout(timeoutId);
-        const keyId = event.data.key_id;
+      let handler: ((event: MessageEvent) => void) | undefined;
+      const cleanup = () => {
+        if (handler) {
+          window.removeEventListener('message', handler);
+        }
+        if (timeoutId !== undefined) {
+          window.clearTimeout(timeoutId);
+          timeoutId = undefined;
+        }
+        if (oauthMessageCleanupRef.current === cleanup) {
+          oauthMessageCleanupRef.current = null;
+        }
+      };
+      // ⚠️ 高风险边界：窗口消息处理前必须严格核对预期 origin、授权窗口引用及非空 state/provider，切勿改为可选校验。
+      handler = (event: MessageEvent) => {
+        if (event.origin !== expectedOrigin) return;
+        if (event.source !== authWindow) return;
+        if (!event.data || typeof event.data !== 'object') return;
+        if (event.data.type !== 'oauth_callback_success') return;
+        if (event.data.state !== state) return;
+        if (event.data.provider !== providerName) return;
+        cleanup();
+        const keyId = typeof event.data.key_id === 'string' ? event.data.key_id : '';
         if (keyId && !event.data.already_exists) updateKeyAtIndex(idx, keyId);
         void refreshOAuthAccounts();
         if (!authWindow.closed) authWindow.close();
       };
+      oauthMessageCleanupRef.current = cleanup;
       window.addEventListener('message', handler);
-      timeoutId = window.setTimeout(() => window.removeEventListener('message', handler), 300000);
+      timeoutId = window.setTimeout(cleanup, 300000);
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e), '登录出错');
     }

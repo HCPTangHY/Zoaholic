@@ -9,13 +9,17 @@ import stat
 import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
+from typing import Optional
 
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from routes.deps import rate_limit_dependency, verify_admin_api_key
+from core.initialization import get_admin_user
 from core.log_config import logger
 from core.plugins import get_plugin_manager, get_interceptor_registry
+from core.security import verify_password
 
 
 router = APIRouter(prefix="/v1/plugins", tags=["plugins"])
@@ -25,6 +29,23 @@ PLUGINS_DIR = Path("plugins")
 MAX_PLUGIN_UPLOAD_BYTES = 16 * 1024 * 1024
 MAX_PLUGIN_EXPANDED_BYTES = 64 * 1024 * 1024
 MAX_PLUGIN_ZIP_ENTRIES = 1024
+
+
+class PluginPasswordRequest(BaseModel):
+    admin_password: Optional[str] = None
+
+
+async def _require_admin_password(password: Optional[str] = None) -> None:
+    candidate = password if isinstance(password, str) else None
+    if not candidate:
+        raise HTTPException(status_code=403, detail="Administrator password is required")
+
+    admin_user = await get_admin_user()
+    if admin_user is None or not getattr(admin_user, "password_hash", None):
+        raise HTTPException(status_code=503, detail="Administrator account is not initialized")
+
+    if not verify_password(candidate, admin_user.password_hash):
+        raise HTTPException(status_code=403, detail="Invalid administrator password")
 
 
 def _validate_plugin_name(name: str) -> None:
@@ -313,9 +334,12 @@ async def get_plugin(name: str, _: int = Depends(verify_admin_api_key)):
 @router.post("/upload", dependencies=[Depends(rate_limit_dependency)])
 async def upload_plugin(
     file: UploadFile = File(...),
+    admin_password: Optional[str] = Form(default=None),
     _: int = Depends(verify_admin_api_key),
 ):
     """Install an administrator-supplied Python plugin, bounded to the plugin directory."""
+    # ⚠️ 高风险边界：插件代码直接运行在主进程内，写入或删除磁盘插件前必须核验管理员登录口令，切勿移除或跳过此检查。
+    await _require_admin_password(admin_password)
     filename = file.filename or ""
     _validate_plugin_name(filename)
     if not filename.endswith((".py", ".zip")):
@@ -526,10 +550,17 @@ async def reload_all_plugins(_: int = Depends(verify_admin_api_key)):
 
 
 @router.delete("/{name}", dependencies=[Depends(rate_limit_dependency)])
-async def uninstall_plugin(name: str, _: int = Depends(verify_admin_api_key)):
+async def uninstall_plugin(
+    name: str,
+    payload: Optional[PluginPasswordRequest] = Body(default=None),
+    _: int = Depends(verify_admin_api_key),
+):
     """
     卸载并删除插件
     """
+    # ⚠️ 高风险边界：卸载会直接删除磁盘插件文件，必须先通过管理员登录口令核验，切勿跳过。
+    supplied_password = payload.admin_password if isinstance(payload, PluginPasswordRequest) else None
+    await _require_admin_password(supplied_password)
     manager = get_plugin_manager()
     info = manager.loader.get_plugin(name)
     

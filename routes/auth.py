@@ -7,8 +7,6 @@
 - API 网关的用户侧依旧支持 API Key。
 """
 
-from typing import Optional
-
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -32,33 +30,11 @@ class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "Bearer"
     role: str = "admin"
-    # 方便前端显示/生成外部客户端链接（可选）
-    admin_api_key: Optional[str] = None
 
 
 class MeResponse(BaseModel):
     username: str
     role: str
-    admin_api_key: Optional[str] = None
-
-
-def _select_admin_api_key_from_config(conf: dict) -> Optional[str]:
-    api_keys = conf.get("api_keys") or []
-    if not isinstance(api_keys, list):
-        return None
-
-    for item in api_keys:
-        if not isinstance(item, dict):
-            continue
-        if "admin" in str(item.get("role", "")):
-            key = item.get("api")
-            if key:
-                return str(key)
-
-    if api_keys and isinstance(api_keys[0], dict) and api_keys[0].get("api"):
-        return str(api_keys[0]["api"])
-
-    return None
 
 
 @router.post("/login", response_model=LoginResponse, dependencies=[Depends(rate_limit_dependency)])
@@ -79,13 +55,7 @@ async def login(payload: LoginRequest = Body(...)):
         raise HTTPException(status_code=403, detail="Invalid username or password")
 
     token = issue_jwt({"sub": admin_user.username, "role": "admin"})
-
-    # admin_api_key 仅用于前端展示/兼容旧鉴权；配置权威来自 api.yaml（app.state.config）
-    app = get_app()
-    conf = getattr(app.state, "config", None) or {}
-    admin_api_key = _select_admin_api_key_from_config(conf)
-
-    return LoginResponse(access_token=token, admin_api_key=admin_api_key)
+    return LoginResponse(access_token=token)
 
 
 @router.get("/me", response_model=MeResponse, dependencies=[Depends(rate_limit_dependency)])
@@ -97,9 +67,4 @@ async def me(request: Request):
 
     role = str(payload.get("role", "user"))
     username = str(payload.get("sub", ""))
-
-    app = get_app()
-    conf = getattr(app.state, "config", None) or {}
-    admin_api_key = _select_admin_api_key_from_config(conf)
-
-    return MeResponse(username=username, role=role, admin_api_key=admin_api_key)
+    return MeResponse(username=username, role=role)

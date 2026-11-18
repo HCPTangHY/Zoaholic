@@ -27,18 +27,27 @@ RUN uv export --frozen --no-dev --no-hashes --no-emit-project -o requirements.tx
     uv pip install --system --no-cache -r requirements.txt
 
 # ===============
-# Stage 3: Runtime
+# Stage 3: Runtime (non-root)
 # ===============
 FROM python:3.11-slim-bullseye
 
 EXPOSE 8000
 WORKDIR /home
 
+RUN groupadd -g 10001 zoaholic && \
+    useradd -u 10001 -g 10001 -d /home -s /usr/sbin/nologin zoaholic && \
+    mkdir -p /home/data /home/plugins && \
+    chown -R 10001:10001 /home
+
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY . .
+COPY --chown=10001:10001 . .
 
 # 将前端产物放入后端 static/ 目录（FastAPI 直接挂载）
-COPY --from=frontend_builder /app/static ./static
+COPY --from=frontend_builder --chown=10001:10001 /app/static ./static
+
+ENV PYTHONDONTWRITEBYTECODE=1
+
+USER 10001:10001
 
 # 部分云平台会注入 $PORT；用 shell 形式让变量生效
-CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips '*'"]
+CMD ["sh", "-c", "python -m uvicorn main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8000} --no-server-header --proxy-headers --forwarded-allow-ips '*'"]

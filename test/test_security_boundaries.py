@@ -190,6 +190,7 @@ async def test_static_assets_and_frontend_routes_still_work(static_app):
             response = await client.get(path)
             assert response.text == 'frontend'
             assert 'no-store' in response.headers['cache-control']
+            assert "script-src 'self' blob:" in response.headers['content-security-policy']
         response = await client.get('/app.js')
         assert response.text == 'asset'
         assert 'immutable' in response.headers['cache-control']

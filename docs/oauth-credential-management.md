@@ -182,8 +182,8 @@ auto 模式已在后端和前端实现，供声明 `redirect_mode="auto"` 的 pr
 1. 前端发起 authorize 时传入 `origin=window.location.origin`。
 2. 后端优先使用 `origin` 构建 `https://zoaholic.example/v1/oauth/callback` 形式的 redirect_uri；没有 origin 时回退到代理头和请求 Host。
 3. provider 回跳 `/v1/oauth/callback` 后，后端完成 token exchange 并渲染成功页。
-4. 成功页通过 `window.opener.postMessage({ type: "oauth_callback_success", key_id, state }, "*")` 通知管理前端。
-5. 前端校验 state 后写入 key 行，并刷新 OAuth 账号列表。
+4. 成功页通过 `window.opener.postMessage({ type: "oauth_callback_success", key_id, state, provider }, targetOrigin)` 仅向发起授权的前端源通知结果。
+5. 前端严格校验 `event.origin`、`event.source`、必填 `state` 与 `provider` 完全匹配后写入 key 行，并刷新 OAuth 账号列表。
 
 ## 七、token_url 运行时读取
 

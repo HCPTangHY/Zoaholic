@@ -56,15 +56,6 @@ class SetupInitResponse(BaseModel):
     admin_api_key: str
 
 
-class SetupLoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-class SetupLoginResponse(BaseModel):
-    admin_api_key: str
-
-
 async def _get_admin_user():
     return await get_admin_user()
 
@@ -296,31 +287,3 @@ async def _setup_init(request: Request, payload: SetupInitRequest):
 
     logger.info("Setup initialized successfully; admin key created.")
     return SetupInitResponse(admin_api_key=admin_api_key)
-
-
-@router.post("/login", response_model=SetupLoginResponse)
-async def setup_login(payload: SetupLoginRequest = Body(...)):
-    """使用管理员账号密码登录，返回管理员 API Key（兼容现有前端基于 API Key 的鉴权）。"""
-
-    await ensure_initialized(get_app())
-    admin_user = await _get_admin_user()
-    if admin_user is None:
-        raise HTTPException(status_code=404, detail="Admin user not initialized")
-
-    if admin_user.username != payload.username:
-        raise HTTPException(status_code=403, detail="Invalid username or password")
-
-    if not verify_password(payload.password, admin_user.password_hash):
-        raise HTTPException(status_code=403, detail="Invalid username or password")
-
-    # 从当前配置中取管理员 key（配置权威来自 api.yaml/app.state.config）
-    app = get_app()
-    conf = getattr(app.state, "config", None) or {}
-    key = _select_admin_api_key_from_config(conf)
-    if not key:
-        raise HTTPException(
-            status_code=500,
-            detail="No admin API key found in configuration. Please re-run setup.",
-        )
-
-    return SetupLoginResponse(admin_api_key=key)

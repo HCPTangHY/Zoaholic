@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import * as Dialog from '@radix-ui/react-dialog';
 import { apiFetch } from '../lib/api';
-import { toastSuccess, toastError, toastWarning, fmtErr } from '../components/Toast';
+import { toastSuccess, toastError } from '../components/Toast';
 import {
   Puzzle,
   Upload,
@@ -20,6 +21,8 @@ import {
   Code2,
   FileText,
   Zap,
+  Lock,
+  X,
 } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 
@@ -31,8 +34,8 @@ interface PluginInfo {
   source?: string;
   path?: string;
   enabled: boolean;
-  extensions?: any;
-  dependencies?: any;
+  extensions?: string[];
+  dependencies?: string[];
   loaded_at?: string | null;
   error?: string | null;
   metadata?: {
@@ -57,7 +60,7 @@ type PluginStatus = {
     total_plugins?: number;
     enabled_plugins?: number;
   };
-  registry?: any;
+  registry?: Record<string, unknown>;
 };
 
 export default function Plugins() {
@@ -72,6 +75,13 @@ export default function Plugins() {
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [pendingAction, setPendingAction] = useState<
+    | { type: 'upload'; file: File }
+    | { type: 'uninstall'; pluginName: string }
+    | null
+  >(null);
+  const [adminPassword, setAdminPassword] = useState('');
+  const [confirmSubmitting, setConfirmSubmitting] = useState(false);
 
   const authHeaders = useMemo<Record<string, string>>(
     () => (token ? { Authorization: `Bearer ${token}` } : ({} as Record<string, string>)),
@@ -149,7 +159,7 @@ export default function Plugins() {
 
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        toastSuccess(data?.detail || `操作失败: HTTP ${res.status}`);
+        toastError(data?.detail || `操作失败: HTTP ${res.status}`);
         return;
       }
 
@@ -157,7 +167,7 @@ export default function Plugins() {
       if (refreshAfter) await fetchAll();
     } catch (e) {
       console.error(e);
-      toastSuccess('操作失败（网络错误）');
+      toastError('操作失败（网络错误）');
     }
   };
 
@@ -165,33 +175,82 @@ export default function Plugins() {
     fileInputRef.current?.click();
   };
 
-  const handleUploadFile = async (file: File) => {
-    if (!token) return;
-    setUploading(true);
+  const closePasswordDialog = () => {
+    if (confirmSubmitting) return;
+    setPendingAction(null);
+    setAdminPassword('');
+  };
+
+  const requestUploadFile = (file: File) => {
+    setAdminPassword('');
+    setPendingAction({ type: 'upload', file });
+  };
+
+  const requestUninstallPlugin = (pluginName: string) => {
+    setAdminPassword('');
+    setPendingAction({ type: 'uninstall', pluginName });
+  };
+
+  const handleConfirmProtectedAction = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token || !pendingAction) return;
+    if (!adminPassword) {
+      toastError('请输入管理员密码');
+      return;
+    }
+
+    setConfirmSubmitting(true);
+    if (pendingAction.type === 'upload') setUploading(true);
     try {
-      const fd = new FormData();
-      fd.append('file', file);
+      if (pendingAction.type === 'upload') {
+        const fd = new FormData();
+        fd.append('file', pendingAction.file);
+        fd.append('admin_password', adminPassword);
 
-      const res = await apiFetch('/v1/plugins/upload', {
-        method: 'POST',
-        headers: authHeaders,
-        body: fd,
-      });
+        const res = await apiFetch('/v1/plugins/upload', {
+          method: 'POST',
+          headers: authHeaders,
+          body: fd,
+        });
 
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        toastSuccess(data?.detail || `上传失败: HTTP ${res.status}`);
-        return;
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          toastError(data?.detail || `上传失败: HTTP ${res.status}`);
+          return;
+        }
+
+        setPendingAction(null);
+        setAdminPassword('');
+        toastSuccess(data?.message || '插件上传成功');
+        await fetchAll();
+      } else {
+        const res = await apiFetch(`/v1/plugins/${encodeURIComponent(pendingAction.pluginName)}`, {
+          method: 'DELETE',
+          headers: {
+            ...authHeaders,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ admin_password: adminPassword }),
+        });
+
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          toastError(data?.detail || `卸载失败: HTTP ${res.status}`);
+          return;
+        }
+
+        const removedName = pendingAction.pluginName;
+        setPendingAction(null);
+        setAdminPassword('');
+        toastSuccess(`已卸载 ${removedName}`);
+        await fetchAll();
       }
-
-      toastSuccess(data?.message || '插件上传成功');
-      await fetchAll();
-    } catch (e) {
-      console.error(e);
-      toastSuccess('上传失败（网络错误）');
+    } catch (err) {
+      console.error(err);
+      toastError(pendingAction.type === 'upload' ? '上传失败（网络错误）' : '卸载失败（网络错误）');
     } finally {
+      setConfirmSubmitting(false);
       setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
@@ -200,9 +259,10 @@ export default function Plugins() {
   };
 
   // 解析 extensions 获取拦截器类型列表
-  const getInterceptorTypes = (ext: any): string[] => {
+  const getInterceptorTypes = (ext: unknown): string[] => {
     if (!ext || !Array.isArray(ext)) return [];
-    return ext.map((e: string) => {
+    return ext.map((item) => {
+      const e = String(item);
       if (e.includes('request')) return '请求拦截';
       if (e.includes('response')) return '响应拦截';
       return e;
@@ -262,7 +322,8 @@ export default function Plugins() {
             className="hidden"
             onChange={(e) => {
               const f = e.target.files?.[0];
-              if (f) handleUploadFile(f);
+              e.target.value = '';
+              if (f) requestUploadFile(f);
             }}
           />
         </div>
@@ -454,11 +515,7 @@ export default function Plugins() {
                     </button>
 
                     <button
-                      onClick={async () => {
-                        const ok = confirm(`确定要卸载并删除插件 "${p.name}" 吗？\n\n注意：source=entry_point 的插件无法在此删除。`);
-                        if (!ok) return;
-                        await callAction(`/v1/plugins/${encodeURIComponent(p.name)}`, { method: 'DELETE' }, `已卸载 ${p.name}`);
-                      }}
+                      onClick={() => requestUninstallPlugin(p.name)}
                       className="bg-destructive hover:bg-destructive/90 text-destructive-foreground px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium transition-colors"
                     >
                       <Trash2 className="w-3.5 h-3.5" /> 卸载
@@ -586,12 +643,93 @@ export default function Plugins() {
       <section className="bg-muted/30 border border-border rounded-xl p-4 text-sm text-muted-foreground">
         <div className="font-medium text-foreground mb-2">提示</div>
         <ul className="list-disc pl-5 space-y-1">
-          <li>上传插件会写入后端的 <code className="bg-muted px-1 py-0.5 rounded">plugins/</code> 目录，并尝试立即加载。</li>
+          <li>上传插件与卸载插件需要再次验证管理员登录密码，验证通过后才会写入或删除 <code className="bg-muted px-1 py-0.5 rounded">plugins/</code> 目录文件。</li>
           <li>你也可以把插件文件直接放到服务器的 <code className="bg-muted px-1 py-0.5 rounded">plugins/</code> 目录，然后点"重新扫描并加载"。</li>
           <li>禁用=卸载（保留文件）；卸载=卸载并删除文件。</li>
           <li>点击插件卡片可展开查看详细参数说明、配置示例和扩展点信息。</li>
         </ul>
       </section>
+
+      {/* Administrator Password Confirmation Dialog */}
+      <Dialog.Root
+        open={Boolean(pendingAction)}
+        onOpenChange={(open) => {
+          if (!open) closePasswordDialog();
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 bg-black/60 z-40" />
+          <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-[min(92vw,420px)] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border bg-background p-5 shadow-2xl">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2 text-foreground font-semibold">
+                <Lock className="w-4 h-4 text-primary" />
+                <Dialog.Title className="text-base">验证管理员密码</Dialog.Title>
+              </div>
+              <Dialog.Close
+                disabled={confirmSubmitting}
+                className="rounded-md p-1 text-muted-foreground hover:text-foreground hover:bg-muted transition-colors disabled:opacity-50"
+              >
+                <X className="w-4 h-4" />
+              </Dialog.Close>
+            </div>
+
+            <Dialog.Description className="text-xs text-muted-foreground mt-2 leading-relaxed">
+              {pendingAction?.type === 'upload'
+                ? `准备上传并加载插件 "${pendingAction.file.name}"。请输入管理员登录密码确认该操作。`
+                : pendingAction?.type === 'uninstall'
+                ? `确定要卸载并删除插件 "${pendingAction.pluginName}" 吗？请输入管理员登录密码确认删除（entry_point 插件无法在此删除）。`
+                : ''}
+            </Dialog.Description>
+
+            <form onSubmit={handleConfirmProtectedAction} className="mt-4 space-y-4">
+              <div>
+                <label htmlFor="plugin-admin-password" className="block text-xs font-medium text-foreground mb-1.5">
+                  管理员密码
+                </label>
+                <input
+                  id="plugin-admin-password"
+                  type="password"
+                  autoComplete="current-password"
+                  autoFocus
+                  value={adminPassword}
+                  onChange={(e) => setAdminPassword(e.target.value)}
+                  placeholder="请输入管理员登录密码"
+                  disabled={confirmSubmitting}
+                  className="w-full bg-background border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={closePasswordDialog}
+                  disabled={confirmSubmitting}
+                  className="bg-muted hover:bg-muted/80 text-foreground px-3 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+                >
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  disabled={confirmSubmitting || !adminPassword}
+                  className={`px-3.5 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
+                    pendingAction?.type === 'uninstall'
+                      ? 'bg-destructive hover:bg-destructive/90 text-destructive-foreground'
+                      : 'bg-emerald-600 hover:bg-emerald-600/90 text-white'
+                  }`}
+                >
+                  {confirmSubmitting
+                    ? pendingAction?.type === 'uninstall'
+                      ? '卸载中...'
+                      : '上传中...'
+                    : pendingAction?.type === 'uninstall'
+                    ? '确认卸载'
+                    : '确认上传'}
+                </button>
+              </div>
+            </form>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
     </div>
   );
 }

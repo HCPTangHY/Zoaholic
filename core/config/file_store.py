@@ -60,7 +60,9 @@ def save_api_yaml(config_data):
             import time as _time
             if len(existing_providers) > 5 and len(new_providers) < len(existing_providers) * 0.5 and not config_data.get("_allow_mass_shrink"):
                 try:
-                    _snap = f"{target_path}.bak_autosave_{_time.strftime('%Y%m%d_%H%M%S')}"
+                    _snap_dir = os.path.join(os.path.dirname(target_path) or ".", "data", "config_backups")
+                    os.makedirs(_snap_dir, exist_ok=True)
+                    _snap = os.path.join(_snap_dir, f"api.yaml.bak_autosave_{_time.strftime('%Y%m%d_%H%M%S')}")
                     shutil.copy2(target_path, _snap)
                     logger.warning(f"[save_api_yaml] old config snapshotted to {_snap}")
                 except Exception as _snap_err:
@@ -93,7 +95,8 @@ def save_api_yaml(config_data):
             logger.warning(f"[save_api_yaml] Could not read existing file for safety check: {e}")
 
     target_dir = os.path.dirname(target_path) or "."
-    os.makedirs(target_dir, exist_ok=True)
+    if not os.path.isdir(target_dir):
+        os.makedirs(target_dir, exist_ok=True)
 
     if os.path.isdir(target_path):
         raise RuntimeError(
@@ -105,31 +108,41 @@ def save_api_yaml(config_data):
 
     temp_path = None
     try:
-        fd, temp_path = tempfile.mkstemp(prefix=".api.yaml.", suffix=".tmp", dir=target_dir)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            yaml.dump(processed_data, f)
-            f.flush()
-            os.fsync(f.fileno())
-
         try:
-            os.replace(temp_path, target_path)
-            temp_path = None
-            return
+            fd, temp_path = tempfile.mkstemp(prefix=".api.yaml.", suffix=".tmp", dir=target_dir)
         except OSError as e:
-            replace_errno = getattr(e, "errno", None)
-            if replace_errno not in {errno.EBUSY, errno.EXDEV, errno.EPERM, errno.EACCES}:
+            if getattr(e, "errno", None) not in {errno.EROFS, errno.EPERM, errno.EACCES}:
                 raise
-
             logger.warning(
-                f"Atomic replace unavailable for '{target_path}', falling back to direct write. "
-                f"This is common with Docker single-file bind mounts. err={e}"
+                f"Temporary file creation unavailable in '{target_dir}', falling back to direct write for '{target_path}'. err={e}"
             )
+            fd = None
+
+        if fd is not None and temp_path is not None:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                yaml.dump(processed_data, f)
+                f.flush()
+                os.fsync(f.fileno())
 
             try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-            temp_path = None
+                os.replace(temp_path, target_path)
+                temp_path = None
+                return
+            except OSError as e:
+                replace_errno = getattr(e, "errno", None)
+                if replace_errno not in {errno.EBUSY, errno.EXDEV, errno.EPERM, errno.EACCES, errno.EROFS}:
+                    raise
+
+                logger.warning(
+                    f"Atomic replace unavailable for '{target_path}', falling back to direct write. "
+                    f"This is common with Docker single-file bind mounts. err={e}"
+                )
+
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                temp_path = None
 
         with open(target_path, "w", encoding="utf-8") as f:
             yaml.dump(processed_data, f)

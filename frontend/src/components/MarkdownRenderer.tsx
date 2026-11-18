@@ -4,7 +4,6 @@ import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
-import rehypeRaw from 'rehype-raw';
 import { Check, Copy } from 'lucide-react';
 import 'katex/dist/katex.min.css';
 
@@ -129,9 +128,9 @@ function createMarkdownComponents(tone: MarkdownTone): Components {
   const styles = TONE_STYLES[tone];
   const listMarkerClass = tone === 'inverse' ? 'marker:text-primary-foreground/50' : 'marker:text-muted-foreground/60';
 
-  // 修改原因：旧实现用正则和 if else 手写解析，无法稳定覆盖锚点、HTML、嵌套列表、GFM 和数学公式。
-  // 修改方式：把语法解析交给 react-markdown、remark-gfm、remark-math、rehype-raw 和 rehype-katex，这里只通过 components 迁移项目现有样式。
-  // 目的：保留原有视觉表现和复制按钮，同时获得标准 markdown 生态的解析能力。
+  // 修改原因：旧实现用正则和 if else 手写解析，无法稳定覆盖锚点、嵌套列表、GFM 和数学公式。
+  // 修改方式：把语法解析交给 react-markdown、remark-gfm、remark-math 和 rehype-katex，原始标签统一按纯文本转义显示。
+  // ⚠️ 高风险边界：切勿在此启用原始 HTML 解析插件或直接注入富文本节点，否则不可信文本会在管理界面上下文中直接执行。
   return {
     h1({ node, className, ...props }) {
       void node;
@@ -302,12 +301,11 @@ export function MarkdownRenderer({ content, className = '', tone = 'default' }: 
 
   return (
     <div className={`markdown-body break-words text-left text-[14.5px] leading-relaxed ${TONE_STYLES[tone].root} ${tone === 'inverse' ? '[&_.katex]:text-primary-foreground/90' : ''} [&_.katex-display]:my-3 [&_.katex-display]:overflow-x-auto ${className}`.trim()}>
-      {/* 修改原因：Markdown 语法解析需要由标准库负责，避免手写 parser 漏掉锚点、HTML、嵌套列表和 GFM 语法。
-          修改方式：ReactMarkdown 负责语法树渲染，remark/rehype 插件负责 GFM、数学公式、KaTeX 和 raw HTML，components 负责主题样式迁移。
-          目的：保持现有组件接口和视觉表现，同时提升 markdown 规范兼容性。 */}
+      {/* ⚠️ 高风险边界：模型输出与工作区文档属于不可信内容，此处仅允许挂载标准 Markdown 与公式插件，
+          严禁启用原始 HTML 渲染能力，所有内嵌标签必须保持纯文本转义状态。 */}
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[rehypeRaw, rehypeKatex]}
+        rehypePlugins={[rehypeKatex]}
         components={components}
         urlTransform={defaultUrlTransform}
       >

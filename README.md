@@ -73,9 +73,14 @@ docker run --rm -p 8000:8000 \
   ghcr.io/hcptanghy/zoaholic:latest
 ```
 
-如果你使用仓库中的 `docker-compose.yml`，默认会将配置保存到数据库（`CONFIG_STORAGE=db`），并把 SQLite 数据库持久化到 `./data/stats.db`。这样可以避免 Docker 单文件挂载 `api.yaml` 带来的写入问题。
+如果你使用仓库中的 `docker-compose.yml`，容器默认以非 root 用户（`10001:10001`）和只读根文件系统运行，将配置保存到数据库（`CONFIG_STORAGE=db`），并挂载 `./data` 与 `./plugins`。首次启动前请先在宿主机创建可写目录并赋予对应属主权限：
 
-如果你坚持使用文件模式，请挂载目录，再通过 `API_YAML_PATH` 指向目录内的文件；不建议直接把单个 `api.yaml` 绑定到容器内的 `/home/api.yaml`。
+```bash
+mkdir -p data plugins && chown -R 10001:10001 data plugins
+docker compose up -d --build
+```
+
+如果你坚持使用文件模式，请挂载目录并通过 `API_YAML_PATH` 指向目录内的文件，或提前创建属主为 `10001:10001` 的 `api.yaml` 后再挂载。
 
 ### 3）首次初始化
 

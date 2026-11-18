@@ -65,3 +65,23 @@ def test_save_api_yaml_allows_empty_providers_when_existing_file_has_no_provider
     # 修改方式：用旧 providers 为空的临时文件调用真实保存逻辑。
     # 目的：保持首次初始化或显式清空空配置文件时的兼容性。
     assert _read_yaml(target) == new_config
+
+
+def test_save_api_yaml_falls_back_to_direct_write_when_parent_dir_is_read_only(tmp_path, monkeypatch):
+    """只读根文件系统下单文件挂载 api.yaml 时，mkstemp 返回 EROFS 应回退为直接写入。"""
+    import errno
+    import tempfile
+
+    target = tmp_path / "api.yaml"
+    _write_yaml(target, {"providers": [{"provider": "p1", "api": ["k1"]}], "api_keys": [], "preferences": {}})
+    monkeypatch.setattr(file_store, "API_YAML_PATH", str(target))
+
+    def readonly_mkstemp(*args, **kwargs):
+        raise OSError(errno.EROFS, "Read-only file system")
+
+    monkeypatch.setattr(tempfile, "mkstemp", readonly_mkstemp)
+
+    updated_config = {"providers": [{"provider": "p1", "api": ["k1", "k2"]}], "api_keys": [], "preferences": {"ok": True}}
+    file_store.save_api_yaml(updated_config)
+
+    assert _read_yaml(target) == updated_config

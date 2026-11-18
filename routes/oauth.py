@@ -6,6 +6,7 @@ import json
 import secrets
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -78,6 +79,28 @@ def _first_header_value(value: str | None) -> str:
     return value.split(",", 1)[0].strip()
 
 
+def _normalize_http_origin(value: str | None) -> str | None:
+    """提取合法的 http/https Origin（scheme://host[:port]），非法输入返回 None。"""
+    if not value or not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw or any(ch in raw for ch in (" ", "\t", "\r", "\n", "\\")):
+        return None
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    try:
+        _ = parsed.port
+    except ValueError:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 def _build_redirect_uri(request: Request) -> str:
     """根据当前请求构建 Zoaholic 直连 OAuth callback 地址。"""
     # 修改原因：auto 模式需要把 provider 回调指向 Zoaholic 后端，且线上通常经过反向代理。
@@ -102,11 +125,16 @@ def _oauth_error_page(title: str, message: str, status_code: int = 400) -> HTMLR
     return HTMLResponse(f"<h2>{safe_title}</h2><p>{safe_message}</p>", status_code=status_code)
 
 
-def _oauth_success_page(key_id: str, state: str, provider: str, already_exists: bool = False) -> HTMLResponse:
+def _oauth_success_page(
+    key_id: str,
+    state: str,
+    provider: str,
+    already_exists: bool = False,
+    target_origin: str | None = None,
+) -> HTMLResponse:
     """生成 OAuth 成功提示页，并通知前端窗口刷新账号列表。"""
-    # 修改原因：callback 页面需要把新增账号标识和渠道名传回管理前端，but key_id/provider 不能直接拼进脚本字符串。
-    # 修改方式：HTML 展示部分使用 html.escape，postMessage 载荷先用 json.dumps 序列化，再转义脚本敏感字符。
-    # 目的：完成弹窗登录闭环，同时避免账号字符串中的特殊字符破坏 HTML、JavaScript 或 script 标签边界。
+    # ⚠️ 高风险边界：postMessage 目标源必须保持精确源地址（或同源 window.location.origin），切勿改回 '*' 通配符。
+    # HTML 展示部分使用 html.escape，消息载荷与目标源统一做 JSON 与脚本边界转义。
     safe_key_id = html.escape(key_id)
     message_payload = (
         json.dumps(
@@ -116,6 +144,15 @@ def _oauth_success_page(key_id: str, state: str, provider: str, already_exists: 
         .replace("&", "\\u0026")
         .replace("<", "\\u003c")
         .replace(">", "\\u003e")
+    )
+    normalized_origin = _normalize_http_origin(target_origin)
+    target_origin_expr = (
+        json.dumps(normalized_origin, ensure_ascii=False)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        if normalized_origin
+        else "window.location.origin"
     )
     return HTMLResponse(f"""
 <!DOCTYPE html>
@@ -136,8 +173,9 @@ def _oauth_success_page(key_id: str, state: str, provider: str, already_exists: 
   <p>此窗口将在 3 秒后自动关闭</p>
 </div>
 <script>
-  if (window.opener) {{
-    window.opener.postMessage({message_payload}, '*');
+  const targetOrigin = {target_origin_expr};
+  if (window.opener && targetOrigin) {{
+    window.opener.postMessage({message_payload}, targetOrigin);
   }}
   setTimeout(() => window.close(), 3000);
 </script>
@@ -542,6 +580,7 @@ async def oauth_authorize(type: str, provider: str, request: Request, mode: str 
         )
 
     state = _encode_oauth_state(channel_id)
+    normalized_origin = _normalize_http_origin(origin)
     if effective_mode == "manual":
         # 修改原因：manual 模式必须使用 provider 白名单内的 localhost callback，否则授权服务会拒绝 redirect_uri。
         # 修改方式：优先使用路由覆盖表，其次使用 provider.localhost_redirect_uri，最后回退到基类默认值。
@@ -552,12 +591,13 @@ async def oauth_authorize(type: str, provider: str, request: Request, mode: str 
         )
     else:
         # 修改原因：auto 模式需要 provider 直接回跳 Zoaholic 后端 callback 端点。
-        # 修改方式：从当前请求和代理头动态生成 {scheme}://{host}/v1/oauth/callback。
-        # 目的：后端收到回调后可以直接换 token，并通过成功页 postMessage 通知管理前端。
-        if origin and origin.startswith("http"):
-            redirect_uri = f"{origin.rstrip('/')}/v1/oauth/callback"
+        # 修改方式：优先使用通过严格协议/主机校验的前端 origin，否则从当前请求和代理头生成 {scheme}://{host}/v1/oauth/callback。
+        # 目的：后端收到回调后可以直接换 token，并通过成功页向受限 targetOrigin 发送 postMessage 通知管理前端。
+        if normalized_origin:
+            redirect_uri = f"{normalized_origin}/v1/oauth/callback"
         else:
             redirect_uri = _build_redirect_uri(request)
+            normalized_origin = _normalize_http_origin(redirect_uri)
 
     auth_url, verifier = oauth_provider.build_auth_url(state, redirect_uri)
     created_at = time.time()
@@ -566,6 +606,7 @@ async def oauth_authorize(type: str, provider: str, request: Request, mode: str 
         "provider": channel_id,
         "verifier": verifier,
         "redirect_uri": redirect_uri,
+        "origin": normalized_origin,
         "created_at": created_at,
         "mode": effective_mode,
     }
@@ -698,7 +739,14 @@ async def oauth_callback(code: str, state: str, request: Request):
     key_id = email or f"oauth_{secrets.token_hex(4)}"
     already_exists = _key_exists_in_provider(request.app, channel_id, key_id)
     await oauth_mgr.register(channel_id, key_id, flow["type"], token_data)
-    return _oauth_success_page(key_id, state, channel_id, already_exists=already_exists)
+    callback_origin = _normalize_http_origin(flow.get("origin")) or _normalize_http_origin(flow.get("redirect_uri"))
+    return _oauth_success_page(
+        key_id,
+        state,
+        channel_id,
+        already_exists=already_exists,
+        target_origin=callback_origin,
+    )
 
 
 @router.post("/v1/oauth/import", dependencies=[Depends(verify_admin_api_key)])
