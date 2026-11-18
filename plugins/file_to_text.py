@@ -185,21 +185,39 @@ def _guess_lang(filename: str, mime: str) -> str:
     return ""
 
 
-def _decode_content(data_str: str, mime: str = "") -> Optional[str]:
-    """从 base64 / data URI 解码文本内容"""
+MAX_FILE_BASE64_CHARS = 8 * 1024 * 1024  # ~6 MiB raw
+MAX_DECODED_TEXT_BYTES = 5 * 1024 * 1024  # 5 MiB
+
+
+def _decode_content(data_str: Optional[str], mime: str = "") -> Optional[str]:
+    """从 base64 / data URI 解码文本内容（带长度上限控制）"""
+    if not isinstance(data_str, str) or not data_str:
+        return None
+    if len(data_str) > MAX_FILE_BASE64_CHARS:
+        logger.warning("[file_to_text] 跳过超大内联文件解码: chars=%d > %d", len(data_str), MAX_FILE_BASE64_CHARS)
+        return None
     try:
         # data URI: data:mime;base64,xxxxx
         if data_str.startswith("data:"):
             match = re.match(r"data:[^;]*;base64,(.+)", data_str, re.DOTALL)
             if match:
-                raw = base64.b64decode(match.group(1))
+                b64_part = match.group(1)
+                if len(b64_part) > MAX_FILE_BASE64_CHARS:
+                    return None
+                raw = base64.b64decode(b64_part)
             else:
                 # 可能是 data:text/plain,xxxxx（非 base64）
                 _, _, content = data_str.partition(",")
+                if len(content.encode("utf-8", errors="ignore")) > MAX_DECODED_TEXT_BYTES:
+                    return None
                 return content
         else:
             # 纯 base64
             raw = base64.b64decode(data_str)
+
+        if len(raw) > MAX_DECODED_TEXT_BYTES:
+            logger.warning("[file_to_text] 解码后文本超过上限: bytes=%d > %d", len(raw), MAX_DECODED_TEXT_BYTES)
+            return None
 
         # 尝试 UTF-8 解码
         try:

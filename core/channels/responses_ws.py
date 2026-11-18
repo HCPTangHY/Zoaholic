@@ -103,21 +103,57 @@ def error_frame_to_chunk(source: str, status: int, error: dict) -> dict:
     return {"error": f"{source} HTTP Error", "status_code": status, "details": {"error": error}}
 
 
-# ==================== CONNECT 隧道 ====================
+# ==================== 代理隧道（HTTP CONNECT / SOCKS4 / SOCKS4a / SOCKS5 / SOCKS5h） ====================
 
 async def _open_tunnel_socket(proxy_url: str, host: str, port: int) -> socket.socket:
-    """通过 HTTP 代理建立 CONNECT 隧道，返回已连接的裸 socket（TLS 由 websockets 完成）。"""
+    """通过 HTTP CONNECT 或 SOCKS4/4a/5/5h 代理建立隧道，返回已连接的非阻塞裸 socket（TLS 由 websockets 完成）。"""
     p = urlparse(proxy_url)
+    raw_scheme = p.scheme.lower()
+    base_scheme = raw_scheme.rstrip("ha")
+
+    if base_scheme in ("socks5", "socks4"):
+        try:
+            from python_socks.async_.asyncio import Proxy
+            rdns = raw_scheme in ("socks5h", "socks4a")
+            normalized_url = (
+                proxy_url.replace("socks5h://", "socks5://", 1)
+                .replace("SOCKS5H://", "socks5://", 1)
+                .replace("socks4a://", "socks4://", 1)
+                .replace("SOCKS4A://", "socks4://", 1)
+            )
+            proxy_obj = Proxy.from_url(normalized_url, rdns=rdns)
+            sock = await proxy_obj.connect(dest_host=host, dest_port=port, timeout=15)
+            sock.setblocking(False)
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+            return sock
+        except Exception as e:
+            raise WsUnavailable(f"socks proxy tunnel failed: {e}") from e
+
     proxy_host = p.hostname
-    proxy_port = p.port or 8080
+    proxy_port = p.port or (443 if raw_scheme == "https" else 8080)
     if not proxy_host:
         raise WsUnavailable(f"invalid proxy url: {proxy_url!r}")
 
     loop = asyncio.get_running_loop()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        addr_infos = await loop.getaddrinfo(proxy_host, proxy_port, type=socket.SOCK_STREAM)
+    except Exception as e:
+        raise WsUnavailable(f"failed to resolve proxy host {proxy_host!r}: {e}") from e
+    if not addr_infos:
+        raise WsUnavailable(f"no address found for proxy host {proxy_host!r}")
+
+    af, socktype, proto, _, sockaddr = addr_infos[0]
+    sock = socket.socket(af, socktype, proto)
     sock.setblocking(False)
     try:
-        await asyncio.wait_for(loop.sock_connect(sock, (proxy_host, proxy_port)), timeout=15)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    try:
+        await asyncio.wait_for(loop.sock_connect(sock, sockaddr), timeout=15)
 
         auth = b""
         if p.username:
@@ -189,20 +225,29 @@ class ResponsesWsPool:
             (k, v) for k, v in (headers or {}).items()
             if k.lower() not in ("host", "content-length", "connection")
         ]
+        import inspect
+        connect_params = inspect.signature(websockets.connect).parameters
+        header_kwarg = "additional_headers" if "additional_headers" in connect_params else "extra_headers"
+        connect_kwargs: dict[str, Any] = {
+            "sock": sock,
+            header_kwarg: extra or None,
+            "open_timeout": min(timeout or 200, 30),
+            "max_size": WS_MAX_SIZE,
+        }
+        if sock is not None and parsed.scheme == "wss":
+            connect_kwargs["server_hostname"] = parsed.hostname
         try:
-            ws = await websockets.connect(
-                ws_url,
-                sock=sock,
-                extra_headers=extra or None,
-                open_timeout=min(timeout or 200, 30),
-                max_size=WS_MAX_SIZE,
-            )
+            ws = await websockets.connect(ws_url, **connect_kwargs)
         except Exception as e:
             if sock is not None:
                 sock.close()
             raise WsUnavailable(f"websocket handshake failed: {e}") from e
         logger.info(f"[responses-ws] connected: {ws_url} (proxy={'yes' if proxy else 'no'})")
-        return _PooledConn(ws, getattr(ws, "response_headers", None))
+        resp_headers = getattr(ws, "response_headers", None)
+        if resp_headers is None:
+            resp_obj = getattr(ws, "response", None)
+            resp_headers = getattr(resp_obj, "headers", None)
+        return _PooledConn(ws, resp_headers)
 
     async def get(self, key: tuple, url: str, headers: dict, proxy: Optional[str], timeout: float) -> _PooledConn:
         async with self._guard:

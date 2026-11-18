@@ -1,12 +1,25 @@
 import asyncio
 import base64
 import mimetypes
+import stat
+from pathlib import Path
 from typing import Optional
 
 import httpx
 from fastapi import HTTPException
 
 from core.public_fetch import PublicURLTransport, UnsafeFileURL, validate_file_url
+
+
+def is_link_or_reparse(path: Path) -> bool:
+    """检测路径是否为 POSIX 符号链接或 Windows NTFS 重解析点/目录联接。"""
+    if path.is_symlink():
+        return True
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    return bool(getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
 
 
 _shared_fetch_client: Optional[httpx.AsyncClient] = None

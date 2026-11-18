@@ -122,15 +122,16 @@ async def load_config(app=None):
                     write=30.0,
                     pool=200
                 )
-                client = httpx.AsyncClient(
+                async with httpx.AsyncClient(
                     timeout=timeout,
                     **default_config
-                )
-                response = await client.get(config_url)
-                response.raise_for_status()
-                conf_seed = yaml.load(response.text)
+                ) as client:
+                    response = await client.get(config_url)
+                    response.raise_for_status()
+                    conf_seed = yaml.load(response.text)
             except Exception as e:
-                logger.error(f"Error fetching or parsing config from {config_url}: {str(e)}")
+                from core.utils import scrub_sensitive_error_text
+                logger.error("Error fetching or parsing config from CONFIG_URL: %s", scrub_sensitive_error_text(str(e)))
                 conf_seed = None
 
     if not conf_seed or not isinstance(conf_seed, dict):

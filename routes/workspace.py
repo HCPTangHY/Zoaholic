@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from core.file_utils import is_link_or_reparse
 from routes.deps import rate_limit_dependency, verify_admin_api_key
 
 # 修改原因：本文件全部端点（浏览/读/写/删/下载后端文件）都是管理面能力，
@@ -64,9 +65,20 @@ def _normalize_rel(rel_path: str) -> str:
     return "/".join(safe_parts)
 
 
+def _assert_no_symlink_components(rel_normalized: str) -> None:
+    current = PROJECT_ROOT
+    if not rel_normalized:
+        return
+    for part in PurePosixPath(rel_normalized).parts:
+        current = current / part
+        if is_link_or_reparse(current):
+            raise HTTPException(status_code=403, detail="禁止访问符号链接或重解析点")
+
+
 def _resolve_path(rel_path: str) -> Path:
-    """将相对路径解析为绝对路径，并验证不超出项目根目录。"""
+    """将相对路径解析为绝对路径，并验证不超出项目根目录且不含软链接/重解析点。"""
     normalized = _normalize_rel(rel_path)
+    _assert_no_symlink_components(normalized)
     absolute = (PROJECT_ROOT / normalized).resolve()
     # 确保在项目根目录内
     if not absolute.is_relative_to(PROJECT_ROOT):
@@ -80,11 +92,16 @@ def _get_permissions(rel_path: str) -> str:
     if not normalized:
         return ""
 
-    # 检查文件名/扩展名是否在黑名单中
-    name = Path(normalized).name
-    suffix = Path(normalized).suffix.lower()
-    if name in BLOCKED_NAMES or suffix in BLOCKED_EXTENSIONS:
-        return ""
+    parts = PurePosixPath(normalized).parts
+    for part in parts:
+        if part in BLOCKED_NAMES or Path(part).suffix.lower() in BLOCKED_EXTENSIONS:
+            return ""
+
+    current = PROJECT_ROOT
+    for part in parts:
+        current = current / part
+        if is_link_or_reparse(current):
+            return ""
 
     best_match = ""
     best_match_len = -1

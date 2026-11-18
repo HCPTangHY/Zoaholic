@@ -50,4 +50,4 @@ ENV PYTHONDONTWRITEBYTECODE=1
 USER 10001:10001
 
 # 部分云平台会注入 $PORT；用 shell 形式让变量生效
-CMD ["sh", "-c", "python -m uvicorn main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8000} --no-server-header --proxy-headers --forwarded-allow-ips '*'"]
+CMD ["sh", "-c", "python -m uvicorn main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8000} --no-server-header --proxy-headers --forwarded-allow-ips ${FORWARDED_ALLOW_IPS:-127.0.0.1}"]

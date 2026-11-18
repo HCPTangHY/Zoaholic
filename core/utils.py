@@ -7,6 +7,8 @@
 """
 
 import json
+import re
+from typing import Any, List, Optional
 import httpx
 import traceback
 from httpx_socks import AsyncProxyTransport
@@ -245,19 +247,32 @@ def get_engine(provider, endpoint=None, original_model=""):
 
     return engine, stream, stream_mode
 
-def get_proxy(proxy, client_config = {}):
-    if proxy:
-        # 解析代理URL
-        parsed = urlparse(proxy)
-        scheme = parsed.scheme.rstrip('h')
+def get_proxy(proxy, client_config=None):
+    if client_config is None:
+        client_config = {}
+    if not proxy:
+        return client_config
 
-        if scheme == 'socks5':
-            proxy = proxy.replace('socks5h://', 'socks5://')
-            transport = AsyncProxyTransport.from_url(proxy)
-            client_config["transport"] = transport
-            # print("proxy", proxy)
-        else:
-            client_config["proxy"] = proxy
+    parsed = urlparse(proxy)
+    raw_scheme = parsed.scheme.lower()
+    scheme = raw_scheme.rstrip("ha")
+
+    if scheme in ("socks5", "socks4"):
+        # 保留 socks5h / socks4a 的远端 DNS 解析标志 (rdns=True)
+        rdns = raw_scheme in ("socks5h", "socks4a")
+        normalized_proxy = (
+            proxy.replace("socks5h://", "socks5://", 1)
+            .replace("SOCKS5H://", "socks5://", 1)
+            .replace("socks4a://", "socks4://", 1)
+            .replace("SOCKS4A://", "socks4://", 1)
+        )
+        transport_kwargs = {"rdns": rdns}
+        for key in ("verify", "cert", "trust_env", "limits", "http2"):
+            if key in client_config:
+                transport_kwargs[key] = client_config[key]
+        client_config["transport"] = AsyncProxyTransport.from_url(normalized_proxy, **transport_kwargs)
+    else:
+        client_config["proxy"] = proxy
     return client_config
 
 
@@ -389,3 +404,54 @@ def truncate_for_logging(
         serialized = serialized[:max_total_size] + f"... [截断总计 {len(serialized) - max_total_size} 字符]"
 
     return serialized
+
+
+_QUERY_SECRET_RE = re.compile(
+    r'((?:[?&]|\b)(?:key|api_key|apikey|token|access_token|client_secret|secret)=)([^&\s"\'\)\]]+)',
+    re.IGNORECASE,
+)
+_BEARER_SECRET_RE = re.compile(
+    r'\b(Bearer\s+)[A-Za-z0-9._\-]{12,}',
+    re.IGNORECASE,
+)
+_KNOWN_KEY_PATTERNS_RE = re.compile(
+    r'\b(?:AIza[0-9A-Za-z_\-]{20,}|AQ\.[0-9A-Za-z_\-.]{16,}|sk-[0-9A-Za-z_\-]{16,}|zk-[0-9A-Za-z_\-]{16,})\b'
+)
+
+
+def scrub_sensitive_error_text(text: Any, extra_secrets: Optional[List[Optional[str]]] = None) -> str:
+    """擦除异常或错误文本中的上游 API Key、URL 查询参数凭证与 Bearer Token。"""
+    raw = str(text or "")
+    if not raw:
+        return raw
+
+    if extra_secrets:
+        for secret in extra_secrets:
+            if isinstance(secret, str):
+                cleaned = secret.strip()
+                if len(cleaned) >= 6 and cleaned in raw:
+                    raw = raw.replace(cleaned, "***")
+
+    raw = _QUERY_SECRET_RE.sub(r"\1***", raw)
+    raw = _BEARER_SECRET_RE.sub(r"\1***", raw)
+    raw = _KNOWN_KEY_PATTERNS_RE.sub("***", raw)
+    return raw
+
+
+def is_valid_model_name(model_name: str, *, check_encoded: bool = False) -> bool:
+    """校验模型名称格式（过滤相对路径符、URL 查询/锚点分隔符与控制字符）。"""
+    if not model_name:
+        return False
+    if (
+        ".." in model_name
+        or "\\" in model_name
+        or "?" in model_name
+        or "#" in model_name
+        or any(ord(ch) < 32 for ch in model_name)
+    ):
+        return False
+    if check_encoded:
+        lowered = model_name.lower()
+        if "%2e" in lowered or "%2f" in lowered or "%5c" in lowered:
+            return False
+    return True

@@ -30,9 +30,14 @@ from core.log_config import logger
 from core.models import ModerationRequest, UnifiedRequest
 from core.metrics import on_request_start, on_request_end, on_request_model
 from core.stats import enqueue_stats
-from core.utils import truncate_for_logging
+from core.utils import scrub_sensitive_error_text, truncate_for_logging
 from core.error_response import openai_error_response
-from core.ip_blacklist import ip_blocked_error_response, is_global_ip_blocked, is_key_ip_blocked
+from core.ip_blacklist import (
+    extract_client_ip,
+    ip_blocked_error_response,
+    is_global_ip_blocked,
+    is_key_ip_blocked,
+)
 from core.byok import (
     get_byok_prefixes,
     reset_byok_context,
@@ -51,6 +56,7 @@ request_info = contextvars.ContextVar("request_info", default={})
 # 修改方式：标准 /v1 鉴权前先匹配公开路径白名单。
 # 目的：让中间件鉴权覆盖所有非方言 /v1 端点的同时，不破坏 OAuth 登录回跳。
 _PUBLIC_V1_PATHS = frozenset({"/v1/oauth/callback"})
+MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", str(64 * 1024 * 1024)))
 
 
 def get_api_key_from_headers(headers: list) -> Optional[str]:
@@ -168,25 +174,10 @@ class StatsMiddleware:
 
     @staticmethod
     def _get_client_ip(scope: Scope, headers: list) -> str:
-        """
-        获取客户端真实 IP。
-        优先级：X-Forwarded-For > X-Real-IP > scope["client"]
-        """
+        """获取客户端真实 IP（统一委托 core.ip_blacklist.extract_client_ip）。"""
         headers_dict = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in headers}
-
-        # X-Forwarded-For: client, proxy1, proxy2 —— 取第一个
-        forwarded_for = headers_dict.get("x-forwarded-for")
-        if forwarded_for:
-            real_ip = forwarded_for.split(",")[0].strip()
-            if real_ip:
-                return real_ip
-
-        real_ip_header = headers_dict.get("x-real-ip")
-        if real_ip_header:
-            return real_ip_header.strip()
-
         client = scope.get("client")
-        return client[0] if client else "unknown"
+        return extract_client_ip(headers_dict, client[0] if client else "unknown")
 
     def _normalize_endpoint(self, method: str, path: str) -> str:
         """归一化端点路径，将带模型名的路径转换为模板格式"""
@@ -477,13 +468,33 @@ class StatsMiddleware:
             content_type = headers_dict.get("content-type", "")
 
             if method == "POST" and "application/json" in content_type:
+                content_length_raw = headers_dict.get("content-length")
+                if content_length_raw:
+                    try:
+                        if int(content_length_raw) > MAX_REQUEST_BODY_BYTES:
+                            response = openai_error_response("Request body too large", 413)
+                            await response(scope, receive, send)
+                            reset_byok_context(byok_context_tokens)
+                            return
+                    except ValueError:
+                        pass
                 # 收集所有 body chunks
                 body_chunks = []
+                total_body_bytes = 0
                 while True:
                     message = await receive()
                     if message["type"] == "http.disconnect":
+                        reset_byok_context(byok_context_tokens)
                         return
-                    body_chunks.append(message.get("body", b""))
+                    chunk = message.get("body", b"")
+                    total_body_bytes += len(chunk)
+                    if total_body_bytes > MAX_REQUEST_BODY_BYTES:
+                        body_chunks.clear()
+                        response = openai_error_response("Request body too large", 413)
+                        await response(scope, receive, send)
+                        reset_byok_context(byok_context_tokens)
+                        return
+                    body_chunks.append(chunk)
                     if not message.get("more_body", False):
                         break
                 body_bytes = b"".join(body_chunks)
@@ -651,8 +662,9 @@ class StatsMiddleware:
                     import traceback
                     traceback.print_exc()
                 import traceback as _tb
-                logger.error("Error processing request: %s\n%s", str(e), _tb.format_exc())
-                response = openai_error_response(f"Internal server error: {str(e)}", 500)
+                safe_err = scrub_sensitive_error_text(str(e))
+                logger.error("Error processing request: %s\n%s", safe_err, scrub_sensitive_error_text(_tb.format_exc()))
+                response = openai_error_response(f"Internal server error: {safe_err}", 500)
                 await response(scope, receive_wrapper, send)
         finally:
             scope.pop("_zoaholic_parsed_json", None)

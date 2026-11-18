@@ -199,8 +199,7 @@ class AudioTranscriptionRequest(BaseRequest):
     stream: bool = False
     timestamp_granularities: Optional[List[str]] = Field(default=["segment"])
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
 class ModerationRequest(BaseRequest):
     input: Union[str, List[str]]

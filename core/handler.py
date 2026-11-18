@@ -46,7 +46,15 @@ from core.models import (
     ModerationRequest,
     EmbeddingRequest,
 )
-from core.utils import get_engine, get_model_dict, provider_api_circular_list, truncate_for_logging, is_local_api_key
+from core.utils import (
+    get_engine,
+    get_model_dict,
+    provider_api_circular_list,
+    truncate_for_logging,
+    is_local_api_key,
+    is_valid_model_name,
+    scrub_sensitive_error_text,
+)
 from core.routing import get_right_order_providers
 from core.byok import get_byok_real_key, get_byok_template_key, is_byok_provider
 from core.error_response import openai_error_response
@@ -620,7 +628,9 @@ class ModelRequestHandler:
             响应对象
         """
         config = self.app.state.config
-        request_model_name = request_data.model
+        request_model_name = str(request_data.model or "")
+        if not is_valid_model_name(request_model_name):
+            raise HTTPException(status_code=400, detail="Invalid model name")
         _canonical_materialized = canonical_request_factory is None
 
         async def _ensure_canonical_request() -> Any:
@@ -660,9 +670,14 @@ class ModelRequestHandler:
                     from core.middleware import request_info
                     _ri = request_info.get()
                     _client_ip = _ri.get('client_ip', '') if _ri else ''
+                    if quota_registry.is_exhausted(final_api_key):
+                        raise HTTPException(status_code=429, detail="Quota exhausted, please check your account.")
                     reject_reason = quota_registry.check(final_api_key, request_model_name, client_ip=_client_ip)
                     if reject_reason:
                         raise HTTPException(status_code=429, detail=reject_reason)
+                paid_states = getattr(self.app.state, "paid_api_keys_states", None)
+                if paid_states and safe_get(paid_states, final_api_key, "enabled", default=None) is False:
+                    raise HTTPException(status_code=429, detail="Balance is insufficient, please check your account.")
                 await self.app.state.user_api_keys_rate_limit[final_api_key].next(request_model_name)
             except HTTPException:
                 raise
@@ -683,9 +698,16 @@ class ModelRequestHandler:
                 request_total_tokens = 0
                 if request_data and isinstance(request_data, RequestModel):
                     for message in request_data.messages:
-                        if message.content and isinstance(message.content, str):
+                        if isinstance(message.content, str):
                             request_total_tokens += len(message.content)
+                        elif isinstance(message.content, list):
+                            for part in message.content:
+                                part_text = getattr(part, "text", None) if not isinstance(part, dict) else part.get("text")
+                                if part_text:
+                                    request_total_tokens += len(part_text)
                 request_total_tokens = int(request_total_tokens / 4)
+            if info is not None and request_total_tokens > 0:
+                info["_estimated_prompt_tokens"] = request_total_tokens
 
             matching_providers = await get_right_order_providers(
                 request_model_name, config, api_index, scheduling_algorithm, 
@@ -802,6 +824,7 @@ class ModelRequestHandler:
             config, 'api_keys', api_index, 'preferences', 'enabled_plugins',
             default=None
         ) if not override_providers else None
+        _is_client_disconnected = getattr(raw_request, "is_disconnected", None) if raw_request is not None else None
         try:
             from core.plugins.interceptors import apply_inbound_interceptors, has_active_inbound_interceptors
             if has_active_inbound_interceptors(_key_enabled_plugins):
@@ -892,6 +915,17 @@ class ModelRequestHandler:
                 break
             # 即使候选全被跳过，也让取消请求和其他任务有机会执行。
             await asyncio.sleep(0)
+            if current_retry_count > 0 and _is_client_disconnected is not None:
+                try:
+                    if await _is_client_disconnected():
+                        logger.info(
+                            f"Client disconnected before retry #{current_retry_count} for {request_model_name}, aborting retry loop"
+                        )
+                        raise asyncio.CancelledError()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
             attempts += 1
             current_index = index % num_matching_providers
             index += 1
@@ -1141,6 +1175,12 @@ class ModelRequestHandler:
                 else:
                     full_error = str(e)
 
+                _secret_candidates = [
+                    locals().get("current_api"),
+                    locals().get("byok_real_key"),
+                ]
+                full_error = scrub_sensitive_error_text(full_error, _secret_candidates)
+
                 retry_path.append({
                     "provider": provider_name,
                     "error": full_error[:2000],  # 增加错误信息长度限制到 2000 字符
@@ -1186,10 +1226,16 @@ class ModelRequestHandler:
                 elif isinstance(e, HTTPException):
                     status_code = e.status_code
                     # 错误解析应尽量由各渠道适配器完成，这里只做通用兜底。
-                    error_message = str(getattr(e, "detail", None) or str(e))
+                    error_message = scrub_sensitive_error_text(
+                        str(getattr(e, "detail", None) or str(e)),
+                        _secret_candidates,
+                    )
                 else:
                     status_code = 500  # Internal Server Error
-                    error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
+                    error_message = scrub_sensitive_error_text(
+                        str(e) or f"Unknown error: {e.__class__.__name__}",
+                        _secret_candidates,
+                    )
                     # 修改原因：该分支此前完全静默，尝试期抛出的非 HTTP/非网络异常（如转换器
                     # RecursionError、payload 解析错误）只把 str(e) 写进 500 响应体，不落任何日志，
                     # 下游反馈 500 时无法定位是哪个渠道哪次尝试抛的什么异常。

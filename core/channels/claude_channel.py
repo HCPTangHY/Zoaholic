@@ -447,7 +447,9 @@ async def get_claude_payload(request, engine, provider, api_key=None):
         tools = payload.get("tools", [])  # 保留已有的工具（如插件添加的）
         for tool in request.tools:
             # 检查是否已经是 Claude 服务器端工具格式（如 web_search_20250305）
-            if hasattr(tool, 'dict'):
+            if hasattr(tool, 'model_dump'):
+                tool_dict = tool.model_dump()
+            elif hasattr(tool, 'dict'):
                 tool_dict = tool.dict()
             else:
                 tool_dict = tool if isinstance(tool, dict) else {}

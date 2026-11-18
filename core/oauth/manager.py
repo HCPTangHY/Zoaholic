@@ -8,7 +8,7 @@ import os
 import tempfile
 from datetime import datetime, timezone
 
-from .state import STATE_PATH, load_state
+from .state import STATE_PATH, load_state, save_state
 
 logger = logging.getLogger(__name__)
 
@@ -763,30 +763,7 @@ class OAuthManager:
 
     def _write_state_atomic(self) -> None:
         """同步执行 oauth_state.json 原子写。"""
-        # 修改原因：os.replace 只有在同目录临时文件上才能可靠保持原子替换语义。
-        # 修改方式：在状态文件同目录创建 .tmp 文件，写入并 fsync 后再替换正式路径。
-        # 目的：降低机器断电、进程崩溃或写盘异常导致 OAuth 凭据永久损坏的风险。
-        data = json.dumps(self._state, indent=2, ensure_ascii=False)
-        state_path = self._state_path
-        dir_path = os.path.dirname(state_path) or "."
-        os.makedirs(dir_path, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=dir_path, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, state_path)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-        try:
-            os.chmod(state_path, 0o600)
-        except OSError:
-            pass
+        save_state(self._state_path, self._state)
 
     def _lock_key(self, channel_id: str | None, key_id: str) -> str:
         """生成渠道级刷新锁 key。"""

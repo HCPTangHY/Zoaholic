@@ -178,6 +178,12 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
         if ":" in request.url.path:
             path_params["action"] = request.url.path.split(":")[-1]
 
+        from core.utils import is_valid_model_name
+
+        raw_path_model = str(path_params.get("model") or "")
+        if raw_path_model and not is_valid_model_name(raw_path_model, check_encoded=True):
+            return openai_error_response("Invalid model name in URL path", 400)
+
         lightweight_request = build_lightweight_dialect_request(dialect_id, native_body, path_params)
         if lightweight_request is not None:
             canonical_request = lightweight_request

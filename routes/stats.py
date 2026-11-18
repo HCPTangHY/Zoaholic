@@ -543,14 +543,15 @@ def _safe_int(value: Any) -> int:
     目的：让接口返回类型稳定，不受数据库驱动影响。
     """
 
-    if value is None:
+    if value is None or isinstance(value, bool):
         return 0
     try:
         return int(value)
     except (TypeError, ValueError):
         try:
-            return int(float(value))
-        except (TypeError, ValueError):
+            from decimal import Decimal
+            return int(Decimal(str(value)))
+        except Exception:
             return 0
 
 
@@ -1248,7 +1249,7 @@ async def get_key_analytics_ip_detail(
         key=lambda value: _stringify_datetime(value) or "",
         default=None,
     )
-    request_app = getattr(request, "app", None)
+    request_app = request.scope.get("app") if hasattr(request, "scope") and isinstance(request.scope, dict) else getattr(request, "app", None)
     quota_registry = getattr(request_app.state, "quota_registry", None) if request_app is not None else None
     quota_rules = quota_registry.get_ip_quota_breakdown(matched_api_key, ip) if quota_registry else []
 
@@ -1699,7 +1700,7 @@ async def get_model_trend(
     hours: Optional[int] = Query(default=24, ge=1, le=8760),
     provider: Optional[str] = None,
     model: Optional[str] = None,
-    granularity: Optional[str] = Query(default=None, regex='^(hour|day)$'),
+    granularity: Optional[str] = Query(default=None, pattern='^(hour|day)$'),
 ):
     """
     获取筛选模型的时间趋势数据，用于折线图展示。

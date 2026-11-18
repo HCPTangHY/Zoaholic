@@ -409,6 +409,26 @@ def process_tool_parameters(data):
         process_tool_parameters(items)
 
 
+def extract_tool_call_signature(tc) -> str | None:
+    """从 ToolCall 的 extra_content、扩展属性或 id(__thought__ 编码) 中提取 thoughtSignature。"""
+    extra = (tc.model_extra or {}).get("extra_content") if hasattr(tc, "model_extra") else getattr(tc, "extra_content", None)
+    google_extra = extra.get("google") if isinstance(extra, dict) else None
+    if isinstance(google_extra, dict):
+        for key in ("thoughtSignature", "thought_signature", "signature"):
+            val = google_extra.get(key)
+            if val:
+                return val
+    model_extra = (tc.model_extra or {}) if hasattr(tc, "model_extra") else {}
+    for key in ("thoughtSignature", "thought_signature"):
+        val = model_extra.get(key) or getattr(tc, key, None)
+        if val:
+            return val
+    tc_id = getattr(tc, "id", None)
+    if isinstance(tc_id, str) and "__thought__" in tc_id:
+        return tc_id.split("__thought__", 1)[1]
+    return None
+
+
 def _extract_tool_result_text(content) -> str:
     """将 OpenAI tool 消息的 content (str | list[ContentItem] | None) 归一化为纯文本。"""
     if content is None:
@@ -718,15 +738,8 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
                 if getattr(tc, "id", None):
                     tool_call_name_map[tc.id] = tc.function.name
                 pending_fc_names.append(tc.function.name)
-                # 签名逻辑：第一个 FC 必须携带签名（兼容 thoughtSignature / thought_signature / signature）
-                _ec_google = (getattr(tc, "extra_content", {}) or {}).get("google", {}) or {}
-                sig = (
-                    _ec_google.get("thoughtSignature")
-                    or _ec_google.get("thought_signature")
-                    or _ec_google.get("signature")
-                    or getattr(tc, "thoughtSignature", None)
-                    or getattr(tc, "thought_signature", None)
-                )
+                # 签名逻辑：第一个 FC 必须携带签名（兼容 thoughtSignature / thought_signature / signature 及 __thought__ 编码）
+                sig = extract_tool_call_signature(tc)
                 if not sig and i == 0:
                     sig = msg_signature or "skip_thought_signature_validator"
                 

@@ -67,6 +67,7 @@ export function useChannelOAuth({
   // 目的：在不继续拆分 CRUD、Key、子渠道等逻辑的前提下，降低 useChannelEditor 的体积和职责范围。
   const [oauthAccounts, setOauthAccounts] = useState<Record<string, any>>({});
   const oauthKeyFocusSnapshotRef = useRef<Record<number, string>>({});
+  const oauthRefreshSeqRef = useRef(0);
   const [importModalIdx, setImportModalIdx] = useState<number | null>(null);
   const [importToken, setImportToken] = useState('');
   const [importing, setImporting] = useState(false);
@@ -170,6 +171,9 @@ export function useChannelOAuth({
     });
     if (targets.length === 0) return;
 
+    const controller = new AbortController();
+    let cancelled = false;
+
     setOauthAccounts(prev => {
       const next = { ...prev };
       for (const [keyId] of targets) {
@@ -181,6 +185,7 @@ export function useChannelOAuth({
     apiFetch('/v1/channels/balance', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      signal: controller.signal,
       body: JSON.stringify({
         provider: formData?.provider,
         engine: formData?.engine,
@@ -191,13 +196,16 @@ export function useChannelOAuth({
     })
       .then(async res => {
         if (res.ok) return await res.json();
-        try {
-          const errBody = await res.json();
-          toastWarning(errBody?.error || `HTTP ${res.status}`);
-        } catch { /* ignore */ }
+        if (!cancelled) {
+          try {
+            const errBody = await res.json();
+            toastWarning(errBody?.error || `HTTP ${res.status}`);
+          } catch { /* ignore */ }
+        }
         return null;
       })
       .then(data => {
+        if (cancelled) return;
         setOauthAccounts(prev => {
           const next = { ...prev };
           const perAccount = data?.results || {};
@@ -224,6 +232,7 @@ export function useChannelOAuth({
         });
       })
       .catch(() => {
+        if (cancelled) return;
         setOauthAccounts(prev => {
           const next = { ...prev };
           for (const [keyId] of targets) {
@@ -235,6 +244,11 @@ export function useChannelOAuth({
           return next;
         });
       });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [isModalOpen, isOAuthEngine, oauthAccounts, token, formData?.provider]);
 
   const handleOAuthKeyFocus = (idx: number, keyStr: string) => {
@@ -343,17 +357,18 @@ export function useChannelOAuth({
         return;
       }
       const expectedOrigin = window.location.origin;
-      const authWindow = window.open(auth_url, '_blank', 'width=600,height=700');
-      if (!authWindow) {
-        toastError('无法打开弹出窗口，请允许弹窗后重试');
-        return;
-      }
       if (mode === 'manual') {
+        const authWindow = window.open(auth_url, '_blank', 'width=600,height=700');
+        if (!authWindow) {
+          toastError('无法打开弹出窗口，请允许弹窗后重试');
+          return;
+        }
         setOauthManualState({ idx, state, provider: providerName });
         setManualUrl('');
         return;
       }
       oauthMessageCleanupRef.current?.();
+      let authWindow: Window | null = null;
       let timeoutId: number | undefined;
       let handler: ((event: MessageEvent) => void) | undefined;
       const cleanup = () => {
@@ -372,6 +387,7 @@ export function useChannelOAuth({
       handler = (event: MessageEvent) => {
         if (event.origin !== expectedOrigin) return;
         if (event.source !== authWindow) return;
+        if (!authWindow) return;
         if (!event.data || typeof event.data !== 'object') return;
         if (event.data.type !== 'oauth_callback_success') return;
         if (event.data.state !== state) return;
@@ -384,6 +400,12 @@ export function useChannelOAuth({
       };
       oauthMessageCleanupRef.current = cleanup;
       window.addEventListener('message', handler);
+      authWindow = window.open(auth_url, '_blank', 'width=600,height=700');
+      if (!authWindow) {
+        cleanup();
+        toastError('无法打开弹出窗口，请允许弹窗后重试');
+        return;
+      }
       timeoutId = window.setTimeout(cleanup, 300000);
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e), '登录出错');

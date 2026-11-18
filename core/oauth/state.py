@@ -10,7 +10,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-STATE_PATH = "data/oauth_state.json"
+STATE_PATH = os.path.join(os.getenv("DATA_DIR", "data"), "oauth_state.json")
 
 
 def load_state(path: str = STATE_PATH) -> dict:

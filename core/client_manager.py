@@ -5,16 +5,33 @@ HTTP 客户端管理模块
 """
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 from typing import Dict, Optional
 
 import httpx
 
+from core.env import env_bool
 from core.utils import get_proxy
 
 
 _POOL_ACQUIRE_TIMEOUT = 10.0
+_KEEPALIVE_EXPIRY = 120.0
+_HTTP2_DEFAULT_HOSTS = (
+    "anthropic.com",
+    "claude.ai",
+    "openai.com",
+    "chatgpt.com",
+    "googleapis.com",
+    "openrouter.ai",
+    "deepseek.com",
+    "x.ai",
+    "cloudflare.com",
+    "groq.com",
+    "mistral.ai",
+    "aliyuncs.com",
+)
 
 
 async def _enforce_pool_acquire_timeout(request: httpx.Request) -> None:
@@ -72,9 +89,7 @@ class ClientManager:
 
         client_key = f"{host}"
         if proxy:
-            # 规范化 socks5 代理前缀，保持与原实现一致
-            proxy_normalized = proxy.replace("socks5h://", "socks5://")
-            client_key += f"_{proxy_normalized}"
+            client_key += f"_{proxy.strip()}"
 
         if client_key not in self.clients:
             async with self._get_client_lock(client_key):
@@ -87,7 +102,8 @@ class ClientManager:
                     )
                     limits = httpx.Limits(
                         max_connections=self.pool_size,
-                        max_keepalive_connections=self.max_keepalive_connections
+                        max_keepalive_connections=self.max_keepalive_connections,
+                        keepalive_expiry=_KEEPALIVE_EXPIRY,
                     )
 
                     client_config = {
@@ -105,9 +121,13 @@ class ClientManager:
                     ]
                     client_config["event_hooks"] = event_hooks
 
-                    # Anthropic 域名开 HTTP/2（Claude Code CLI 原生走 HTTP/2）
-                    if "anthropic.com" in host or "claude.ai" in host:
-                        client_config["http2"] = True
+                    # 对主流官方 HTTPS 上游默认开启 HTTP/2 多路复用（可通过 HTTP2_ENABLED 环境变量控制）
+                    if "http2" not in client_config and "transport" not in client_config:
+                        host_lower = host.lower()
+                        if os.getenv("HTTP2_ENABLED") is not None:
+                            client_config["http2"] = env_bool("HTTP2_ENABLED", True)
+                        elif parsed_url.scheme == "https" and any(h in host_lower for h in _HTTP2_DEFAULT_HOSTS):
+                            client_config["http2"] = True
 
                     client_config = get_proxy(proxy, client_config)
                     self.clients[client_key] = httpx.AsyncClient(**client_config)

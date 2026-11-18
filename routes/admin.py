@@ -59,6 +59,9 @@ def _rebuild_runtime_rate_limits(app) -> None:
     if quota_registry is not None:
         quota_registry.init_from_config(config)
 
+    from core.auth import list_admin_api_keys
+    app.state.admin_api_key = list_admin_api_keys(api_keys)
+
 
 def _validate_preferences(preferences, owner: str) -> None:
     """Reject malformed limits before runtime normalization or persistence."""
@@ -193,7 +196,7 @@ async def _persist_config(app, sections_to_verify=None, changed_providers=None, 
 
 
 @router.get("/v1/generate-api-key", dependencies=[Depends(rate_limit_dependency)])
-async def generate_api_key():
+async def generate_api_key(_: str = Depends(verify_admin_api_key)):
     """
     生成新的 API Key
     """

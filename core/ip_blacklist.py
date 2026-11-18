@@ -3,23 +3,35 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from ipaddress import ip_address, ip_network, _BaseAddress, _BaseNetwork
-from typing import Iterable, Any
+from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network, ip_address, ip_network
+import os
+from typing import Any, Iterable, Union
 
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
 
+IPAddress = Union[IPv4Address, IPv6Address]
+IPNetwork = Union[IPv4Network, IPv6Network]
 IP_BLOCKED_MESSAGE = "Your IP has been blocked. Please contact the administrator."
 IP_BLOCKED_TYPE = "ip_blocked"
+_DEFAULT_TRUSTED_PROXIES = (
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "::1/128",
+    "fc00::/7",
+)
+_TRUSTED_PROXY_CACHE: tuple[str, bool, ParsedIPBlacklist] | None = None
 
 
 @dataclass(frozen=True)
 class ParsedIPBlacklist:
     """预解析后的 IP 黑名单，精确 IP 用 set，CIDR 网段用 list。"""
 
-    exact: frozenset[_BaseAddress]
-    networks: tuple[_BaseNetwork, ...]
+    exact: frozenset[IPAddress]
+    networks: tuple[IPNetwork, ...]
 
 
 def _coerce_blacklist_items(raw_entries: Any) -> list[str]:
@@ -151,6 +163,44 @@ def get_client_ip_from_request_info(default: str | None = None) -> str | None:
         return str(client_ip).strip() if client_ip else default
     except Exception:
         return default
+
+
+def _is_trusted_proxy(peer_host: str | None) -> bool:
+    """检查直连上游节点是否位于代理转发白名单网段内。"""
+    global _TRUSTED_PROXY_CACHE
+    if not peer_host or peer_host == "unknown":
+        return False
+    raw_env = (os.getenv("TRUSTED_PROXIES") or "").strip()
+    if _TRUSTED_PROXY_CACHE is None or _TRUSTED_PROXY_CACHE[0] != raw_env:
+        if raw_env == "*":
+            _TRUSTED_PROXY_CACHE = (raw_env, True, ParsedIPBlacklist(frozenset(), ()))
+        elif raw_env.lower() in ("none", "false", "0"):
+            _TRUSTED_PROXY_CACHE = (raw_env, False, ParsedIPBlacklist(frozenset(), ()))
+        elif raw_env:
+            _TRUSTED_PROXY_CACHE = (raw_env, False, parse_ip_blacklist(raw_env))
+        else:
+            _TRUSTED_PROXY_CACHE = (raw_env, False, parse_ip_blacklist(_DEFAULT_TRUSTED_PROXIES))
+    _, trust_all, parsed_proxies = _TRUSTED_PROXY_CACHE
+    if trust_all:
+        return True
+    return is_ip_blacklisted(parsed_proxies, peer_host)
+
+
+def extract_client_ip(headers: Any, fallback_host: str | None = None) -> str:
+    """统一提取客户端 IP（CF-Connecting-IP > X-Forwarded-For > X-Real-IP > fallback）。"""
+    if headers is not None and (fallback_host is None or _is_trusted_proxy(fallback_host)):
+        cf_ip = (headers.get("cf-connecting-ip") or "").strip()
+        if cf_ip:
+            return cf_ip
+        forwarded_for = headers.get("x-forwarded-for")
+        if forwarded_for:
+            hops = [part.strip() for part in str(forwarded_for).split(",") if part.strip()]
+            if hops:
+                return hops[-1]
+        real_ip = (headers.get("x-real-ip") or "").strip()
+        if real_ip:
+            return real_ip
+    return fallback_host or "unknown"
 
 
 def is_global_ip_blocked(app: Any, client_ip: str | None) -> bool:

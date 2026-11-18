@@ -16,12 +16,14 @@ Responses API WebSocket 透传端点
 上游是否走 WS 由渠道的 preferences.websocket 开关独立决定，两端解耦。
 """
 
+import os
 import uuid
 from time import time
 from typing import Any, Optional
 
 from fastapi import APIRouter, BackgroundTasks, WebSocket, WebSocketDisconnect
 
+from ..ip_blacklist import extract_client_ip
 from ..json_utils import json_loads, json_dumps_text
 from ..log_config import logger
 
@@ -45,18 +47,13 @@ async def _send_error_frame(websocket: WebSocket, status: int, message: str,
         pass
 
 
+MAX_WS_FRAME_BYTES = int(os.getenv("WS_MAX_FRAME_BYTES", str(10 * 1024 * 1024)))
+
+
 def _get_client_ip(websocket: WebSocket) -> str:
-    """与 StatsMiddleware 相同的客户端 IP 解析优先级。"""
-    forwarded_for = websocket.headers.get("x-forwarded-for")
-    if forwarded_for:
-        real_ip = forwarded_for.split(",")[0].strip()
-        if real_ip:
-            return real_ip
-    real_ip_header = websocket.headers.get("x-real-ip")
-    if real_ip_header:
-        return real_ip_header.strip()
+    """统一委托 core.ip_blacklist.extract_client_ip 解析客户端 IP。"""
     client = websocket.client
-    return client.host if client else "unknown"
+    return extract_client_ip(websocket.headers, client.host if client else "unknown")
 
 
 def _authenticate(websocket: WebSocket) -> tuple[Optional[int], Optional[str], Optional[str]]:
@@ -425,6 +422,9 @@ async def responses_websocket(websocket: WebSocket) -> None:
     try:
         while True:
             raw = await websocket.receive_text()
+            if len(raw.encode("utf-8", errors="ignore")) > MAX_WS_FRAME_BYTES:
+                await _send_error_frame(websocket, 413, "frame payload too large", code="payload_too_large")
+                continue
             try:
                 frame = json_loads(raw)
             except Exception:
@@ -445,6 +445,12 @@ async def responses_websocket(websocket: WebSocket) -> None:
             payload = {k: v for k, v in frame.items() if k != "type"}
             if not payload.get("model"):
                 await _send_error_frame(websocket, 400, "missing required field: model")
+                continue
+
+            from core.auth import rate_limiter
+            global_limit = getattr(websocket.app.state, "global_rate_limit", None)
+            if global_limit and await rate_limiter.is_rate_limited("global", global_limit):
+                await _send_error_frame(websocket, 429, "Too many requests", code="rate_limit_exceeded")
                 continue
 
             # A live connection must not retain an index across key reorder/disable/migration.

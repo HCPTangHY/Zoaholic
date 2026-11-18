@@ -7,17 +7,23 @@
 # 目的：让业务代码按领域归属维护，同时保留根 utils.py 和 utils_pkg shim 的旧导入兼容性。
 import asyncio
 import json
+import os
 import time as time_module
-from typing import Optional
+from typing import Any, Optional
 
 import h2.exceptions
 import httpx
 from fastapi import HTTPException
 
-from core.json_utils import json_dumps_text, json_loads
+from core.json_utils import ORJSON_AVAILABLE, json_dumps_text, json_loads
 from core.log_config import logger
 from core.utils import safe_get
 from core.stream_utils import close_async_iterator, OwnedAsyncIterator
+
+
+STREAM_PRE_COMMIT_KEEPALIVE_SECONDS = float(
+    os.getenv("STREAM_PRE_COMMIT_KEEPALIVE_SECONDS", "45")
+)
 from core.stream_errors import guard_stream, extract_stream_error, UpstreamStreamError
 
 
@@ -27,9 +33,8 @@ async def ensure_string(item, as_sse: bool = True):
     elif isinstance(item, str):
         return item
     elif isinstance(item, dict):
-        # 大 dict（如含 base64 图片的响应）同步序列化会阻塞事件循环，
-        # 放到线程池执行，避免高并发生图时 event loop block
-        json_str = await asyncio.to_thread(json_dumps_text, item)
+        # orjson 在 C/Rust 层微秒级完成序列化，仅在回退到标准库 json 时卸载到线程池
+        json_str = json_dumps_text(item) if ORJSON_AVAILABLE else await asyncio.to_thread(json_dumps_text, item)
         if as_sse:
             return f"data: {json_str}\n\n"
         return json_str
@@ -224,7 +229,11 @@ async def prepare_stream(generator, *, current_info=None, keepalive_interval=Non
                     break
                 # status == "timeout"
                 wait_task = item_or_task
-                if info.get("_upstream_first_byte_ok") and keepalive_interval:
+                pre_commit_ready = (
+                    STREAM_PRE_COMMIT_KEEPALIVE_SECONDS > 0
+                    and (time_module.monotonic() - start) >= STREAM_PRE_COMMIT_KEEPALIVE_SECONDS
+                )
+                if keepalive_interval and (info.get("_upstream_first_byte_ok") or pre_commit_ready):
                     pending, first = wait_task, None
                     break
                 now_after = time_module.monotonic()

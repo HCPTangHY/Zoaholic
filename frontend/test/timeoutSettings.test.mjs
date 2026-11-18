@@ -88,7 +88,7 @@ test('subchannel honors shallow parent merge, canonical alias priority, then glo
   assert.deepEqual(resolveTimeoutPreview('stream_header_timeout',{stream_header_timeout:0},globals,CODE_TIMEOUT_DEFAULTS,'channel','carbon','carbon',parent),{value:0,rule:'default',source:'channel'});
 });
 
-test('initial render is read-only, has three controls and explains missing runtime metadata', async () => {
+test('initial render is read-only, has three controls and omits verbose prose', async () => {
   const bundle = await build({stdin:{resolveDir:root,loader:'tsx',contents:`
     import React from 'react';
     import {renderToStaticMarkup} from 'react-dom/server';
@@ -99,7 +99,12 @@ test('initial render is read-only, has three controls and explains missing runti
   `},bundle:true,write:false,platform:'node',format:'cjs',logLevel:'silent'});
   const html=execFileSync(process.execPath,['-'],{input:bundle.outputFiles[0].text,cwd:root,maxBuffer:2*1024*1024}).toString();
   assert.match(html,/首包等待上限/);assert.match(html,/网络读取超时/);assert.match(html,/SSE 心跳间隔/);
-  assert.match(html,/服务未提供运行时默认值/);
+  assert.doesNotMatch(html,/慢首包模型|服务未提供运行时默认值|三项设置相互独立/);
   assert.equal((html.match(/<select/g)||[]).length,3);
   assert.doesNotMatch(html,/role="dialog"/);
+
+  const editorSource = readFileSync(new URL('../src/pages/channels/components/ChannelEditor.tsx', import.meta.url), 'utf8');
+  const advancedIdx = editorSource.indexOf('高级设置');
+  const timeoutIdx = editorSource.indexOf('aria-label="渠道超时与心跳"');
+  assert.ok(advancedIdx > -1 && timeoutIdx > advancedIdx, '渠道超时与心跳区块应位于高级设置下方');
 });

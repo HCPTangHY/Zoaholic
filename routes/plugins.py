@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from routes.deps import rate_limit_dependency, verify_admin_api_key
+from core.file_utils import is_link_or_reparse
 from core.initialization import get_admin_user
 from core.log_config import logger
 from core.plugins import get_plugin_manager, get_interceptor_registry
@@ -57,8 +58,8 @@ def _validate_plugin_name(name: str) -> None:
 
 def _plugin_upload_root() -> Path:
     root = PLUGINS_DIR.absolute()
-    # Do not follow an existing symlink in the configured installation path.
-    if any(path.is_symlink() for path in (root, *root.parents)):
+    # Do not follow an existing symlink or Windows NTFS junction in the configured installation path.
+    if any(is_link_or_reparse(path) for path in (root, *root.parents)):
         raise HTTPException(400, "Plugin installation directory cannot contain symlinks")
     root.mkdir(parents=True, exist_ok=True)
     return root.resolve()
@@ -67,7 +68,7 @@ def _plugin_upload_root() -> Path:
 def _plugin_upload_target(root: Path, name: str, *, directory: bool) -> Path:
     _validate_plugin_name(name)
     target = root / name
-    if target.is_symlink() or not target.resolve().is_relative_to(root):
+    if is_link_or_reparse(target) or not target.resolve().is_relative_to(root):
         raise HTTPException(400, "Plugin target is outside the installation directory")
     if target.exists() and target.is_dir() != directory:
         raise HTTPException(400, "Plugin target has a conflicting file type")
@@ -124,7 +125,12 @@ def _extract_plugin_zip(archive_path: Path, destination: Path) -> None:
 
 
 def _remove_upload_target(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
+    if is_link_or_reparse(path):
+        if path.is_dir() and not path.is_symlink():
+            path.rmdir()
+        else:
+            path.unlink()
+    elif path.is_file():
         path.unlink()
     elif path.exists():
         shutil.rmtree(path)
@@ -503,22 +509,19 @@ async def reload_all_plugins(_: int = Depends(verify_admin_api_key)):
     manager = get_plugin_manager()
     interceptor_registry = get_interceptor_registry()
 
-    # 1. 注销所有已注册的插件拦截器
+    # 1. 注销所有已注册的插件拦截器并卸载插件（包含 teardown 与扩展点注销）
     existing_plugins = list(manager.loader.plugins.keys())
     for name in existing_plugins:
         try:
             interceptor_registry.unregister_plugin_interceptors(name)
         except Exception:
             pass
-
-    # 2. 卸载所有插件
-    for name in existing_plugins:
         try:
-            manager.loader.unload_plugin(name)
+            manager.unload_plugin(name)
         except Exception:
             pass
 
-    # 3. 清空插件注册表
+    # 2. 清空插件注册表
     manager.loader._plugins.clear()
 
     # 4. 重新扫描并加载

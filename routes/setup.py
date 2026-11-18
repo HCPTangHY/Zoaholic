@@ -11,14 +11,20 @@ import os
 import secrets
 from typing import Optional
 
-from fastapi import APIRouter, Body, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from core.log_config import logger
-from core.auth import _extract_token, authenticate_admin_api_key_token
+from core.auth import _extract_token, authenticate_admin_api_key_token, select_admin_api_key
 from core.initialization import ensure_initialized, get_admin_user, refresh_initialization
 from core.security import hash_password, verify_password
-from routes.deps import get_app
+from routes.auth import (
+    _check_login_lockout,
+    _clear_login_failures,
+    _extract_login_client_ip,
+    _record_login_failure,
+)
+from routes.deps import get_app, rate_limit_dependency
 from utils import update_config, load_config_from_db
 from db import DISABLE_DATABASE, async_session_scope
 
@@ -94,24 +100,7 @@ def _generate_admin_api_key() -> str:
     return "zk-" + secrets.token_urlsafe(36)
 
 
-def _select_admin_api_key_from_config(conf: dict) -> Optional[str]:
-    api_keys = conf.get("api_keys") or []
-    if not isinstance(api_keys, list):
-        return None
-
-    for item in api_keys:
-        if not isinstance(item, dict):
-            continue
-        if "admin" in str(item.get("role", "")):
-            key = item.get("api")
-            if key:
-                return str(key)
-
-    # fallback：第一把 key
-    if api_keys and isinstance(api_keys[0], dict) and api_keys[0].get("api"):
-        return str(api_keys[0]["api"])
-
-    return None
+_select_admin_api_key_from_config = select_admin_api_key
 
 
 @router.get("/status", response_model=SetupStatus)
@@ -136,7 +125,7 @@ async def setup_status():
     )
 
 
-@router.post("/init", response_model=SetupInitResponse)
+@router.post("/init", response_model=SetupInitResponse, dependencies=[Depends(rate_limit_dependency)])
 async def setup_init(request: Request, payload: SetupInitRequest = Body(...)):
     """首次初始化：设置管理员账号密码，并写入最小可用配置到 DB。
 
@@ -170,14 +159,16 @@ async def _setup_init(request: Request, payload: SetupInitRequest):
     # recovered after proving ownership of that account, not by anonymous setup.
     if has_config and admin_user is not None:
         raise HTTPException(status_code=409, detail="Already initialized")
+    client_ip = _extract_login_client_ip(request)
     if has_config:
         token = await _extract_token(request, None)
-        from core.middleware import StatsMiddleware
-        client_ip = StatsMiddleware._get_client_ip(request.scope, request.scope.get("headers", []))
         authenticate_admin_api_key_token(app, token, client_ip, require_explicit_role=True)
     elif admin_user is not None:
+        _check_login_lockout(client_ip)
         if admin_user.username != payload.username.strip() or not verify_password(payload.password, admin_user.password_hash):
+            _record_login_failure(client_ip)
             raise HTTPException(status_code=403, detail="Existing administrator credentials are required")
+        _clear_login_failures(client_ip)
 
     if admin_user is None:
         await _create_admin_user(payload.username.strip(), payload.password, secrets.token_urlsafe(48))

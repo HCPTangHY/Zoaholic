@@ -141,16 +141,26 @@ async def get_responses_payload(request, engine, provider, api_key=None):
                     instructions_list.append(content or "")
                 continue
 
+        # tool result -> function_call_output（顶层 item）
+        if role == "tool" or tool_call_id:
+            from .openai_channel import serialize_tool_message_content
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": tool_call_id or msg.name or "call_0",
+                "output": serialize_tool_message_content(content),
+            })
+            continue
+
         # content(list) -> message(content=[input_text/input_image...])
         if isinstance(content, list):
             content_items = []
             for item in content:
-                if getattr(item, "type", None) == "text":
-                    content_items.append(format_text_item(item.text, role))
+                if getattr(item, "type", None) in ("text", "input_text", "output_text", "summary_text"):
+                    content_items.append(format_text_item(item.text if item.text is not None else "", role))
                 elif getattr(item, "type", None) == "image_url" and provider.get("image", True):
                     image_item = await format_input_image(item.image_url.url)
                     content_items.append(image_item)
-                elif getattr(item, "type", None) == "file":
+                elif getattr(item, "type", None) == "file" and item.file is not None:
                     if getattr(item.file, "url", None) and item.file.url.startswith("data:image/"):
                         image_item = await format_input_image(item.file.url)
                         content_items.append(image_item)
@@ -173,33 +183,24 @@ async def get_responses_payload(request, engine, provider, api_key=None):
                         content_items.append(file_item)
             if content_items:
                 input_items.append({"type": "message", "role": role, "content": content_items})
-
-        # tool result -> function_call_output（顶层 item）
-        elif tool_call_id:
-            input_items.append({
-                "type": "function_call_output",
-                "call_id": tool_call_id,
-                "output": content or "",
-            })
-
         else:
-            # 文本消息
-            if content or role == "assistant":
+            # 文本消息（当存在 tool_calls 且无文本内容时，避免生成空 assistant 文本块）
+            if content or (role == "assistant" and not tool_calls):
                 input_items.append({
                     "type": "message",
                     "role": role,
                     "content": [format_text_item(content or "", role)],
                 })
 
-            # tool_calls -> function_call（顶层 item）
-            if tool_calls:
-                for tool_call in tool_calls:
-                    input_items.append({
-                        "type": "function_call",
-                        "call_id": tool_call.id,
-                        "name": tool_call.function.name,
-                        "arguments": tool_call.function.arguments,
-                    })
+        # tool_calls -> function_call（顶层 item，兼容列表 content 与字符串 content）
+        if tool_calls:
+            for tool_call in tool_calls:
+                input_items.append({
+                    "type": "function_call",
+                    "call_id": tool_call.id,
+                    "name": tool_call.function.name,
+                    "arguments": tool_call.function.arguments,
+                })
 
     # 构建 payload
     payload = {

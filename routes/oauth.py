@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from core.ip_blacklist import _is_trusted_proxy
+from core.utils import scrub_sensitive_error_text
 from routes.deps import verify_admin_api_key
 
 router = APIRouter(tags=["OAuth"])
@@ -103,12 +105,15 @@ def _normalize_http_origin(value: str | None) -> str | None:
 
 def _build_redirect_uri(request: Request) -> str:
     """根据当前请求构建 Zoaholic 直连 OAuth callback 地址。"""
-    # 修改原因：auto 模式需要把 provider 回调指向 Zoaholic 后端，且线上通常经过反向代理。
-    # 修改方式：优先读取 X-Forwarded-Proto 和 X-Forwarded-Host，缺失时回退到 request.url 与 Host 头。
-    # 目的：让 Google、Antigravity 等允许自定义 redirect_uri 的 provider 可以直连完成 token 交换。
-    scheme = _first_header_value(request.headers.get("x-forwarded-proto")) or request.url.scheme
+    client = getattr(request, "client", None)
+    peer_host = getattr(client, "host", None)
+    trust_forwarded = peer_host is None or _is_trusted_proxy(peer_host)
+    scheme = (
+        (_first_header_value(request.headers.get("x-forwarded-proto")) if trust_forwarded else "")
+        or request.url.scheme
+    )
     host = (
-        _first_header_value(request.headers.get("x-forwarded-host"))
+        (_first_header_value(request.headers.get("x-forwarded-host")) if trust_forwarded else "")
         or _first_header_value(request.headers.get("host"))
         or request.url.netloc
     )
@@ -136,6 +141,7 @@ def _oauth_success_page(
     # ⚠️ 高风险边界：postMessage 目标源必须保持精确源地址（或同源 window.location.origin），切勿改回 '*' 通配符。
     # HTML 展示部分使用 html.escape，消息载荷与目标源统一做 JSON 与脚本边界转义。
     safe_key_id = html.escape(key_id)
+    script_nonce = secrets.token_urlsafe(16)
     message_payload = (
         json.dumps(
             {"type": "oauth_callback_success", "key_id": key_id, "state": state, "provider": provider, "already_exists": already_exists},
@@ -154,7 +160,12 @@ def _oauth_success_page(
         if normalized_origin
         else "window.location.origin"
     )
-    return HTMLResponse(f"""
+    csp_header = (
+        f"default-src 'self'; script-src 'nonce-{script_nonce}'; style-src 'unsafe-inline'; "
+        "object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    )
+    return HTMLResponse(
+        f"""
 <!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>登录成功</title>
@@ -172,7 +183,7 @@ def _oauth_success_page(
   <p>账号 <span class="email">{safe_key_id}</span> 已添加到 Zoaholic</p>
   <p>此窗口将在 3 秒后自动关闭</p>
 </div>
-<script>
+<script nonce="{script_nonce}">
   const targetOrigin = {target_origin_expr};
   if (window.opener && targetOrigin) {{
     window.opener.postMessage({message_payload}, targetOrigin);
@@ -181,7 +192,9 @@ def _oauth_success_page(
 </script>
 </body>
 </html>
-""")
+""",
+        headers={"Content-Security-Policy": csp_header},
+    )
 
 
 def _token_data_from_body(body: dict) -> dict:
@@ -671,7 +684,7 @@ async def oauth_exchange(request: Request):
                 code_verifier=flow["verifier"],
             )
     except Exception as exc:
-        return JSONResponse({"error": f"Token exchange failed: {exc}"}, status_code=500)
+        return JSONResponse({"error": f"Token exchange failed: {scrub_sensitive_error_text(exc)}"}, status_code=500)
 
     # 修改原因：渠道 api_keys 需要保存稳定可读的账号标识，Codex token 中通常能解析出邮箱。
     # 修改方式：优先使用 token_data.email；缺失时生成 oauth_ 前缀的短随机标识，并按 channel_id 注册。
@@ -730,7 +743,7 @@ async def oauth_callback(code: str, state: str, request: Request):
                 code_verifier=flow["verifier"],
             )
     except Exception as exc:
-        return _oauth_error_page("授权失败", f"换取 token 出错: {exc}", status_code=500)
+        return _oauth_error_page("授权失败", f"换取 token 出错: {scrub_sensitive_error_text(exc)}", status_code=500)
 
     # 修改原因：渠道 api_keys 需要保存稳定可读的账号标识，Codex token 中通常能解析出邮箱。
     # 修改方式：优先使用 token_data.email；缺失时生成 oauth_ 前缀的短随机标识，并按 pending flow 中的 provider 注册。

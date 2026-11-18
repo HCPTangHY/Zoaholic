@@ -49,6 +49,31 @@ async def _extract_token(request: Request, credentials: Optional[HTTPAuthorizati
     return None
 
 
+def list_admin_api_keys(conf_or_keys: object) -> list[str]:
+    """从配置字典或 api_keys 列表中提取显式声明 role 含 admin 的 API Key 列表。"""
+    if isinstance(conf_or_keys, dict):
+        api_keys = conf_or_keys.get("api_keys") or []
+    elif isinstance(conf_or_keys, list):
+        api_keys = conf_or_keys
+    else:
+        return []
+    if not isinstance(api_keys, list):
+        return []
+    result: list[str] = []
+    for item in api_keys:
+        if isinstance(item, dict) and "admin" in str(item.get("role", "")).lower():
+            key = item.get("api")
+            if key:
+                result.append(str(key))
+    return result
+
+
+def select_admin_api_key(conf_or_keys: object) -> Optional[str]:
+    """从配置中选择第一把显式声明为 admin 角色的 API Key。"""
+    keys = list_admin_api_keys(conf_or_keys)
+    return keys[0] if keys else None
+
+
 async def rate_limit_dependency(request: Request):
     """
     全局速率限制依赖
@@ -56,7 +81,8 @@ async def rate_limit_dependency(request: Request):
     根据 app.state.global_rate_limit 对所有请求进行限流。
     """
     app = request.app
-    if await rate_limiter.is_rate_limited("global", app.state.global_rate_limit):
+    global_limit = getattr(app.state, "global_rate_limit", None)
+    if global_limit and await rate_limiter.is_rate_limited("global", global_limit):
         raise HTTPException(status_code=429, detail="Too many requests")
 
 
@@ -77,10 +103,6 @@ def _resolve_admin_api_index(app) -> Optional[int]:
             role = str(item.get("role", "")).lower()
             if "admin" in role:
                 return i
-
-        # 单 key 情况默认视为 admin
-        if len(api_keys_db) == 1:
-            return 0
 
     return None
 
@@ -294,17 +316,14 @@ def authenticate_admin_api_key_token(app, token: Optional[str], client_ip: Optio
         # 目的：管理端和用户端都遵守同一层级的访问控制规则。
         raise_ip_blocked()
 
+    role_str = str(app.state.api_keys_db[api_index].get("role", "")).lower()
     if require_explicit_role:
-        if str(app.state.api_keys_db[api_index].get("role", "")).lower() != "admin":
+        if role_str != "admin":
             raise HTTPException(status_code=403, detail="An explicitly configured administrator API Key is required")
         return token
 
-    # 单 key 情况直接视为 admin
-    if len(api_list) == 1:
-        return token
-
-    # 检查配置中的角色
-    if "admin" not in app.state.api_keys_db[api_index].get("role", ""):
+    # 检查配置中的角色（要求显式包含 admin 角色）
+    if "admin" not in role_str:
         raise HTTPException(status_code=403, detail="Permission denied")
 
     return token

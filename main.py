@@ -144,22 +144,21 @@ async def _do_compact_db(app, force: bool = True):
             logger.info('[db_compact] 统计缓冲区尚未排空，推迟本轮压缩')
             return
 
-        # Step 3: VACUUM INTO
-        def do_vacuum_into():
-            if os.path.exists(compact_path):
-                os.remove(compact_path)
-            conn = sqlite3.connect(db_path)
-            conn.execute(f"VACUUM INTO '{compact_path}'")
-            conn.close()
-
-        await asyncio.to_thread(do_vacuum_into)
-        compact_size_mb = os.path.getsize(compact_path) / (1024 * 1024)
-        logger.info(f'[db_compact] VACUUM INTO 完成: {db_size_mb:.0f}MB -> {compact_size_mb:.0f}MB')
-
-        # Step 4-6: 持有写入信号量后关闭连接、替换文件并重新初始化引擎，避免与后台统计写入并发竞争
+        # Step 3-6: 持有写入信号量后执行 VACUUM INTO、关闭连接、替换文件并重新初始化引擎
         from core.stats import db_semaphore
         from db import close_db, init_db
         async with db_semaphore:
+            def do_vacuum_into():
+                if os.path.exists(compact_path):
+                    os.remove(compact_path)
+                conn = sqlite3.connect(db_path)
+                conn.execute("VACUUM INTO ?", (compact_path,))
+                conn.close()
+
+            await asyncio.to_thread(do_vacuum_into)
+            compact_size_mb = os.path.getsize(compact_path) / (1024 * 1024)
+            logger.info(f'[db_compact] VACUUM INTO 完成: {db_size_mb:.0f}MB -> {compact_size_mb:.0f}MB')
+
             await close_db()
 
             def do_replace():
@@ -192,10 +191,14 @@ async def _do_compact_db(app, force: bool = True):
         logger.error(f'[db_compact] 压缩失败: {e}')
         # 尝试恢复
         try:
-            if os.path.exists(old_path) and not os.path.exists(db_path):
+            if os.path.exists(old_path):
+                if os.path.exists(db_path):
+                    os.remove(db_path)
                 os.rename(old_path, db_path)
                 for suffix in ['-wal', '-shm']:
                     if os.path.exists(old_path + suffix):
+                        if os.path.exists(db_path + suffix):
+                            os.remove(db_path + suffix)
                         os.rename(old_path + suffix, db_path + suffix)
                 logger.info('[db_compact] 已恢复旧数据库')
             if os.path.exists(compact_path):
@@ -695,14 +698,10 @@ async def lifespan(app: FastAPI):
             app.state.needs_setup = True
             app.state.admin_api_key = []
         else:
-            app.state.admin_api_key = []
-            for item in app.state.api_keys_db:
-                if "admin" in item.get("role", ""):
-                    app.state.admin_api_key.append(item.get("api"))
-            if app.state.admin_api_key == []:
-                # 兼容旧配置：如果没显式标记 admin，就默认第一把 key 为 admin
-                if len(app.state.api_keys_db) >= 1:
-                    app.state.admin_api_key = [app.state.api_keys_db[0].get("api")]
+            from core.auth import list_admin_api_keys
+            app.state.admin_api_key = list_admin_api_keys(app.state.api_keys_db)
+            if not app.state.admin_api_key:
+                logger.warning("No API key with role='admin' configured in api_keys; admin API key list remains empty.")
 
         app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
         app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", DEFAULT_KEEPALIVE_INTERVAL)
@@ -874,7 +873,7 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.warning(f"[daily_maintenance] Activity refresh failed: {e}")
 
-    asyncio.get_running_loop().create_task(daily_maintenance())
+    daily_maintenance_task = asyncio.get_running_loop().create_task(daily_maintenance())
 
     # 定期 malloc_trim：强制 glibc 归还 free 了但没还给 OS 的内存
     # Python 大字符串（请求/响应体）释放后 pymalloc 标记为可用但 RSS 不降，
@@ -930,7 +929,7 @@ async def lifespan(app: FastAPI):
                 except Exception as e:
                     logger.warning(f"[memory_maintenance] malloc_trim failed: {e}")
 
-    asyncio.get_running_loop().create_task(memory_maintenance())
+    memory_maintenance_task = asyncio.get_running_loop().create_task(memory_maintenance())
 
     # 启动完成，删除热重载标记文件（通知 monitor 服务已恢复）
     _reload_marker = os.path.join(os.path.dirname(__file__), 'data', '.reloading')
@@ -951,29 +950,18 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
-    # 取消清理任务
-    if cleanup_task:
-        cleanup_task.cancel()
-        try:
-            await cleanup_task
-        except asyncio.CancelledError:
-            pass
-
-    if logs_cleanup_task:
-        logs_cleanup_task.cancel()
-        try:
-            await logs_cleanup_task
-        except asyncio.CancelledError:
-            pass
-
-    if compact_task:
-        compact_task.cancel()
-        try:
-            await compact_task
-        except asyncio.CancelledError:
-            pass
+    # 取消后台周期任务
+    for bg_task in (cleanup_task, logs_cleanup_task, compact_task, daily_maintenance_task, memory_maintenance_task):
+        if bg_task:
+            bg_task.cancel()
+            try:
+                await bg_task
+            except asyncio.CancelledError:
+                pass
     
     app.state.startup_completed = False
+    if hasattr(app.state, 'oauth_manager'):
+        app.state.oauth_manager.stop_proactive_refresh()
     if hasattr(app.state, 'block_watchdog'):
         try:
             await app.state.block_watchdog.stop()
@@ -1063,8 +1051,7 @@ async def health_check():
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     if exc.status_code == 404:
-        token = await get_api_key(request)
-        logger.error(f"404 Error: {exc.detail} api_key: {token}")
+        logger.error(f"404 Error: {exc.detail} path={request.url.path}")
     if isinstance(exc.detail, dict) and exc.detail.get("type") == "ip_blocked":
         # 修改原因：IP 黑名单命中需要返回需求指定的 error.type，而默认 403 会变成 permission_denied_error。
         # 修改方式：当依赖鉴权抛出的 detail 带有 type=ip_blocked 时，显式传入 error_type。
@@ -1080,10 +1067,10 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 # 配置 CORS 中间件
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 允许所有来源
-    allow_credentials=True,
-    allow_methods=["*"],  # 允许所有 HTTP 方法
-    allow_headers=["*"],  # 允许所有头部字段
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.add_middleware(StatsMiddleware, debug=is_debug)
@@ -1108,7 +1095,8 @@ class EnsureModelsListMiddleware:
                             models_list = []
                             try:
                                 headers = {"Authorization": f"Bearer {provider_name}"}
-                                base_url = "http://127.0.0.1:8000/v1/models"
+                                _self_port = int(os.getenv("PORT", "8000"))
+                                base_url = f"http://127.0.0.1:{_self_port}/v1/models"
                                 async with app.state.client_manager.get_client(base_url) as client:
                                     response = await client.get(base_url, headers=headers)
                                     if response.status_code == 200:
@@ -1134,7 +1122,7 @@ model_handler: Optional[ModelRequestHandler] = None
 from fastapi.responses import FileResponse
 
 STATIC_ROOT = Path("./static").resolve()
-SPA_ROUTES = ["/channels", "/playground", "/admin", "/settings", "/logs", "/login"]
+SPA_ROUTES = ["/channels", "/playground", "/admin", "/settings", "/logs", "/login", "/plugins", "/backend-logs", "/workspace", "/setup"]
 HTML_CSP_POLICY = (
     "default-src 'self'; "
     "script-src 'self' blob:; "
@@ -1153,6 +1141,7 @@ HTML_NO_CACHE_HEADERS = {
     "Cache-Control": "no-cache, no-store, must-revalidate",
     "Pragma": "no-cache",
     "Expires": "0",
+    "X-Content-Type-Options": "nosniff",
     "Content-Security-Policy": HTML_CSP_POLICY,
 }
 ASSET_CACHE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}
@@ -1231,7 +1220,7 @@ if __name__ == '__main__':
         "port": PORT,
         "server_header": False,
         "proxy_headers": True,
-        "forwarded_allow_ips": "*",
+        "forwarded_allow_ips": os.getenv("FORWARDED_ALLOW_IPS", "127.0.0.1"),
         # 修改原因：/v1/responses 新增 WebSocket 透传端点，原配置 ws="none" 会让 WS 握手落到 SPA fallback 返回 HTML。
         # 修改方式：启用 websockets 实现（依赖已存在）。
         # 目的：让客户端 WS 连接正常完成 101 升级。

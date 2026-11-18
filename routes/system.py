@@ -8,6 +8,7 @@
 """
 
 import os
+import shutil
 import subprocess
 import asyncio
 from pathlib import Path
@@ -391,6 +392,19 @@ async def _update_git(steps: list) -> JSONResponse:
     # 修改方式：只有显式配置 ZOAHOLIC_PROD_DIR 时才把源码同步到另一个目录，未配置时只更新当前目录。
     prod_dir = os.getenv("ZOAHOLIC_PROD_DIR") or cwd
 
+    # Step 0: 记录 pull 前的 HEAD，避免多 commit 合并拉取时 HEAD~1 漏检 frontend 变更
+    old_head = "HEAD~1"
+    try:
+        r_head = await asyncio.to_thread(
+            subprocess.run,
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, cwd=cwd, timeout=5
+        )
+        if r_head.returncode == 0 and r_head.stdout.strip():
+            old_head = r_head.stdout.strip()
+    except Exception:
+        pass
+
     # Step 1: git pull
     result = await asyncio.to_thread(
         subprocess.run,
@@ -413,17 +427,34 @@ async def _update_git(steps: list) -> JSONResponse:
     else:
         steps.append({"step": "sync_backend", "success": True, "output": "same dir, skipped"})
 
-    # Step 4: 前端 build（如有变更）
+    # Step 4: 前端 build（对比 old_head..HEAD 是否有 frontend/ 变更，或 static/ 产物比 frontend/src 旧）
     frontend_changed = False
     try:
         r = await asyncio.to_thread(
             subprocess.run,
-            ["git", "diff", "HEAD~1", "--name-only", "--", "frontend/"],
+            ["git", "diff", old_head, "HEAD", "--name-only", "--", "frontend/"],
             capture_output=True, text=True, cwd=cwd, timeout=5
         )
         frontend_changed = bool(r.stdout.strip())
     except Exception:
         pass
+
+    if not frontend_changed:
+        try:
+            static_index = Path(prod_dir) / "static" / "index.html"
+            src_root = Path(cwd) / "frontend" / "src"
+            if not static_index.exists():
+                frontend_changed = True
+            elif src_root.is_dir():
+                static_mtime = static_index.stat().st_mtime
+                latest_src_mtime = max(
+                    (p.stat().st_mtime for p in src_root.rglob("*") if p.is_file()),
+                    default=0.0,
+                )
+                if latest_src_mtime > static_mtime:
+                    frontend_changed = True
+        except Exception:
+            pass
 
     if frontend_changed:
         frontend_dir = os.path.join(cwd, "frontend")
@@ -564,18 +595,19 @@ def _read_version_from_pyproject(cwd: str) -> str:
 
 
 async def _sync_dirs(src: str, dst: str, exclude: list[str] | None = None) -> bool:
-    """同步目录，优先 rsync，fallback cp"""
-    src = src.rstrip("/") + "/"
-    dst = dst.rstrip("/") + "/"
+    """同步目录，优先 rsync，fallback shutil.copytree"""
+    src_dir = src.rstrip("/") + "/"
+    dst_dir = dst.rstrip("/") + "/"
 
     # 尝试 rsync
     try:
-        exclude_args = ""
+        cmd = ["rsync", "-a"]
         if exclude:
-            exclude_args = " ".join(f"--exclude='{e}'" for e in exclude)
-        cmd = f"rsync -a {exclude_args} {src} {dst}"
+            for item in exclude:
+                cmd.append(f"--exclude={item}")
+        cmd.extend([src_dir, dst_dir])
         result = await asyncio.to_thread(
-            subprocess.run, cmd, shell=True,
+            subprocess.run, cmd,
             capture_output=True, text=True, timeout=30
         )
         if result.returncode == 0:
@@ -583,14 +615,25 @@ async def _sync_dirs(src: str, dst: str, exclude: list[str] | None = None) -> bo
     except Exception:
         pass
 
-    # fallback: cp（不支持 exclude，直接全量覆盖）
+    # fallback: shutil.copytree
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            f"cp -r {src}* {dst}",
-            shell=True, capture_output=True, text=True, timeout=30
-        )
-        return result.returncode == 0
+        exclude_set = set(exclude or [])
+
+        def _copy_sync():
+            src_path = Path(src)
+            dst_path = Path(dst)
+            dst_path.mkdir(parents=True, exist_ok=True)
+            for item in src_path.iterdir():
+                if item.name in exclude_set:
+                    continue
+                target = dst_path / item.name
+                if item.is_dir():
+                    shutil.copytree(item, target, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, target)
+            return True
+
+        return await asyncio.to_thread(_copy_sync)
     except Exception:
         return False
 

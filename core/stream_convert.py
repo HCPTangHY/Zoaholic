@@ -84,8 +84,9 @@ async def assemble_stream_to_json(stream_generator):
                         role = delta["role"]
                     if "content" in delta and isinstance(delta["content"], str):
                         content += delta["content"]
-                    if "reasoning_content" in delta and isinstance(delta["reasoning_content"], str):
-                        reasoning_content += delta["reasoning_content"]
+                    if "reasoning_content" in delta:
+                        from .channels.openai_channel import flatten_reasoning_content
+                        reasoning_content += flatten_reasoning_content(delta["reasoning_content"])
                     if "refusal" in delta and isinstance(delta["refusal"], str):
                         if "refusal" not in locals() or refusal is None:
                             refusal = ""
@@ -103,11 +104,15 @@ async def assemble_stream_to_json(stream_generator):
                                         "arguments": "",
                                     },
                                 }
+                                if tc.get("extra_content"):
+                                    tool_calls_accum[idx]["extra_content"] = tc["extra_content"]
                             else:
                                 if tc.get("id"):
                                     tool_calls_accum[idx]["id"] = tc["id"]
                                 if tc.get("type"):
                                     tool_calls_accum[idx]["type"] = tc["type"]
+                                if tc.get("extra_content"):
+                                    tool_calls_accum[idx]["extra_content"] = tc["extra_content"]
                             fn = tc.get("function", {})
                             if fn.get("name"):
                                 tool_calls_accum[idx]["function"]["name"] = fn["name"]

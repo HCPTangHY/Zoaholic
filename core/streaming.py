@@ -62,6 +62,7 @@ class LoggingStreamingResponse(Response):
         current_info = self.current_info
         logging_iterator = self._logging_iterator()
         response_chunks = []
+        streamed_bytes = 0
         remaining = 100 * 1024
         should_save = current_info.get("raw_data_expires_at") is not None
         try:
@@ -75,6 +76,7 @@ class LoggingStreamingResponse(Response):
                 await send({
                     "type": "http.response.body", "body": chunk, "more_body": True,
                 })
+                streamed_bytes += len(chunk) if isinstance(chunk, (bytes, bytearray)) else len(str(chunk).encode("utf-8", errors="ignore"))
                 # 正常帧和错误帧走同一记录入口，只保存 send 成功返回的字节。
                 if should_save and remaining:
                     prefix = chunk[:remaining]
@@ -103,6 +105,18 @@ class LoggingStreamingResponse(Response):
                         current_info["response_body"] = truncate_for_logging(b"".join(response_chunks))
                     if "start_time" in current_info:
                         current_info["process_time"] = time() - current_info["start_time"]
+                    if current_info.get("_stream_committed") and not (current_info.get("total_tokens") or 0):
+                        est_prompt = int(current_info.get("_estimated_prompt_tokens") or 0)
+                        if not (current_info.get("prompt_tokens") or 0) and est_prompt > 0 and (
+                            current_info.get("_stream_has_output") or current_info.get("status_code") == 499
+                        ):
+                            current_info["prompt_tokens"] = est_prompt
+                        if not (current_info.get("completion_tokens") or 0) and current_info.get("_stream_has_output") and streamed_bytes > 0:
+                            current_info["completion_tokens"] = max(1, streamed_bytes // 32)
+                        pt = int(current_info.get("prompt_tokens") or 0)
+                        ct = int(current_info.get("completion_tokens") or 0)
+                        if pt > 0 or ct > 0:
+                            current_info["total_tokens"] = pt + ct
                     # 渠道统计必须等待真实流结束，不能在创建 Response 时提前记成功。
                     channel_stats = current_info.pop("_channel_stats_call", None)
                     if channel_stats:

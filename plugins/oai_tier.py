@@ -117,17 +117,13 @@ _TIER_MODEL_PRIORITY = [
 ]
 
 
-def _tpm_to_tier(tpm: int, model_name: str = "") -> str:
+def _tpm_to_tier(tpm: Optional[int], model_name: str = "") -> str:
     """根据 TPM 上限精确匹配 Tier（与 keychecker 一致）"""
     if not isinstance(tpm, int):
         return "Tier Unknown"
-    import copy
-    fixed_tiers = copy.deepcopy(_OAI_TIERS)
-    # 非 gpt-5 系列的 Tier 5 TPM 是 30M 不是 40M
-    if "gpt-5" not in model_name:
-        fixed_tiers['Tier 5']['tpm'] = 30_000_000
-    for tier_name, tier_data in fixed_tiers.items():
-        if tier_data['tpm'] == tpm:
+    for tier_name, tier_data in _OAI_TIERS.items():
+        expected_tpm = 30_000_000 if (tier_name == "Tier 5" and "gpt-5" not in model_name) else tier_data["tpm"]
+        if expected_tpm == tpm:
             return tier_name
     return "Tier Unknown"
 

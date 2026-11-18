@@ -61,7 +61,9 @@ async def audio_transcriptions(
             timestamp_granularities = None
 
         # 读取上传的文件内容
-        content = await file.read()
+        content = await file.read(MAX_AUDIO_UPLOAD_BYTES + 1)
+        if len(content) > MAX_AUDIO_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Uploaded audio file exceeds maximum size limit")
         file_obj = io.BytesIO(content)
 
         # 创建 AudioTranscriptionRequest 对象
@@ -79,6 +81,8 @@ async def audio_transcriptions(
         return await model_handler.request_model(
             request_obj, api_index, background_tasks, endpoint="/v1/audio/transcriptions", raw_request=http_request
         )
+    except HTTPException:
+        raise
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="Invalid audio file encoding")
     except Exception as e:

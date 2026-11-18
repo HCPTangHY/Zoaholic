@@ -79,7 +79,7 @@ export default function Login() {
       try {
         const saved = sessionStorage.getItem(REDIRECT_AFTER_LOGIN_KEY);
         sessionStorage.removeItem(REDIRECT_AFTER_LOGIN_KEY);
-        if (saved && saved !== '/login' && saved.startsWith('/')) {
+        if (saved && saved !== '/login' && saved.startsWith('/') && !saved.startsWith('//')) {
           redirectTo = saved;
         }
       } catch {

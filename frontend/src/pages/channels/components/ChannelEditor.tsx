@@ -1226,24 +1226,6 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                   </div>
                 </section>}
 
-                <section aria-label="渠道超时与心跳">
-                  <div className="mb-4 flex items-center gap-2 border-b border-border pb-2 text-sm font-semibold text-foreground">
-                    <Timer className="h-4 w-4 text-muted-foreground" /> 超时与心跳
-                  </div>
-                  <TimeoutSettings
-                    key={timeoutEditorVersion}
-                    scope="channel"
-                    preferences={formData.preferences}
-                    globalPreferences={timeoutGlobalPreferences}
-                    parentPreferences={editingSubChannel ? timeoutParentPreferences : undefined}
-                    inheritanceLabel={editingSubChannel ? '沿用主渠道 / 全局配置' : '沿用全局配置'}
-                    defaults={timeoutDefaults}
-                    modelSuggestions={Array.from(new Set([...formData.models, ...formData.mappings.flatMap(mapping => [mapping.from, mapping.to]), ...getProviderModelNameListForUi()])).filter(model => model && model !== '*')}
-                    onChange={next => updateFormData('preferences', next)}
-                    onValidityChange={setTimeoutSettingsValid}
-                  />
-                </section>
-
                 {/* 6. 高级设置 */}
                 <section>
                   <div className="flex items-center gap-2 text-sm font-semibold text-foreground mb-4 border-b border-border pb-2">
@@ -1590,6 +1572,25 @@ export function ChannelEditor({ state }: ChannelEditorProps) {
                     </div>}
 
                   </div>
+                </section>
+
+                {/* 7. 超时与心跳 */}
+                <section aria-label="渠道超时与心跳">
+                  <div className="mb-3 flex items-center gap-2 border-b border-border pb-2 text-sm font-semibold text-foreground">
+                    <Timer className="h-4 w-4 text-muted-foreground" /> 超时与心跳
+                  </div>
+                  <TimeoutSettings
+                    key={timeoutEditorVersion}
+                    scope="channel"
+                    preferences={formData.preferences}
+                    globalPreferences={timeoutGlobalPreferences}
+                    parentPreferences={editingSubChannel ? timeoutParentPreferences : undefined}
+                    inheritanceLabel={editingSubChannel ? '沿用主渠道 / 全局' : '沿用全局'}
+                    defaults={timeoutDefaults}
+                    modelSuggestions={Array.from(new Set([...formData.models, ...formData.mappings.flatMap(mapping => [mapping.from, mapping.to]), ...getProviderModelNameListForUi()])).filter(model => model && model !== '*')}
+                    onChange={next => updateFormData('preferences', next)}
+                    onValidityChange={setTimeoutSettingsValid}
+                  />
                 </section>
 
                 <div className="h-10"></div>
