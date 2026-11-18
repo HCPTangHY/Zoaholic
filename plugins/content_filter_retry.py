@@ -124,7 +124,8 @@ def _mutate_payload(payload: dict) -> Optional[dict]:
 
     返回 None 表示无法修改（没有 user 消息）。
     """
-    payload = copy.deepcopy(payload)
+    from core.dialects.passthrough import clone_passthrough_payload_shell
+    payload = clone_passthrough_payload_shell(payload)
     messages = payload.get("messages")
     if not messages or not isinstance(messages, list):
         return None

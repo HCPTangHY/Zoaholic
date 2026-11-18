@@ -41,7 +41,8 @@ from core.error_response import create_error_response, openai_error_response
 
 from utils import safe_get, load_config
 
-from db import DISABLE_DATABASE, RequestStat, DB_TYPE, async_session_scope
+from core.db_gate import db_ready as _db_ready
+from db import DISABLE_DATABASE, RequestStat, DB_TYPE, async_session_scope, resolve_sqlite_db_path
 from core.stats import (
     create_tables,
     update_paid_api_keys_states,
@@ -108,17 +109,15 @@ def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT,
     return result
 
 # ---- 数据库压缩闸门 ----
-_db_ready = asyncio.Event()
-_db_ready.set()  # 初始状态：放行
 _last_compact_date = None  # 每天最多压缩一次
 
 
-async def _do_compact_db(app):
+async def _do_compact_db(app, force: bool = True):
     """执行 VACUUM INTO 压缩数据库（纯执行，不含条件判断）。"""
     global _last_compact_date
     import os, sqlite3
 
-    db_path = os.path.join(os.environ.get('DATA_DIR', 'data'), 'stats.db')
+    db_path = resolve_sqlite_db_path()
     compact_path = db_path + '.compact'
     old_path = db_path + '.old'
     db_size_mb = os.path.getsize(db_path) / (1024 * 1024)
@@ -128,15 +127,22 @@ async def _do_compact_db(app):
     logger.info('[db_compact] 已挂起新请求')
 
     try:
-        # Step 2: 等待 stats buffer 消费完
+        # Step 2: 等待 stats buffer 与 channel stats buffer 消费完
+        buffers_drained = True
         try:
             from core.stats import _stats_buffer
+            from core.handler import _channel_stats_buffer
             for _ in range(100):  # 最多等 10 秒
-                if len(_stats_buffer) == 0:
+                if len(_stats_buffer) == 0 and len(_channel_stats_buffer) == 0:
                     break
                 await asyncio.sleep(0.1)
+            buffers_drained = (len(_stats_buffer) == 0 and len(_channel_stats_buffer) == 0)
         except ImportError:
             pass
+
+        if not buffers_drained and not force:
+            logger.info('[db_compact] 统计缓冲区尚未排空，推迟本轮压缩')
+            return
 
         # Step 3: VACUUM INTO
         def do_vacuum_into():
@@ -150,30 +156,22 @@ async def _do_compact_db(app):
         compact_size_mb = os.path.getsize(compact_path) / (1024 * 1024)
         logger.info(f'[db_compact] VACUUM INTO 完成: {db_size_mb:.0f}MB -> {compact_size_mb:.0f}MB')
 
-        # Step 4: 关闭数据库连接
-        try:
-            from db import close_db
+        # Step 4-6: 持有写入信号量后关闭连接、替换文件并重新初始化引擎，避免与后台统计写入并发竞争
+        from core.stats import db_semaphore
+        from db import close_db, init_db
+        async with db_semaphore:
             await close_db()
-        except ImportError:
-            pass
 
-        # Step 5: 替换文件
-        def do_replace():
-            for suffix in ['', '-wal', '-shm']:
-                src = db_path + suffix
-                dst = old_path + suffix
-                if os.path.exists(src):
-                    os.rename(src, dst)
-            os.rename(compact_path, db_path)
+            def do_replace():
+                for suffix in ['', '-wal', '-shm']:
+                    src = db_path + suffix
+                    dst = old_path + suffix
+                    if os.path.exists(src):
+                        os.rename(src, dst)
+                os.rename(compact_path, db_path)
 
-        await asyncio.to_thread(do_replace)
-
-        # Step 6: 重新打开数据库连接
-        try:
-            from db import init_db
+            await asyncio.to_thread(do_replace)
             await init_db()
-        except ImportError:
-            pass
 
         # Step 7: 清理旧文件
         def do_cleanup_old():
@@ -202,6 +200,9 @@ async def _do_compact_db(app):
                 logger.info('[db_compact] 已恢复旧数据库')
             if os.path.exists(compact_path):
                 os.remove(compact_path)
+            import db as _db_mod
+            if _db_mod.db_engine is None:
+                await _db_mod.init_db()
         except Exception as re:
             logger.error(f'[db_compact] 恢复也失败了: {re}')
     finally:
@@ -268,7 +269,7 @@ async def db_compact_loop(app):
                 continue
 
             # 文件大小检查
-            db_path = os.path.join(os.environ.get('DATA_DIR', 'data'), 'stats.db')
+            db_path = resolve_sqlite_db_path()
             if not os.path.exists(db_path):
                 continue
             db_size_mb = os.path.getsize(db_path) / (1024 * 1024)
@@ -280,7 +281,8 @@ async def db_compact_loop(app):
             buffer_len = 0
             try:
                 from core.stats import _stats_buffer
-                buffer_len = len(_stats_buffer)
+                from core.handler import _channel_stats_buffer
+                buffer_len = len(_stats_buffer) + len(_channel_stats_buffer)
                 if buffer_len > 10:
                     busy = True
             except ImportError:
@@ -291,14 +293,18 @@ async def db_compact_loop(app):
                 logger.info(f'[db_compact] 请求活跃 (buffer={buffer_len}), 推迟压缩 ({defer_count}/{MAX_DEFER})')
                 continue
 
-            if defer_count >= MAX_DEFER:
+            force_compact = defer_count >= MAX_DEFER
+            if force_compact:
                 logger.info(f'[db_compact] 已推迟 {MAX_DEFER} 次，强制执行')
 
             logger.info(f'[db_compact] 触发压缩: {db_size_mb:.0f}MB > {compact_threshold_mb}MB, '
                         f'时间 {now_local.strftime("%H:%M")} (窗口 {compact_start}:00-{compact_end}:00)')
 
-            await _do_compact_db(app)
-            defer_count = 0
+            await _do_compact_db(app, force=force_compact)
+            if _last_compact_date == today:
+                defer_count = 0
+            elif not force_compact:
+                defer_count += 1
 
         except asyncio.CancelledError:
             logger.info('[db_compact] Task cancelled')
@@ -995,7 +1001,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to close shared fetch client: {e}")
 
-app = FastAPI(lifespan=lifespan, debug=is_debug)
+enable_docs = env_bool("ENABLE_DOCS", False)
+app = FastAPI(
+    lifespan=lifespan,
+    debug=is_debug,
+    docs_url="/docs" if enable_docs else None,
+    redoc_url="/redoc" if enable_docs else None,
+    openapi_url="/openapi.json" if enable_docs else None,
+)
 app.include_router(api_router)
 app.include_router(oauth_router)
 
@@ -1031,13 +1044,14 @@ def generate_markdown_docs():
 
     return markdown
 
-@app.get("/docs/markdown")
-async def get_markdown_docs():
-    markdown = generate_markdown_docs()
-    return Response(
-        content=markdown,
-        media_type="text/markdown"
-    )
+if enable_docs:
+    @app.get("/docs/markdown")
+    async def get_markdown_docs():
+        markdown = generate_markdown_docs()
+        return Response(
+            content=markdown,
+            media_type="text/markdown"
+        )
 
 @app.get("/-/health")
 async def health_check():
@@ -1074,39 +1088,41 @@ app.add_middleware(
 
 app.add_middleware(StatsMiddleware, debug=is_debug)
 
-@app.middleware("http")
-async def ensure_config(request: Request, call_next):
-    # 避免在 /v1 请求内进行自调用，防止递归卡死
-    if request.url.path.startswith("/v1"):
-        return await call_next(request)
 
-    if app and app.state.api_keys_db and not hasattr(app.state, "models_list"):
-        app.state.models_list = {}
-        for item in app.state.api_keys_db:
-            api_key_model_list = item.get("model", [])
-            for provider_rule in api_key_model_list:
-                provider_name = provider_rule.split("/")[0]
-                if is_local_api_key(provider_name) and provider_name in app.state.api_list:
-                    models_list = []
-                    try:
-                        # 构建请求头
-                        headers = {
-                            "Authorization": f"Bearer {provider_name}"
-                        }
-                        # 发送GET请求获取模型列表
-                        base_url = "http://127.0.0.1:8000/v1/models"
-                        async with app.state.client_manager.get_client(base_url) as client:
-                            response = await client.get(base_url, headers=headers)
-                            if response.status_code == 200:
-                                models_data = response.json()
-                                # 将获取到的模型添加到models_list
-                                for model in models_data.get("data", []):
-                                    models_list.append(model["id"])
-                    except Exception as e:
-                        if str(e):
-                            logger.error(f"获取模型列表失败: {str(e)}")
-                    app.state.models_list[provider_name] = models_list
-    return await call_next(request)
+class EnsureModelsListMiddleware:
+    """纯 ASGI 中间件：替代 BaseHTTPMiddleware，避免流式响应经过 anyio 内存流转发。"""
+
+    def __init__(self, inner_app):
+        self.app = inner_app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            path = scope.get("path") or ""
+            if not path.startswith("/v1") and app and getattr(app.state, "api_keys_db", None) and not hasattr(app.state, "models_list"):
+                app.state.models_list = {}
+                for item in app.state.api_keys_db:
+                    api_key_model_list = item.get("model", [])
+                    for provider_rule in api_key_model_list:
+                        provider_name = provider_rule.split("/")[0]
+                        if is_local_api_key(provider_name) and provider_name in app.state.api_list:
+                            models_list = []
+                            try:
+                                headers = {"Authorization": f"Bearer {provider_name}"}
+                                base_url = "http://127.0.0.1:8000/v1/models"
+                                async with app.state.client_manager.get_client(base_url) as client:
+                                    response = await client.get(base_url, headers=headers)
+                                    if response.status_code == 200:
+                                        models_data = response.json()
+                                        for model in models_data.get("data", []):
+                                            models_list.append(model["id"])
+                            except Exception as e:
+                                if str(e):
+                                    logger.error(f"获取模型列表失败: {str(e)}")
+                            app.state.models_list[provider_name] = models_list
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(EnsureModelsListMiddleware)
 
 
 # ModelRequestHandler 实例，将在应用生命周期中初始化
@@ -1119,7 +1135,26 @@ from fastapi.responses import FileResponse
 
 STATIC_ROOT = Path("./static").resolve()
 SPA_ROUTES = ["/channels", "/playground", "/admin", "/settings", "/logs", "/login"]
-HTML_NO_CACHE_HEADERS = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
+HTML_CSP_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self' blob:; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob: http: https:; "
+    "font-src 'self' data:; "
+    "connect-src 'self' ws: wss: http: https:; "
+    "media-src 'self' data: blob: http: https:; "
+    "frame-src 'self' data: blob: http: https:; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'; "
+    "frame-ancestors 'self'"
+)
+HTML_NO_CACHE_HEADERS = {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+    "Content-Security-Policy": HTML_CSP_POLICY,
+}
 ASSET_CACHE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}
 
 
@@ -1187,12 +1222,14 @@ async def spa_fallback(path: str):
 
 if __name__ == '__main__':
     import uvicorn
+    HOST = os.getenv("HOST", "0.0.0.0")
     PORT = int(os.getenv("PORT", "8000"))
     RELOAD = os.getenv("RELOAD", "false").lower() in ("true", "1", "yes")
     
     uvicorn_config = {
-        "host": "0.0.0.0",
+        "host": HOST,
         "port": PORT,
+        "server_header": False,
         "proxy_headers": True,
         "forwarded_allow_ips": "*",
         # 修改原因：/v1/responses 新增 WebSocket 透传端点，原配置 ws="none" 会让 WS 握手落到 SPA fallback 返回 HTML。

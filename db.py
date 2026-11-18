@@ -477,6 +477,54 @@ async_session = None
 # D1 运行时对象
 d1_client: Optional[D1HTTPClient] = None
 
+
+def resolve_sqlite_db_path() -> str:
+    """统一解析 SQLite 数据库文件路径（兼容 DATABASE_URL、DB_PATH 与 DATA_DIR）。"""
+    if DATABASE_URL:
+        normalized = _normalize_database_url(DATABASE_URL, "sqlite")
+        if normalized.startswith("sqlite+aiosqlite:///") and ":memory:" not in normalized:
+            raw_path = normalized.split("sqlite+aiosqlite:///", 1)[1].split("?", 1)[0]
+            if raw_path:
+                return raw_path
+    default_path = os.path.join(os.environ.get("DATA_DIR", "./data"), "stats.db")
+    return os.getenv("DB_PATH", default_path)
+
+
+def _attach_sqlite_pragmas(engine) -> None:
+    @event.listens_for(engine.sync_engine, "connect")
+    def set_sqlite_pragma_on_connect(dbapi_connection, connection_record):
+        cursor = None
+        try:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA busy_timeout = 30000;")  # 30 seconds
+            cursor.execute("PRAGMA synchronous = NORMAL;")  # Faster writes
+            cursor.execute("PRAGMA cache_size = -4000;")  # 4MB cache per connection
+        except Exception as e:
+            logger.error(f"Failed to set PRAGMA for SQLite: {e}")
+        finally:
+            if cursor:
+                cursor.close()
+
+
+def _create_sqlite_engine(is_debug: bool):
+    if DATABASE_URL:
+        db_url = _normalize_database_url(DATABASE_URL, "sqlite")
+        if db_url.startswith("sqlite+aiosqlite:///") and ":memory:" not in db_url:
+            raw_path = db_url.split("sqlite+aiosqlite:///", 1)[1].split("?", 1)[0]
+            dir_path = os.path.dirname(raw_path)
+            if dir_path:
+                os.makedirs(dir_path, exist_ok=True)
+        engine = create_async_engine(db_url, echo=is_debug)
+    else:
+        db_path = resolve_sqlite_db_path()
+        data_dir = os.path.dirname(db_path)
+        if data_dir:
+            os.makedirs(data_dir, exist_ok=True)
+        engine = create_async_engine("sqlite+aiosqlite:///" + db_path, echo=is_debug)
+    _attach_sqlite_pragmas(engine)
+    return engine
+
 if not DISABLE_DATABASE:
     is_debug = env_bool("DEBUG", False)
 
@@ -537,36 +585,7 @@ if not DISABLE_DATABASE:
         )
 
     elif DB_TYPE == "sqlite":
-        if DATABASE_URL:
-            db_url = _normalize_database_url(DATABASE_URL, DB_TYPE)
-            # 尝试为文件型 sqlite 创建目录（:memory: 不处理）
-            if db_url.startswith("sqlite+aiosqlite:///") and ":memory:" not in db_url:
-                raw_path = db_url.split("sqlite+aiosqlite:///", 1)[1].split("?", 1)[0]
-                # 允许 ./data/xxx.db
-                dir_path = os.path.dirname(raw_path)
-                if dir_path:
-                    os.makedirs(dir_path, exist_ok=True)
-            db_engine = create_async_engine(db_url, echo=is_debug)
-        else:
-            db_path = os.getenv("DB_PATH", "./data/stats.db")
-            data_dir = os.path.dirname(db_path)
-            os.makedirs(data_dir, exist_ok=True)
-            db_engine = create_async_engine("sqlite+aiosqlite:///" + db_path, echo=is_debug)
-
-        @event.listens_for(db_engine.sync_engine, "connect")
-        def set_sqlite_pragma_on_connect(dbapi_connection, connection_record):
-            cursor = None
-            try:
-                cursor = dbapi_connection.cursor()
-                cursor.execute("PRAGMA journal_mode=WAL;")
-                cursor.execute("PRAGMA busy_timeout = 30000;")  # 30 seconds
-                cursor.execute("PRAGMA synchronous = NORMAL;")  # Faster writes
-                cursor.execute("PRAGMA cache_size = -4000;")  # 4MB cache per connection
-            except Exception as e:
-                logger.error(f"Failed to set PRAGMA for SQLite: {e}")
-            finally:
-                if cursor:
-                    cursor.close()
+        db_engine = _create_sqlite_engine(is_debug)
     else:
         if DB_TYPE == "d1":
             if not (D1_ACCOUNT_ID and D1_DATABASE_ID and D1_API_TOKEN):
@@ -592,6 +611,8 @@ async def close_db():
     global db_engine, _legacy_async_session
     if db_engine is not None:
         await db_engine.dispose()
+        db_engine = None
+        _legacy_async_session = None
         logger.info("Database engine disposed")
 
 
@@ -600,21 +621,9 @@ async def init_db():
     global db_engine, _legacy_async_session
     if DISABLE_DATABASE or DB_TYPE != "sqlite":
         return
-    db_path = os.getenv("DB_PATH", "./data/stats.db")
-    is_debug = env_bool("DEBUG", False)
-    db_engine = create_async_engine("sqlite+aiosqlite:///" + db_path, echo=is_debug)
-
-    @event.listens_for(db_engine.sync_engine, "connect")
-    def set_sqlite_pragma_on_reconnect(dbapi_connection, connection_record):
-        cursor = None
-        try:
-            cursor = dbapi_connection.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL;")
-            cursor.execute("PRAGMA busy_timeout = 30000;")
-        finally:
-            if cursor:
-                cursor.close()
-
+    if db_engine is not None:
+        await db_engine.dispose()
+    db_engine = _create_sqlite_engine(env_bool("DEBUG", False))
     _legacy_async_session = sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
     logger.info("Database engine re-initialized")
 

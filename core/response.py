@@ -283,6 +283,20 @@ def _save_upstream_response_for_non_stream(response):
         logger.error(f"Error saving upstream response for non-stream: {str(e)}")
 
 
+def release_stream_request_buffer(response) -> None:
+    """流式请求头已成功接收后，释放 httpx.Response._request 上滞留的大请求体字节。"""
+    try:
+        req = getattr(response, "_request", None)
+        if req is not None:
+            if hasattr(req, "_content"):
+                req._content = b""
+            if hasattr(req, "stream") and req.stream is not None:
+                import httpx as _httpx
+                req.stream = _httpx.ByteStream(b"")
+    except Exception:
+        pass
+
+
 def _log_upstream_request(url, payload):
     """在 fetch 层记录实际发给上游的请求体（force_stream 等插件修改后的真实值）"""
     try:
@@ -464,6 +478,7 @@ async def fetch_response_stream(
             chunk_iter = adapter(client, url, headers, payload, model, timeout, provider=provider)
         else:
             chunk_iter = adapter(client, url, headers, payload, model, timeout)
+        payload = None
         try:
             async for chunk in chunk_iter:
                 # 应用响应拦截器和新增出站阶段

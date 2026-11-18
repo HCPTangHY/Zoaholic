@@ -14,8 +14,181 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from core.log_config import logger
+from core.models import Message, RequestModel
 from core.usage import extract_cache_usage
 from core.utils import safe_get
+
+
+_SHARED_CONTENT_KEYS = frozenset({
+    "contents",
+    "messages",
+    "input",
+    "system",
+    "systemInstruction",
+    "system_instruction",
+})
+
+
+def _clone_gemini_contents_shell(contents: list) -> list:
+    cloned = []
+    for turn in contents:
+        if isinstance(turn, dict):
+            turn_copy = dict(turn)
+            parts = turn_copy.get("parts")
+            if isinstance(parts, list):
+                turn_copy["parts"] = [dict(p) if isinstance(p, dict) else p for p in parts]
+            cloned.append(turn_copy)
+        else:
+            cloned.append(turn)
+    return cloned
+
+
+def _clone_messages_shell(messages: list) -> list:
+    cloned = []
+    for msg in messages:
+        if isinstance(msg, dict):
+            msg_copy = dict(msg)
+            content = msg_copy.get("content")
+            if isinstance(content, list):
+                msg_copy["content"] = [dict(b) if isinstance(b, dict) else b for b in content]
+            cloned.append(msg_copy)
+        else:
+            cloned.append(msg)
+    return cloned
+
+
+def _clone_system_shell(value: Any) -> Any:
+    if isinstance(value, str) or value is None:
+        return value
+    if isinstance(value, list):
+        return [dict(b) if isinstance(b, dict) else b for b in value]
+    if isinstance(value, dict):
+        sys_copy = dict(value)
+        parts = sys_copy.get("parts")
+        if isinstance(parts, list):
+            sys_copy["parts"] = [dict(p) if isinstance(p, dict) else p for p in parts]
+        return sys_copy
+    return copy.deepcopy(value)
+
+
+def clone_passthrough_payload_shell(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """复制外层结构与小型配置字段，底层大文本与多模态数据保持引用共享。"""
+    if not isinstance(payload, dict):
+        return copy.deepcopy(payload)
+    new_payload: Dict[str, Any] = {}
+    for k, v in payload.items():
+        if k == "contents" and isinstance(v, list):
+            new_payload[k] = _clone_gemini_contents_shell(v)
+        elif k in ("messages", "input") and isinstance(v, list):
+            new_payload[k] = _clone_messages_shell(v)
+        elif k in ("system", "systemInstruction", "system_instruction"):
+            new_payload[k] = _clone_system_shell(v)
+        elif k in _SHARED_CONTENT_KEYS and isinstance(v, str):
+            new_payload[k] = v
+        elif isinstance(v, (str, int, float, bool)) or v is None:
+            new_payload[k] = v
+        else:
+            new_payload[k] = copy.deepcopy(v)
+    return new_payload
+
+
+def estimate_native_payload_tokens(native_body: Any) -> int:
+    """只读遍历原生请求体估算输入 token 数（约 4 字符/token），不分配中间副本。"""
+    if not isinstance(native_body, dict):
+        return 0
+    total_chars = 0
+    for key in ("instructions", "system"):
+        val = native_body.get(key)
+        if isinstance(val, str):
+            total_chars += len(val)
+        elif isinstance(val, list):
+            for b in val:
+                if isinstance(b, dict) and isinstance(b.get("text"), str):
+                    total_chars += len(b["text"])
+    for key in ("systemInstruction", "system_instruction"):
+        sys_inst = native_body.get(key)
+        if isinstance(sys_inst, dict) and isinstance(sys_inst.get("parts"), list):
+            for p in sys_inst["parts"]:
+                if isinstance(p, dict) and isinstance(p.get("text"), str):
+                    total_chars += len(p["text"])
+    contents = native_body.get("contents")
+    if isinstance(contents, list):
+        for turn in contents:
+            if isinstance(turn, dict) and isinstance(turn.get("parts"), list):
+                for p in turn["parts"]:
+                    if isinstance(p, dict) and isinstance(p.get("text"), str):
+                        total_chars += len(p["text"])
+    for key in ("messages", "input"):
+        items = native_body.get(key)
+        if isinstance(items, str):
+            total_chars += len(items)
+        elif isinstance(items, list):
+            for m in items:
+                if isinstance(m, str):
+                    total_chars += len(m)
+                elif isinstance(m, dict):
+                    c = m.get("content")
+                    if isinstance(c, str):
+                        total_chars += len(c)
+                    elif isinstance(c, list):
+                        for b in c:
+                            if isinstance(b, str):
+                                total_chars += len(b)
+                            elif isinstance(b, dict) and isinstance(b.get("text"), str):
+                                total_chars += len(b["text"])
+    return int(total_chars / 4)
+
+
+def build_lightweight_dialect_request(
+    dialect_id: str,
+    native_body: Any,
+    path_params: Optional[Dict[str, str]] = None,
+) -> Optional[RequestModel]:
+    """在原生请求结构合法时构造仅含路由元数据的轻量 RequestModel，延迟全量消息解析。"""
+    if not isinstance(native_body, dict):
+        return None
+    path_params = path_params or {}
+    if dialect_id == "gemini":
+        if "contents" in native_body and not isinstance(native_body.get("contents"), list):
+            return None
+        model = path_params.get("model") or native_body.get("model") or ""
+        action = path_params.get("action") or ""
+        stream_flag = "streamGenerateContent" in action or bool(native_body.get("stream"))
+    elif dialect_id == "claude":
+        if "messages" in native_body and not isinstance(native_body.get("messages"), list):
+            return None
+        model = native_body.get("model") or path_params.get("model") or ""
+        stream_flag = bool(native_body.get("stream", False))
+    elif dialect_id == "openai-responses":
+        model = native_body.get("model") or ""
+        stream_flag = bool(native_body.get("stream", False))
+    elif dialect_id == "openai":
+        msgs = native_body.get("messages")
+        if not isinstance(msgs, list) or not msgs:
+            return None
+        # 保留最后一条消息的 role 供非透传回退前的轻量元信息读取，不展开正文
+        last_msg = msgs[-1]
+        if not isinstance(last_msg, dict) or not isinstance(last_msg.get("role"), str):
+            return None
+        model = native_body.get("model") or ""
+        stream_flag = bool(native_body.get("stream", False))
+        if not isinstance(model, str) or not model:
+            return None
+        return RequestModel.model_construct(
+            model=model,
+            messages=[Message.model_construct(role=last_msg["role"], content="")],
+            stream=stream_flag,
+        )
+    else:
+        return None
+
+    if not isinstance(model, str) or not model:
+        return None
+    return RequestModel.model_construct(
+        model=model,
+        messages=[Message.model_construct(role="user", content="")],
+        stream=stream_flag,
+    )
 
 
 @dataclass
@@ -120,7 +293,7 @@ def apply_passthrough_modifications(
         request_model: 请求别名模型（RequestModel.model）
         original_model: 上游真实模型名
     """
-    new_payload = copy.deepcopy(payload)
+    new_payload = clone_passthrough_payload_shell(payload)
 
     # model 重命名：Gemini 的 model 在 URL 中处理，这里只处理非 Gemini
     if modifications.get("model_rename") and dialect_id != "gemini":

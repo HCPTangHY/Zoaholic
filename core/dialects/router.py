@@ -126,6 +126,31 @@ def _create_dialect_verify_api_key(dialect_id: str):
     return verify
 
 
+async def consume_request_json(request: Request) -> Dict[str, Any]:
+    """复用中间件预解析的 JSON 请求体并消费一次底层流，避免二次解析与残留字节缓存。"""
+    scope = getattr(request, "scope", {})
+    if "_zoaholic_parsed_json" in scope:
+        native_body = scope.pop("_zoaholic_parsed_json")
+        # Consume the replayed body once so disconnect handling still reads the socket.
+        await request.body()
+        request._json = native_body
+        return native_body
+    return await request.json()
+
+
+def clear_request_body_cache(request: Any) -> None:
+    """释放 Starlette Request 上缓存的原始字节与预解析对象引用。"""
+    if request is None:
+        return
+    if hasattr(request, "_body"):
+        request._body = b""
+    if hasattr(request, "_json"):
+        try:
+            delattr(request, "_json")
+        except Exception:
+            request._json = None
+
+
 def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
     """为方言端点创建通用处理函数"""
     verify_api_key = _create_dialect_verify_api_key(dialect_id)
@@ -137,20 +162,14 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
     ):
         from routes.deps import get_model_handler
         from core.streaming import LoggingStreamingResponse
+        from .passthrough import build_lightweight_dialect_request, estimate_native_payload_tokens
 
         dialect = get_dialect(dialect_id)
         if not dialect or not dialect.parse_request:
             return openai_error_response(f"{dialect_id} dialect not registered", 500)
 
         try:
-            scope = getattr(request, "scope", {})
-            if "_zoaholic_parsed_json" in scope:
-                native_body = scope.pop("_zoaholic_parsed_json")
-                # Consume the replayed body once so disconnect handling still reads the socket.
-                await request.body()
-                request._json = native_body
-            else:
-                native_body = await request.json()
+            native_body = await consume_request_json(request)
         except Exception:
             native_body = {}
 
@@ -159,25 +178,43 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
         if ":" in request.url.path:
             path_params["action"] = request.url.path.split(":")[-1]
 
-        canonical_request = await dialect.parse_request(native_body, path_params, headers)
+        lightweight_request = build_lightweight_dialect_request(dialect_id, native_body, path_params)
+        if lightweight_request is not None:
+            canonical_request = lightweight_request
+            estimated_tokens = estimate_native_payload_tokens(native_body)
 
+            async def _parse_canonical():
+                return await dialect.parse_request(native_body, path_params, headers)
+
+            canonical_factory = _parse_canonical
+        else:
+            canonical_request = await dialect.parse_request(native_body, path_params, headers)
+            estimated_tokens = None
+            canonical_factory = None
+
+        request_model_name = canonical_request.model
         model_handler = get_model_handler()
-        resp = await model_handler.request_model(
-            request_data=canonical_request,
-            api_index=api_index,
-            background_tasks=background_tasks,
-            endpoint=request.url.path,
-            dialect_id=dialect_id,
-            original_payload=native_body,
-            original_headers=headers,
-            raw_request=request,
-            passthrough_only=endpoint.passthrough_only,
-        )
-
-        # Inbound plugins may inspect the original body while request_model runs.
-        # Once routing is complete, streaming doesn't need its byte cache.
-        if "_zoaholic_parsed_json" not in scope and hasattr(request, "_body"):
-            request._body = b""
+        try:
+            request_kwargs: Dict[str, Any] = {
+                "request_data": canonical_request,
+                "api_index": api_index,
+                "background_tasks": background_tasks,
+                "endpoint": request.url.path,
+                "dialect_id": dialect_id,
+                "original_payload": native_body,
+                "original_headers": headers,
+                "raw_request": request,
+                "passthrough_only": endpoint.passthrough_only,
+            }
+            if canonical_factory is not None:
+                request_kwargs["canonical_request_factory"] = canonical_factory
+                request_kwargs["estimated_prompt_tokens"] = estimated_tokens
+            resp = await model_handler.request_model(**request_kwargs)
+        finally:
+            clear_request_body_cache(request)
+            native_body = None
+            canonical_factory = None
+            headers = None
 
         if resp.headers.get("x-zoaholic-passthrough") or resp.status_code != 200:
             return resp
@@ -223,7 +260,7 @@ def _create_generic_handler(dialect_id: str, endpoint: EndpointDefinition):
 
         current_info = getattr(resp, "current_info", {}) or {}
         
-        converted_json = await dialect.render_response(canonical_json, canonical_request.model) if dialect.render_response else canonical_json
+        converted_json = await dialect.render_response(canonical_json, request_model_name) if dialect.render_response else canonical_json
 
         async def converted_iter():
             yield json_dumps_text(converted_json, ensure_ascii=False)

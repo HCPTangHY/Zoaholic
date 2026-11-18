@@ -403,6 +403,23 @@ class InterceptorRegistry:
         interceptors.sort(key=lambda i: i.priority)
         return interceptors
     
+    def has_active_inbound_interceptors(self, enabled_plugins: Optional[List[str]] = None) -> bool:
+        """检查当前 Key 是否存在需要实际执行的入站拦截器。"""
+        interceptors = self.get_inbound_interceptors(enabled_only=True)
+        if not interceptors:
+            return False
+        enabled_plugin_names = (
+            set(parse_enabled_plugins(enabled_plugins).keys())
+            if enabled_plugins is not None
+            else None
+        )
+        for interceptor in interceptors:
+            if interceptor.plugin_name:
+                if not enabled_plugin_names or interceptor.plugin_name not in enabled_plugin_names:
+                    continue
+            return True
+        return False
+
     async def apply_inbound_interceptors(
         self,
         request_data: Any,
@@ -501,6 +518,23 @@ class InterceptorRegistry:
             interceptors = [i for i in interceptors if i.enabled]
         interceptors.sort(key=lambda i: i.priority)
         return interceptors
+
+    def has_active_channel_inbound_interceptors(self, enabled_plugins: Optional[List[str]] = None) -> bool:
+        """检查当前渠道是否存在需要实际执行的渠道入站拦截器。"""
+        interceptors = self.get_channel_inbound_interceptors(enabled_only=True)
+        if not interceptors:
+            return False
+        enabled_plugin_names = (
+            set(parse_enabled_plugins(enabled_plugins).keys())
+            if enabled_plugins is not None
+            else None
+        )
+        for interceptor in interceptors:
+            if interceptor.plugin_name:
+                if not enabled_plugin_names or interceptor.plugin_name not in enabled_plugin_names:
+                    continue
+            return True
+        return False
 
     async def apply_channel_inbound_interceptors(
         self,
@@ -1316,6 +1350,10 @@ def unregister_inbound_interceptor(interceptor_id: str) -> bool:
     return get_interceptor_registry().unregister_inbound_interceptor(interceptor_id)
 
 
+def has_active_inbound_interceptors(enabled_plugins: Optional[List[str]] = None) -> bool:
+    return get_interceptor_registry().has_active_inbound_interceptors(enabled_plugins)
+
+
 async def apply_inbound_interceptors(
     request_data: Any,
     request: Any,
@@ -1348,6 +1386,10 @@ def register_channel_inbound_interceptor(
 def unregister_channel_inbound_interceptor(interceptor_id: str) -> bool:
     """注销渠道入站拦截器（便捷函数）"""
     return get_interceptor_registry().unregister_channel_inbound_interceptor(interceptor_id)
+
+
+def has_active_channel_inbound_interceptors(enabled_plugins: Optional[List[str]] = None) -> bool:
+    return get_interceptor_registry().has_active_channel_inbound_interceptors(enabled_plugins)
 
 
 async def apply_channel_inbound_interceptors(

@@ -826,10 +826,14 @@ async def _responses_events_to_sse(events, model):
 
 async def fetch_responses_stream(client, url, headers, payload, model, timeout):
     """处理 Responses API 的流式响应（HTTP SSE 传输）"""
+    from ..response import release_stream_request_buffer
     json_payload = await asyncio.to_thread(json_dumps_text, payload)
+    payload = None
 
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
+        json_payload = None
         error_message = await check_response(response, "fetch_responses_stream")
+        release_stream_request_buffer(response)
         if error_message:
             yield error_message
             return

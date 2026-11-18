@@ -619,10 +619,14 @@ async def fetch_claude_response(client, url, headers, payload, model, timeout):
 
 async def fetch_claude_response_stream(client, url, headers, payload, model, timeout):
     """处理 Claude 流式响应"""
+    from ..response import release_stream_request_buffer
     timestamp = int(datetime.timestamp(datetime.now()))
     json_payload = await asyncio.to_thread(json_dumps_text, payload)
+    payload = None
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
+        json_payload = None
         error_message = await check_response(response, "fetch_claude_response_stream")
+        release_stream_request_buffer(response)
         if error_message:
             yield error_message
             return

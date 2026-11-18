@@ -210,7 +210,7 @@ async def _fetch_passthrough_stream(
     
     读取超时遵循渠道配置；心跳只维持下游连接，不延长上游读取期限。
     """
-    from .response import _log_upstream_request, _apply_response_path_interceptors
+    from .response import _log_upstream_request, _apply_response_path_interceptors, release_stream_request_buffer
     _log_upstream_request(url, payload)
     
     stream_timeout = httpx.Timeout(
@@ -221,8 +221,11 @@ async def _fetch_passthrough_stream(
     )
     
     json_payload = await asyncio.to_thread(json_dumps_bytes, payload)
+    payload = None
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=stream_timeout) as response:
+        json_payload = None
         error_message = await check_response(response, "passthrough_stream")
+        release_stream_request_buffer(response)
         if error_message:
             # 修改原因：透传流式错误响应也要按 response → channel_outbound → key_outbound 的顺序处理。
             # 修改方式：复用 response.py 的统一返回路径 helper，并传入渠道与 Key 级插件上下文。
@@ -269,13 +272,14 @@ async def _fetch_passthrough_response(
     
     直接转发上游 JSON 响应，不做任何格式转换
     """
-    from .response import _log_upstream_request, _apply_response_path_interceptors
+    from .response import _log_upstream_request, _apply_response_path_interceptors, release_stream_request_buffer
     _log_upstream_request(url, payload)
     
     import time as _time
     t0 = _time.time()
     
     json_payload = await asyncio.to_thread(json_dumps_bytes, payload)
+    payload = None
     t1 = _time.time()
     logger.debug(f"[passthrough] json.dumps took {t1-t0:.3f}s")
     
@@ -292,10 +296,12 @@ async def _fetch_passthrough_response(
     # 这样可以避免先 aread() 再 decode() 带来的整包双份内存占用。
     if not enabled_plugins and not key_enabled_plugins:
         async with client.stream('POST', url, headers=headers, content=json_payload, timeout=request_timeout) as response:
+            json_payload = None
             t2 = _time.time()
             logger.debug(f"[passthrough] POST request took {t2-t1:.3f}s, status={response.status_code}")
 
             error_message = await check_response(response, "passthrough_non_stream")
+            release_stream_request_buffer(response)
             if error_message:
                 yield error_message
                 return

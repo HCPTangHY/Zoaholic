@@ -10,6 +10,7 @@
 """
 
 import asyncio
+import hashlib
 import json
 from collections import deque
 
@@ -907,10 +908,31 @@ async def _batch_write_stats(batch: list) -> None:
                 break
 
 
+def mask_provider_api_key(key: Optional[str]) -> Optional[str]:
+    """对落库的上游渠道凭证做确定性脱敏（保留短指纹以避免同前后缀凭证聚合冲突）。"""
+    if key is None:
+        return None
+    s = str(key)
+    if s == "" or s == "*":
+        return s
+    if "...#" in s:
+        _, tail = s.split("...#", 1)
+        if len(tail) in (6, 8, 10) and all(c in "0123456789abcdef" for c in tail[:6]):
+            return s
+    digest = hashlib.sha256(s.encode("utf-8")).hexdigest()[:6]
+    if len(s) >= 12:
+        return f"{s[:6]}...#{digest}{s[-4:]}"
+    if len(s) > 4:
+        return f"{s[:2]}...#{digest}{s[-2:]}"
+    return f"...#{digest}"
+
+
 async def update_channel_stats(request_id, provider, model, api_key, success, provider_api_key: str = None):
     """更新渠道统计到数据库"""
     if DISABLE_DATABASE:
         return
+
+    masked_provider_key = mask_provider_api_key(provider_api_key)
 
     # 使用重试机制写入数据库
     for attempt in range(SQLITE_MAX_RETRIES):
@@ -930,7 +952,7 @@ async def update_channel_stats(request_id, provider, model, api_key, success, pr
                         provider,
                         model,
                         api_key,
-                        provider_api_key,
+                        masked_provider_key,
                         1 if success else 0,
                     ]
                     await d1_client.execute(sql, params)
@@ -944,7 +966,7 @@ async def update_channel_stats(request_id, provider, model, api_key, success, pr
                             provider=provider,
                             model=model,
                             api_key=api_key,
-                            provider_api_key=provider_api_key,
+                            provider_api_key=masked_provider_key,
                             success=success,
                         )
                         session.add(channel_stat)
@@ -1000,7 +1022,7 @@ async def batch_update_channel_stats(items: list) -> None:
                         item["provider"],
                         item["model"],
                         item["api_key"],
-                        item.get("provider_api_key"),
+                        mask_provider_api_key(item.get("provider_api_key")),
                         1 if item["success"] else 0,
                     ])
 
@@ -1043,7 +1065,7 @@ async def batch_update_channel_stats(items: list) -> None:
                                 provider=item["provider"],
                                 model=item["model"],
                                 api_key=item["api_key"],
-                                provider_api_key=item.get("provider_api_key"),
+                                provider_api_key=mask_provider_api_key(item.get("provider_api_key")),
                                 success=item["success"],
                             )
                             for item in items

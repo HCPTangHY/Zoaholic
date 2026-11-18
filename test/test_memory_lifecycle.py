@@ -517,3 +517,559 @@ async def test_http_stream_close_keeps_redirect_history_and_headers():
         assert response.history[0].request.content == b'body'
         await response.aclose()
         await response.aclose()
+
+
+@pytest.mark.asyncio
+async def test_passthrough_shell_clone_shares_large_content_and_isolates_channel_mutations():
+    from core.channels.claude_channel import patch_passthrough_claude_payload
+    from core.channels.gemini_channel import patch_passthrough_gemini_payload
+    from core.channels.vertex_channel import patch_passthrough_vertex_gemini_payload
+    from core.dialects.passthrough import apply_passthrough_modifications
+    from core.models import Message, RequestModel
+
+    large_user_text = "U" * (256 * 1024)
+    large_b64 = "B" * (512 * 1024)
+    inline_obj = {"mimeType": "image/png", "data": large_b64}
+    original_gemini = {
+        "systemInstruction": {"parts": [{"text": "base system"}]},
+        "contents": [
+            {"parts": [{"text": large_user_text}, {"inlineData": inline_obj}]},
+            {"role": "system", "parts": [{"text": "extra instruction"}]},
+            {"role": "model", "parts": [{"functionCall": {"name": "lookup", "args": {"q": "a"}}}]},
+        ],
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+            {"category": "HARM_CATEGORY_IMAGE_HATE", "threshold": "OFF"},
+        ],
+        "generationConfig": {"temperature": 0.7},
+    }
+    req_stub = RequestModel.model_construct(
+        model="gemini-test",
+        messages=[Message.model_construct(role="user", content="")],
+        stream=True,
+    )
+
+    # Attempt 1: AI Studio passthrough mutates roles, trailing model turn, thoughtSignature, safetySettings, overrides
+    ais_payload = apply_passthrough_modifications(
+        original_gemini,
+        {"overrides": {"all": {"generationConfig": {"thinkingConfig": {"includeThoughts": True}}}}},
+        "gemini",
+        "gemini-test",
+        "gemini-test",
+    )
+    ais_payload = await patch_passthrough_gemini_payload(
+        ais_payload, {}, req_stub, "gemini", {"provider": "ais", "engine": "gemini"}
+    )
+
+    assert ais_payload["contents"][0]["parts"][0]["text"] is large_user_text
+    assert ais_payload["contents"][0]["parts"][1]["inlineData"] is inline_obj
+    assert ais_payload["contents"][0]["parts"][1]["inlineData"]["data"] is large_b64
+    assert ais_payload["contents"][-1]["role"] == "user"
+    assert ais_payload["contents"][2]["parts"][0]["thoughtSignature"] == "skip_thought_signature_validator"
+
+    # Original payload must remain completely untouched for Attempt 2 (Vertex)
+    assert "role" not in original_gemini["contents"][0]
+    assert original_gemini["contents"][1]["role"] == "system"
+    assert len(original_gemini["contents"]) == 3
+    assert "thoughtSignature" not in original_gemini["contents"][2]["parts"][0]
+    assert "thinkingConfig" not in original_gemini["generationConfig"]
+    assert len(original_gemini["safetySettings"]) == 2
+
+    vertex_payload = apply_passthrough_modifications(original_gemini, {}, "gemini", "gemini-test", "gemini-test")
+    vertex_payload = await patch_passthrough_vertex_gemini_payload(
+        vertex_payload, {}, req_stub, "vertex-gemini", {"provider": "vtx", "engine": "vertex-gemini"}
+    )
+    assert vertex_payload["contents"][0]["role"] == "user"
+    assert vertex_payload["contents"][0]["parts"][0]["text"] is large_user_text
+    assert "role" not in original_gemini["contents"][0]
+
+    # Claude passthrough system block mutation isolation
+    large_claude_msg = "C" * (256 * 1024)
+    original_claude = {
+        "model": "claude-sonnet-4-5",
+        "system": [{"type": "text", "text": "client sys"}],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": large_claude_msg}]}],
+    }
+    c_payload = apply_passthrough_modifications(
+        original_claude, {"system_prompt": "channel sys"}, "claude", "claude-sonnet-4-5", "claude-sonnet-4-5"
+    )
+    c_payload = await patch_passthrough_claude_payload(
+        c_payload, {"system_prompt": "channel sys"}, req_stub, "claude", {"provider": "cc"}
+    )
+    assert c_payload["messages"][0]["content"][0]["text"] is large_claude_msg
+    assert c_payload["system"][0]["text"].startswith("channel sys")
+    assert original_claude["system"][0]["text"] == "client sys"
+
+
+@pytest.mark.asyncio
+async def test_dialect_passthrough_skips_canonical_parse_with_request_plugin_and_materializes_once_on_fallback(monkeypatch):
+    from core.channel_manager import ChannelManager
+    from core.channels.registry import get_channel
+    from core.dialects import gemini as gemini_dialect_mod
+    from core.dialects.registry import get_dialect, register_dialect
+    from core.handler import ModelRequestHandler
+    from core.plugins.interceptors import register_request_interceptor, unregister_request_interceptor
+
+    orig_dialect = get_dialect("gemini")
+    if orig_dialect is None:
+        gemini_dialect_mod.register()
+        orig_dialect = get_dialect("gemini")
+    parse_calls = 0
+    orig_parse = gemini_dialect_mod.parse_gemini_request
+
+    async def counting_parse(native_body, path_params, headers):
+        nonlocal parse_calls
+        parse_calls += 1
+        return await orig_parse(native_body, path_params, headers)
+
+    monkeypatch.setattr(gemini_dialect_mod, "parse_gemini_request", counting_parse)
+    register_dialect(
+        gemini_dialect_mod.DialectDefinition(
+            id="gemini",
+            name="Google Gemini",
+            description="test",
+            parse_request=counting_parse,
+            render_response=gemini_dialect_mod.render_gemini_response,
+            render_stream=gemini_dialect_mod.render_gemini_stream,
+            parse_usage=gemini_dialect_mod.parse_gemini_usage,
+            target_engine="gemini",
+            endpoints=[],
+        ),
+        overwrite=True,
+    )
+
+    plugin_seen = []
+
+    async def req_plugin(request, engine, provider, api_key, url, headers, payload):
+        plugin_seen.append((provider["provider"], getattr(request, "model", ""), isinstance(payload, dict)))
+        return url, headers, payload
+
+    register_request_interceptor(
+        "test_mem_req_plugin", req_plugin, priority=50, plugin_name="test_mem_plugin", overwrite=True
+    )
+
+    passthrough_calls = 0
+    non_passthrough_messages = []
+
+    async def fake_passthrough(request_data, provider, *args, **kwargs):
+        nonlocal passthrough_calls
+        passthrough_calls += 1
+        from core.plugins.interceptors import apply_request_interceptors
+        await apply_request_interceptors(
+            request_data, provider["engine"], provider, "k1", "https://u", {}, kwargs["passthrough_ctx"].original_payload,
+            provider.get("preferences", {}).get("enabled_plugins"),
+        )
+        if provider["provider"].endswith("-fail"):
+            raise HTTPException(status_code=429, detail="rate limit")
+        return LoggingStreamingResponse(iter(()), media_type="text/event-stream")
+
+    async def fake_process_request(request_data, provider, *args, **kwargs):
+        non_passthrough_messages.append([m.content for m in request_data.messages])
+        if provider["provider"].endswith("-fail"):
+            raise HTTPException(status_code=502, detail="bad gateway")
+        return LoggingStreamingResponse(iter(()), media_type="text/event-stream")
+
+    monkeypatch.setattr("core.handler.process_request_passthrough", fake_passthrough)
+    monkeypatch.setattr("core.handler.process_request", fake_process_request)
+
+    class DummyRateLimiter:
+        async def next(self, model):
+            return "zk-test"
+
+    fake_app = SimpleNamespace(
+        state=SimpleNamespace(
+            admin_initialized=True,
+            api_list=["zk-test"],
+            api_keys_db=[{"api": "zk-test", "model": ["all"], "role": "user"}],
+            user_api_keys_rate_limit={"zk-test": DummyRateLimiter()},
+            provider_timeouts={"global": {"default": 60}},
+            keepalive_interval={"global": {"default": 15}},
+            stream_header_timeouts={"global": {"default": 30}},
+            error_triggers=[],
+            channel_manager=ChannelManager(cooldown_period=0),
+            config={
+                "preferences": {"SCHEDULING_ALGORITHM": "fixed_priority"},
+                "api_keys": [{"api": "zk-test", "model": ["all"], "preferences": {"AUTO_RETRY": True}}],
+                "providers": [],
+            },
+        )
+    )
+    info = {"request_id": "r1", "api_key": "zk-test"}
+    req_handler = ModelRequestHandler(fake_app, lambda: info, lambda *a, **kw: None)
+    monkeypatch.setattr("routes.deps.get_model_handler", lambda: req_handler)
+    monkeypatch.setattr("core.dialects.router._create_dialect_verify_api_key", lambda dialect_id: (lambda: 0))
+
+    route = _create_generic_handler(
+        "gemini",
+        EndpointDefinition(path="/v1beta/models/{model}:streamGenerateContent", methods=["POST"]),
+    )
+
+    body_dict = {"contents": [{"role": "user", "parts": [{"text": "hello passthrough"}]}]}
+    raw_bytes = json.dumps(body_dict).encode("utf-8")
+
+    try:
+        # Case 1: Pure passthrough WITH channel request_interceptor plugin -> 0 full canonical parses
+        fake_app.state.config["providers"] = [
+            {
+                "provider": "ais-1",
+                "engine": "gemini",
+                "enabled": True,
+                "model": ["gemini-2.5-pro"],
+                "_model_dict_cache": {"gemini-2.5-pro": "gemini-2.5-pro"},
+                "preferences": {"enabled_plugins": ["test_mem_plugin"]},
+            }
+        ]
+        assert get_channel("gemini") is not None
+
+        async def receive_1():
+            return {"type": "http.request", "body": raw_bytes, "more_body": False}
+
+        scope_1 = {
+            "type": "http",
+            "path": "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+            "path_params": {"model": "gemini-2.5-pro"},
+            "method": "POST",
+            "headers": [(b"content-type", b"application/json")],
+            "query_string": b"alt=sse",
+            "app": fake_app,
+            "_zoaholic_parsed_json": body_dict,
+        }
+        req_1 = Request(scope_1, receive_1)
+        resp_1 = await route(req_1, BackgroundTasks(), api_index=0)
+        assert resp_1.status_code == 200
+        assert parse_calls == 0
+        assert plugin_seen == [("ais-1", "gemini-2.5-pro", True)]
+        assert getattr(req_1, "_body", b"") == b""
+        assert not hasattr(req_1, "_json")
+
+        # Case 2: Passthrough 429 -> fallback to two non-passthrough providers -> materialized ONCE
+        fake_app.state.config["providers"] = [
+            {
+                "provider": "ais-fail",
+                "engine": "gemini",
+                "enabled": True,
+                "_fail": True,
+                "model": ["gemini-2.5-pro"],
+                "_model_dict_cache": {"gemini-2.5-pro": "gemini-2.5-pro"},
+                "preferences": {"enabled_plugins": ["test_mem_plugin"]},
+            },
+            {
+                "provider": "oai-fail",
+                "engine": "openai",
+                "enabled": True,
+                "_fail": True,
+                "model": ["gemini-2.5-pro"],
+                "_model_dict_cache": {"gemini-2.5-pro": "gemini-2.5-pro"},
+            },
+            {
+                "provider": "oai-ok",
+                "engine": "openai",
+                "enabled": True,
+                "model": ["gemini-2.5-pro"],
+                "_model_dict_cache": {"gemini-2.5-pro": "gemini-2.5-pro"},
+            },
+        ]
+
+        async def receive_2():
+            return {"type": "http.request", "body": raw_bytes, "more_body": False}
+
+        scope_2 = {
+            "type": "http",
+            "path": "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+            "path_params": {"model": "gemini-2.5-pro"},
+            "method": "POST",
+            "headers": [(b"content-type", b"application/json")],
+            "query_string": b"alt=sse",
+            "app": fake_app,
+            "_zoaholic_parsed_json": body_dict,
+        }
+        req_2 = Request(scope_2, receive_2)
+        resp_2 = await route(req_2, BackgroundTasks(), api_index=0)
+        assert resp_2.status_code == 200
+        assert parse_calls == 1
+        assert len(non_passthrough_messages) == 2
+        assert non_passthrough_messages[0] == ["hello passthrough"]
+        assert non_passthrough_messages[1] == ["hello passthrough"]
+    finally:
+        unregister_request_interceptor("test_mem_req_plugin")
+        if orig_dialect is not None:
+            register_dialect(orig_dialect, overwrite=True)
+
+
+@pytest.mark.asyncio
+async def test_passthrough_stream_releases_request_payload_before_sse_completion():
+    allow_finish = asyncio.Event()
+    captured_response = []
+
+    class TrackableDict(dict):
+        pass
+
+    class SlowSSEStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}\n\n'
+            await allow_finish.wait()
+            yield b"data: [DONE]\n\n"
+
+    async def upstream(request):
+        assert len(request.content) > 200_000
+        resp = httpx.Response(200, stream=SlowSSEStream(), headers={"content-type": "text/event-stream"})
+        captured_response.append(resp)
+        return resp
+
+    payload = TrackableDict({"contents": [{"role": "user", "parts": [{"text": "X" * 250_000}]}]})
+    payload_ref = weakref.ref(payload)
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+            gen = _fetch_passthrough_stream(client, "https://test.invalid/stream", {}, payload, 30)
+            del payload
+            first_chunk = await anext(gen)
+            assert "hi" in first_chunk
+            # While stream is still open waiting for remaining SSE events, request payload & bytes are already freed
+            assert payload_ref() is None
+            assert captured_response and captured_response[0].request._content == b""
+            allow_finish.set()
+            rest = [c async for c in gen]
+            assert rest
+    finally:
+        allow_finish.set()
+        if was_enabled:
+            gc.enable()
+
+
+@pytest.mark.asyncio
+async def test_large_json_body_uses_worker_thread_in_stats_middleware(monkeypatch):
+    import threading
+
+    ready = asyncio.Event()
+    ready.set()
+    monkeypatch.setitem(sys.modules, "main", SimpleNamespace(_db_ready=ready))
+    main_tid = threading.get_ident()
+    decode_tids = []
+    orig_loads = json.loads
+
+    def record_thread_loads(raw):
+        decode_tids.append(threading.get_ident())
+        return orig_loads(raw)
+
+    monkeypatch.setattr("core.middleware.json_loads", record_thread_loads)
+
+    async def inner_app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}", "more_body": False})
+
+    big_body = json.dumps({"model": "m", "messages": [{"role": "user", "content": "Z" * 80_000}]}).encode("utf-8")
+    assert len(big_body) > 65536
+
+    async def receive():
+        return {"type": "http.request", "body": big_body, "more_body": False}
+
+    async def send(msg):
+        pass
+
+    mw = StatsMiddleware(inner_app)
+    mw._dialect_prefixes = ["/v1"]
+    fake_app = SimpleNamespace(
+        state=SimpleNamespace(
+            admin_initialized=True,
+            api_list=["k"],
+            config={"preferences": {"log_raw_data_retention_hours": 0}},
+        )
+    )
+    scope = {
+        "type": "http",
+        "path": "/v1/chat/completions",
+        "method": "POST",
+        "headers": [(b"content-type", b"application/json")],
+        "query_string": b"",
+        "app": fake_app,
+    }
+    await mw(scope, receive, send)
+    assert decode_tids and decode_tids[0] != main_tid
+
+
+def test_app_middleware_stack_contains_no_base_http_middleware():
+    from starlette.middleware.base import BaseHTTPMiddleware
+    import main as main_mod
+
+    offenders = [
+        m.cls for m in main_mod.app.user_middleware
+        if isinstance(getattr(m, "cls", None), type) and issubclass(m.cls, BaseHTTPMiddleware)
+    ]
+    assert offenders == []
+
+
+@pytest.mark.asyncio
+async def test_init_db_disposes_previous_engine_and_close_db_clears_reference(monkeypatch):
+    import db as db_mod
+
+    disposed = []
+
+    class DummyOldEngine:
+        async def dispose(self):
+            disposed.append("old")
+
+    class DummyNewEngine:
+        sync_engine = None
+
+        async def dispose(self):
+            disposed.append("new")
+
+    orig_engine = db_mod.db_engine
+    orig_session = db_mod._legacy_async_session
+    orig_disable = db_mod.DISABLE_DATABASE
+    orig_type = db_mod.DB_TYPE
+    try:
+        monkeypatch.setattr(db_mod, "DISABLE_DATABASE", False)
+        monkeypatch.setattr(db_mod, "DB_TYPE", "sqlite")
+        monkeypatch.setattr(db_mod, "_create_sqlite_engine", lambda debug: DummyNewEngine())
+        monkeypatch.setattr(db_mod, "sessionmaker", lambda *a, **kw: "dummy_session_factory")
+        db_mod.db_engine = DummyOldEngine()
+
+        await db_mod.init_db()
+        assert disposed == ["old"]
+        assert isinstance(db_mod.db_engine, DummyNewEngine)
+        assert db_mod._legacy_async_session == "dummy_session_factory"
+
+        await db_mod.close_db()
+        assert disposed == ["old", "new"]
+        assert db_mod.db_engine is None
+        assert db_mod._legacy_async_session is None
+    finally:
+        db_mod.db_engine = orig_engine
+        db_mod._legacy_async_session = orig_session
+        db_mod.DISABLE_DATABASE = orig_disable
+        db_mod.DB_TYPE = orig_type
+
+
+@pytest.mark.asyncio
+async def test_mask_provider_api_key_and_smart_key_sorting_compat(monkeypatch):
+    from core import key_stats as key_stats_mod
+    from core.stats import mask_provider_api_key
+
+    assert mask_provider_api_key(None) is None
+    assert mask_provider_api_key("") == ""
+    assert mask_provider_api_key("*") == "*"
+
+    k1 = "sk-proj-11111111111111119999"
+    k2 = "sk-proj-22222222222222229999"
+    m1 = mask_provider_api_key(k1)
+    m2 = mask_provider_api_key(k2)
+    assert m1 != k1 and "1111111111" not in m1
+    assert m1 != m2  # Distinct short digest even with identical prefix and suffix
+    assert mask_provider_api_key(m1) == m1  # Idempotent
+
+    async def fake_query(provider_name, start_dt=None, end_dt=None):
+        return [
+            # k1 has masked new stats (90%)
+            {"api_key": m1, "success_rate": 0.9, "total_requests": 10, "success_count": 9},
+            # k2 has both legacy raw stats (1/2) and new masked stats (1/2) -> combined 50% (2/4)
+            {"api_key": k2, "success_rate": 0.5, "total_requests": 2, "success_count": 1},
+            {"api_key": m2, "success_rate": 0.5, "total_requests": 2, "success_count": 1},
+        ]
+
+    monkeypatch.setattr(key_stats_mod, "query_channel_key_stats", fake_query)
+    ordered = await key_stats_mod.get_sorted_api_keys("prov", [k2, "sk-unused-key-0000", k1], group_size=100)
+    assert ordered == [k1, k2, "sk-unused-key-0000"]
+
+
+@pytest.mark.asyncio
+async def test_middleware_validation_error_log_omits_raw_payload(monkeypatch):
+    from pydantic import BaseModel
+
+    class StrictBody(BaseModel):
+        count: int
+
+    logged_messages = []
+    monkeypatch.setattr(
+        "core.middleware.logger.error",
+        lambda msg, *args: logged_messages.append(msg % args if args else str(msg)),
+    )
+
+    secret_marker = "PRIVATE_CONVERSATION_BODY_MARKER_98765"
+
+    async def failing_app(scope, receive, send):
+        StrictBody.model_validate({"count": "not-an-int"})
+
+    raw_bytes = json.dumps({"model": "m", "text": secret_marker}).encode("utf-8")
+
+    async def receive():
+        return {"type": "http.request", "body": raw_bytes, "more_body": False}
+
+    captured_status = []
+
+    async def send(msg):
+        if msg["type"] == "http.response.start":
+            captured_status.append(msg["status"])
+
+    mw = StatsMiddleware(failing_app)
+    mw._dialect_prefixes = ["/v1"]
+    fake_app = SimpleNamespace(
+        state=SimpleNamespace(
+            admin_initialized=True,
+            api_list=["k"],
+            config={"preferences": {"log_raw_data_retention_hours": 0}},
+        )
+    )
+    scope = {
+        "type": "http",
+        "path": "/v1/chat/completions",
+        "method": "POST",
+        "headers": [(b"content-type", b"application/json")],
+        "query_string": b"",
+        "app": fake_app,
+    }
+    await mw(scope, receive, send)
+    assert captured_status == [422]
+    assert logged_messages
+    assert all(secret_marker not in m for m in logged_messages)
+    assert all("not-an-int" not in m for m in logged_messages)
+
+
+@pytest.mark.asyncio
+async def test_db_gate_shared_instance_suspends_and_resumes_middleware():
+    from core.db_gate import db_ready
+    import main as main_mod
+
+    assert main_mod._db_ready is db_ready
+    reached_app = asyncio.Event()
+
+    async def inner_app(scope, receive, send):
+        reached_app.set()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(msg):
+        pass
+
+    mw = StatsMiddleware(inner_app)
+    scope = {"type": "http", "path": "/-/health", "method": "GET", "headers": []}
+    db_ready.clear()
+    try:
+        task = asyncio.create_task(mw(scope, receive, send))
+        await asyncio.sleep(0.02)
+        assert not reached_app.is_set()
+        db_ready.set()
+        await asyncio.wait_for(task, timeout=1.0)
+        assert reached_app.is_set()
+    finally:
+        db_ready.set()
+
+
+def test_docs_routes_disabled_by_default():
+    import main as main_mod
+
+    assert main_mod.app.docs_url is None
+    assert main_mod.app.redoc_url is None
+    assert main_mod.app.openapi_url is None
+    route_paths = {getattr(r, "path", None) for r in main_mod.app.routes}
+    assert "/docs" not in route_paths
+    assert "/redoc" not in route_paths
+    assert "/openapi.json" not in route_paths
+    assert "/docs/markdown" not in route_paths
+    assert "/-/health" in route_paths

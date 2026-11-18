@@ -515,24 +515,46 @@ async def responses_handler(
     将 Responses API 请求转换为 Chat Completions 格式，调用内部处理器
     """
     from routes.deps import get_model_handler
+    from .passthrough import build_lightweight_dialect_request, estimate_native_payload_tokens
+    from .router import clear_request_body_cache, consume_request_json
 
-    native_body: Dict[str, Any] = await request.json()
+    native_body: Dict[str, Any] = await consume_request_json(request)
+    headers = dict(request.headers)
 
-    # 转换为 RequestModel
-    request_model = await parse_responses_request(native_body, {}, {})
+    lightweight_request = build_lightweight_dialect_request("openai-responses", native_body, {})
+    if lightweight_request is not None:
+        request_model = lightweight_request
+        estimated_tokens = estimate_native_payload_tokens(native_body)
+
+        async def _parse_canonical():
+            return await parse_responses_request(native_body, {}, headers)
+
+        canonical_factory = _parse_canonical
+    else:
+        request_model = await parse_responses_request(native_body, {}, headers)
+        estimated_tokens = None
+        canonical_factory = None
 
     model_handler = get_model_handler()
-
-    # 调用内部处理器，传递原始 payload 用于透传判断
-    return await model_handler.request_model(
-        request_model,
-        api_index,
-        background_tasks,
-        dialect_id="openai-responses",
-        original_payload=native_body,
-        original_headers=dict(request.headers),
-        raw_request=request,
-    )
+    try:
+        extra_kwargs: Dict[str, Any] = {}
+        if canonical_factory is not None:
+            extra_kwargs["canonical_request_factory"] = canonical_factory
+            extra_kwargs["estimated_prompt_tokens"] = estimated_tokens
+        return await model_handler.request_model(
+            request_model,
+            api_index,
+            background_tasks,
+            dialect_id="openai-responses",
+            original_payload=native_body,
+            original_headers=headers,
+            raw_request=request,
+            **extra_kwargs,
+        )
+    finally:
+        clear_request_body_cache(request)
+        native_body = None
+        canonical_factory = None
 
 
 async def responses_subpath_handler(
@@ -550,14 +572,16 @@ async def responses_subpath_handler(
     """
     from core.error_response import openai_error_response
     from routes.deps import get_model_handler
+    from .router import clear_request_body_cache, consume_request_json
 
     try:
-        native_body: Dict[str, Any] = await request.json()
+        native_body: Dict[str, Any] = await consume_request_json(request)
     except Exception:
         native_body = {}
 
     model = native_body.get("model")
     if not isinstance(model, str) or not model.strip():
+        clear_request_body_cache(request)
         return openai_error_response("Missing required parameter: model", 400)
 
     request_model = RequestModel(
@@ -567,17 +591,21 @@ async def responses_subpath_handler(
     )
 
     model_handler = get_model_handler()
-    return await model_handler.request_model(
-        request_model,
-        api_index,
-        background_tasks,
-        endpoint=request.url.path,
-        dialect_id="openai-responses",
-        original_payload=native_body,
-        original_headers=dict(request.headers),
-        raw_request=request,
-        passthrough_only=True,
-    )
+    try:
+        return await model_handler.request_model(
+            request_model,
+            api_index,
+            background_tasks,
+            endpoint=request.url.path,
+            dialect_id="openai-responses",
+            original_payload=native_body,
+            original_headers=dict(request.headers),
+            raw_request=request,
+            passthrough_only=True,
+        )
+    finally:
+        clear_request_body_cache(request)
+        native_body = None
 
 
 # ============================================================

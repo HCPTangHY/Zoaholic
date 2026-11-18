@@ -219,6 +219,8 @@ async def get_sorted_api_keys(
     if not all_keys_in_config:
         return []
 
+    from core.stats import mask_provider_api_key
+
     key_stats = {}
     try:
         start_time = datetime.now(timezone.utc) - timedelta(hours=72)
@@ -227,6 +229,7 @@ async def get_sorted_api_keys(
             key_stats[stat["api_key"]] = {
                 "success_rate": stat["success_rate"],
                 "total_requests": stat["total_requests"],
+                "success_count": stat.get("success_count", 0),
             }
     except Exception as e:
         logger.error(
@@ -235,15 +238,25 @@ async def get_sorted_api_keys(
         # 在数据库查询失败时，返回原始顺序，确保系统可用性
         return all_keys_in_config
 
+    def _score_key(raw_key: str) -> tuple[float, int]:
+        masked = mask_provider_api_key(raw_key)
+        s_masked = key_stats.get(masked)
+        s_raw = key_stats.get(raw_key) if masked != raw_key else None
+        if s_masked and s_raw:
+            tot = s_masked["total_requests"] + s_raw["total_requests"]
+            succ = s_masked["success_count"] + s_raw["success_count"]
+            return ((succ / tot) if tot > 0 else 0.0, tot)
+        entry = s_masked or s_raw
+        if entry:
+            return (entry["success_rate"], entry["total_requests"])
+        return (-1.0, 0)
+
     # 对所有在配置文件中定义的key进行排序
     # 排序规则：1. 成功率降序 2. 总尝试次数降序（成功率相同时，尝试多的更可信）
     # 对于从未用过的key，它们会自然排在最后
     sorted_keys = sorted(
         all_keys_in_config,
-        key=lambda k: (
-            key_stats.get(k, {"success_rate": -1})["success_rate"],
-            key_stats.get(k, {"total_requests": 0})["total_requests"],
-        ),
+        key=_score_key,
         reverse=True,
     )
 

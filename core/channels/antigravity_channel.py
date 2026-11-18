@@ -689,11 +689,11 @@ def _first_text_from_content(content: Any) -> str:
     return ""
 
 
-def _first_user_message_text(request: Any) -> str:
+def _first_user_message_text(request: Any, gemini_payload: dict | None = None) -> str:
     """提取第一条 user message 文本，用于稳定 sessionId。"""
     # 修改原因：Antigravity sessionId 由首条用户消息派生，需要跨重试保持稳定。
-    # 修改方式：优先扫描 role=user 的第一条文本，找不到时退回第一条有文本的消息。
-    # 目的：同一会话请求在上游侧获得一致 sessionId，而不是每次随机。
+    # 修改方式：优先扫描 role=user 的第一条文本；若透传轻量 RequestModel 未展开 messages，则从 gemini_payload.contents 读取。
+    # 目的：同一会话请求在上游侧获得一致 sessionId，同时不强制透传路径展开完整 RequestModel。
     messages = getattr(request, "messages", None) or []
     fallback = ""
     for msg in messages:
@@ -703,6 +703,22 @@ def _first_user_message_text(request: Any) -> str:
             fallback = text
         if role == "user" and text:
             return text
+    if isinstance(gemini_payload, dict) and isinstance(gemini_payload.get("contents"), list):
+        for turn in gemini_payload["contents"]:
+            if not isinstance(turn, dict):
+                continue
+            parts = turn.get("parts")
+            if not isinstance(parts, list):
+                continue
+            turn_text = ""
+            for p in parts:
+                if isinstance(p, dict) and not p.get("thought") and isinstance(p.get("text"), str) and p["text"]:
+                    turn_text = p["text"]
+                    break
+            if turn_text and not fallback:
+                fallback = turn_text
+            if (turn.get("role") or "user") == "user" and turn_text:
+                return turn_text
     prompt = getattr(request, "prompt", None)
     if isinstance(prompt, str) and prompt:
         return prompt
@@ -1013,7 +1029,8 @@ def _normalize_antigravity_request_payload(payload: dict) -> dict:
     # 修改原因：普通 Gemini adapter 会混入 URL 模型、snake_case tool_config 等字段，Antigravity 外层已单独携带 model。
     # 修改方式：深拷贝后移除 model，并把 system/toolConfig 等关键字段规范为 camelCase。
     # 目的：让请求体与 CPA 的 geminiToAntigravity 结构保持一致。
-    request_payload = copy.deepcopy(payload) if isinstance(payload, dict) else {}
+    from ..dialects.passthrough import clone_passthrough_payload_shell
+    request_payload = clone_passthrough_payload_shell(payload) if isinstance(payload, dict) else {}
     request_payload.pop("model", None)
 
     if "system_instruction" in request_payload and "systemInstruction" not in request_payload:
@@ -1138,7 +1155,7 @@ def _build_antigravity_payload(gemini_payload: dict, original_model: str, provid
     upstream_model, thinking_level = _rewrite_thinking_suffix(original_model)
     is_image = _is_image_model(original_model)
     request_payload = _normalize_antigravity_request_payload(gemini_payload)
-    request_payload["sessionId"] = _build_session_id(_first_user_message_text(request))
+    request_payload["sessionId"] = _build_session_id(_first_user_message_text(request, gemini_payload))
     _apply_claude_validated_tool_config(request_payload, upstream_model)
     _sanitize_reasoning_model_payload(request_payload, upstream_model, thinking_level)
 
@@ -1400,9 +1417,13 @@ async def fetch_antigravity_passthrough_stream(client, url, headers, payload, mo
         write=300.0,
         pool=10.0,
     )
+    from ..response import release_stream_request_buffer
     json_payload = await asyncio.to_thread(json_dumps_text, payload)
+    payload = None
     async with wrapped_client.stream("POST", url, headers=headers, content=json_payload, timeout=stream_timeout) as response:
+        json_payload = None
         error_message = await check_response(response, "fetch_antigravity_passthrough_stream")
+        release_stream_request_buffer(response)
         if error_message:
             yield error_message
             return

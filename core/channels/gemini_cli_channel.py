@@ -397,14 +397,17 @@ def _build_gemini_cli_payload(payload: dict, original_model: str, provider: dict
     # 修改原因：CPA 当前 Gemini CLI 执行器发送的是 {project, request, model}，不是普通 Gemini /models URL body。
     # 修改方式：把普通 Gemini body 深拷贝后放入 request，按渠道配置补 project，并把映射后的模型写到顶层 model。
     # 目的：修复旧实现直接发送普通 Gemini payload 导致 Cloud Code Assist 端点无法识别的问题。
-    source_payload = copy.deepcopy(payload) if isinstance(payload, dict) else {}
-    if isinstance(source_payload.get("request"), dict):
-        wrapped = source_payload
-        wrapped["request"] = _normalize_gemini_cli_request_payload(wrapped["request"])
+    from ..dialects.passthrough import clone_passthrough_payload_shell
+    if isinstance(payload, dict) and isinstance(payload.get("request"), dict):
+        wrapped = dict(payload)
+        wrapped["request"] = _normalize_gemini_cli_request_payload(
+            clone_passthrough_payload_shell(payload["request"])
+        )
         wrapped.setdefault("model", original_model)
         wrapped.setdefault("project", _extract_gemini_cli_project_id(provider))
         return wrapped
 
+    source_payload = clone_passthrough_payload_shell(payload) if isinstance(payload, dict) else {}
     request_payload = _normalize_gemini_cli_request_payload(source_payload)
     return {
         "project": _extract_gemini_cli_project_id(provider),

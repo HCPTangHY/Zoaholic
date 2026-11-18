@@ -450,16 +450,17 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
     tool_call_name_map = {}
     pending_fc_names = []
     seen_non_system = False
-    request_messages = copy.deepcopy(request.messages)
+    request_messages = request.messages
     for msg in request_messages:
-        if msg.role == "assistant":
-            msg.role = "model"
-        elif msg.role in ("system", "developer"):
+        msg_role = msg.role
+        if msg_role == "assistant":
+            msg_role = "model"
+        elif msg_role in ("system", "developer"):
             if seen_non_system:
-                msg.role = "user"
+                msg_role = "user"
             else:
-                msg.role = "system"
-        if msg.role != "system":
+                msg_role = "system"
+        if msg_role != "system":
             seen_non_system = True
         content = []
         # 修改原因：Gemini 3.7+ 要求多轮对话中 functionCall parts 携带 thoughtSignature，缺失会 400。
@@ -516,7 +517,7 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
         elif msg.content:
             content.append({"text": msg.content})
 
-        if msg.role == "model" and msg.tool_calls:
+        if msg_role == "model" and msg.tool_calls:
             # 修改原因：工具调用可能与思维链/文本共存于同一 model 回合。
             # 修改方式：functionCall 追加到已有 content parts 之后，不再要求 content 为空，arguments 解析失败降级为空对象。
             # 目的：保留全部 parts，避免 functionCall 丢失导致后续 functionResponse 无对应调用。
@@ -555,7 +556,7 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
                     "parts": content
                 }
             )
-        elif msg.role == "tool":
+        elif msg_role == "tool":
             if msg.tool_call_id and msg.tool_call_id in tool_call_name_map:
                 function_call_name = tool_call_name_map[msg.tool_call_id]
             elif msg.name:
@@ -588,12 +589,12 @@ async def get_vertex_gemini_payload(request, engine, provider, api_key=None):
                         "parts": [fr_part]
                     }
                 )
-        elif msg.role != "system" and content:
+        elif msg_role != "system" and content:
             # 无 tool_calls 时若有残余签名，附到最后一个 part
             if msg_signature:
                 content[-1]["thoughtSignature"] = msg_signature
-            messages.append({"role": msg.role, "parts": content})
-        elif msg.role == "system" and content:
+            messages.append({"role": msg_role, "parts": content})
+        elif msg_role == "system" and content:
             sys_txt = "".join([p.get("text", "") for p in content if "text" in p])
             if sys_txt:
                 system_prompt = f"{system_prompt}\n\n{sys_txt}" if system_prompt else sys_txt
@@ -1163,11 +1164,15 @@ async def fetch_vertex_claude_response(client, url, headers, payload, model, tim
 async def fetch_vertex_claude_response_stream(client, url, headers, payload, model, timeout):
     """处理 Vertex Claude 流式响应"""
     from ..log_config import logger
+    from ..response import release_stream_request_buffer
     
     timestamp = int(datetime.timestamp(datetime.now()))
     json_payload = await asyncio.to_thread(json_dumps_text, payload)
+    payload = None
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
+        json_payload = None
         error_message = await check_response(response, "fetch_vertex_claude_response_stream")
+        release_stream_request_buffer(response)
         if error_message:
             yield error_message
             return

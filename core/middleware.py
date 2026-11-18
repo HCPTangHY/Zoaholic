@@ -10,6 +10,7 @@ import os
 import json
 
 from core.env import env_bool
+from core.db_gate import db_ready
 from core.initialization import ensure_initialized
 from core.json_utils import json_loads
 import uuid
@@ -230,13 +231,11 @@ class StatsMiddleware:
             return
 
         # 数据库压缩期间挂起请求（不返回错误，等压缩完自动放行）
-        try:
-            from main import _db_ready
-            if not _db_ready.is_set():
-                
-                await asyncio.wait_for(_db_ready.wait(), timeout=30)
-        except (ImportError, asyncio.TimeoutError):
-            pass
+        if not db_ready.is_set():
+            try:
+                await asyncio.wait_for(db_ready.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                pass
 
         # OPTIONS 直接放行
         if method == "OPTIONS":
@@ -493,8 +492,11 @@ class StatsMiddleware:
 
                 if body_bytes:
                     try:
-                        # 使用 asyncio.to_thread 避免大请求体阻塞事件循环
-                        parsed_body = json_loads(body_bytes)
+                        # 大请求体走线程池解码，避免长上下文或 Base64 请求在主事件循环同步阻塞
+                        if len(body_bytes) > 65536:
+                            parsed_body = await asyncio.to_thread(json_loads, body_bytes)
+                        else:
+                            parsed_body = json_loads(body_bytes)
                     except json.JSONDecodeError:
                         parsed_body = None
 
@@ -591,11 +593,16 @@ class StatsMiddleware:
                             is_flagged = moderation_response.get("results", [{}])[0].get("flagged", False)
 
                             if is_flagged:
-                                logger.error("Content did not pass the moral check: %s", moderated_content)
+                                logger.warning(
+                                    "Content did not pass moderation check: path=%s, model=%s",
+                                    path,
+                                    model,
+                                )
                                 process_time = time() - start_time
                                 current_info["process_time"] = process_time
                                 current_info["is_flagged"] = is_flagged
-                                current_info["text"] = moderated_content
+                                if current_info.get("raw_data_expires_at") or self.debug:
+                                    current_info["text"] = truncate_for_logging(moderated_content)
                                 # 修改原因：直接 await update_stats 会在 SQLite 单写信号量前堆积请求协程。
                                 # 修改方式：改为同步入队，由 core.stats 的常驻 consumer 批量写入 request_stats。
                                 # 目的：在道德审查拦截路径也避免协程积压，同时保留完整请求统计。
@@ -623,17 +630,16 @@ class StatsMiddleware:
                     if message["type"] == "http.response.body" and not message.get("more_body", False):
                         response_completed = True
 
-                # Dialect routes take ownership of the parsed object via scope.
-                if is_dialect:
-                    parsed_body = None
+                # 鉴权与审查完成后立即释放中间件栈帧中的 parsed_body 引用，避免流式期间双份驻留
+                parsed_body = None
                 await self.app(scope, receive_wrapper, send_wrapper)
 
             except ValidationError as e:
-                logger.error(
-                    "Invalid request body: %s, errors: %s",
-                    json.dumps(parsed_body, indent=2, ensure_ascii=False) if parsed_body else "None",
-                    e.errors(),
-                )
+                error_summary = [
+                    {"loc": err.get("loc"), "msg": err.get("msg"), "type": err.get("type")}
+                    for err in e.errors()[:5]
+                ]
+                logger.error("Invalid request body on %s: errors=%s", path, error_summary)
                 # 将 validation 错误信息格式化为可读字符串
                 error_details = "; ".join([f"{err['loc'][-1]}: {err['msg']}" for err in e.errors()[:3]])
                 if len(e.errors()) > 3:

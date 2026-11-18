@@ -363,12 +363,45 @@ def get_preference(
     return timeout_value
 
 
-def _clone_request_data_for_channel_attempt(request_data: Any) -> Any:
-    """为单个 provider 尝试复制请求对象。"""
-    # 修改原因：channel_inbound 在 provider 已选定后执行，若直接修改 request_data，失败重试到下一个 provider 时会继承上一个渠道的修改。
-    # 修改方式：每次 provider 尝试前优先用 Pydantic model_copy(deep=True) 深拷贝，请求对象不支持时回退到 copy.deepcopy，失败时再使用原对象。
-    # 目的：让渠道入站拦截器的修改尽量局限于当前渠道尝试，避免跨渠道重试污染。
+def _clone_request_data_for_channel_attempt(request_data: Any, deep: bool = False) -> Any:
+    """为单个 provider 尝试复制请求对象骨架，底层大文本字符串保持引用共享。"""
     try:
+        if not deep:
+            if hasattr(request_data, "model_copy"):
+                return request_data.model_copy(deep=False)
+            if isinstance(request_data, dict):
+                return dict(request_data)
+            return copy.copy(request_data)
+
+        if isinstance(request_data, RequestModel):
+            cloned_msgs = []
+            for msg in request_data.messages:
+                if hasattr(msg, "model_copy"):
+                    content = getattr(msg, "content", None)
+                    if isinstance(content, list):
+                        cloned_items = [
+                            item.model_copy(deep=False)
+                            if hasattr(item, "model_copy")
+                            else (dict(item) if isinstance(item, dict) else item)
+                            for item in content
+                        ]
+                        cloned_msgs.append(msg.model_copy(update={"content": cloned_items}, deep=False))
+                    else:
+                        cloned_msgs.append(msg.model_copy(deep=False))
+                elif isinstance(msg, dict):
+                    m_copy = dict(msg)
+                    if isinstance(m_copy.get("content"), list):
+                        m_copy["content"] = [dict(x) if isinstance(x, dict) else x for x in m_copy["content"]]
+                    cloned_msgs.append(m_copy)
+                else:
+                    cloned_msgs.append(msg)
+            updates: Dict[str, Any] = {"messages": cloned_msgs}
+            if getattr(request_data, "tools", None) is not None:
+                updates["tools"] = copy.deepcopy(request_data.tools)
+            if getattr(request_data, "extra_body", None) is not None:
+                updates["extra_body"] = copy.deepcopy(request_data.extra_body)
+            return request_data.model_copy(update=updates, deep=False)
+
         if hasattr(request_data, "model_copy"):
             return request_data.model_copy(deep=True)
         if hasattr(request_data, "copy"):
@@ -566,6 +599,8 @@ class ModelRequestHandler:
         force_api_key: Optional[str] = None,
         override_auto_retry: Optional[bool] = None,
         override_timeout: Optional[int] = None,
+        canonical_request_factory: Optional[Callable[[], Any]] = None,
+        estimated_prompt_tokens: Optional[int] = None,
     ) -> Response:
         """
         处理模型请求
@@ -586,6 +621,15 @@ class ModelRequestHandler:
         """
         config = self.app.state.config
         request_model_name = request_data.model
+        _canonical_materialized = canonical_request_factory is None
+
+        async def _ensure_canonical_request() -> Any:
+            nonlocal request_data, _canonical_materialized, canonical_request_factory
+            if not _canonical_materialized and canonical_request_factory is not None:
+                request_data = await canonical_request_factory()
+                _canonical_materialized = True
+                canonical_request_factory = None
+            return request_data
 
         # ── override 模式：跳过用户限速和全局路由（测试/直接调用场景） ──
         if override_providers is not None:
@@ -633,12 +677,15 @@ class ModelRequestHandler:
                 default=safe_get(config, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
             )
 
-            request_total_tokens = 0
-            if request_data and isinstance(request_data, RequestModel):
-                for message in request_data.messages:
-                    if message.content and isinstance(message.content, str):
-                        request_total_tokens += len(message.content)
-            request_total_tokens = int(request_total_tokens / 4)
+            if not _canonical_materialized and estimated_prompt_tokens is not None:
+                request_total_tokens = int(estimated_prompt_tokens)
+            else:
+                request_total_tokens = 0
+                if request_data and isinstance(request_data, RequestModel):
+                    for message in request_data.messages:
+                        if message.content and isinstance(message.content, str):
+                            request_total_tokens += len(message.content)
+                request_total_tokens = int(request_total_tokens / 4)
 
             matching_providers = await get_right_order_providers(
                 request_model_name, config, api_index, scheduling_algorithm, 
@@ -756,14 +803,26 @@ class ModelRequestHandler:
             default=None
         ) if not override_providers else None
         try:
-            from core.plugins.interceptors import apply_inbound_interceptors
-            request_data = await apply_inbound_interceptors(
-                request_data, raw_request, _interceptor_api_key_info, _key_enabled_plugins
-            )
+            from core.plugins.interceptors import apply_inbound_interceptors, has_active_inbound_interceptors
+            if has_active_inbound_interceptors(_key_enabled_plugins):
+                request_data = await _ensure_canonical_request()
+                request_data = await apply_inbound_interceptors(
+                    request_data, raw_request, _interceptor_api_key_info, _key_enabled_plugins
+                )
         except HTTPException:
             raise
         except Exception as _inbound_err:
             logger.warning(f"Inbound interceptors error: {_inbound_err}")
+        finally:
+            if raw_request is not None:
+                if hasattr(raw_request, "_body"):
+                    raw_request._body = b""
+                if hasattr(raw_request, "_json"):
+                    try:
+                        delattr(raw_request, "_json")
+                    except Exception:
+                        raw_request._json = None
+                raw_request = None
 
         retry_count = _calc_retry_count(matching_providers)
         max_attempts = min(num_matching_providers + retry_count, 500)  # 绝对上限防死循环
@@ -895,16 +954,42 @@ class ModelRequestHandler:
                         index = grp_end
                     continue
 
-            # 不可用渠道不复制请求体，也不执行渠道入站插件。
-            attempt_request_data = _clone_request_data_for_channel_attempt(request_data)
-            try:
-                from core.plugins.interceptors import apply_channel_inbound_interceptors
-                provider_enabled_plugins = safe_get(provider, 'preferences', 'enabled_plugins', default=None)
-                attempt_request_data = await apply_channel_inbound_interceptors(
-                    attempt_request_data, None, provider, _interceptor_api_key_info, provider_enabled_plugins
+            passthrough_ctx = None
+            if dialect_id and original_payload is not None and isinstance(request_data, RequestModel):
+                from core.dialects.passthrough import evaluate_passthrough
+                passthrough_ctx = await evaluate_passthrough(
+                    dialect_id=dialect_id,
+                    original_payload=original_payload,
+                    original_headers=original_headers or {},
+                    target_provider=provider,
+                    request_model=request_model_name,
                 )
-            except Exception as _channel_inbound_err:
-                logger.warning(f"Channel inbound interceptors error for provider {provider_name}: {_channel_inbound_err}")
+
+            # passthrough_only 前置拦截：不兼容渠道在克隆请求体和执行插件前直接跳过。
+            if passthrough_only and not (passthrough_ctx and passthrough_ctx.enabled):
+                error_message = f"Endpoint {endpoint} requires passthrough mode, but provider {provider_name} is not compatible"
+                status_code = 501
+                continue
+
+            provider_enabled_plugins = safe_get(provider, 'preferences', 'enabled_plugins', default=None)
+            from core.plugins.interceptors import (
+                apply_channel_inbound_interceptors,
+                has_active_channel_inbound_interceptors,
+            )
+            has_channel_inbound = has_active_channel_inbound_interceptors(provider_enabled_plugins)
+            if not (passthrough_ctx and passthrough_ctx.enabled) or has_channel_inbound:
+                request_data = await _ensure_canonical_request()
+
+            attempt_request_data = _clone_request_data_for_channel_attempt(
+                request_data, deep=has_channel_inbound
+            )
+            if has_channel_inbound:
+                try:
+                    attempt_request_data = await apply_channel_inbound_interceptors(
+                        attempt_request_data, None, provider, _interceptor_api_key_info, provider_enabled_plugins
+                    )
+                except Exception as _channel_inbound_err:
+                    logger.warning(f"Channel inbound interceptors error for provider {provider_name}: {_channel_inbound_err}")
 
             original_request_model = (original_model, attempt_request_data.model)
             
@@ -997,25 +1082,6 @@ class ModelRequestHandler:
                 pass
 
             try:
-                passthrough_ctx = None
-                if dialect_id and original_payload is not None and isinstance(attempt_request_data, RequestModel):
-                    from core.dialects.passthrough import evaluate_passthrough
-                    passthrough_ctx = await evaluate_passthrough(
-                        dialect_id=dialect_id,
-                        original_payload=original_payload,
-                        original_headers=original_headers or {},
-                        target_provider=provider,
-                        request_model=request_model_name,
-                    )
-
-                # passthrough_only 前置拦截：如果该端点仅支持透传，
-                # 但当前 provider 与入口方言不匹配（透传未启用），
-                # 直接跳过该 provider，不发送任何真实上游请求。
-                if passthrough_only and not (passthrough_ctx and passthrough_ctx.enabled):
-                    error_message = f"Endpoint {endpoint} requires passthrough mode, but provider {provider_name} is not compatible"
-                    status_code = 501
-                    continue
-
                 process_fn = process_request_passthrough if (passthrough_ctx and passthrough_ctx.enabled) else process_request
                 # 修改原因：只有 BYOK provider 才应使用请求中的真实上游 key；普通 provider 仍按配置 key pool 轮换。
                 # 修改方式：按当前 provider 是否为 BYOK provider 计算 effective_force_api_key，并传给普通和透传路径。

@@ -634,16 +634,17 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
     try:
         request_messages = [Message(role="user", content=request.prompt)]
     except Exception:
-        request_messages = copy.deepcopy(request.messages)
+        request_messages = request.messages
     for msg in request_messages:
-        if msg.role == "assistant":
-            msg.role = "model"
-        elif msg.role in ("system", "developer"):
+        msg_role = msg.role
+        if msg_role == "assistant":
+            msg_role = "model"
+        elif msg_role in ("system", "developer"):
             if seen_non_system:
-                msg.role = "user"
+                msg_role = "user"
             else:
-                msg.role = "system"
-        if msg.role != "system":
+                msg_role = "system"
+        if msg_role != "system":
             seen_non_system = True
         
         parts = []
@@ -698,7 +699,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
             parts.append({"text": msg.content})
 
         # 3. 处理工具调用 (Model 角色下)
-        if msg.role == "model" and msg.tool_calls:
+        if msg_role == "model" and msg.tool_calls:
             for i, tc in enumerate(msg.tool_calls):
                 # 转换 arguments
                 try:
@@ -741,7 +742,7 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
             parts[-1]["thoughtSignature"] = msg_signature
 
         # 5. 处理函数响应 (Tool 角色下)
-        if msg.role == "tool":
+        if msg_role == "tool":
             fc_name = None
             if msg.tool_call_id:
                 fc_name = tool_call_name_map.get(msg.tool_call_id)
@@ -770,9 +771,9 @@ async def get_gemini_payload(request, engine, provider, api_key=None):
                     "role": "user",
                     "parts": [fr_part]
                 })
-        elif msg.role != "system" and parts:
-            messages.append({"role": msg.role, "parts": parts})
-        elif msg.role == "system":
+        elif msg_role != "system" and parts:
+            messages.append({"role": msg_role, "parts": parts})
+        elif msg_role == "system":
             # 系统提示词处理逻辑保持不变（不再将连续下划线压缩为单下划线）
             sys_text = "".join([p.get("text", "") for p in parts if "text" in p])
             if sys_text:
@@ -1326,10 +1327,14 @@ async def fetch_gemini_response(client, url, headers, payload, model, timeout):
 
 async def fetch_gemini_response_stream(client, url, headers, payload, model, timeout):
     """处理 Gemini 流式响应"""
+    from ..response import release_stream_request_buffer
     timestamp = int(datetime.timestamp(datetime.now()))
     json_payload = await asyncio.to_thread(json_dumps_bytes, payload)
+    payload = None
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
+        json_payload = None
         error_message = await check_response(response, "fetch_gemini_response_stream")
+        release_stream_request_buffer(response)
         if error_message:
             yield _normalize_gemini_http_error(error_message)
             return

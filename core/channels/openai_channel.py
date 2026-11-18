@@ -319,10 +319,14 @@ async def fetch_gpt_response_stream(client, url, headers, payload, model, timeou
     # 修改原因：core 不解析供应商私有思维链文本，避免把上游内容拆成 reasoning_content。
     # 修改方式：删除思维链解析状态变量，后续流式内容按原始 chunk 透传或按已有结构字段处理。
     # 目的：让思维链处理完全交给上游或插件。
+    from ..response import release_stream_request_buffer
     json_payload = await asyncio.to_thread(json_dumps_text, payload)
+    payload = None
     
     async with client.stream('POST', url, headers=headers, content=json_payload, timeout=timeout) as response:
+        json_payload = None
         error_message = await check_response(response, "fetch_gpt_response_stream")
+        release_stream_request_buffer(response)
         if error_message:
             yield error_message
             return
